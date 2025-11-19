@@ -46,10 +46,22 @@ type LazyFullNode struct {
 
 	// Session rollover monitoring state
 	rolloverState *sessionRolloverState
+
+	// TODO_TECHDEBT(@adshmh): Make the load testing supplier filtering logic more visible.
+	//
+	// If specified, will only return endpoints matching the supplier address.
+	// Used for load testing against a single RelayMiner.
+	allowedSupplierAddr string
 }
 
+// TODO_TECHDEBT(@adshmh): Refactor to find a better fit for the load testing configuration.
+//
 // NewLazyFullNode builds and returns a LazyFullNode using the provided configuration.
-func NewLazyFullNode(logger polylog.Logger, config FullNodeConfig) (*LazyFullNode, error) {
+func NewLazyFullNode(
+	logger polylog.Logger,
+	config FullNodeConfig,
+	allowedSupplierAddr string,
+) (*LazyFullNode, error) {
 	logger = logger.With("component", "fullnode_lazy")
 
 	blockClient, err := newBlockClient(config.RpcURL)
@@ -103,7 +115,7 @@ func (lfn *LazyFullNode) GetSession(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	appAddr string,
-) (sessiontypes.Session, error) {
+) (hydratedSession, error) {
 	session, err := lfn.sessionClient.GetSession(
 		ctx,
 		appAddr,
@@ -112,23 +124,34 @@ func (lfn *LazyFullNode) GetSession(
 	)
 
 	if err != nil {
-		return sessiontypes.Session{},
+		return hydratedSession{},
 			fmt.Errorf("GetSession: error getting the session for service %s app %s: %w",
 				serviceID, appAddr, err,
 			)
 	}
 
 	if session == nil {
-		return sessiontypes.Session{},
+		return hydratedSession{},
 			fmt.Errorf("GetSession: got nil session for service %s app %s: %w",
 				serviceID, appAddr, err,
 			)
 	}
 
 	// Update session rollover boundaries for rollover monitoring
-	lfn.rolloverState.updateSessionRolloverBoundaries(*session)
+	lfn.rolloverState.updateSessionRolloverBoundaries(session)
 
-	return *session, nil
+	// TODO_TECHDEBT(@adshmh): Refactor load testing related code to make the filtering more visible.
+	//
+	// TODO_UPNEXT(@adshmh): Log and handle potential errors.
+	//
+	// In Load Testing using RelayMiner mode: drop any endpoints ot matching the single supplier specified in the config.
+	//
+	endpoints, _ := endpointsFromSession(session, lfn.allowedSupplierAddr)
+
+	return hydratedSession{
+		session:   session,
+		endpoints: endpoints,
+	}, nil
 }
 
 // ValidateRelayResponse:
@@ -187,7 +210,7 @@ func (lfn *LazyFullNode) GetSessionWithExtendedValidity(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	appAddr string,
-) (sessiontypes.Session, error) {
+) (hydratedSession, error) {
 	logger := lfn.logger.With(
 		"service_id", serviceID,
 		"app_addr", appAddr,
@@ -198,7 +221,7 @@ func (lfn *LazyFullNode) GetSessionWithExtendedValidity(
 	currentSession, err := lfn.GetSession(ctx, serviceID, appAddr)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to get current session")
-		return sessiontypes.Session{}, fmt.Errorf("error getting current session: %w", err)
+		return hydratedSession{}, fmt.Errorf("error getting current session: %w", err)
 	}
 
 	// Get shared parameters to determine grace period
@@ -216,15 +239,15 @@ func (lfn *LazyFullNode) GetSessionWithExtendedValidity(
 	}
 
 	// Calculate when the previous session's grace period would end
-	prevSessionEndHeight := currentSession.Header.SessionStartBlockHeight - 1
+	prevSessionEndHeight := currentSession.session.Header.SessionStartBlockHeight - 1
 	prevSessionEndHeightWithExtendedValidity := prevSessionEndHeight + int64(sharedParams.GracePeriodEndOffsetBlocks)
 
 	logger = logger.With(
 		"prev_session_end_height", prevSessionEndHeight,
 		"prev_session_end_height_with_extended_validity", prevSessionEndHeightWithExtendedValidity,
 		"current_height", currentHeight,
-		"current_session_start_height", currentSession.Header.SessionStartBlockHeight,
-		"current_session_end_height", currentSession.Header.SessionEndBlockHeight,
+		"current_session_start_height", currentSession.session.Header.SessionStartBlockHeight,
+		"current_session_end_height", currentSession.session.Header.SessionEndBlockHeight,
 	)
 
 	// If we're not within the grace period of the previous session, return the current session
@@ -241,10 +264,10 @@ func (lfn *LazyFullNode) GetSessionWithExtendedValidity(
 	}
 
 	// Update session rollover boundaries for rollover monitoring
-	lfn.rolloverState.updateSessionRolloverBoundaries(currentSession)
+	lfn.rolloverState.updateSessionRolloverBoundaries(currentSession.session)
 
 	// Return the previous session
-	return *prevSession, nil
+	return createHydratedSession(prevSession, lfn.allowedSupplierAddr)
 }
 
 // IsInSessionRollover returns true if we're currently in a session rollover period.
@@ -359,4 +382,20 @@ func newSharedClient(config grpc.GRPCConfig) (*sdk.SharedClient, error) {
 	}
 
 	return &sdk.SharedClient{QueryClient: sharedtypes.NewQueryClient(conn)}, nil
+}
+
+// createHydratedSession creates a hydratedSession from a session by computing its endpoints
+func createHydratedSession(
+	session *sessiontypes.Session,
+	allowedSupplierAddr string,
+) (hydratedSession, error) {
+	endpoints, err := endpointsFromSession(session, allowedSupplierAddr)
+	if err != nil {
+		return hydratedSession{}, fmt.Errorf("failed to create endpoints from session: %w", err)
+	}
+
+	return hydratedSession{
+		session:   session,
+		endpoints: endpoints,
+	}, nil
 }

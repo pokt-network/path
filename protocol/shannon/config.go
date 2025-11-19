@@ -339,6 +339,18 @@ func (fnc *FullNodeConfig) HydrateDefaults() {
 	}
 }
 
+func (ltc *LoadTestingConfig) GetAllowedSupplierAddr() string {
+	relayMinerConfig := ltc.RelayMinerConfig
+
+	// RelayMiner config not specified:
+	// No restrictions on supplier address.
+	if relayMinerConfig == nil {
+		return ""
+	}
+
+	return relayMinerConfig.SupplierAddr
+}
+
 func (ltc *LoadTestingConfig) Validate() error {
 	// Error: neither backend server nor RelayMiner config are specified.
 	if ltc.BackendServiceURL == nil && ltc.RelayMinerConfig == nil {

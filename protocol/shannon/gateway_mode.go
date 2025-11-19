@@ -7,7 +7,6 @@ import (
 	"slices"
 
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
-	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 
 	"github.com/buildwithgrove/path/protocol"
 )
@@ -36,7 +35,7 @@ func (p *Protocol) getActiveGatewaySessions(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	httpReq *http.Request,
-) ([]sessiontypes.Session, error) {
+) ([]hydratedSession, error) {
 	p.logger.With(
 		"service_id", serviceID,
 		"gateway_mode", p.gatewayMode,

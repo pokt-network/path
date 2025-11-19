@@ -305,7 +305,7 @@ func buildEndpointFromWebSocketConnectionObservation(
 ) endpoint {
 	session := buildSessionFromWebSocketConnectionObservation(observation)
 	return &protocolEndpoint{
-		session:  session,
+		session:  &session,
 		supplier: observation.GetSupplier(),
 		url:      observation.GetEndpointUrl(),
 	}

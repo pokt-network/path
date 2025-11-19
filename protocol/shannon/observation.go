@@ -237,8 +237,8 @@ func buildEndpointFromObservation(
 // Used to identify an endpoint for applying sanctions.
 func buildSessionFromObservation(
 	observation *protocolobservations.ShannonEndpointObservation,
-) sessiontypes.Session {
-	return sessiontypes.Session{
+) *sessiontypes.Session {
+	return &sessiontypes.Session{
 		// Only Session Header is required for processing observations.
 		Header: &sessiontypes.SessionHeader{
 			ApplicationAddress:      observation.GetEndpointAppAddress(),

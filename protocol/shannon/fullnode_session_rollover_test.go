@@ -141,7 +141,7 @@ func Test_updateSessionRolloverBoundaries(t *testing.T) {
 			srs.sessionRolloverEnd = tt.initialRolloverEnd
 			srs.currentBlockHeight = tt.initialBlockHeight
 
-			srs.updateSessionRolloverBoundaries(tt.session)
+			srs.updateSessionRolloverBoundaries(&tt.session)
 
 			if tt.shouldReturn && (srs.sessionRolloverStart != tt.expectedRolloverStart || srs.sessionRolloverEnd != tt.expectedRolloverEnd) {
 				t.Errorf("updateSessionRolloverBoundaries() should have returned early, but state changed")

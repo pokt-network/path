@@ -13,8 +13,6 @@ import (
 	"context"
 	"fmt"
 
-	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
-
 	"github.com/buildwithgrove/path/protocol"
 )
 
@@ -22,7 +20,7 @@ import (
 func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
-) ([]sessiontypes.Session, error) {
+) ([]hydratedSession, error) {
 	logger := p.logger.With(
 		"method", "getCentralizedGatewayModeActiveSessions",
 		"service_id", string(serviceID),
@@ -39,9 +37,9 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 	}
 
 	// Loop over the address of apps owned by the gateway in Centralized gateway mode.
-	var ownedAppSessions []sessiontypes.Session
+	var ownedAppSessions []hydratedSession
 	for _, ownedAppAddr := range ownedAppsForService {
-		session, err := p.getSession(ctx, logger, ownedAppAddr, serviceID)
+		session, err := p.getSession(ctx, p.logger, ownedAppAddr, serviceID)
 		if err != nil {
 			return nil, err
 		}

@@ -130,7 +130,7 @@ type protocolEndpoint struct {
 	// the first app will be chosen. A randomization among the apps in this (unlikely) scenario
 	// may be needed.
 	// session is the active session corresponding to the app, of which the endpoint is a member.
-	session sessiontypes.Session
+	session *sessiontypes.Session
 }
 
 // IsFallback returns false for protocol endpoints.
@@ -165,7 +165,7 @@ func (e protocolEndpoint) WebsocketURL() (string, error) {
 
 // Session returns a pointer to the session associated with the endpoint.
 func (e protocolEndpoint) Session() *sessiontypes.Session {
-	return &e.session
+	return e.session
 }
 
 // Supplier returns the supplier address of the endpoint.
@@ -177,7 +177,7 @@ func (e protocolEndpoint) Supplier() string {
 // It returns a map for efficient lookup, as the main/only consumer of this function uses
 // the return value for selecting an endpoint for sending a relay.
 func endpointsFromSession(
-	session sessiontypes.Session,
+	session *sessiontypes.Session,
 	// TODO_TECHDEBT(@adshmh): Refactor load testing logic to make it more visible.
 	//
 	// The only supplier allowed from the session.
@@ -185,7 +185,7 @@ func endpointsFromSession(
 	allowedSupplierAddr string,
 ) (map[protocol.EndpointAddr]endpoint, error) {
 	sf := sdk.SessionFilter{
-		Session: &session,
+		Session: session,
 	}
 
 	// AllEndpoints will return a map of supplier address to a list of supplier endpoints.

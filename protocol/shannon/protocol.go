@@ -7,7 +7,6 @@ import (
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
-	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/buildwithgrove/path/gateway"
@@ -411,7 +410,7 @@ func (p *Protocol) IsAlive() bool {
 func (p *Protocol) getUniqueEndpoints(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
-	activeSessions []sessiontypes.Session,
+	activeSessions []hydratedSession,
 	filterSanctioned bool,
 	rpcType sharedtypes.RPCType,
 ) (map[protocol.EndpointAddr]endpoint, error) {
@@ -465,7 +464,7 @@ func (p *Protocol) getUniqueEndpoints(
 func (p *Protocol) getSessionsUniqueEndpoints(
 	_ context.Context,
 	serviceID protocol.ServiceID,
-	activeSessions []sessiontypes.Session,
+	activeSessions []hydratedSession,
 	filterByRPCType sharedtypes.RPCType,
 ) (map[protocol.EndpointAddr]endpoint, error) {
 	logger := p.logger.With(
@@ -480,38 +479,20 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 
 	endpoints := make(map[protocol.EndpointAddr]endpoint)
 
-	// TODO_TECHDEBT(@adshmh): Refactor load testing related code to make the filtering more visible.
-	//
-	// In Load Testing using RelayMiner mode: drop any endpoints ot matching the single supplier specified in the config.
-	//
-	var allowedSupplierAddr string
-	if ltc := p.loadTestingConfig; ltc != nil {
-		if ltc.RelayMinerConfig != nil {
-			allowedSupplierAddr = ltc.RelayMinerConfig.SupplierAddr
-		}
-	}
-
 	// Iterate over all active sessions for the service ID.
-	for _, session := range activeSessions {
-		app := session.Application
+	for _, hydratedSession := range activeSessions {
+		app := hydratedSession.session.Application
 
 		// Using a single iteration scope for this logger.
 		// Avoids adding all apps in the loop to the logger's fields.
 		// Hydrate the logger with session details.
 		logger := logger.With("valid_app_address", app.Address).With("method", "getSessionsUniqueEndpoints")
-		logger = hydrateLoggerWithSession(logger, &session)
-		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msgf("Finding unique endpoints for session %s for app %s for service %s.", session.SessionId, app.Address, serviceID)
-
-		// Retrieve all endpoints for the session.
-		sessionEndpoints, err := endpointsFromSession(session, allowedSupplierAddr)
-		if err != nil {
-			logger.Error().Err(err).Msgf("Internal error: error getting all endpoints for service %s app %s and session: skipping the app.", serviceID, app.Address)
-			continue
-		}
+		logger = hydrateLoggerWithSession(logger, hydratedSession.session)
+		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msgf("Finding unique endpoints for session %s for app %s for service %s.", hydratedSession.session.SessionId, app.Address, serviceID)
 
 		// Initialize the qualified endpoints as the full set of session endpoints.
 		// Sanctioned endpoints will be filtered out below if a valid RPC type is provided.
-		qualifiedEndpoints := sessionEndpoints
+		qualifiedEndpoints := hydratedSession.endpoints
 
 		// Filter out sanctioned endpoints if a valid RPC type is provided.
 		// If no valid RPC type is provided, don't filter out sanctioned endpoints.
@@ -519,7 +500,7 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		if sanctionedEndpointsStore, ok := p.sanctionedEndpointsStores[filterByRPCType]; ok {
 			logger.Debug().Msgf(
 				"app %s has %d endpoints before filtering sanctioned endpoints.",
-				app.Address, len(sessionEndpoints),
+				app.Address, len(hydratedSession.endpoints),
 			)
 
 			// Filter out any sanctioned endpoints
@@ -528,7 +509,7 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 			if len(filteredEndpoints) == 0 {
 				logger.Error().Msgf(
 					"❌ All %d session endpoints are sanctioned for service %s, app %s. SKIPPING the app.",
-					len(sessionEndpoints), serviceID, app.Address,
+					len(hydratedSession.endpoints), serviceID, app.Address,
 				)
 				continue
 			}
@@ -538,13 +519,13 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		}
 
 		// Log the number of endpoints before and after filtering
-		logger.Info().Msgf("Filtered session endpoints for app %s from %d to %d.", app.Address, len(sessionEndpoints), len(qualifiedEndpoints))
+		logger.Info().Msgf("Filtered session endpoints for app %s from %d to %d.", app.Address, len(hydratedSession.endpoints), len(qualifiedEndpoints))
 
 		maps.Copy(endpoints, qualifiedEndpoints)
 
 		logger.Info().Msgf(
 			"Successfully fetched %d endpoints for session %s for application %s for service %s.",
-			len(qualifiedEndpoints), session.SessionId, app.Address, serviceID,
+			len(qualifiedEndpoints), hydratedSession.session.SessionId, app.Address, serviceID,
 		)
 	}
 

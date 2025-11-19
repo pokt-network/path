@@ -11,7 +11,6 @@ import (
 	"net/http"
 
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
-	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 
 	"github.com/buildwithgrove/path/protocol"
 	"github.com/buildwithgrove/path/request"
@@ -28,7 +27,7 @@ func (p *Protocol) getDelegatedGatewayModeActiveSession(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	httpReq *http.Request,
-) ([]sessiontypes.Session, error) {
+) ([]hydratedSession, error) {
 	logger := p.logger.With("method", "getDelegatedGatewayModeActiveSession")
 
 	extractedAppAddr, err := getAppAddrFromHTTPReq(httpReq)
@@ -45,7 +44,7 @@ func (p *Protocol) getDelegatedGatewayModeActiveSession(
 	}
 
 	// Skip the session's app if it is not staked for the requested service.
-	selectedApp := session.Application
+	selectedApp := session.session.Application
 	if !appIsStakedForService(serviceID, selectedApp) {
 		err = fmt.Errorf("%w: Trying to use app %s that is not staked for the service %s", errProtocolContextSetupAppNotStaked, selectedApp.Address, serviceID)
 		logger.Error().Err(err).Msgf("SHOULD NEVER HAPPEN: %s", err.Error())
@@ -54,7 +53,7 @@ func (p *Protocol) getDelegatedGatewayModeActiveSession(
 
 	logger.Debug().Msgf("successfully verified the gateway (%s) has delegation for the selected app (%s) for service (%s).", p.gatewayAddr, selectedApp.Address, serviceID)
 
-	return []sessiontypes.Session{session}, nil
+	return []hydratedSession{session}, nil
 }
 
 // appIsStakedForService returns true if the supplied application is staked for the supplied service ID.

@@ -129,7 +129,7 @@ func (srs *sessionRolloverState) updateBlockHeight() {
 // updateSessionRolloverBoundaries updates rollover boundaries when we fetch a new session.
 // Called from GetSession() to keep rollover monitoring current.
 // Only updates rollover boundaries if the current rollover period has ended.
-func (srs *sessionRolloverState) updateSessionRolloverBoundaries(session sessiontypes.Session) {
+func (srs *sessionRolloverState) updateSessionRolloverBoundaries(session *sessiontypes.Session) {
 	if session.Header == nil {
 		srs.logger.Warn().Msg("Session header is nil, cannot update session values")
 		return
