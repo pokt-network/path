@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -45,10 +46,34 @@ func setupEndpointHydrator(
 		return nil, errors.New("endpoint hydrator enabled but no protocol provided. this should never happen")
 	}
 
+	// Get configured service IDs from the protocol instance.
+	gatewayServiceIDs := protocolInstance.ConfiguredServiceIDs()
+
+	// Filter out any service IDs that are manually disabled by the user.
+	activeQoSServices := make(map[protocol.ServiceID]gateway.QoSService)
+	for serviceID, qosService := range qosServices {
+		activeQoSServices[serviceID] = qosService
+	}
+
+	for _, disabledQoSServiceIDForGateway := range hydratorConfig.QoSDisabledServiceIDs {
+		// Throw error if any manually disabled service IDs are not found in the protocol's configured service IDs.
+		if _, found := gatewayServiceIDs[disabledQoSServiceIDForGateway]; !found {
+			return nil, fmt.Errorf("[INVALID CONFIGURATION] QoS manually disabled for service ID: %s BUT NOT not found in protocol's configured service IDs", disabledQoSServiceIDForGateway)
+		}
+		logger.Info().Msgf("Gateway manually disabled QoS for service ID: %s", disabledQoSServiceIDForGateway)
+		delete(activeQoSServices, disabledQoSServiceIDForGateway)
+	}
+
+	// Check if all QoS services were disabled after filtering
+	if len(activeQoSServices) == 0 {
+		logger.Warn().Msg("endpoint hydrator is fully disabled: all QoS services were manually disabled")
+		return nil, nil
+	}
+
 	endpointHydrator := gateway.EndpointHydrator{
 		Logger:                  cmdLogger,
 		Protocol:                protocolInstance,
-		ActiveQoSServices:       qosServices,
+		ActiveQoSServices:       activeQoSServices,
 		RunInterval:             hydratorConfig.RunInterval,
 		MaxEndpointCheckWorkers: hydratorConfig.MaxEndpointCheckWorkers,
 		MetricsReporter:         metricsReporter,

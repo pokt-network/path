@@ -32,14 +32,11 @@ type QoS struct {
 }
 
 // NewQoSInstance builds and returns an instance of the EVM QoS service.
-func NewQoSInstance(logger polylog.Logger, config EVMServiceQoSConfig) *QoS {
-	evmChainID := config.getEVMChainID()
-	serviceId := config.GetServiceID()
-
+func NewQoSInstance(logger polylog.Logger, serviceID protocol.ServiceID, serviceConfig *Config) *QoS {
 	logger = logger.With(
 		"qos_instance", "evm",
-		"service_id", serviceId,
-		"evm_chain_id", evmChainID,
+		"service_id", serviceID,
+		"evm_chain_id", serviceConfig.ChainID,
 	)
 
 	store := &endpointStore{
@@ -50,16 +47,17 @@ func NewQoSInstance(logger polylog.Logger, config EVMServiceQoSConfig) *QoS {
 
 	serviceState := &serviceState{
 		logger:           logger,
-		serviceQoSConfig: config,
+		serviceID:        serviceID,
+		serviceQoSConfig: serviceConfig,
 		endpointStore:    store,
 	}
 
 	// TODO_CONSIDERATION(@olshansk): Archival checks are currently optional to enable iteration
 	// and optionality. In the future, evaluate whether it should be mandatory for all EVM services.
-	if config.archivalCheckEnabled() {
-		serviceState.archivalState = archivalState{
+	if serviceConfig.ArchivalCheck != nil {
+		serviceState.archivalState = &archivalState{
 			logger:              logger.With("state", "archival"),
-			archivalCheckConfig: config.getEVMArchivalCheckConfig(),
+			archivalCheckConfig: serviceConfig.ArchivalCheck,
 			// Initialize the balance consensus map.
 			// It keeps track and maps a balance (at the configured address and contract)
 			// to the number of occurrences seen across all endpoints.
@@ -69,8 +67,8 @@ func NewQoSInstance(logger polylog.Logger, config EVMServiceQoSConfig) *QoS {
 
 	evmRequestValidator := &evmRequestValidator{
 		logger:       logger,
-		serviceID:    serviceId,
-		chainID:      evmChainID,
+		serviceID:    serviceID,
+		chainID:      serviceConfig.ChainID,
 		serviceState: serviceState,
 	}
 

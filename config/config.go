@@ -20,6 +20,7 @@ type GatewayConfig struct {
 	HydratorConfig     EndpointHydratorConfig        `yaml:"hydrator_config"`
 	MessagingConfig    MessagingConfig               `yaml:"messaging_config"`
 	DataReporterConfig HTTPDataReporterConfig        `yaml:"data_reporter_config"`
+	ServicesQoSConfigs *ServicesQoSConfig            `yaml:"services_qos_configs"`
 }
 
 // LoadGatewayConfigFromYAML reads a YAML configuration file from the specified path

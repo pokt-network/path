@@ -20,7 +20,7 @@ var _ gateway.QoSEndpointCheckGenerator = &requestValidator{}
 
 // CheckWebsocketConnection returns true if the endpoint supports Websocket connections.
 func (rv *requestValidator) CheckWebsocketConnection() bool {
-	_, supportsWebsockets := rv.serviceState.serviceQoSConfig.getSupportedAPIs()[sharedtypes.RPCType_WEBSOCKET]
+	_, supportsWebsockets := rv.serviceState.serviceQoSConfig.GetSupportedAPIs()[sharedtypes.RPCType_WEBSOCKET]
 	return supportsWebsockets
 }
 
@@ -31,7 +31,7 @@ func (rv *requestValidator) GetRequiredQualityChecks(endpointAddr protocol.Endpo
 	endpoint := rv.serviceState.endpointStore.getEndpoint(endpointAddr)
 
 	// Get the RPC types supported by the CosmosSDK service.
-	supportedAPIs := rv.serviceState.serviceQoSConfig.getSupportedAPIs()
+	supportedAPIs := rv.serviceState.serviceQoSConfig.GetSupportedAPIs()
 
 	// List of all synthetic QoS checks required for the endpoint.
 	var checks []gateway.RequestQoSContext

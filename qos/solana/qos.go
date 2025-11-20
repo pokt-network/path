@@ -2,12 +2,13 @@ package solana
 
 import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
+
+	"github.com/buildwithgrove/path/protocol"
 )
 
 // NewQoSInstance builds and returns an instance of the Solana QoS service.
-func NewQoSInstance(logger polylog.Logger, serviceConfig SolanaServiceQoSConfig) *QoS {
-	chainID := serviceConfig.getChainID()
-	serviceID := serviceConfig.GetServiceID()
+func NewQoSInstance(logger polylog.Logger, serviceID protocol.ServiceID, serviceConfig *Config) *QoS {
+	chainID := serviceConfig.ChainID
 
 	logger = logger.With(
 		"qos_instance", "solana",

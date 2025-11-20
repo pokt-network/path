@@ -57,7 +57,7 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
 	}
 
 	// Get the RPC types supported by the CosmosSDK service.
-	supportedAPIs := ss.serviceQoSConfig.getSupportedAPIs()
+	supportedAPIs := ss.serviceQoSConfig.GetSupportedAPIs()
 
 	// If the service supports CometBFT, validate the endpoint's CometBFT checks.
 	if _, ok := supportedAPIs[sharedtypes.RPCType_COMET_BFT]; ok {
@@ -136,7 +136,7 @@ func (ss *serviceState) isCometBFTStatusValid(check endpointCheckCometBFTStatus)
 		return fmt.Errorf("%w: %v", errNoCometBFTStatusObs, err)
 	}
 
-	expectedChainID := ss.serviceQoSConfig.getCosmosSDKChainID()
+	expectedChainID := ss.serviceQoSConfig.CosmosChainID
 	if chainID != expectedChainID {
 		return fmt.Errorf("%w: chain ID %s does not match expected chain ID %s",
 			errInvalidCometBFTChainIDObs, chainID, expectedChainID)
@@ -205,7 +205,7 @@ func (ss *serviceState) isCosmosStatusValid(check endpointCheckCosmosStatus) err
 // validateBlockHeightSyncAllowance returns an error if:
 //   - The endpoint's block height is outside the latest block height minus the sync allowance.
 func (ss *serviceState) validateBlockHeightSyncAllowance(latestBlockHeight uint64) error {
-	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
+	syncAllowance := ss.serviceQoSConfig.SyncAllowance
 	minAllowedBlockNumber := ss.perceivedBlockNumber - syncAllowance
 	if latestBlockHeight < minAllowedBlockNumber {
 		return fmt.Errorf("%w: block number %d is outside the sync allowance relative to min allowed block number %d and sync allowance %d",
@@ -234,7 +234,7 @@ func (ss *serviceState) isEVMChainIDValid(check endpointCheckEVMChainID) error {
 		return err
 	}
 
-	expectedEVMChainID := ss.serviceQoSConfig.getEVMChainID()
+	expectedEVMChainID := ss.serviceQoSConfig.EVMChainID
 	if evmChainID != expectedEVMChainID {
 		return fmt.Errorf("%w: chain ID %s does not match expected chain ID %s",
 			errInvalidEVMChainIDObs, evmChainID, expectedEVMChainID)

@@ -33,7 +33,7 @@ type serviceState struct {
 	serviceStateLock sync.RWMutex
 
 	// serviceQoSConfig maintains the QoS configs for this service
-	serviceQoSConfig CosmosSDKServiceQoSConfig
+	serviceQoSConfig *Config
 
 	// endpointStore maintains the set of available endpoints and their quality data
 	endpointStore *endpointStore

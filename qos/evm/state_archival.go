@@ -29,7 +29,7 @@ type archivalState struct {
 	logger polylog.Logger
 
 	// archivalCheckConfig contains all configurable values for an EVM archival check.
-	archivalCheckConfig evmArchivalCheckConfig
+	archivalCheckConfig *ArchivalCheckConfig
 
 	// balanceConsensus is a map where:
 	//   - key: hex balance value for the archival block number
@@ -90,17 +90,11 @@ func (as *archivalState) updateArchivalState(
 	}
 }
 
-// isEnabled returns true if archival checks are enabled for the service.
-// Not all EVM services will require archival checks (for example, if a service is expected to run pruned nodes).
-func (as *archivalState) isEnabled() bool {
-	return !as.archivalCheckConfig.IsEmpty()
-}
-
 // calculateArchivalBlockNumber determines a, archival block number based on the perceived block number.
 // See comment on `archivalState.blockNumberHex` in `archivalState` struct for more details on the calculation.
 func (as *archivalState) calculateArchivalBlockNumber(perceivedBlockNumber uint64) {
-	archivalThreshold := as.archivalCheckConfig.threshold
-	minArchivalBlock := as.archivalCheckConfig.contractStartBlock
+	archivalThreshold := as.archivalCheckConfig.Threshold
+	minArchivalBlock := as.archivalCheckConfig.ContractStartBlock
 
 	var blockNumHex string
 	// Case 1: Block number is below or equal to the archival threshold
@@ -174,7 +168,7 @@ func (as *archivalState) updateExpectedBalance(updatedEndpoints map[protocol.End
 				as.expectedBalance = balance
 				as.logger.Info().
 					Str("archival_block_number", as.blockNumberHex).
-					Str("contract_address", as.archivalCheckConfig.contractAddress).
+					Str("contract_address", as.archivalCheckConfig.ContractAddress).
 					Str("expected_balance", balance).
 					Msg("Updated expected archival balance")
 				as.balanceConsensus = make(map[string]int)
@@ -190,10 +184,6 @@ func (as *archivalState) updateExpectedBalance(updatedEndpoints map[protocol.End
 // isArchivalBalanceValid returns an error if the endpoint's observed
 // archival balance does not match the expected archival balance.
 func (as *archivalState) isArchivalBalanceValid(check endpointCheckArchival) error {
-	if !as.isEnabled() {
-		return nil
-	}
-
 	if check.observedArchivalBalance == "" {
 		return errNoArchivalBalanceObs
 	}
@@ -209,7 +199,7 @@ func (as *archivalState) shouldArchivalCheckRun(check endpointCheckArchival) boo
 	// Do not perform an archival check if:
 	// 	- The archival check is not enabled for the service.
 	// 	- The archival block number has not yet been set in the archival state.
-	if !as.isEnabled() || as.blockNumberHex == "" {
+	if as.blockNumberHex == "" {
 		return false
 	}
 
