@@ -1,4 +1,4 @@
-module github.com/buildwithgrove/path
+module github.com/pokt-network/path
 
 go 1.24.3
 
