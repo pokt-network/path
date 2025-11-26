@@ -6,8 +6,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/protocol/crypto"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/protocol/crypto"
 )
 
 // getOwnedApps:

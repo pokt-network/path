@@ -73,7 +73,7 @@ const file_path_http_proto_rawDesc = "" +
 	"\n" +
 	"\x0fpath/http.proto\x12\x04path\"-\n" +
 	"\x17HTTPRequestObservations\x12\x12\n" +
-	"\x04host\x18\x01 \x01(\tR\x04hostB,Z*github.com/buildwithgrove/path/observationb\x06proto3"
+	"\x04host\x18\x01 \x01(\tR\x04hostB,Z*github.com/pokt-network/path/observationb\x06proto3"
 
 var (
 	file_path_http_proto_rawDescOnce sync.Once

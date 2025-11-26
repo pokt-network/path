@@ -3,7 +3,7 @@ package evm
 import (
 	"time"
 
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
+	qosobservations "github.com/pokt-network/path/observation/qos"
 )
 
 // endpoint captures the details required to validate an EVM endpoint.

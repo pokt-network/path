@@ -32,9 +32,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
 	"github.com/cheggaaa/pb/v3"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // ===== ANSI Color Constants (for log output) =====

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
+	qosobservations "github.com/pokt-network/path/observation/qos"
 )
 
 // Expected value of the `result` field to a `getHealth` request.

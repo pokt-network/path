@@ -2,7 +2,7 @@
 # See: https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml
 
 # To validate the config file, the following comment must be placed at the top of the .config.yaml file:
-# <REMOVE THIS TAG> yaml-language-server: $schema=https://raw.githubusercontent.com/buildwithgrove/path/refs/heads/main/config/config.schema.yaml
+# <REMOVE THIS TAG> yaml-language-server: $schema=https://raw.githubusercontent.com/pokt-network/path/refs/heads/main/config/config.schema.yaml
 #
 # Use the following if you need it to point to the local schema file:
 # <REMOVE THIS TAG> yaml-language-server: $schema=../../../config/config.schema.yaml

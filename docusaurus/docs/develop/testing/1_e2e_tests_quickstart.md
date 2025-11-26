@@ -44,4 +44,4 @@ You can view the default E2E test configuration file in `e2e/config/e2e_load_tes
 
 ## Supported Services in E2E Tests
 
-To see the list of supported services for the tests, see the `test_cases` array in the [E2E Test Config](https://github.com/buildwithgrove/path/blob/main/e2e/config/e2e_load_test.config.default.yaml) file.
+To see the list of supported services for the tests, see the `test_cases` array in the [E2E Test Config](https://github.com/pokt-network/path/blob/main/e2e/config/e2e_load_test.config.default.yaml) file.

@@ -6,9 +6,9 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/config"
-	"github.com/buildwithgrove/path/data"
-	"github.com/buildwithgrove/path/gateway"
+	"github.com/pokt-network/path/config"
+	"github.com/pokt-network/path/data"
+	"github.com/pokt-network/path/gateway"
 )
 
 // setupHTTPDataReporter initializes and starts the HTTP data reporter.

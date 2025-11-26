@@ -3,7 +3,7 @@ package cosmos
 import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // QoSType is the QoS type for the CosmosSDK blockchain.

@@ -1,7 +1,7 @@
 package noop
 
 import (
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // endpointResponse keeps the response received from an endpoint, along with the correspoding

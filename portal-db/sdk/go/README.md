@@ -22,7 +22,7 @@ This Go SDK provides a type-safe client for the Portal DB API, generated using [
 ## Installation
 
 ```bash
-go get github.com/buildwithgrove/path/portal-db/sdk/go
+go get github.com/pokt-network/path/portal-db/sdk/go
 ```
 
 ## Quick Start
@@ -38,7 +38,7 @@ import (
     "fmt"
     "log"
     
-    "github.com/buildwithgrove/path/portal-db/sdk/go"
+    "github.com/pokt-network/path/portal-db/sdk/go"
 )
 
 func main() {
@@ -77,7 +77,7 @@ import (
     "context"
     "net/http"
     
-    "github.com/buildwithgrove/path/portal-db/sdk/go"
+    "github.com/pokt-network/path/portal-db/sdk/go"
 )
 
 func authenticatedExample() {

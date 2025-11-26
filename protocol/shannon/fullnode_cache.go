@@ -14,7 +14,7 @@ import (
 	sdk "github.com/pokt-network/shannon-sdk"
 	"github.com/viccon/sturdyc"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // ---------------- Cache Configuration ----------------

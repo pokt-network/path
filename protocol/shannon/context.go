@@ -18,10 +18,10 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	sdk "github.com/pokt-network/shannon-sdk"
 
-	"github.com/buildwithgrove/path/gateway"
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/gateway"
+	pathhttp "github.com/pokt-network/path/network/http"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // TODO_IMPROVE(@commoddity): Re-evaluate how much of this code should live in the shannon-sdk package.

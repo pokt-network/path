@@ -8,7 +8,7 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	sdk "github.com/pokt-network/shannon-sdk"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // TODO_TECHDEBT(@adshmh): Refactor this:
@@ -17,7 +17,7 @@ import (
 // - Example: Make endpoint an interface, implemented by:
 //   - A Shannon endpoint
 //   - A "fallback" URL with configurable fields: e.g. the Supplier set as "fallback"
-// - PR Review Reference: https://github.com/buildwithgrove/path/pull/395#discussion_r2261426190
+// - PR Review Reference: https://github.com/pokt-network/path/pull/395#discussion_r2261426190
 
 // endpoint defines the interface for Shannon endpoints, allowing for
 // different implementations (e.g., protocol vs fallback endpoints).
@@ -223,7 +223,7 @@ func endpointsFromSession(
 		// 	- `WEBSOCKET`
 		//
 		// References:
-		// 	- PATH PR #345 - https://github.com/buildwithgrove/path/pull/345
+		// 	- PATH PR #345 - https://github.com/pokt-network/path/pull/345
 		// 	- poktroll `RPCType` enum - https://github.com/pokt-network/poktroll/blob/main/x/shared/types/service.pb.go#L31
 		for _, supplierRPCTypeEndpoint := range supplierEndpoints {
 			switch supplierRPCTypeEndpoint.RPCType() {

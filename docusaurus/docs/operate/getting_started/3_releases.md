@@ -19,9 +19,9 @@ PATH builds provide a Docker image to quickly bootstrap your Path gateway withou
 
 ### PATH Build Resources
 
-- [**Container Registry**](https://github.com/buildwithgrove/path/pkgs/container/path): Find all PATH Docker images
-- [**Releases**](https://github.com/buildwithgrove/path/releases): Find the latest release and release notes
-- [**Package Versions**](https://github.com/buildwithgrove/path/pkgs/container/path/versions): Find all available versions of the PATH Docker image
+- [**Container Registry**](https://github.com/pokt-network/path/pkgs/container/path): Find all PATH Docker images
+- [**Releases**](https://github.com/pokt-network/path/releases): Find the latest release and release notes
+- [**Package Versions**](https://github.com/pokt-network/path/pkgs/container/path/versions): Find all available versions of the PATH Docker image
 
 ### Example Usage
 
@@ -61,4 +61,4 @@ git push origin $(git tag)
 
 ### 3. Draft a new GitHub release
 
-Draft a new release at [buildwithgrove/path/releases/new](https://github.com/buildwithgrove/path/releases/new) using the tag (e.g. `v0.1.12-dev3`) created in the previous step.
+Draft a new release at [buildwithgrove/path/releases/new](https://github.com/pokt-network/path/releases/new) using the tag (e.g. `v0.1.12-dev3`) created in the previous step.

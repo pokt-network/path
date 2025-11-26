@@ -4,7 +4,7 @@
 syntax = "proto3";
 package path;
 
-option go_package = "github.com/buildwithgrove/path/observation";
+option go_package = "github.com/pokt-network/path/observation";
 
 // RequestAuth captures all fields related to the authentication of the request.
 // These are all external to PATH, i.e. reported to PATH by the authentication layer.

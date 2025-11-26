@@ -3,7 +3,7 @@ package qos
 import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // RequestContextFromInternalError returns a request context for an internal error.

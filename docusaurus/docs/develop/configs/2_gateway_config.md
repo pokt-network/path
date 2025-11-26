@@ -69,7 +69,7 @@ In local development mode, the config file must be located at:
 If you are using VSCode, we recommend using the [YAML Language Support](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml) extension for in-editor validation of the `.config.yaml` file. Enable it by ensuring the following annotation is present at the top of your config file:
 
 ```yaml
-# yaml-language-server: $schema=https://raw.githubusercontent.com/buildwithgrove/path/refs/heads/main/config/config.schema.yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/pokt-network/path/refs/heads/main/config/config.schema.yaml
 ```
 
 :::

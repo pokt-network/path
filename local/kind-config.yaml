@@ -6,7 +6,7 @@ nodes:
     # GUARD (Envoy Gateway)
     # Port will be patched to 30070 after install
     # For more context see: 
-    #   https://github.com/buildwithgrove/path/blob/main/local/scripts/patch_envoy_gateway.sh
+    #   https://github.com/pokt-network/path/blob/main/local/scripts/patch_envoy_gateway.sh
     - containerPort: 30070 
       hostPort: 3070
       protocol: TCP

@@ -352,7 +352,7 @@ The container mounts your local PATH repository at `/app`, enabling:
 
 ### Configuration Validation
 
-On startup, the container validates your `./local/.config.yaml` against the [YAML schema](https://github.com/buildwithgrove/path/blob/main/config/config.schema.yaml) in the PATH repo.
+On startup, the container validates your `./local/.config.yaml` against the [YAML schema](https://github.com/pokt-network/path/blob/main/config/config.schema.yaml) in the PATH repo.
 
 ## Development Workflow
 

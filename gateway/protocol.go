@@ -4,12 +4,12 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/buildwithgrove/path/health"
-	"github.com/buildwithgrove/path/metrics/devtools"
-	"github.com/buildwithgrove/path/observation"
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/websockets"
+	"github.com/pokt-network/path/health"
+	"github.com/pokt-network/path/metrics/devtools"
+	"github.com/pokt-network/path/observation"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/websockets"
 )
 
 // Protocol defines the core functionality of a protocol from the perspective of a gateway.

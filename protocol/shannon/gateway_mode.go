@@ -9,7 +9,7 @@ import (
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // TODO_DOCUMENT(@adshmh): Convert the following notion doc into a proper README.
@@ -26,7 +26,7 @@ func (p *Protocol) SupportedGatewayModes() []protocol.GatewayMode {
 
 // TODO_TECHDEBT(@commoddity): Most of the functionality in this file should be moved to the Shannon SDK.
 // Evaluate the exact implementation of this as defined in issue:
-// https://github.com/buildwithgrove/path/issues/291
+// https://github.com/pokt-network/path/issues/291
 
 // getActiveGatewaySessions returns the active sessions under the supplied gateway mode.
 // The active sessions are retrieved as follows:

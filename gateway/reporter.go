@@ -1,7 +1,7 @@
 package gateway
 
 import (
-	"github.com/buildwithgrove/path/observation"
+	"github.com/pokt-network/path/observation"
 )
 
 // RequestResponseReporter defines the interface for reporting observations with respect to

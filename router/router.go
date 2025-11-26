@@ -10,12 +10,12 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/config"
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/health"
-	"github.com/buildwithgrove/path/metrics/devtools"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/request"
+	"github.com/pokt-network/path/config"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/health"
+	"github.com/pokt-network/path/metrics/devtools"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/request"
 )
 
 // TODO_TECHDEBT(@adshmh): Make this configurable.

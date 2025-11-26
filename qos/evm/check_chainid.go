@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // EVM checks begin with 1 for JSON-RPC requests.

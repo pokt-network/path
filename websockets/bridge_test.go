@@ -12,7 +12,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
 	"github.com/stretchr/testify/require"
 
-	"github.com/buildwithgrove/path/observation"
+	"github.com/pokt-network/path/observation"
 )
 
 func Test_Bridge_StartBridge(t *testing.T) {

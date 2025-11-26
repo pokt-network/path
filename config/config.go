@@ -6,7 +6,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/buildwithgrove/path/config/shannon"
+	"github.com/pokt-network/path/config/shannon"
 )
 
 /* ---------------------------------  Gateway Config Struct -------------------------------- */

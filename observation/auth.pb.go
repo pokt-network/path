@@ -160,7 +160,7 @@ const file_path_auth_proto_rawDesc = "" +
 	"\x13_portal_credentials\"s\n" +
 	"\x11PortalCredentials\x12*\n" +
 	"\x11portal_account_id\x18\x03 \x01(\tR\x0fportalAccountId\x122\n" +
-	"\x15portal_application_id\x18\x04 \x01(\tR\x13portalApplicationIdB,Z*github.com/buildwithgrove/path/observationb\x06proto3"
+	"\x15portal_application_id\x18\x04 \x01(\tR\x13portalApplicationIdB,Z*github.com/pokt-network/path/observationb\x06proto3"
 
 var (
 	file_path_auth_proto_rawDescOnce sync.Once

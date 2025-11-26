@@ -11,7 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/observation"
+	"github.com/pokt-network/path/observation"
 )
 
 // A WebsocketMessageProcessor processes websocket messages.

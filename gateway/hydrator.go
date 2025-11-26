@@ -9,8 +9,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/health"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/health"
+	"github.com/pokt-network/path/protocol"
 )
 
 // EndpointHydrator provides the functionality required for health check.

@@ -144,7 +144,7 @@ const file_path_qos_jsonrpc_validation_error_proto_rawDesc = "" +
 	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp*\x85\x01\n" +
 	"\x1aJsonRpcValidationErrorType\x12.\n" +
 	"*JSON_RPC_VALIDATION_ERROR_TYPE_UNSPECIFIED\x10\x00\x127\n" +
-	"3JSON_RPC_VALIDATION_ERROR_TYPE_NON_JSONRPC_RESPONSE\x10\x01B0Z.github.com/buildwithgrove/path/observation/qosb\x06proto3"
+	"3JSON_RPC_VALIDATION_ERROR_TYPE_NON_JSONRPC_RESPONSE\x10\x01B0Z.github.com/pokt-network/path/observation/qosb\x06proto3"
 
 var (
 	file_path_qos_jsonrpc_validation_error_proto_rawDescOnce sync.Once

@@ -5,7 +5,7 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/metrics"
+	"github.com/pokt-network/path/metrics"
 )
 
 // TODO_TECHDEBT(@adshmh): Support configurable pprof server address/port.

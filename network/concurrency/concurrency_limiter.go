@@ -28,7 +28,7 @@ import (
 	"sync"
 	"time"
 
-	shannonmetrics "github.com/buildwithgrove/path/metrics/protocol/shannon"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 )
 
 // TODO_IMPROVE: Make this configurable via settings

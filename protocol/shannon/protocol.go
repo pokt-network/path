@@ -10,12 +10,12 @@ import (
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/health"
-	"github.com/buildwithgrove/path/metrics/devtools"
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/health"
+	"github.com/pokt-network/path/metrics/devtools"
+	pathhttp "github.com/pokt-network/path/network/http"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // gateway package's Protocol interface is fulfilled by the Protocol struct

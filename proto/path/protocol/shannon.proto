@@ -1,7 +1,7 @@
 syntax = "proto3";
 package path.protocol;
 
-option go_package = "github.com/buildwithgrove/path/observation/protocol";
+option go_package = "github.com/pokt-network/path/observation/protocol";
 
 import "google/protobuf/timestamp.proto";
 

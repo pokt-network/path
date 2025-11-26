@@ -3,7 +3,7 @@
 // For example, Processing should fail here only if no authoritative service ID is provided - Bad Request
 //
 // The responsibility of the `request` package is to extract the authoritative service ID and return the target service's corresponding QoS instance.
-// See: https://github.com/buildwithgrove/path/blob/e0067eb0f9ab0956127c952980b09909a795b300/gateway/gateway.go#L52C2-L52C45
+// See: https://github.com/pokt-network/path/blob/e0067eb0f9ab0956127c952980b09909a795b300/gateway/gateway.go#L52C2-L52C45
 package request
 
 import (
@@ -13,10 +13,10 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/gateway"
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/noop"
+	"github.com/pokt-network/path/gateway"
+	pathhttp "github.com/pokt-network/path/network/http"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/noop"
 )
 
 // HTTP Request Headers

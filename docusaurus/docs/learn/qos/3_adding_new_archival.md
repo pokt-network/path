@@ -27,7 +27,7 @@ The process of configuring archival checks for a new chain is manual but only ne
 
 ### Service QoS Configurations
 
-QoS configurations are stored in [`path/config/service_qos_config.go`](https://github.com/buildwithgrove/path/blob/main/config/service_qos_config.go).
+QoS configurations are stored in [`path/config/service_qos_config.go`](https://github.com/pokt-network/path/blob/main/config/service_qos_config.go).
 
 ## Adding an Archival Check By Example: `Polygon zkEVM`
 
@@ -71,7 +71,7 @@ Take note of the block number of the first transaction for that address.
 
 ### 4. Add the new archival check configuration
 
-In the [`path/config/service_qos_config.go`](https://github.com/buildwithgrove/path/blob/main/config/service_qos_config.go) file, add a new entry to the `shannonServices` array.
+In the [`path/config/service_qos_config.go`](https://github.com/pokt-network/path/blob/main/config/service_qos_config.go) file, add a new entry to the `shannonServices` array.
 
 **The configuration MUST be entered in this exact format**:
 

@@ -7,11 +7,11 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/gateway"
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/gateway"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // Maximum length for error messages stored in validation failure logs/observations.

@@ -7,7 +7,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/buildwithgrove/path/observation"
+	"github.com/pokt-network/path/observation"
 )
 
 const (

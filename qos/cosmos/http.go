@@ -3,7 +3,7 @@ package cosmos
 import (
 	"net/http"
 
-	pathhttp "github.com/buildwithgrove/path/network/http"
+	pathhttp "github.com/pokt-network/path/network/http"
 )
 
 // httpHeadersApplicationJSON is the `Content-Type` HTTP header used in all CosmosSDK responses.

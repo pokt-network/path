@@ -1,8 +1,8 @@
 package message
 
 import (
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/observation"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/observation"
 )
 
 // NATSMetricsReporter provides the functionality required by the gateway package for publishing metrics on requests and their corresponding response.

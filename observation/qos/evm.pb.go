@@ -13,7 +13,7 @@
 package qos
 
 import (
-	_ "github.com/buildwithgrove/path/observation/metadata"
+	_ "github.com/pokt-network/path/observation/metadata"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -1187,7 +1187,7 @@ const file_path_qos_evm_proto_rawDesc = "" +
 	")EVM_RESPONSE_VALIDATION_ERROR_UNSPECIFIED\x10\x00\x12'\n" +
 	"#EVM_RESPONSE_VALIDATION_ERROR_EMPTY\x10\x01\x12+\n" +
 	"'EVM_RESPONSE_VALIDATION_ERROR_UNMARSHAL\x10\x02\x12-\n" +
-	")EVM_RESPONSE_VALIDATION_ERROR_NO_RESPONSE\x10\x03B0Z.github.com/buildwithgrove/path/observation/qosb\x06proto3"
+	")EVM_RESPONSE_VALIDATION_ERROR_NO_RESPONSE\x10\x03B0Z.github.com/pokt-network/path/observation/qosb\x06proto3"
 
 var (
 	file_path_qos_evm_proto_rawDescOnce sync.Once

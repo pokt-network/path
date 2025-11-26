@@ -66,14 +66,14 @@ If you are using VSCode, we recommend using the [YAML Language Support](https://
 Enable it by ensuring the following annotation is present at the top of your config file:
 
 ```yaml
-# yaml-language-server: $schema=https://raw.githubusercontent.com/buildwithgrove/path/refs/heads/main/e2e/config/e2e_load_test.config.schema.yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/pokt-network/path/refs/heads/main/e2e/config/e2e_load_test.config.schema.yaml
 ```
 
 :::
 
 ## Supported Services in E2E Tests
 
-To see the list of supported services for the tests, see the `test_cases` array in the [E2E Test Config](https://github.com/buildwithgrove/path/blob/main/e2e/config/e2e_load_test.config.default.yaml) file.
+To see the list of supported services for the tests, see the `test_cases` array in the [E2E Test Config](https://github.com/pokt-network/path/blob/main/e2e/config/e2e_load_test.config.default.yaml) file.
 
 ## Environment Variables
 

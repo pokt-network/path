@@ -15,7 +15,7 @@ import (
 
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // getCentralizedGatewayModeActiveSessions returns the set of active sessions under the Centralized gateway mode.

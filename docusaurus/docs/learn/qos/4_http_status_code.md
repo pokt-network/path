@@ -90,5 +90,5 @@ func (r Response) GetRecommendedHTTPStatusCode() int {
 
 ## References
 
-- Original GitHub Issue can be found [here](https://github.com/buildwithgrove/path/issues/179)
-- Original GitHub PR can be found [here](https://github.com/buildwithgrove/path/pull/186/files)
+- Original GitHub Issue can be found [here](https://github.com/pokt-network/path/issues/179)
+- Original GitHub PR can be found [here](https://github.com/pokt-network/path/pull/186/files)

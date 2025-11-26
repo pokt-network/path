@@ -7,7 +7,7 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/log"
+	"github.com/pokt-network/path/log"
 )
 
 // TODO_MVP(@adshmh): Add a JSON-RPC request validator to reject invalid/unsupported

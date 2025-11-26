@@ -3,7 +3,7 @@ package config
 import (
 	"time"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 /* --------------------------------- Hydrator Config Defaults -------------------------------- */

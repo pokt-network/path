@@ -320,7 +320,7 @@ const file_path_qos_cosmos_request_proto_rawDesc = "" +
 	" BACKEND_SERVICE_TYPE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cBACKEND_SERVICE_TYPE_JSONRPC\x10\x01\x12\x1d\n" +
 	"\x19BACKEND_SERVICE_TYPE_REST\x10\x02\x12!\n" +
-	"\x1dBACKEND_SERVICE_TYPE_COMETBFT\x10\x03B0Z.github.com/buildwithgrove/path/observation/qosb\x06proto3"
+	"\x1dBACKEND_SERVICE_TYPE_COMETBFT\x10\x03B0Z.github.com/pokt-network/path/observation/qosb\x06proto3"
 
 var (
 	file_path_qos_cosmos_request_proto_rawDescOnce sync.Once

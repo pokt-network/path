@@ -424,7 +424,7 @@ const file_path_gateway_proto_rawDesc = "" +
 	"-GATEWAY_REQUEST_ERROR_KIND_MISSING_SERVICE_ID\x10\x01\x12.\n" +
 	"*GATEWAY_REQUEST_ERROR_KIND_REJECTED_BY_QOS\x10\x02\x128\n" +
 	"4GATEWAY_REQUEST_ERROR_KIND_WEBSOCKET_REJECTED_BY_QOS\x10\x03\x12:\n" +
-	"6GATEWAY_REQUEST_ERROR_KIND_WEBSOCKET_CONNECTION_FAILED\x10\x04B,Z*github.com/buildwithgrove/path/observationb\x06proto3"
+	"6GATEWAY_REQUEST_ERROR_KIND_WEBSOCKET_CONNECTION_FAILED\x10\x04B,Z*github.com/pokt-network/path/observationb\x06proto3"
 
 var (
 	file_path_gateway_proto_rawDescOnce sync.Once

@@ -1,6 +1,6 @@
 package noop
 
-import pathhttp "github.com/buildwithgrove/path/network/http"
+import pathhttp "github.com/pokt-network/path/network/http"
 
 // HTTPResponse provides all the functionality required by the gate.HTTPResponse interface.
 var _ pathhttp.HTTPResponse = &HTTPResponse{}
@@ -27,7 +27,7 @@ func (h *HTTPResponse) GetHTTPStatusCode() int {
 }
 
 // GetHTTPHeaders always returns nil, as HTTP headers are not used by noop QoS as of PR #106.
-// See: https://github.com/buildwithgrove/path/pull/106
+// See: https://github.com/pokt-network/path/pull/106
 // Implements the pathhttp.HTTPResponse interface.
 func (h *HTTPResponse) GetHTTPHeaders() map[string]string {
 	return nil

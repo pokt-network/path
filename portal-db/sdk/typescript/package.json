@@ -15,9 +15,9 @@
     "url": "https://github.com/buildwithgrove/path.git",
     "directory": "portal-db/sdk/typescript"
   },
-  "homepage": "https://github.com/buildwithgrove/path/tree/main/portal-db/sdk/typescript",
+  "homepage": "https://github.com/pokt-network/path/tree/main/portal-db/sdk/typescript",
   "bugs": {
-    "url": "https://github.com/buildwithgrove/path/issues"
+    "url": "https://github.com/pokt-network/path/issues"
   },
   "scripts": {
     "type-check": "tsc --noEmit"

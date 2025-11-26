@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // ===== JSON-RPC Response Validation =====

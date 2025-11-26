@@ -9,8 +9,8 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	"github.com/buildwithgrove/path/protocol"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // buildSuccessfulEndpointLookupObservation builds a minimum observation to indicate the endpoint lookup was successful.

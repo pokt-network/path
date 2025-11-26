@@ -6,8 +6,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 const (

@@ -271,7 +271,7 @@ const file_path_qos_endpoint_selection_metadata_proto_rawDesc = "" +
 	":ENDPOINT_VALIDATION_FAILURE_REASON_NO_CHAIN_ID_OBSERVATION\x10\x06\x12<\n" +
 	"8ENDPOINT_VALIDATION_FAILURE_REASON_ARCHIVAL_CHECK_FAILED\x10\a\x129\n" +
 	"5ENDPOINT_VALIDATION_FAILURE_REASON_ENDPOINT_NOT_FOUND\x10\b\x12.\n" +
-	"*ENDPOINT_VALIDATION_FAILURE_REASON_UNKNOWN\x10\tB0Z.github.com/buildwithgrove/path/observation/qosb\x06proto3"
+	"*ENDPOINT_VALIDATION_FAILURE_REASON_UNKNOWN\x10\tB0Z.github.com/pokt-network/path/observation/qosb\x06proto3"
 
 var (
 	file_path_qos_endpoint_selection_metadata_proto_rawDescOnce sync.Once

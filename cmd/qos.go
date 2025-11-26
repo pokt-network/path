@@ -6,12 +6,12 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/config"
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/cosmos"
-	"github.com/buildwithgrove/path/qos/evm"
-	"github.com/buildwithgrove/path/qos/solana"
+	"github.com/pokt-network/path/config"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/cosmos"
+	"github.com/pokt-network/path/qos/evm"
+	"github.com/pokt-network/path/qos/solana"
 )
 
 // getServiceQoSInstances returns all QoS instances to be used by the Gateway and the EndpointHydrator.

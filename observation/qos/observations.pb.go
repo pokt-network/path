@@ -137,7 +137,7 @@ const file_path_qos_observations_proto_rawDesc = "" +
 	"\x06solana\x18\x01 \x01(\v2#.path.qos.SolanaRequestObservationsH\x00R\x06solana\x124\n" +
 	"\x03evm\x18\x02 \x01(\v2 .path.qos.EVMRequestObservationsH\x00R\x03evm\x12=\n" +
 	"\x06cosmos\x18\x03 \x01(\v2#.path.qos.CosmosRequestObservationsH\x00R\x06cosmosB\x16\n" +
-	"\x14service_observationsB0Z.github.com/buildwithgrove/path/observation/qosb\x06proto3"
+	"\x14service_observationsB0Z.github.com/pokt-network/path/observation/qosb\x06proto3"
 
 var (
 	file_path_qos_observations_proto_rawDescOnce sync.Once

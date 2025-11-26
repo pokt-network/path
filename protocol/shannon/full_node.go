@@ -9,7 +9,7 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	sdk "github.com/pokt-network/shannon-sdk"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // FullNode defines the set of capabilities the Shannon protocol integration needs

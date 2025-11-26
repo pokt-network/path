@@ -216,7 +216,7 @@ const file_path_qos_jsonrpc_proto_rawDesc = "" +
 	"\x06_error\"D\n" +
 	"\x14JsonRpcResponseError\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x03R\x04code\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessageB0Z.github.com/buildwithgrove/path/observation/qosb\x06proto3"
+	"\amessage\x18\x02 \x01(\tR\amessageB0Z.github.com/pokt-network/path/observation/qosb\x06proto3"
 
 var (
 	file_path_qos_jsonrpc_proto_rawDescOnce sync.Once

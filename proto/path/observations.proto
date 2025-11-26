@@ -4,7 +4,7 @@
 syntax = "proto3";
 package path;
 
-option go_package = "github.com/buildwithgrove/path/observation";
+option go_package = "github.com/pokt-network/path/observation";
 
 import "path/http.proto";
 import "path/gateway.proto";

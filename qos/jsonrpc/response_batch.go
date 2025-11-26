@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/poktroll/pkg/polylog"
 )
 

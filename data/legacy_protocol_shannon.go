@@ -7,8 +7,8 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 
-	shannonmetrics "github.com/buildwithgrove/path/metrics/protocol/shannon"
-	protocolobservation "github.com/buildwithgrove/path/observation/protocol"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
+	protocolobservation "github.com/pokt-network/path/observation/protocol"
 )
 
 // setLegacyFieldsFromShannonProtocolObservations populates legacy record with Shannon protocol data.

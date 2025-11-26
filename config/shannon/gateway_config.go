@@ -3,7 +3,7 @@ package shannon
 import (
 	"gopkg.in/yaml.v3"
 
-	shannonprotocol "github.com/buildwithgrove/path/protocol/shannon"
+	shannonprotocol "github.com/pokt-network/path/protocol/shannon"
 )
 
 // Fields that are unmarshaled from the config YAML must be capitalized.

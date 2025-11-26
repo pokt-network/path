@@ -3,7 +3,7 @@ package evm
 import (
 	"fmt"
 
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // TODO_CONSIDERATION(@adshmh): Is there any value in further breaking down error codes here to indicate different failures?

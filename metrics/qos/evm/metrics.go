@@ -6,9 +6,9 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/prometheus/client_golang/prometheus"
 
-	shannonmetrics "github.com/buildwithgrove/path/metrics/protocol/shannon"
-	"github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
+	"github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
 )
 
 const (

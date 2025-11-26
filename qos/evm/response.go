@@ -6,9 +6,9 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/log"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/log"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // responseUnmarshaller is the entrypoint function for any

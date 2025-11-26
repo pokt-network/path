@@ -3,7 +3,7 @@ package jsonrpc
 import (
 	"net/http"
 
-	pathhttp "github.com/buildwithgrove/path/network/http"
+	pathhttp "github.com/pokt-network/path/network/http"
 )
 
 const (

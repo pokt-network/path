@@ -5,8 +5,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	shannonmetrics "github.com/buildwithgrove/path/metrics/protocol/shannon"
-	"github.com/buildwithgrove/path/protocol"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
+	"github.com/pokt-network/path/protocol"
 )
 
 // SolanaObservationInterpreter extracts and interprets data from Solana request observations.

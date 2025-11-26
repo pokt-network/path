@@ -1431,7 +1431,7 @@ const file_path_protocol_shannon_proto_rawDesc = "" +
 	"\x1cSHANNON_SANCTION_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18SHANNON_SANCTION_SESSION\x10\x01\x12\x1e\n" +
 	"\x1aSHANNON_SANCTION_PERMANENT\x10\x02\x12$\n" +
-	" SHANNON_SANCTION_DO_NOT_SANCTION\x10\x03B5Z3github.com/buildwithgrove/path/observation/protocolb\x06proto3"
+	" SHANNON_SANCTION_DO_NOT_SANCTION\x10\x03B5Z3github.com/pokt-network/path/observation/protocolb\x06proto3"
 
 var (
 	file_path_protocol_shannon_proto_rawDescOnce sync.Once

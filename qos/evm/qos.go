@@ -6,9 +6,9 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/metrics/devtools"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/metrics/devtools"
+	"github.com/pokt-network/path/protocol"
 )
 
 // QoS implements gateway.QoSService by providing:

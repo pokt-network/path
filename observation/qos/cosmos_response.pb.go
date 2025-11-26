@@ -636,7 +636,7 @@ const file_path_qos_cosmos_response_proto_rawDesc = "" +
 	"+COSMOS_RESPONSE_VALIDATION_TYPE_UNSPECIFIED\x10\x00\x12+\n" +
 	"'COSMOS_RESPONSE_VALIDATION_TYPE_JSONRPC\x10\x01\x12(\n" +
 	"$COSMOS_RESPONSE_VALIDATION_TYPE_JSON\x10\x02\x120\n" +
-	",COSMOS_RESPONSE_VALIDATION_TYPE_UNSTRUCTURED\x10\x03B0Z.github.com/buildwithgrove/path/observation/qosb\x06proto3"
+	",COSMOS_RESPONSE_VALIDATION_TYPE_UNSTRUCTURED\x10\x03B0Z.github.com/pokt-network/path/observation/qosb\x06proto3"
 
 var (
 	file_path_qos_cosmos_response_proto_rawDescOnce sync.Once

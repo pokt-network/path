@@ -5,8 +5,8 @@ import (
 	"errors"
 	"strings"
 
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
+	pathhttp "github.com/pokt-network/path/network/http"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
 )
 
 var (

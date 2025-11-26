@@ -38,7 +38,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // -----------------------------------------------------------------------------

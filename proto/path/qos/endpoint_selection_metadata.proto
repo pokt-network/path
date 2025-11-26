@@ -3,7 +3,7 @@ syntax = "proto3";
 // TODO_TECHDEBT(@adshmh): Package name "path.qos" should be suffixed with a correctly formed version, such as "path.qos.v1"
 package path.qos;
 
-option go_package = "github.com/buildwithgrove/path/observation/qos";
+option go_package = "github.com/pokt-network/path/observation/qos";
 
 // EndpointValidationFailureReason enumerates the possible reasons why an endpoint fails validation.
 enum EndpointValidationFailureReason {

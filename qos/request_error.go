@@ -3,8 +3,8 @@ package qos
 import (
 	"errors"
 
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // GetRequestErrorForProtocolError returns a request error for a protocol error

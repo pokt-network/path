@@ -83,7 +83,7 @@ const file_path_qos_request_origin_proto_rawDesc = "" +
 	"\rRequestOrigin\x12\x1e\n" +
 	"\x1aREQUEST_ORIGIN_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16REQUEST_ORIGIN_ORGANIC\x10\x01\x12\x1c\n" +
-	"\x18REQUEST_ORIGIN_SYNTHETIC\x10\x02B0Z.github.com/buildwithgrove/path/observation/qosb\x06proto3"
+	"\x18REQUEST_ORIGIN_SYNTHETIC\x10\x02B0Z.github.com/pokt-network/path/observation/qosb\x06proto3"
 
 var (
 	file_path_qos_request_origin_proto_rawDescOnce sync.Once

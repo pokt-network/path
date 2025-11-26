@@ -7,7 +7,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 var (

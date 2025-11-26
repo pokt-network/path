@@ -12,11 +12,11 @@ description: Intro and environment setup
 <br/>
 
 ![Static Badge](https://img.shields.io/badge/Maintained_by-Grove-green)
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/buildwithgrove/path/main-build.yml)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/pokt-network/path/main-build.yml)
 ![GitHub last commit](https://img.shields.io/github/last-commit/buildwithgrove/path)
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/buildwithgrove/path)
 ![GitHub Release](https://img.shields.io/github/v/release/buildwithgrove/path)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/buildwithgrove/path/total)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/pokt-network/path/total)
 ![GitHub Issues or Pull Requests](https://img.shields.io/github/issues/buildwithgrove/path)
 ![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-pr/buildwithgrove/path)
 ![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-closed/buildwithgrove/path)

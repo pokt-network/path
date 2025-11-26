@@ -12,7 +12,7 @@ import (
 
 	vegeta "github.com/tsenart/vegeta/lib"
 
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 /* -------------------- Solana JSON-RPC Method Definitions -------------------- */

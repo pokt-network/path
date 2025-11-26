@@ -6,8 +6,8 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // TODO_UPNEXT(@adshmh): Update solana and cometbft QoS to detect and sanction malformed endpoint responses to any request.

@@ -7,10 +7,10 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/metrics/devtools"
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/metrics/devtools"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
 )
 
 // QoS implements gateway.QoSService by providing:

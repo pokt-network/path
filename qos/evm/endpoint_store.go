@@ -7,8 +7,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
 )
 
 // endpointStore maintains QoS data on the set of available endpoints

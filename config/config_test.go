@@ -7,10 +7,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/buildwithgrove/path/config/shannon"
-	"github.com/buildwithgrove/path/network/grpc"
-	"github.com/buildwithgrove/path/protocol"
-	shannonprotocol "github.com/buildwithgrove/path/protocol/shannon"
+	"github.com/pokt-network/path/config/shannon"
+	"github.com/pokt-network/path/network/grpc"
+	"github.com/pokt-network/path/protocol"
+	shannonprotocol "github.com/pokt-network/path/protocol/shannon"
 )
 
 // getTestDefaultGRPCConfig returns a GRPCConfig with default values applied

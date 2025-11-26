@@ -11,8 +11,8 @@ import (
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	"github.com/buildwithgrove/path/network/grpc"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/network/grpc"
+	"github.com/pokt-network/path/protocol"
 )
 
 // defaultURLKey is the key for the default URL in the fallback endpoints map.

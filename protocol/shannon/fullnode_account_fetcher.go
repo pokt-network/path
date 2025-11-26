@@ -3,7 +3,7 @@ package shannon
 // TODO_TECHDEBT(@commoddity): Refactor (remove?) this whole file
 // as part of the #291 refactor, as it will not longer be needed.
 //
-// https://github.com/buildwithgrove/path/issues/291
+// https://github.com/pokt-network/path/issues/291
 
 import (
 	"context"

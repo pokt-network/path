@@ -6,11 +6,11 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/gateway"
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/gateway"
+	pathhttp "github.com/pokt-network/path/network/http"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 var (

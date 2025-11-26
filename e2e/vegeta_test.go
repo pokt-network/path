@@ -15,9 +15,9 @@ import (
 	"github.com/cheggaaa/pb/v3"
 	vegeta "github.com/tsenart/vegeta/lib"
 
-	"github.com/buildwithgrove/path/log"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/log"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // This file contains HTTP-specific test configuration, execution, and metrics collection.

@@ -3,7 +3,7 @@ package cosmos
 import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 var (

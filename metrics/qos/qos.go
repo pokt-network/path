@@ -4,10 +4,10 @@ package qos
 import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/metrics/qos/cosmos"
-	"github.com/buildwithgrove/path/metrics/qos/evm"
-	"github.com/buildwithgrove/path/metrics/qos/solana"
-	"github.com/buildwithgrove/path/observation/qos"
+	"github.com/pokt-network/path/metrics/qos/cosmos"
+	"github.com/pokt-network/path/metrics/qos/evm"
+	"github.com/pokt-network/path/metrics/qos/solana"
+	"github.com/pokt-network/path/observation/qos"
 )
 
 // PublishMetrics builds and exports all qos-related metrics using qos-level observations.

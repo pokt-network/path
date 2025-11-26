@@ -4,8 +4,8 @@ import (
 	"errors"
 	"math/rand"
 
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/selector"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/selector"
 )
 
 // RandomEndpointSelector provides the functionality defined by the protocol.EndpointSelector interface.

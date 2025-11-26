@@ -6,7 +6,7 @@
 -- configuring passwords outside of the main schema migrations.
 --
 -- See this file details on Postgres schema authentication and authorization: 
--- https://github.com/buildwithgrove/path/blob/main/portal-db/schema/002_postgrest_init.sql
+-- https://github.com/pokt-network/path/blob/main/portal-db/schema/002_postgrest_init.sql
 --
 -- ⚠️  LOCAL DEVELOPMENT ONLY - NOT FOR PRODUCTION USE
 -- 
