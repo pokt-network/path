@@ -636,7 +636,7 @@ func processEndpointErrors(
 ) {
 	for _, endpointObs := range observations {
 		// Skip if there's no error
-		if endpointObs.ErrorType == nil {
+		if endpointObs == nil || endpointObs.ErrorType == nil {
 			continue
 		}
 
