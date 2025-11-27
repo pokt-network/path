@@ -16,8 +16,8 @@ import (
 	sdk "github.com/pokt-network/shannon-sdk"
 	sdktypes "github.com/pokt-network/shannon-sdk/types"
 
-	"github.com/buildwithgrove/path/network/grpc"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/network/grpc"
+	"github.com/pokt-network/path/protocol"
 )
 
 // The Shannon FullNode interface is implemented by the LazyFullNode struct below.

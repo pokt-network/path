@@ -6,7 +6,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/buildwithgrove/path/observation/qos"
+	"github.com/pokt-network/path/observation/qos"
 )
 
 const (

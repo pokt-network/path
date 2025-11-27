@@ -9,4 +9,4 @@ Should you require additional Technical Support please open a ticket in [**Grove
 
 ## Bug Report
 
-If you would like to submit a Bug Report or an Enhancement Request please create a [**GitHub Issue**](https://github.com/buildwithgrove/path/issues).
+If you would like to submit a Bug Report or an Enhancement Request please create a [**GitHub Issue**](https://github.com/pokt-network/path/issues).

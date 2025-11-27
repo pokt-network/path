@@ -10,12 +10,12 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	shannonmetrics "github.com/buildwithgrove/path/metrics/protocol/shannon"
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	"github.com/buildwithgrove/path/observation"
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
+	pathhttp "github.com/pokt-network/path/network/http"
+	"github.com/pokt-network/path/observation"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
 )
 
 var (

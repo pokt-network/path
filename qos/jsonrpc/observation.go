@@ -1,7 +1,7 @@
 package jsonrpc
 
 import (
-	"github.com/buildwithgrove/path/observation/qos"
+	"github.com/pokt-network/path/observation/qos"
 )
 
 // TODO_TECHDEBT(@adshmh): Add a method to response struct to build validation error observations.

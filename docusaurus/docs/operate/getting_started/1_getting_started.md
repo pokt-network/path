@@ -45,7 +45,7 @@ TODO_IMPROVE: Replace `main` with `latest` once the artifact release CI is compl
 
 :::
 
-1. Set the PATH container image version from [the set of available tags](https://github.com/buildwithgrove/path/pkgs/container/path):
+1. Set the PATH container image version from [the set of available tags](https://github.com/pokt-network/path/pkgs/container/path):
 
    ```bash
    export PATH_IMAGE_TAG='main'

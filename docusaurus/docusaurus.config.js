@@ -53,7 +53,7 @@ const config = {
           sidebarCollapsible: false,
           docItemComponent: "@theme/ApiItem",
           editUrl:
-            "https://github.com/buildwithgrove/path/edit/main/docusaurus",
+            "https://github.com/pokt-network/path/edit/main/docusaurus",
         },
         theme: {
           customCss: "./src/css/custom.css",

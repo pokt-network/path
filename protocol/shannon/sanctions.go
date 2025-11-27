@@ -9,8 +9,8 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sdk "github.com/pokt-network/shannon-sdk"
 
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
+	pathhttp "github.com/pokt-network/path/network/http"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
 )
 
 // classifyRelayError determines the ShannonEndpointErrorType and recommended ShannonSanctionType for a given relay error.

@@ -4,10 +4,10 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/buildwithgrove/path/metrics/devtools"
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	"github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/metrics/devtools"
+	pathhttp "github.com/pokt-network/path/network/http"
+	"github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
 )
 
 // RequestQoSContext

@@ -4,8 +4,8 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/pokt-network/poktroll/x/session/types"
 
-	"github.com/buildwithgrove/path/log"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/log"
+	"github.com/pokt-network/path/protocol"
 )
 
 // hydrateLoggerWithEndpoint enhances a logger with a Shannon endpoint details.

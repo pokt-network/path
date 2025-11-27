@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/selector"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/selector"
 )
 
 var (

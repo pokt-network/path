@@ -6,8 +6,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	pathhttp "github.com/pokt-network/path/network/http"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // httpHeadersApplicationJSON is the `Content-Type` HTTP header used in all JSONRPC responses.

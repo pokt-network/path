@@ -6,7 +6,7 @@ import (
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 func (r Request) BuildPayload() (protocol.Payload, error) {

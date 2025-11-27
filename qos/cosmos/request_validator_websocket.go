@@ -6,10 +6,10 @@ import (
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	"github.com/buildwithgrove/path/gateway"
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/qos"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/gateway"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/qos"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // TODO_TECHDEBT(@adshmh): Build the request context with necessary functions for websocket requests:

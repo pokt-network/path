@@ -6,7 +6,7 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // runHTTPChecks performs HTTP-based QoS checks for all services and endpoints.

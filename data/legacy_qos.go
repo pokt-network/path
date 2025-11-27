@@ -8,7 +8,7 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	qosobservation "github.com/buildwithgrove/path/observation/qos"
+	qosobservation "github.com/pokt-network/path/observation/qos"
 )
 
 // setLegacyFieldsFromQoSObservations populates legacy records with QoS observation data.

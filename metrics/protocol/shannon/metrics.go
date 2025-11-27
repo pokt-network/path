@@ -7,7 +7,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/prometheus/client_golang/prometheus"
 
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
 )
 
 // TODO_METRICS(@commoddity): Add additional Websocket-specific metrics
@@ -636,7 +636,7 @@ func processEndpointErrors(
 ) {
 	for _, endpointObs := range observations {
 		// Skip if there's no error
-		if endpointObs.ErrorType == nil {
+		if endpointObs == nil || endpointObs.ErrorType == nil {
 			continue
 		}
 

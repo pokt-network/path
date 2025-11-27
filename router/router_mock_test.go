@@ -14,8 +14,8 @@ import (
 	http "net/http"
 	reflect "reflect"
 
-	devtools "github.com/buildwithgrove/path/metrics/devtools"
-	protocol "github.com/buildwithgrove/path/protocol"
+	devtools "github.com/pokt-network/path/metrics/devtools"
+	protocol "github.com/pokt-network/path/protocol"
 	gomock "go.uber.org/mock/gomock"
 )
 

@@ -6,11 +6,11 @@
 <br/>
 
 ![Static Badge](https://img.shields.io/badge/Maintained_by-Grove-green)
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/buildwithgrove/path/main-build.yml)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/pokt-network/path/main-build.yml)
 ![GitHub last commit](https://img.shields.io/github/last-commit/buildwithgrove/path)
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/buildwithgrove/path)
 ![GitHub Release](https://img.shields.io/github/v/release/buildwithgrove/path)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/buildwithgrove/path/total)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/pokt-network/path/total)
 ![GitHub Issues or Pull Requests](https://img.shields.io/github/issues/buildwithgrove/path)
 ![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-pr/buildwithgrove/path)
 ![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-closed/buildwithgrove/path)
@@ -31,7 +31,7 @@ The source code for the documentation is available in the `docs` directory.
 
 ## Support
 
-For Bug Reports and Enhancement Requests, please open an [Issue](https://github.com/buildwithgrove/path/issues).
+For Bug Reports and Enhancement Requests, please open an [Issue](https://github.com/pokt-network/path/issues).
 
 For Technical Support please open a ticket in [Grove's Discord](https://discord.gg/build-with-grove).
 
@@ -48,4 +48,4 @@ See the following docs for more information:
 
 ## License
 
-This project is licensed under the MIT License; see the [LICENSE](https://github.com/buildwithgrove/path/blob/main/LICENSE) file for details.
+This project is licensed under the MIT License; see the [LICENSE](https://github.com/pokt-network/path/blob/main/LICENSE) file for details.

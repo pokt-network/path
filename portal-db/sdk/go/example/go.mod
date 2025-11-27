@@ -2,9 +2,9 @@ module example.com/portaldb-example
 
 go 1.23
 
-replace github.com/buildwithgrove/path/portal-db/sdk/go => ../
+replace github.com/pokt-network/path/portal-db/sdk/go => ../
 
-require github.com/buildwithgrove/path/portal-db/sdk/go v0.0.0-20251006170518-7fd85f003655
+require github.com/pokt-network/path/portal-db/sdk/go v0.0.0-20251006170518-7fd85f003655
 
 require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect

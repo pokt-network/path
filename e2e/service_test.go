@@ -11,10 +11,10 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	vegeta "github.com/tsenart/vegeta/lib"
 
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
-	"github.com/buildwithgrove/path/request"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/jsonrpc"
+	"github.com/pokt-network/path/request"
 )
 
 type serviceType string

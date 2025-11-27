@@ -5,9 +5,9 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	shannonconfig "github.com/buildwithgrove/path/config/shannon"
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/protocol/shannon"
+	shannonconfig "github.com/pokt-network/path/config/shannon"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/protocol/shannon"
 )
 
 // getShannonFullNode builds and returns a Shannon FullNode configuration.

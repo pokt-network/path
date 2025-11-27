@@ -7,8 +7,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/selector"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/selector"
 )
 
 // EndpointStore provides the endpoint selection capability required

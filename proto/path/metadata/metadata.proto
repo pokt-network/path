@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package path.metadata;
 
-option go_package = "github.com/buildwithgrove/path/observation/metadata";
+option go_package = "github.com/pokt-network/path/observation/metadata";
 
 import "google/protobuf/descriptor.proto";
 

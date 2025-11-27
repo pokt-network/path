@@ -14,7 +14,7 @@ make install_tools_optional
 
 :::tip
 
-Easy to use make targets are provided in the [test load Makefile](https://github.com/buildwithgrove/path/blob/main/makefiles/test_load.mk).
+Easy to use make targets are provided in the [test load Makefile](https://github.com/pokt-network/path/blob/main/makefiles/test_load.mk).
 
 You can run the following commands if you have a local PATH instance running pointing to Pocket Network.
 

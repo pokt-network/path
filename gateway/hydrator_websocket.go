@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // websocketCheckInterval is the interval at which Websocket connection checks are performed.

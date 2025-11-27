@@ -8,8 +8,8 @@ import (
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	"github.com/buildwithgrove/path/protocol"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // ---------- Message-Level Observations ----------

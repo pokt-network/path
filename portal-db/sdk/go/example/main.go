@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	portaldb "github.com/buildwithgrove/path/portal-db/sdk/go"
+	portaldb "github.com/pokt-network/path/portal-db/sdk/go"
 )
 
 func main() {

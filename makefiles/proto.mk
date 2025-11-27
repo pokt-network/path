@@ -13,7 +13,7 @@ proto_gen_observation: ## Generate observation protobuf artifacts
 	@echo "Generating observation protobuf artifacts..."
 	@protoc -I=./proto \
 		--go_out=./observation \
-		--go_opt=module=github.com/buildwithgrove/path/observation \
+		--go_opt=module=github.com/pokt-network/path/observation \
 		./proto/path/*.proto \
 		./proto/path/metadata/*.proto \
 		./proto/path/protocol/*.proto \

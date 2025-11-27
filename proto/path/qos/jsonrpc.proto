@@ -1,7 +1,7 @@
 syntax = "proto3";
 package path.qos;
 
-option go_package = "github.com/buildwithgrove/path/observation/qos";
+option go_package = "github.com/pokt-network/path/observation/qos";
 
 // JsonRpcRequest represents essential fields of a JSON-RPC request for observation purposes.
 // Reference: https://www.jsonrpc.org/specification#request_object

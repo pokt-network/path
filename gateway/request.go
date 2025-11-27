@@ -4,8 +4,8 @@ import (
 	"context"
 	"net/http"
 
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	"github.com/buildwithgrove/path/protocol"
+	pathhttp "github.com/pokt-network/path/network/http"
+	"github.com/pokt-network/path/protocol"
 )
 
 // HTTPRequestParser is used, in handling an HTTP service request, to extract

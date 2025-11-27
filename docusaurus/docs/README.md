@@ -42,7 +42,7 @@ This documentation is an active work in progress and there's a lot more we want 
 - [ ] Deployment instructions
 - [ ] Billing integrations
 - [ ] ETL Pipelines
-- [ ] [Add your request here](https://github.com/buildwithgrove/path/issues/new/choose)
+- [ ] [Add your request here](https://github.com/pokt-network/path/issues/new/choose)
 
 ## Is PATH for me?
 

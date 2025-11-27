@@ -15,14 +15,14 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
 
-	configpkg "github.com/buildwithgrove/path/config"
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/health"
-	"github.com/buildwithgrove/path/metrics"
-	"github.com/buildwithgrove/path/metrics/devtools"
-	protocolPkg "github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/request"
-	"github.com/buildwithgrove/path/router"
+	configpkg "github.com/pokt-network/path/config"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/health"
+	"github.com/pokt-network/path/metrics"
+	"github.com/pokt-network/path/metrics/devtools"
+	protocolPkg "github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/request"
+	"github.com/pokt-network/path/router"
 )
 
 // Version information injected at build time via ldflags

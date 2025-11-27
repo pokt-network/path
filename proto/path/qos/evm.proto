@@ -14,7 +14,7 @@ package path.qos;
 // As a reader of the code, the separation of concerns yet simultaneous overlap of data & primitives
 // leads to very confusing conflation between qos (i.e. request/responses) with observations (i.e. metrics/data).
 
-option go_package = "github.com/buildwithgrove/path/observation/qos";
+option go_package = "github.com/pokt-network/path/observation/qos";
 
 import "path/qos/jsonrpc.proto";
 import "path/qos/request_origin.proto";

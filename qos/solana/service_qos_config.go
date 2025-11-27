@@ -1,6 +1,6 @@
 package solana
 
-import "github.com/buildwithgrove/path/protocol"
+import "github.com/pokt-network/path/protocol"
 
 // QoSType is the QoS type for the Solana blockchain.
 const QoSType = "solana"

@@ -9,8 +9,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/observation"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/observation"
 )
 
 // defaultDataReporterPostTimeoutMillisec defines the default timeout for HTTP POST operations in milliseconds (10 seconds)
@@ -50,7 +50,7 @@ func (drh *DataReporterHTTP) Publish(observations *observation.RequestResponseOb
 	//
 	// If the observations are for an EVM batch request, legacyDataRecords will contain multiple records.
 	// As of PR #388 all other QoS observations are expected to be single records.
-	// Reference: https://github.com/buildwithgrove/path/pull/388
+	// Reference: https://github.com/pokt-network/path/pull/388
 	for i, legacyDataRecord := range legacyDataRecords {
 		recordLogger := logger.With("record_index", i, "total_records", len(legacyDataRecords))
 

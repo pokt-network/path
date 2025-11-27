@@ -215,9 +215,9 @@ if [ ! -f "package.json" ]; then
     "url": "https://github.com/buildwithgrove/path.git",
     "directory": "portal-db/sdk/typescript"
   },
-  "homepage": "https://github.com/buildwithgrove/path/tree/main/portal-db/sdk/typescript",
+  "homepage": "https://github.com/pokt-network/path/tree/main/portal-db/sdk/typescript",
   "bugs": {
-    "url": "https://github.com/buildwithgrove/path/issues"
+    "url": "https://github.com/pokt-network/path/issues"
   },
   "scripts": {
     "type-check": "tsc --noEmit"
@@ -361,7 +361,7 @@ echo "   Go SDK:       $GO_OUTPUT_DIR"
 echo "   TypeScript:   $TS_OUTPUT_DIR"
 echo ""
 echo -e "${BLUE}🐹 Go SDK:${NC}"
-echo "   Module:   github.com/buildwithgrove/path/portal-db/sdk/go"
+echo "   Module:   github.com/pokt-network/path/portal-db/sdk/go"
 echo "   Package:  portaldb"
 echo "   Files:"
 echo "   • models.go       - Generated data models and types (updated)"
@@ -386,7 +386,7 @@ echo ""
 echo -e "${BLUE}Go SDK:${NC}"
 echo "   1. Review generated models: cat $GO_OUTPUT_DIR/models.go | head -50"
 echo "   2. Review generated client: cat $GO_OUTPUT_DIR/client.go | head -50" 
-echo "   3. Import in your project: go get github.com/buildwithgrove/path/portal-db/sdk/go"
+echo "   3. Import in your project: go get github.com/pokt-network/path/portal-db/sdk/go"
 echo "   4. Check documentation: cat $GO_OUTPUT_DIR/README.md"
 echo ""
 echo -e "${BLUE}TypeScript SDK:${NC}"

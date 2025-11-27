@@ -3,7 +3,7 @@ package data
 import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/observation"
+	"github.com/pokt-network/path/observation"
 )
 
 // TODO_MVP(@adshmh): Remove once the data pipeline has been updated.

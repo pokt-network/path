@@ -26,7 +26,7 @@ release_tag_local_testing: ## Tag a new local testing release (e.g. v1.0.1 -> v1
 	echo "New local testing version tagged: $$NEW_TAG"; \
 	echo "Run the following commands to push the new tag:"; \
 	echo "  git push origin $$NEW_TAG"; \
-	echo "And draft a new release at https://github.com/buildwithgrove/path/releases/new";
+	echo "And draft a new release at https://github.com/pokt-network/path/releases/new";
 
 
 .PHONY: release_tag_dev
@@ -50,7 +50,7 @@ release_tag_dev: ## Tag a new dev release (e.g. v1.0.1 -> v1.0.1-dev1, v1.0.1-de
 	echo "1. Run the following commands to push the new tag:"; \
 	echo "   git push origin $$NEW_TAG"; \
 	echo ""; \
-	echo "2. And draft a new release at https://github.com/buildwithgrove/path/releases/new"; \
+	echo "2. And draft a new release at https://github.com/pokt-network/path/releases/new"; \
 	echo ""; \
 	echo "If you need to delete a tag, run:"; \
 	echo "  git tag -d $$NEW_TAG"; \
@@ -74,7 +74,7 @@ release_tag_bug_fix: ## Tag a new bug fix release (e.g. v1.0.1 -> v1.0.2)
 	echo "1. Run the following commands to push the new tag:"; \
 	echo "   git push origin $$NEW_TAG"; \
 	echo ""; \
-	echo "2. And draft a new release at https://github.com/buildwithgrove/path/releases/new"; \
+	echo "2. And draft a new release at https://github.com/pokt-network/path/releases/new"; \
 	echo ""; \
 	echo "If you need to delete a tag, run:"; \
 	echo "  git tag -d $$NEW_TAG"; \
@@ -99,7 +99,7 @@ release_tag_minor_release: ## Tag a new minor release (e.g. v1.0.0 -> v1.1.0)
 	echo "1. Run the following commands to push the new tag:"; \
 	echo "   git push origin $$NEW_TAG"; \
 	echo ""; \
-	echo "2. And draft a new release at https://github.com/buildwithgrove/path/releases/new"; \
+	echo "2. And draft a new release at https://github.com/pokt-network/path/releases/new"; \
 	echo ""; \
 	echo "If you need to delete a tag, run:"; \
 	echo "  git tag -d $$NEW_TAG"; \

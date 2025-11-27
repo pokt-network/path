@@ -13,8 +13,8 @@ import (
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/request"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/request"
 )
 
 // Delegated Gateway Mode - Shannon Protocol Integration

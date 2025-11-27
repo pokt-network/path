@@ -1,7 +1,7 @@
 syntax = "proto3";
 package path;
 
-option go_package = "github.com/buildwithgrove/path/observation";
+option go_package = "github.com/pokt-network/path/observation";
 
 // HTTPRequestObservations captures all the observations regarding an HTTP service request.
 message HTTPRequestObservations {

@@ -3,7 +3,7 @@ package devtools
 import (
 	"time"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // DisqualifiedEndpointResponse contains useful information about currently disqualified endpoints.

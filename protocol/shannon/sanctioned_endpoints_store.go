@@ -9,9 +9,9 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/metrics/devtools"
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/metrics/devtools"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // Constants for sanction expiration and cache cleanup

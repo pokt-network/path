@@ -9,8 +9,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/message"
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/message"
+	"github.com/pokt-network/path/protocol"
 )
 
 // The topic used by QoS publishers and subscribers

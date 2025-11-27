@@ -5,8 +5,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	"github.com/buildwithgrove/path/protocol"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 // buildConnectionEstablishmentFailureObservation creates a connection establishment failure observation

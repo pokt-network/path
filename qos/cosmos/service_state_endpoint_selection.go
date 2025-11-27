@@ -5,8 +5,8 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/selector"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/selector"
 )
 
 var (

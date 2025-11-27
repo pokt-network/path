@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 /* -------------------- CometBFT Health Check -------------------- */

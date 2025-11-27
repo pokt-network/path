@@ -4,8 +4,8 @@ package protocol
 import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/metrics/protocol/shannon"
-	"github.com/buildwithgrove/path/observation/protocol"
+	"github.com/pokt-network/path/metrics/protocol/shannon"
+	"github.com/pokt-network/path/observation/protocol"
 )
 
 // PublishMetrics builds and exports all protocol-related metrics using protocol-level observations.

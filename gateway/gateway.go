@@ -21,7 +21,7 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/observation"
+	"github.com/pokt-network/path/observation"
 )
 
 // Gateway handles end-to-end service requests via HandleHTTPServiceRequest:

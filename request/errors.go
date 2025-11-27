@@ -3,7 +3,7 @@ package request
 import (
 	"fmt"
 
-	"github.com/buildwithgrove/path/gateway"
+	"github.com/pokt-network/path/gateway"
 )
 
 var (

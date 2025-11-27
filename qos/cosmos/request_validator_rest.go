@@ -7,12 +7,12 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	gateway "github.com/buildwithgrove/path/gateway"
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	gateway "github.com/pokt-network/path/gateway"
+	pathhttp "github.com/pokt-network/path/network/http"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // restRequestID is a dummy string value used as the request ID for REST requests.

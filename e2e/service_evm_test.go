@@ -14,8 +14,8 @@ import (
 
 	vegeta "github.com/tsenart/vegeta/lib"
 
-	"github.com/buildwithgrove/path/qos/evm"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/qos/evm"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // TODO_TECHDEBT(@commoddity): The service_<SERVICE_TYPE>_test.go files in this package

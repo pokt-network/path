@@ -3,10 +3,10 @@ package config
 import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos/cosmos"
-	"github.com/buildwithgrove/path/qos/evm"
-	"github.com/buildwithgrove/path/qos/solana"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/cosmos"
+	"github.com/pokt-network/path/qos/evm"
+	"github.com/pokt-network/path/qos/solana"
 )
 
 // How to add archival checks: https://path.grove.city/learn/qos/adding_new_archival
@@ -802,7 +802,7 @@ var shannonServices = []ServiceQoSConfig{
 	}),
 
 	// Namada TODO_TECHDEBT(@commoddity): Namada is not a conventional Cosmos SDK chain and likely requires a custom implementation.
-	// Reference: https://github.com/buildwithgrove/path/issues/376#issuecomment-3127611273
+	// Reference: https://github.com/pokt-network/path/issues/376#issuecomment-3127611273
 	// cosmos.NewCosmosSDKServiceQoSConfig("namada", "","", map[sharedtypes.RPCType]struct{}{
 	// 	sharedtypes.RPCType_REST:      {}, // CosmosSDK
 	// 	sharedtypes.RPCType_COMET_BFT: {},

@@ -27,7 +27,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // websocketTestClient handles Websocket connections and JSON-RPC requests.

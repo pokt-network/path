@@ -3,8 +3,8 @@ package cosmos
 import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
+	pathhttp "github.com/pokt-network/path/network/http"
+	qosobservations "github.com/pokt-network/path/observation/qos"
 )
 
 // responseRESTUnrecognized handles unrecognized REST endpoint responses

@@ -10,10 +10,10 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/buildwithgrove/path/observation"
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/websockets"
+	"github.com/pokt-network/path/observation"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/websockets"
 )
 
 var _ websockets.WebsocketMessageProcessor = &websocketRequestContext{}
@@ -206,7 +206,7 @@ func (wrc *websocketRequestContext) buildProtocolContextAndStartBridge(
 // TODO_TECHDEBT(@commoddity,@adshmh): This needs a few refactors to establish the gateway package's context as the coordinator of operations: e.g.
 //   - receive messages from the protocol context over a channel -> pass to QoS -> use QoS context to write user's response, etc.
 //   - receive observations from the protocol context over a channel -> hand over to publisher(s) like data, metrics, etc.
-// Reference: https://github.com/buildwithgrove/path/pull/419/files#r2333916517
+// Reference: https://github.com/pokt-network/path/pull/419/files#r2333916517
 
 // ProcessClientWebsocketMessage processes a message from the client.
 // It performs both Protocol-level and QoS-level message processing.

@@ -8,12 +8,12 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	"github.com/buildwithgrove/path/gateway"
-	pathhttp "github.com/buildwithgrove/path/network/http"
-	qosobservations "github.com/buildwithgrove/path/observation/qos"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/qos"
-	"github.com/buildwithgrove/path/qos/jsonrpc"
+	"github.com/pokt-network/path/gateway"
+	pathhttp "github.com/pokt-network/path/network/http"
+	qosobservations "github.com/pokt-network/path/observation/qos"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // requestContext provides the support required by the gateway

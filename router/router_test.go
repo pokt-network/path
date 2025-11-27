@@ -14,8 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 	gomock "go.uber.org/mock/gomock"
 
-	"github.com/buildwithgrove/path/config"
-	"github.com/buildwithgrove/path/health"
+	"github.com/pokt-network/path/config"
+	"github.com/pokt-network/path/health"
 )
 
 func newTestRouter(t *testing.T) (*router, *MockgatewayHandler, *httptest.Server) {

@@ -7,8 +7,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	shannonmetrics "github.com/buildwithgrove/path/metrics/protocol/shannon"
-	"github.com/buildwithgrove/path/protocol"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
+	"github.com/pokt-network/path/protocol"
 )
 
 // RandomSelectMultiple performs Fisher-Yates shuffle for random selection without replacement.

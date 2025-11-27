@@ -15,7 +15,7 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	"github.com/buildwithgrove/path/network/concurrency"
+	"github.com/pokt-network/path/network/concurrency"
 )
 
 // TODO_IMPROVE: Make these configurable.

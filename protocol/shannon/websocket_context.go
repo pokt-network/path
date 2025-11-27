@@ -12,12 +12,12 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	sdk "github.com/pokt-network/shannon-sdk"
 
-	"github.com/buildwithgrove/path/gateway"
-	"github.com/buildwithgrove/path/observation"
-	protocolobservations "github.com/buildwithgrove/path/observation/protocol"
-	"github.com/buildwithgrove/path/protocol"
-	"github.com/buildwithgrove/path/request"
-	"github.com/buildwithgrove/path/websockets"
+	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/observation"
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/request"
+	"github.com/pokt-network/path/websockets"
 )
 
 // The requestContext implements the gateway.ProtocolRequestContextWebsocket interface.

@@ -7,7 +7,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
 	"github.com/stretchr/testify/require"
 
-	"github.com/buildwithgrove/path/protocol"
+	"github.com/pokt-network/path/protocol"
 )
 
 func TestRandomSelectMultiple(t *testing.T) {

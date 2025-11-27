@@ -6,7 +6,7 @@ FROM golang:1.24-alpine3.20 AS builder
 RUN apk add --no-cache git make build-base
 
 # Set working directory
-WORKDIR /go/src/github.com/buildwithgrove/path
+WORKDIR /go/src/github.com/pokt-network/path
 
 # Copy only go.mod and go.sum first to leverage Docker's build cache
 COPY go.mod go.sum ./
