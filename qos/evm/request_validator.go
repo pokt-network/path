@@ -1,6 +1,7 @@
 package evm
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 
@@ -11,6 +12,10 @@ import (
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/jsonrpc"
 )
+
+// maxRequestBodySize is the maximum allowed size for HTTP request bodies (100MB).
+// This prevents OOM attacks from unbounded io.ReadAll calls.
+const maxRequestBodySize = 100 * 1024 * 1024
 
 // TODO_TECHDEBT(@adshmh): Simplify the qos package by refactoring gateway.QoSContextBuilder.
 // Proposed change: Create a new ServiceRequest type containing raw payload data ([]byte)
@@ -38,9 +43,14 @@ func (erv *evmRequestValidator) validateHTTPRequest(req *http.Request) (gateway.
 		"method", "validateHTTPRequest",
 	)
 
-	// Read the HTTP request body
-	body, err := io.ReadAll(req.Body)
+	// Read the HTTP request body with size limit to prevent OOM attacks
+	limitedBody := http.MaxBytesReader(nil, req.Body, maxRequestBodySize)
+	body, err := io.ReadAll(limitedBody)
 	if err != nil {
+		// Check if the error is due to body size limit exceeded
+		if err.Error() == "http: request body too large" {
+			err = fmt.Errorf("request body exceeds %d bytes limit", maxRequestBodySize)
+		}
 		logger.Warn().Err(err).Msg("HTTP request body read failed - returning generic error response")
 		return erv.createHTTPBodyReadFailureContext(err), false
 	}

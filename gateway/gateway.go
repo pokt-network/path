@@ -183,9 +183,8 @@ func (g Gateway) handleWebSocketRequest(
 		// Note: We do NOT close messageObservationsChan here because Websocket connections
 		// outlive the HTTP handler. The channel will be closed when the Websocket actually disconnects.
 		// TODO_CONFIG: Add configuration for message channel buffer sizes
-		// Current: Hardcoded buffer size (1000 for observations)
-		// Suggestion: Make configurable based on expected load
-		messageObservationsChan: make(chan *observation.RequestResponseObservations, 1_000),
+		// Reduced from 1000 to 50 to prevent OOM (1000 × ~3KB × 100 connections = 300MB)
+		messageObservationsChan: make(chan *observation.RequestResponseObservations, 50),
 	}
 
 	// Initialize the websocket request context using the HTTP request.

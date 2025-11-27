@@ -3,6 +3,7 @@ package main
 // TODO_TECHDEBT(@olshansk): Revisit the name `hydrator` to something more appropriate.
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -20,7 +21,9 @@ const defaultProtocolHealthTimeout = 2 * time.Minute
 //
 // - Initializes and starts an instance of EndpointHydrator matching the configuration settings.
 // - Will NOT start the EndpointHydrator if no service QoS generators are specified.
+// - The ctx parameter is used for graceful shutdown of hydrator goroutines.
 func setupEndpointHydrator(
+	ctx context.Context,
 	cmdLogger polylog.Logger,
 	protocolInstance gateway.Protocol,
 	qosServices map[protocol.ServiceID]gateway.QoSService,
@@ -55,7 +58,7 @@ func setupEndpointHydrator(
 		DataReporter:            dataReporter,
 	}
 
-	if err := endpointHydrator.Start(); err != nil {
+	if err := endpointHydrator.Start(ctx); err != nil {
 		return nil, err
 	}
 
