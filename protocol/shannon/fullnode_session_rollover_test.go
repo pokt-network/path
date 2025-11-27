@@ -1,6 +1,7 @@
 package shannon
 
 import (
+	"context"
 	"testing"
 
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
@@ -19,7 +20,7 @@ func newMockSessionRolloverState() *sessionRolloverState {
 	// Use the default rollover blocks value for testing
 	const testSessionRolloverBlocks = 24
 
-	return newSessionRolloverState(logger, mockBlockClient, testSessionRolloverBlocks)
+	return newSessionRolloverState(context.Background(), logger, mockBlockClient, testSessionRolloverBlocks)
 }
 
 func Test_getSessionRolloverState(t *testing.T) {

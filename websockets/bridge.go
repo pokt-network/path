@@ -104,6 +104,10 @@ func StartBridge(
 	endpointConn, err := ConnectWebsocketEndpoint(logger, websocketURL, headers)
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ error connecting to websocket endpoint")
+		// Clean up the client connection that was successfully upgraded
+		if closeErr := clientConn.Close(); closeErr != nil {
+			logger.Warn().Err(closeErr).Msg("error closing client connection after endpoint connection failure")
+		}
 		cancelCtx() // Clean up context on error
 		return nil, fmt.Errorf("createWebsocketBridge: %s", err.Error())
 	}

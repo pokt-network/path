@@ -284,6 +284,10 @@ func (rc *requestContext) writeHTTPResponse(response pathhttp.HTTPResponse, w ht
 	logger.Info().Msg("Completed processing the HTTP request and returned an HTTP response.")
 }
 
+// observationBroadcastTimeout is the maximum time allowed for broadcasting observations.
+// This prevents goroutine leaks from hanging observation operations.
+const observationBroadcastTimeout = 30 * time.Second
+
 // BroadcastAllObservations delivers the collected details regarding all aspects
 // of the service request to all the interested parties.
 //
@@ -294,47 +298,64 @@ func (rc *requestContext) writeHTTPResponse(response pathhttp.HTTPResponse, w ht
 func (rc *requestContext) BroadcastAllObservations() {
 	// observation-related tasks are called in Goroutines to avoid potentially blocking the HTTP handler.
 	go func() {
-		// update gateway-level observations: no request error encountered.
-		rc.updateGatewayObservations(nil)
-		// update protocol-level observations: no errors encountered setting up the protocol context.
-		rc.updateProtocolObservations(nil)
-		if rc.protocolObservations != nil {
-			err := rc.protocol.ApplyHTTPObservations(rc.protocolObservations)
-			if err != nil {
-				rc.logger.Warn().Err(err).Msg("error applying protocol observations.")
-			}
-		}
+		// Add timeout to prevent goroutine leaks from hanging operations
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			rc.broadcastObservationsInternal()
+		}()
 
-		// The service request context contains all the details the QoS needs to update its internal metrics about endpoint(s), which it should use to build
-		// the qosobservations.Observations struct.
-		// This ensures that separate PATH instances can communicate and share their QoS observations.
-		// The QoS context will be nil if the target service ID is not specified correctly by the request.
-		var qosObservations qosobservations.Observations
-		if rc.qosCtx != nil {
-			qosObservations = rc.qosCtx.GetObservations()
-			if err := rc.serviceQoS.ApplyObservations(&qosObservations); err != nil {
-				rc.logger.Warn().Err(err).Msg("error applying QoS observations.")
-			}
-		}
-
-		// Prepare and publish observations to both the metrics and data reporters.
-		observations := &observation.RequestResponseObservations{
-			HttpRequest: &rc.httpObservations,
-			Gateway:     rc.gatewayObservations,
-			Protocol:    rc.protocolObservations,
-			Qos:         &qosObservations,
-		}
-
-		if rc.metricsReporter != nil {
-			rc.metricsReporter.Publish(observations)
-		}
-		// Need to account for an empty `data_reporter_config` field in the YAML config file.
-		// E.g. This can happen when running the Gateway in a local environment.
-		// TODO_DELETE: Skip data reporting for "hey" service
-		if rc.dataReporter != nil && rc.serviceID != "hey" {
-			rc.dataReporter.Publish(observations)
+		select {
+		case <-done:
+			// Completed successfully
+		case <-time.After(observationBroadcastTimeout):
+			rc.logger.Warn().Msg("observation broadcast timed out - possible goroutine leak")
 		}
 	}()
+}
+
+// broadcastObservationsInternal performs the actual observation broadcasting work.
+func (rc *requestContext) broadcastObservationsInternal() {
+	// update gateway-level observations: no request error encountered.
+	rc.updateGatewayObservations(nil)
+	// update protocol-level observations: no errors encountered setting up the protocol context.
+	rc.updateProtocolObservations(nil)
+	if rc.protocolObservations != nil {
+		err := rc.protocol.ApplyHTTPObservations(rc.protocolObservations)
+		if err != nil {
+			rc.logger.Warn().Err(err).Msg("error applying protocol observations.")
+		}
+	}
+
+	// The service request context contains all the details the QoS needs to update its internal metrics about endpoint(s), which it should use to build
+	// the qosobservations.Observations struct.
+	// This ensures that separate PATH instances can communicate and share their QoS observations.
+	// The QoS context will be nil if the target service ID is not specified correctly by the request.
+	var qosObservations qosobservations.Observations
+	if rc.qosCtx != nil {
+		qosObservations = rc.qosCtx.GetObservations()
+		if err := rc.serviceQoS.ApplyObservations(&qosObservations); err != nil {
+			rc.logger.Warn().Err(err).Msg("error applying QoS observations.")
+		}
+	}
+
+	// Prepare and publish observations to both the metrics and data reporters.
+	observations := &observation.RequestResponseObservations{
+		HttpRequest: &rc.httpObservations,
+		Gateway:     rc.gatewayObservations,
+		Protocol:    rc.protocolObservations,
+		Qos:         &qosObservations,
+	}
+
+	if rc.metricsReporter != nil {
+		rc.metricsReporter.Publish(observations)
+	}
+	// Need to account for an empty `data_reporter_config` field in the YAML config file.
+	// E.g. This can happen when running the Gateway in a local environment.
+	// TODO_DELETE: Skip data reporting for "hey" service
+	if rc.dataReporter != nil && rc.serviceID != "hey" {
+		rc.dataReporter.Publish(observations)
+	}
 }
 
 // getHTTPRequestLogger returns a logger with attributes set using the supplied HTTP request.
