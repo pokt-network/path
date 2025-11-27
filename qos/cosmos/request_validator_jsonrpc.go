@@ -281,7 +281,7 @@ func (rv *requestValidator) createJSONRPCServicePayloadBuildFailureObservation(
 		RequestLevelError: &qosobservations.RequestError{
 			ErrorKind:      qosobservations.RequestErrorKind_REQUEST_ERROR_INTERNAL_JSONRPC_PAYLOAD_BUILD_ERROR,
 			ErrorDetails:   truncateErrorMessage(err.Error()),
-			HttpStatusCode: int32(200),
+			HttpStatusCode: int32(500),
 		},
 	}
 }
