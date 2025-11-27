@@ -1,0 +1,52 @@
+# Dockerfile for race detection builds
+# Uses CGO and race detector for finding data races during E2E tests
+#
+# Usage: docker build -f Dockerfile.race -t path-race .
+
+# Builder stage with CGO enabled for race detector
+FROM golang:1.24-alpine3.20 AS builder
+
+# Install build dependencies including gcc for CGO
+RUN apk add --no-cache git make build-base gcc musl-dev
+
+WORKDIR /go/src/github.com/pokt-network/path
+
+# Copy go modules first for caching
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+
+# CGO must be enabled for race detector
+ENV CGO_ENABLED=1
+ENV GOOS=linux
+ENV GOARCH=amd64
+ENV GO111MODULE=on
+
+COPY . .
+
+# Build with race detector enabled
+# Note: -race adds ~10x overhead, only use for testing
+RUN go build -race -o /go/bin/path ./cmd
+
+# Final stage - needs libc for race detector runtime
+FROM alpine:3.19 AS final
+
+# Install libc compatibility for race detector
+RUN apk add --no-cache ca-certificates tzdata libc6-compat
+
+# Create non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /app
+
+RUN mkdir -p /app/config && chown -R appuser:appgroup /app
+
+ARG IMAGE_TAG
+ENV IMAGE_TAG=${IMAGE_TAG}
+
+COPY --from=builder /go/bin/path ./
+
+RUN chmod +x /app/path
+
+USER appuser
+
+CMD ["./path"]

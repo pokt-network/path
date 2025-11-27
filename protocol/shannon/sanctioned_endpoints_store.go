@@ -227,7 +227,11 @@ func (ses *sanctionedEndpointsStore) isSanctioned(endpoint endpoint) (bool, stri
 
 	sessionSanctionObj, hasSessionSanction := ses.sessionSanctionsCache.Get(sessionSanctionKey.string())
 	if hasSessionSanction {
-		sanctionRecord := sessionSanctionObj.(sanction)
+		sanctionRecord, ok := sessionSanctionObj.(sanction)
+		if !ok {
+			ses.logger.Error().Msg("SHOULD NEVER HAPPEN: cached sanction is not a sanction type")
+			return false, ""
+		}
 		return true, fmt.Sprintf("session sanction: %s", sanctionRecord.reason)
 	}
 

@@ -162,6 +162,12 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 		return rc.getBatchHTTPResponse()
 	}
 
+	// Guard against empty endpoint responses to prevent index out of bounds panic
+	if numEndpointResponses == 0 {
+		rc.logger.Error().Msg("SHOULD NEVER HAPPEN: No endpoint responses available for single JSON-RPC request")
+		return getGenericResponseNoEndpointResponse(rc.logger).GetHTTPResponse()
+	}
+
 	if numEndpointResponses != 1 {
 		rc.logger.Warn().Msgf("TODO_INVESTIGATE: Expected exactly one endpoint response for single JSON-RPC request, but received %d. Only using the first response for now.", numEndpointResponses)
 	}

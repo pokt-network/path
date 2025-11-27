@@ -57,7 +57,13 @@ func NewBufferPool(maxReaderSize int64) *BufferPool {
 
 // getBuffer retrieves a buffer from the pool.
 func (bp *BufferPool) getBuffer() *bytes.Buffer {
-	buf := bp.pool.Get().(*bytes.Buffer)
+	poolObj := bp.pool.Get()
+	buf, ok := poolObj.(*bytes.Buffer)
+	if !ok {
+		// This should never happen since New always returns *bytes.Buffer,
+		// but handle gracefully to prevent panics.
+		return bytes.NewBuffer(make([]byte, 0, DefaultInitialBufferSize))
+	}
 	buf.Reset() // Always reset to ensure clean state
 	return buf
 }

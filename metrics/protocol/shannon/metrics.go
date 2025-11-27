@@ -595,6 +595,9 @@ func extractRequestError(observations *protocolobservations.ShannonRequestObserv
 // Success is determined by checking if ErrorType is UNSPECIFIED (meaning no error occurred).
 func isAnyObservationSuccessful(observations []*protocolobservations.ShannonEndpointObservation) bool {
 	for _, obs := range observations {
+		if obs == nil {
+			continue
+		}
 		if obs.GetErrorType() == protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED {
 			return true
 		}
@@ -677,8 +680,8 @@ func processSanctionsByDomain(
 	logger = logger.With("method", "processSanctionsByDomain")
 
 	for _, endpointObs := range observations {
-		// Skip if there's no recommended sanction (based on trusted error classification)
-		if endpointObs.RecommendedSanction == nil {
+		// Skip nil observations and those without recommended sanction
+		if endpointObs == nil || endpointObs.RecommendedSanction == nil {
 			continue
 		}
 
@@ -722,6 +725,11 @@ func processEndpointLatency(
 	success := isAnyObservationSuccessful(observations)
 
 	for _, endpointObs := range observations {
+		// Skip nil observations
+		if endpointObs == nil {
+			continue
+		}
+
 		// Skip if we don't have both timestamps (e.g., timeouts)
 		// These will be caught by other metrics indicating endpoint errors.
 		queryTime := endpointObs.GetEndpointQueryTimestamp()
@@ -778,8 +786,8 @@ func processRelayMinerErrors(
 	logger = logger.With("method", "processRelayMinerErrors")
 
 	for _, endpointObs := range observations {
-		// Skip if there's no RelayMinerError
-		if endpointObs.RelayMinerError == nil {
+		// Skip nil observations and those without RelayMinerError
+		if endpointObs == nil || endpointObs.RelayMinerError == nil {
 			continue
 		}
 
