@@ -29,7 +29,6 @@ const (
 func (rv *requestValidator) validateJSONRPCRequest(
 	body []byte,
 ) (gateway.RequestQoSContext, bool) {
-
 	logger := rv.logger.With("validator", "JSONRPC")
 
 	// Parse and validate the JSONRPC request(s) - handles both single and batch requests
@@ -139,7 +138,6 @@ func buildJSONRPCServicePayload(rpcType sharedtypes.RPCType, jsonrpcReq jsonrpc.
 func getJSONRPCRequestEndpointResponseValidator(
 	jsonrpcReqs map[jsonrpc.ID]jsonrpc.Request,
 ) func(polylog.Logger, []byte) response {
-
 	// Delegate the unmarshaling/validation of endpoint response to the specialized JSONRPC unmarshaler.
 	return func(logger polylog.Logger, endpointResponseBz []byte) response {
 		return unmarshalJSONRPCRequestEndpointResponse(logger, jsonrpcReqs, endpointResponseBz)
@@ -245,7 +243,7 @@ func (rv *requestValidator) createJSONRPCParseFailureObservation(
 		RequestLevelError: &qosobservations.RequestError{
 			ErrorKind:      qosobservations.RequestErrorKind_REQUEST_ERROR_USER_ERROR_JSONRPC_PARSE_ERROR,
 			ErrorDetails:   truncateErrorMessage(err.Error()),
-			HttpStatusCode: int32(jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+			HttpStatusCode: int32(500),
 		},
 	}
 }
@@ -283,7 +281,7 @@ func (rv *requestValidator) createJSONRPCServicePayloadBuildFailureObservation(
 		RequestLevelError: &qosobservations.RequestError{
 			ErrorKind:      qosobservations.RequestErrorKind_REQUEST_ERROR_INTERNAL_JSONRPC_PAYLOAD_BUILD_ERROR,
 			ErrorDetails:   truncateErrorMessage(err.Error()),
-			HttpStatusCode: int32(jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+			HttpStatusCode: int32(200),
 		},
 	}
 }

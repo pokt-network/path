@@ -25,14 +25,17 @@ func BuildHTTPResponseFromJSONRPCResponse(
 ) HTTPResponse {
 	bz, err := json.Marshal(jsonrpcResp)
 	// Failed to marshal the JSONRPC response.
+	status := 200
+
 	if err != nil {
 		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Err(err).Msg("SHOULD RARELY HAPPEN: failed to marshal the JSONRPC response.")
+		status = 500
 	}
 
 	return HTTPResponse{
 		responsePayload: bz,
 		// Use the HTTP status code recommended by the JSONRPC response.
-		httpStatusCode: jsonrpcResp.GetRecommendedHTTPStatusCode(),
+		httpStatusCode: status,
 	}
 }
 

@@ -13,10 +13,8 @@ import (
 	"github.com/buildwithgrove/path/qos/jsonrpc"
 )
 
-var (
-	// Error recording that endpoint selection was attempted but failed due to an invalid request
-	errInvalidSelectorUsage = errors.New("endpoint selection attempted on failed request")
-)
+// Error recording that endpoint selection was attempted but failed due to an invalid request
+var errInvalidSelectorUsage = errors.New("endpoint selection attempted on failed request")
 
 // errorContext provides the support required by the gateway package for handling service requests.
 var _ gateway.RequestQoSContext = &errorContext{}
@@ -41,7 +39,6 @@ type errorContext struct {
 	responseHTTPStatusCode int
 }
 
-// GetHTTPResponse formats the stored JSONRPC error as an HTTP response
 // Implements the gateway.RequestQoSContext interface.
 func (ec *errorContext) GetHTTPResponse() pathhttp.HTTPResponse {
 	bz, err := json.Marshal(ec.response)
@@ -56,16 +53,9 @@ func (ec *errorContext) GetHTTPResponse() pathhttp.HTTPResponse {
 		).Warn().Err(err).Msg("Failed to serialize client response.")
 	}
 
-	httpStatusCode := ec.responseHTTPStatusCode
-	// A 0 status code indicates that no HTTP status code was received, observed
-	// or identified yet.
-	if httpStatusCode == 0 {
-		httpStatusCode = ec.response.GetRecommendedHTTPStatusCode()
-	}
-
 	return httpResponse{
 		responsePayload: bz,
-		httpStatusCode:  httpStatusCode,
+		httpStatusCode:  ec.responseHTTPStatusCode,
 	}
 }
 

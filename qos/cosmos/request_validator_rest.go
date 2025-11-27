@@ -154,7 +154,6 @@ func (rv *requestValidator) buildRESTRequestObservations(
 	servicePayload protocol.Payload,
 	requestOrigin qosobservations.RequestOrigin,
 ) *qosobservations.CosmosRequestObservations {
-
 	// Determine content type from headers if available, otherwise empty
 	contentType := ""
 	// Note: We don't have access to headers here, but this would be where we'd extract it
@@ -260,7 +259,7 @@ func (rv *requestValidator) createRESTUnsupportedRPCTypeObservation(
 		RequestLevelError: &qosobservations.RequestError{
 			ErrorKind:      qosobservations.RequestErrorKind_REQUEST_ERROR_USER_ERROR_REST_UNSUPPORTED_RPC_TYPE,
 			ErrorDetails:   "Unsupported RPC type: " + rpcType.String(),
-			HttpStatusCode: int32(jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+			HttpStatusCode: int32(500),
 		},
 	}
 }

@@ -69,7 +69,7 @@ type responseToGetHealth struct {
 func (r responseToGetHealth) GetObservation() qosobservations.SolanaEndpointObservation {
 	return qosobservations.SolanaEndpointObservation{
 		// Set the HTTP status code using the JSONRPC Response
-		HttpStatusCode: int32(r.jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+		HttpStatusCode: int32(200),
 		ResponseObservation: &qosobservations.SolanaEndpointObservation_GetHealthResponse{
 			GetHealthResponse: &qosobservations.SolanaGetHealthResponse{
 				Result: r.HealthResult,

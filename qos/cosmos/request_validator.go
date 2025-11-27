@@ -113,7 +113,7 @@ func (rv *requestValidator) createHTTPBodyReadFailureObservation(
 			RequestLevelError: &qosobservations.RequestError{
 				ErrorKind:      qosobservations.RequestErrorKind_REQUEST_ERROR_INTERNAL_READ_HTTP_ERROR,
 				ErrorDetails:   err.Error(),
-				HttpStatusCode: int32(jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+				HttpStatusCode: int32(500),
 			},
 		},
 	}

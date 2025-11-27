@@ -91,12 +91,12 @@ func (r responseEVMChainID) GetObservation() qosobservations.CosmosEndpointObser
 	return qosobservations.CosmosEndpointObservation{
 		EndpointResponseValidationResult: &qosobservations.CosmosEndpointResponseValidationResult{
 			ResponseValidationType: qosobservations.CosmosResponseValidationType_COSMOS_RESPONSE_VALIDATION_TYPE_JSONRPC,
-			HttpStatusCode:         int32(r.jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+			HttpStatusCode:         int32(200),
 			ValidationError:        nil, // No validation error for successfully processed responses
 			UserJsonrpcResponse:    r.jsonrpcResponse.GetObservation(),
 			ParsedResponse: &qosobservations.CosmosEndpointResponseValidationResult_ResponseEvmJsonrpcChainId{
 				ResponseEvmJsonrpcChainId: &qosobservations.CosmosResponseEVMJSONRPCChainID{
-					HttpStatusCode: int32(r.getHTTPStatusCode()),
+					HttpStatusCode: int32(200),
 					EvmChainId:     r.evmChainID,
 				},
 			},
@@ -108,10 +108,4 @@ func (r responseEVMChainID) GetObservation() qosobservations.CosmosEndpointObser
 // Implements the response interface
 func (r responseEVMChainID) GetHTTPResponse() pathhttp.HTTPResponse {
 	return qos.BuildHTTPResponseFromJSONRPCResponse(r.logger, r.jsonrpcResponse)
-}
-
-// getHTTPStatusCode returns an HTTP status code corresponding to the underlying JSON-RPC response code.
-// DEV_NOTE: This is an opinionated mapping following best practice but not enforced by any specifications or standards.
-func (r responseEVMChainID) getHTTPStatusCode() int {
-	return r.jsonrpcResponse.GetRecommendedHTTPStatusCode()
 }

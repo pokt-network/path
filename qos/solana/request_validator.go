@@ -174,7 +174,7 @@ func createRequestUnmarshalingFailureObservation(
 			RequestError: &qosobservations.RequestError{
 				ErrorKind:      qosobservations.RequestErrorKind_REQUEST_ERROR_USER_ERROR_JSONRPC_PARSE_ERROR,
 				ErrorDetails:   err.Error(),
-				HttpStatusCode: int32(jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+				HttpStatusCode: int32(200),
 			},
 		},
 	}
@@ -192,7 +192,7 @@ func (rv *requestValidator) createHTTPBodyReadFailureObservation(
 			RequestError: &qosobservations.RequestError{
 				ErrorKind:      qosobservations.RequestErrorKind_REQUEST_ERROR_USER_ERROR_JSONRPC_PARSE_ERROR,
 				ErrorDetails:   err.Error(),
-				HttpStatusCode: int32(jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+				HttpStatusCode: int32(500),
 			},
 		},
 	}

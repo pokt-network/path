@@ -73,7 +73,6 @@ func (rv *requestValidator) buildWebsocketRequestObservations(
 	rpcType sharedtypes.RPCType,
 	requestOrigin qosobservations.RequestOrigin,
 ) *qosobservations.CosmosRequestObservations {
-
 	return &qosobservations.CosmosRequestObservations{
 		CosmosChainId: rv.cosmosChainID,
 		ServiceId:     string(rv.serviceID),
@@ -129,7 +128,7 @@ func (rv *requestValidator) createWebsocketUnsupportedRPCTypeObservation(
 		RequestLevelError: &qosobservations.RequestError{
 			ErrorKind:      qosobservations.RequestErrorKind_REQUEST_ERROR_USER_ERROR_JSONRPC_UNSUPPORTED_RPC_TYPE,
 			ErrorDetails:   fmt.Sprintf("Unsupported RPC type %s for service %s", rpcType.String(), string(rv.serviceID)),
-			HttpStatusCode: int32(jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+			HttpStatusCode: int32(500),
 		},
 	}
 }

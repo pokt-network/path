@@ -2,7 +2,6 @@ package evm
 
 import (
 	"encoding/json"
-	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
@@ -65,7 +64,7 @@ func (r responseGeneric) GetObservation() qosobservations.EVMEndpointObservation
 				// Include JSONRPC response's details in the observation.
 				JsonrpcResponse:         r.jsonrpcResponse.GetObservation(),
 				ResponseValidationError: r.validationError,
-				HttpStatusCode:          int32(r.getHTTPStatusCode()),
+				HttpStatusCode:          int32(200),
 			},
 		},
 	}
@@ -77,7 +76,7 @@ func (r responseGeneric) GetHTTPResponse() jsonrpc.HTTPResponse {
 	return jsonrpc.HTTPResponse{
 		ResponsePayload: r.getResponsePayload(),
 		// Use the HTTP status code recommended by for the underlying JSONRPC response by the jsonrpc package.
-		HTTPStatusCode: r.getHTTPStatusCode(),
+		HTTPStatusCode: 200,
 	}
 }
 
@@ -97,25 +96,13 @@ func (r responseGeneric) getResponsePayload() []byte {
 	return bz
 }
 
-// getHTTPStatusCode returns an HTTP status code corresponding to the underlying JSON-RPC response code.
-// DEV_NOTE: This is an opinionated mapping following best practice but not enforced by any specifications or standards.
-func (r responseGeneric) getHTTPStatusCode() int {
-	// Special case for empty batch responses - return 200 OK per JSON-RPC over HTTP best practices
-	if (r.jsonrpcResponse == jsonrpc.Response{}) {
-		return http.StatusOK
-	}
-
-	return r.jsonrpcResponse.GetRecommendedHTTPStatusCode()
-}
-
 // responseUnmarshallerGenericFromResponse processes an already unmarshaled JSON-RPC response into a responseGeneric struct.
 // This avoids double unmarshaling when the response has already been parsed.
 func responseUnmarshallerGenericFromResponse(logger polylog.Logger, jsonrpcReq jsonrpc.Request, jsonrpcResponse jsonrpc.Response) (response, error) {
-	httpStatus := jsonrpcResponse.GetRecommendedHTTPStatusCode()
 	logger.With(
 		"jsonrpc_response", jsonrpcResponse,
 		"jsonrpc_request", jsonrpcReq,
-		"http_status", httpStatus,
+		"http_status", 200,
 	).Debug().Msg("Processing EVM generic response")
 
 	// Response successfully parsed into JSONRPC format.

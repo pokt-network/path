@@ -91,7 +91,7 @@ func (r responseToGetBalance) GetObservation() qosobservations.EVMEndpointObserv
 		ParsedJsonrpcResponse: r.jsonrpcResponse.GetObservation(),
 		ResponseObservation: &qosobservations.EVMEndpointObservation_GetBalanceResponse{
 			GetBalanceResponse: &qosobservations.EVMGetBalanceResponse{
-				HttpStatusCode:          int32(r.getHTTPStatusCode()),
+				HttpStatusCode:          int32(200),
 				ContractAddress:         r.contractAddress,
 				BlockNumber:             r.blockNumber,
 				Balance:                 r.balance,
@@ -106,7 +106,7 @@ func (r responseToGetBalance) GetObservation() qosobservations.EVMEndpointObserv
 func (r responseToGetBalance) GetHTTPResponse() jsonrpc.HTTPResponse {
 	return jsonrpc.HTTPResponse{
 		ResponsePayload: r.getResponsePayload(),
-		HTTPStatusCode:  r.getHTTPStatusCode(),
+		HTTPStatusCode:  200,
 	}
 }
 
@@ -117,11 +117,6 @@ func (r responseToGetBalance) getResponsePayload() []byte {
 		r.logger.Warn().Err(err).Msg("responseToGetBalance: Marshaling JSONRPC response failed.")
 	}
 	return responseBz
-}
-
-// getHTTPStatusCode returns an HTTP status code corresponding to the underlying JSON-RPC response.
-func (r responseToGetBalance) getHTTPStatusCode() int {
-	return r.jsonrpcResponse.GetRecommendedHTTPStatusCode()
 }
 
 // getRequestParams extracts the string params from the JSONRPC request.

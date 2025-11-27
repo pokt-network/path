@@ -29,7 +29,7 @@ func (r *jsonrpcUnrecognizedResponse) GetObservation() qosobservations.CosmosEnd
 	return qosobservations.CosmosEndpointObservation{
 		EndpointResponseValidationResult: &qosobservations.CosmosEndpointResponseValidationResult{
 			ResponseValidationType: qosobservations.CosmosResponseValidationType_COSMOS_RESPONSE_VALIDATION_TYPE_JSONRPC,
-			HttpStatusCode:         int32(r.jsonrpcResponse.GetRecommendedHTTPStatusCode()),
+			HttpStatusCode:         int32(500),
 			ValidationError:        &r.validationErr,
 			UserJsonrpcResponse:    r.jsonrpcResponse.GetObservation(),
 			ParsedResponse: &qosobservations.CosmosEndpointResponseValidationResult_ResponseJsonrpc{

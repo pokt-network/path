@@ -90,7 +90,7 @@ func (r responseToBlockNumber) GetObservation() qosobservations.EVMEndpointObser
 		ParsedJsonrpcResponse: r.jsonrpcResponse.GetObservation(),
 		ResponseObservation: &qosobservations.EVMEndpointObservation_BlockNumberResponse{
 			BlockNumberResponse: &qosobservations.EVMBlockNumberResponse{
-				HttpStatusCode:          int32(r.getHTTPStatusCode()),
+				HttpStatusCode:          int32(200),
 				BlockNumberResponse:     r.result,
 				ResponseValidationError: r.validationError,
 			},
@@ -103,7 +103,7 @@ func (r responseToBlockNumber) GetObservation() qosobservations.EVMEndpointObser
 func (r responseToBlockNumber) GetHTTPResponse() jsonrpc.HTTPResponse {
 	return jsonrpc.HTTPResponse{
 		ResponsePayload: r.getResponsePayload(),
-		HTTPStatusCode:  r.getHTTPStatusCode(),
+		HTTPStatusCode:  200,
 	}
 }
 
@@ -116,12 +116,6 @@ func (r responseToBlockNumber) getResponsePayload() []byte {
 		r.logger.Warn().Err(err).Msg("responseToBlockNumber: Marshaling JSONRPC response failed.")
 	}
 	return bz
-}
-
-// getHTTPStatusCode returns an HTTP status code corresponding to the underlying JSON-RPC response code.
-// DEV_NOTE: This is an opinionated mapping following best practice but not enforced by any specifications or standards.
-func (r responseToBlockNumber) getHTTPStatusCode() int {
-	return r.jsonrpcResponse.GetRecommendedHTTPStatusCode()
 }
 
 // GetJSONRPCID returns the JSONRPC ID of the response.
