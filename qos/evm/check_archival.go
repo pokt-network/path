@@ -48,7 +48,7 @@ func (e *endpointCheckArchival) getRequestID() jsonrpc.ID {
 //
 // For example:
 // '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x28C6c06298d514Db089934071355E5743bf21d60", "0xe71e1d"]}'
-func (e *endpointCheckArchival) getServicePayload(archivalState archivalState) protocol.Payload {
+func (e *endpointCheckArchival) getServicePayload(archivalState *archivalState) protocol.Payload {
 	// Pass params in this order: [<contract_address>, <block_number>]
 	// eg. "params":["0x28C6c06298d514Db089934071355E5743bf21d60", "0xe71e1d"]
 	// Reference: https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getbalance

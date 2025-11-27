@@ -89,7 +89,7 @@ func (ss *serviceState) GetRequiredQualityChecks(endpointAddr protocol.EndpointA
 	if ss.archivalState.shouldArchivalCheckRun(endpoint.checkArchival) {
 		checks = append(
 			checks,
-			ss.getEndpointCheck(endpoint.checkArchival.getRequestID(), endpoint.checkArchival.getServicePayload(ss.archivalState)),
+			ss.getEndpointCheck(endpoint.checkArchival.getRequestID(), endpoint.checkArchival.getServicePayload(&ss.archivalState)),
 		)
 	}
 

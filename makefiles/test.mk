@@ -61,6 +61,28 @@ e2e_test_eth_fallback: shannon_e2e_config_warning check_docker ## Run an E2E Sha
 	fi
 	./e2e/scripts/run_eth_fallback_test.sh $(filter-out $@,$(MAKECMDGOALS))
 
+#######################
+### Race E2E Tests ###
+#######################
+
+# Race detection E2E tests - builds PATH with -race flag to detect data races
+# Note: Race builds are slower (~10x) and use more memory. Use for validation, not CI.
+
+.PHONY: e2e_test_race
+e2e_test_race: shannon_e2e_config_warning check_docker ## Run E2E tests with race detection (e.g. make e2e_test_race eth)
+	@if [ "$(filter-out $@,$(MAKECMDGOALS))" = "" ]; then \
+		echo "$(RED)$(BOLD)❌ Error: Service IDs are required (comma-separated list)$(RESET)"; \
+		echo "  👀 Example: $(CYAN)make e2e_test_race eth,xrplevm$(RESET)"; \
+		exit 1; \
+	fi
+	@echo "$(YELLOW)⚠️  Building PATH with race detector enabled (this may take longer)$(RESET)"
+	(cd e2e && TEST_MODE=e2e TEST_PROTOCOL=shannon TEST_DOCKERFILE=Dockerfile.race TEST_SERVICE_IDS=$(filter-out $@,$(MAKECMDGOALS)) go test -v -tags=e2e -count=1 -run Test_PATH_E2E)
+
+.PHONY: e2e_test_race_all
+e2e_test_race_all: shannon_e2e_config_warning check_docker ## Run all E2E tests with race detection
+	@echo "$(YELLOW)⚠️  Building PATH with race detector enabled (this may take longer)$(RESET)"
+	(cd e2e && TEST_MODE=e2e TEST_PROTOCOL=shannon TEST_DOCKERFILE=Dockerfile.race go test -v -tags=e2e -count=1 -run Test_PATH_E2E)
+
 
 ##################
 ### Load Tests ###

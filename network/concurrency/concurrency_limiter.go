@@ -63,10 +63,10 @@ func (cl *ConcurrencyLimiter) Acquire(ctx context.Context) bool {
 	select {
 	case cl.semaphore <- struct{}{}:
 		cl.mu.Lock()
+		defer cl.mu.Unlock()
 		cl.activeRequests++
 		// Track active relays for observability
 		shannonmetrics.SetActiveHTTPRelays(cl.activeRequests)
-		cl.mu.Unlock()
 		return true
 	case <-ctx.Done():
 		return false
@@ -85,10 +85,10 @@ func (cl *ConcurrencyLimiter) Release() {
 	select {
 	case <-cl.semaphore:
 		cl.mu.Lock()
+		defer cl.mu.Unlock()
 		cl.activeRequests--
 		// Track active relays for observability
 		shannonmetrics.SetActiveHTTPRelays(cl.activeRequests)
-		cl.mu.Unlock()
 	default:
 		// TODO_TECHDEBT: Log acquire/release mismatch for debugging
 	}

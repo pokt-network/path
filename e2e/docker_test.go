@@ -26,11 +26,10 @@ import (
 // This file is used to setup and tear down an ephemeral PATH container using Dockertest.
 
 const (
-	imageName            = "path-image"
 	containerName        = "path"
 	internalPathPort     = "3069"
 	buildContextDir      = ".."
-	dockerfileName       = "Dockerfile" // TODO_TECHDEBT: Consolidate Dockerfile.local and Dockerfile
+	defaultDockerfile    = "Dockerfile"
 	configMountPoint     = ":/app/config/.config.yaml"
 	containerEnvImageTag = "IMAGE_TAG=test"
 	containerExtraHost   = "host.docker.internal:host-gateway" // allows the container to access the host machine's Docker daemon
@@ -40,6 +39,23 @@ const (
 	// Once this time expires, the associated E2E test is marked as failed and the PATH container is removed.
 	maxPathHealthCheckWaitTimeMillisec = 180_000
 )
+
+// getDockerfileName returns the Dockerfile to use, configurable via TEST_DOCKERFILE env var.
+// Use TEST_DOCKERFILE=Dockerfile.race for race detection builds.
+func getDockerfileName() string {
+	if df := os.Getenv("TEST_DOCKERFILE"); df != "" {
+		return df
+	}
+	return defaultDockerfile
+}
+
+// getImageName returns the Docker image name based on the Dockerfile being used.
+func getImageName() string {
+	if os.Getenv("TEST_DOCKERFILE") == "Dockerfile.race" {
+		return "path-image-race"
+	}
+	return "path-image"
+}
 
 // eg. 3069/tcp
 var containerPortAndProtocol = internalPathPort + "/tcp"
@@ -112,6 +128,10 @@ func setupPathDocker(
 	}
 	pool.MaxWait = time.Duration(maxPathHealthCheckWaitTimeMillisec) * time.Millisecond
 
+	// Get dockerfile and image name (configurable via TEST_DOCKERFILE env var)
+	dockerfileName := getDockerfileName()
+	imageName := getImageName()
+
 	// Check if the image already exists and we're not forcing a rebuild
 	imageExists := false
 	if !forceRebuild {
@@ -126,7 +146,7 @@ func setupPathDocker(
 
 	// Only build the image if it doesn't exist or force rebuild is set
 	if !imageExists || forceRebuild {
-		fmt.Println("🏗️  Building Docker image...")
+		fmt.Printf("🏗️  Building Docker image using %s...\n", dockerfileName)
 
 		// Build the image and log build output
 		buildOptions := docker.BuildImageOptions{

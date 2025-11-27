@@ -176,6 +176,24 @@ func getGenericResponseBatchEmpty(logger polylog.Logger) responseGeneric {
 	}
 }
 
+// getGenericResponseNoEndpointResponse creates a responseGeneric instance for the error case
+// where no endpoint responses are available. This should never happen in normal operation
+// and indicates an internal error in the request processing pipeline.
+func getGenericResponseNoEndpointResponse(logger polylog.Logger) responseGeneric {
+	logger.Error().Msg("No endpoint responses available - this indicates an internal error")
+
+	return responseGeneric{
+		logger: logger,
+		jsonrpcResponse: jsonrpc.Response{
+			Error: &jsonrpc.ResponseError{
+				Code:    -32603, // JSON-RPC internal error code
+				Message: "internal error: no endpoint response available",
+			},
+		},
+		validationError: nil,
+	}
+}
+
 // TODO_INCOMPLETE: Handle the string `null`, as it could be returned
 // when an object is expected.
 // See the following link for more details:

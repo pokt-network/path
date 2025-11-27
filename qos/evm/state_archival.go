@@ -28,6 +28,10 @@ const archivalConsensusThreshold = 5
 type archivalState struct {
 	logger polylog.Logger
 
+	// mu protects concurrent access to balanceConsensus, blockNumberHex, and expectedBalance.
+	// These fields are accessed from multiple goroutines during archival state updates.
+	mu sync.RWMutex
+
 	// archivalCheckConfig contains all configurable values for an EVM archival check.
 	archivalCheckConfig evmArchivalCheckConfig
 
@@ -74,6 +78,9 @@ func (as *archivalState) updateArchivalState(
 	perceivedBlockNumber uint64,
 	updatedEndpoints map[protocol.EndpointAddr]endpoint,
 ) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
 	// If the expected archival balance is already set, there is no need to update the archival state.
 	if as.expectedBalance != "" {
 		return
@@ -81,12 +88,12 @@ func (as *archivalState) updateArchivalState(
 
 	// If the archival block number is not yet set for the service, calculate it.
 	if perceivedBlockNumber != 0 && as.blockNumberHex == "" {
-		as.calculateArchivalBlockNumber(perceivedBlockNumber)
+		as.calculateArchivalBlockNumberLocked(perceivedBlockNumber)
 	}
 
 	// If the expected archival balance is not yet set for the service, set it.
 	if as.blockNumberHex != "" && as.expectedBalance == "" {
-		as.updateExpectedBalance(updatedEndpoints)
+		as.updateExpectedBalanceLocked(updatedEndpoints)
 	}
 }
 
@@ -96,9 +103,10 @@ func (as *archivalState) isEnabled() bool {
 	return !as.archivalCheckConfig.IsEmpty()
 }
 
-// calculateArchivalBlockNumber determines a, archival block number based on the perceived block number.
+// calculateArchivalBlockNumberLocked determines an archival block number based on the perceived block number.
 // See comment on `archivalState.blockNumberHex` in `archivalState` struct for more details on the calculation.
-func (as *archivalState) calculateArchivalBlockNumber(perceivedBlockNumber uint64) {
+// REQUIRES: as.mu must be held by the caller.
+func (as *archivalState) calculateArchivalBlockNumberLocked(perceivedBlockNumber uint64) {
 	archivalThreshold := as.archivalCheckConfig.threshold
 	minArchivalBlock := as.archivalCheckConfig.contractStartBlock
 
@@ -131,10 +139,11 @@ func blockNumberToHex(blockNumber uint64) string {
 	return fmt.Sprintf("0x%x", blockNumber)
 }
 
-// updateExpectedBalance checks for consensus of the expected balance at a specific height.
+// updateExpectedBalanceLocked checks for consensus of the expected balance at a specific height.
 //
 // `archivalConsensusThreshold` endpoints must agree on the same balance for it to be set as the expected archival balance.
-func (as *archivalState) updateExpectedBalance(updatedEndpoints map[protocol.EndpointAddr]endpoint) {
+// REQUIRES: as.mu must be held by the caller.
+func (as *archivalState) updateExpectedBalanceLocked(updatedEndpoints map[protocol.EndpointAddr]endpoint) {
 	// Parallelize balance fetching and consensus because some chains have very low block latencies (e.g. arb-one).
 	balanceCh := make(chan string, len(updatedEndpoints))
 	timeout := time.After(5 * time.Second)
@@ -197,7 +206,12 @@ func (as *archivalState) isArchivalBalanceValid(check endpointCheckArchival) err
 	if check.observedArchivalBalance == "" {
 		return errNoArchivalBalanceObs
 	}
-	if check.observedArchivalBalance != as.expectedBalance {
+
+	as.mu.RLock()
+	expectedBalance := as.expectedBalance
+	as.mu.RUnlock()
+
+	if check.observedArchivalBalance != expectedBalance {
 		return errInvalidArchivalBalanceObs
 	}
 
