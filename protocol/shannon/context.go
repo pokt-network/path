@@ -710,10 +710,9 @@ func (rc *requestContext) validateAndProcessResponse(
 		// TODO_TECHDEBT(@adshmh): Refactor to separate Shannon and Fallback endpoints.
 		// The logic below is an example of techdebt resulting from conflating the two.
 		//
-		app := selectedEndpoint.Session().Application
 		var appAddr string
-		if app != nil {
-			appAddr = app.Address
+		if session := selectedEndpoint.Session(); session != nil && session.Application != nil {
+			appAddr = session.Application.Address
 		}
 
 		return nil, fmt.Errorf("relay: error verifying the relay response for app %s, endpoint %s: %w",

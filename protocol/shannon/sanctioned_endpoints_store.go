@@ -327,13 +327,19 @@ func (ses *sanctionedEndpointsStore) getSanctionDetails(serviceID protocol.Servi
 	for key, cachedSanction := range ses.sessionSanctionsCache.Items() {
 		sanction, ok := cachedSanction.Object.(sanction)
 		if !ok {
-			ses.logger.Error().Msg("SHOULD NEVER HAPPEN: cached sanction is not a sanction")
+			ses.logger.Error().
+				Str("cache_key", key).
+				Str("object_type", fmt.Sprintf("%T", cachedSanction.Object)).
+				Msg("INVARIANT VIOLATION: cached sanction object has unexpected type, skipping entry")
 			continue
 		}
 
 		sanctionKey, err := newSessionSanctionKeyFromKey(key)
 		if err != nil {
-			ses.logger.Error().Msgf("SHOULD NEVER HAPPEN: failed to parse session sanction key: %s", err)
+			ses.logger.Error().
+				Err(err).
+				Str("cache_key", key).
+				Msg("INVARIANT VIOLATION: failed to parse session sanction key, skipping entry")
 			continue
 		}
 

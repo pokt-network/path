@@ -39,12 +39,16 @@ type DataReporterHTTP struct {
 // Publish the supplied observations:
 // - Build the expected data records.
 // - Send each record to the configured URL.
+// - Track and log any failures encountered during processing.
 func (drh *DataReporterHTTP) Publish(observations *observation.RequestResponseObservations) {
 	logger := drh.hydrateLogger(observations)
 
 	// TODO_MVP(@adshmh): Replace this with the new DataRecord struct once the data pipeline is updated.
 	// convert to legacy-formatted data records (may be multiple for EVM batch requests)
 	legacyDataRecords := buildLegacyDataRecords(logger, observations)
+
+	// Track failure counts for aggregate logging
+	var serializationFailures, sendFailures int
 
 	// Process each legacy data record as a single relay for data pipeline and metering purposes.
 	//
@@ -57,14 +61,27 @@ func (drh *DataReporterHTTP) Publish(observations *observation.RequestResponseOb
 		// Marshal the data record.
 		serializedRecord, err := json.Marshal(legacyDataRecord)
 		if err != nil {
+			serializationFailures++
 			recordLogger.Warn().Err(err).Msg("Failed to serialize the data record. Skip reporting this record.")
 			continue
 		}
 
 		// Send the marshaled data record to the data processor.
 		if err := drh.sendRecordOverHTTP(serializedRecord); err != nil {
+			sendFailures++
 			recordLogger.Warn().Err(err).Msg("Failed to send the data record over HTTP. Skip reporting this record.")
 		}
+	}
+
+	// Log aggregate failure summary if any failures occurred
+	totalFailures := serializationFailures + sendFailures
+	if totalFailures > 0 {
+		logger.Error().
+			Int("total_records", len(legacyDataRecords)).
+			Int("serialization_failures", serializationFailures).
+			Int("send_failures", sendFailures).
+			Int("total_failures", totalFailures).
+			Msg("Data reporter encountered failures while publishing records")
 	}
 }
 

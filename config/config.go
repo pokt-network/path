@@ -35,7 +35,9 @@ func LoadGatewayConfigFromYAML(path string) (GatewayConfig, error) {
 		return GatewayConfig{}, err
 	}
 
-	config.hydrateDefaults()
+	if err = config.hydrateDefaults(); err != nil {
+		return GatewayConfig{}, err
+	}
 
 	return config, config.validate()
 }
@@ -52,11 +54,14 @@ func (c GatewayConfig) GetRouterConfig() RouterConfig {
 
 /* --------------------------------- Gateway Config Hydration Helpers -------------------------------- */
 
-func (c *GatewayConfig) hydrateDefaults() {
-	c.Router.hydrateRouterDefaults()
+func (c *GatewayConfig) hydrateDefaults() error {
+	if err := c.Router.hydrateRouterDefaults(); err != nil {
+		return fmt.Errorf("invalid router config: %w", err)
+	}
 	c.Logger.hydrateLoggerDefaults()
 	c.HydratorConfig.hydrateHydratorDefaults()
 	c.ShannonConfig.FullNodeConfig.HydrateDefaults()
+	return nil
 }
 
 /* --------------------------------- Gateway Config Validation Helpers -------------------------------- */

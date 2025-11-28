@@ -44,7 +44,8 @@ type RouterConfig struct {
 /* --------------------------------- Router Config Private Helpers -------------------------------- */
 
 // hydrateRouterDefaults assigns default values to RouterConfig fields if they are not set.
-func (c *RouterConfig) hydrateRouterDefaults() {
+// Returns an error if the configuration is invalid.
+func (c *RouterConfig) hydrateRouterDefaults() error {
 	if c.Port == 0 {
 		c.Port = defaultPort
 	}
@@ -64,6 +65,7 @@ func (c *RouterConfig) hydrateRouterDefaults() {
 		c.SystemOverheadAllowanceDuration = defaultSystemOverheadAllowanceDuration
 	}
 	if c.SystemOverheadAllowanceDuration >= c.ReadTimeout || c.SystemOverheadAllowanceDuration >= c.WriteTimeout {
-		panic(fmt.Sprintf("system overhead allowance duration %v must be less than read timeout %v and write timeout %v", c.SystemOverheadAllowanceDuration, c.ReadTimeout, c.WriteTimeout))
+		return fmt.Errorf("system overhead allowance duration %v must be less than read timeout %v and write timeout %v", c.SystemOverheadAllowanceDuration, c.ReadTimeout, c.WriteTimeout)
 	}
+	return nil
 }
