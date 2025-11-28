@@ -56,25 +56,52 @@ func validateResponseLength(responses []json.RawMessage, servicePayloads map[ID]
 	return nil
 }
 
-// validateResponseIDs ensures all request IDs are present in the responses
+// validateResponseIDs ensures all request IDs are present in the responses.
+// Per JSON-RPC 2.0 spec, responses with null IDs are valid for error cases when the
+// server couldn't parse the request ID. Null ID responses act as "wildcards" that
+// can match unmatched request IDs.
 func validateResponseIDs(responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) error {
-	// Check each request ID has a corresponding response
-	for reqID := range servicePayloads {
-		found := false
-		for _, respMsg := range responses {
-			var resp Response
-			if err := json.Unmarshal(respMsg, &resp); err != nil {
-				continue // Skip invalid responses - they'll be handled elsewhere
-			}
+	// Count responses with null IDs (error responses where ID couldn't be determined)
+	// and track which request IDs have matching responses
+	nullIDCount := 0
+	matchedRequestIDs := make(map[string]bool)
+
+	for _, respMsg := range responses {
+		var resp Response
+		if err := json.Unmarshal(respMsg, &resp); err != nil {
+			continue // Skip invalid responses - they'll be handled elsewhere
+		}
+
+		// Check if this response has a null ID
+		if resp.ID.IsEmpty() {
+			nullIDCount++
+			continue
+		}
+
+		// Find matching request ID
+		for reqID := range servicePayloads {
 			if reqID.Equal(resp.ID) {
-				found = true
+				matchedRequestIDs[reqID.String()] = true
 				break
 			}
 		}
-		if !found {
-			return fmt.Errorf("%w: missing response for request ID '%s'", ErrBatchResponseMissingIDs, reqID.String())
+	}
+
+	// Count unmatched request IDs
+	unmatchedCount := 0
+	for reqID := range servicePayloads {
+		if !matchedRequestIDs[reqID.String()] {
+			unmatchedCount++
 		}
 	}
+
+	// Null ID responses can cover unmatched request IDs (per JSON-RPC 2.0 spec,
+	// null IDs indicate errors parsing the original request)
+	if unmatchedCount > nullIDCount {
+		return fmt.Errorf("%w: %d request ID(s) have no matching response and only %d null ID response(s) available",
+			ErrBatchResponseMissingIDs, unmatchedCount, nullIDCount)
+	}
+
 	return nil
 }
 

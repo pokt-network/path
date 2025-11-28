@@ -311,6 +311,9 @@ func (rc requestContext) createNoResponseObservations() []*qosobservations.EVMRe
 //
 // For batch requests: multiple responses are correlated with multiple requests
 // For single requests: one response is correlated with one request
+//
+// Per JSON-RPC 2.0 spec, responses with null IDs are valid for error cases when the server
+// couldn't parse the request ID. These are skipped during observation creation.
 func (rc requestContext) createResponseObservations() []*qosobservations.EVMRequestObservation {
 	var observations []*qosobservations.EVMRequestObservation
 
@@ -322,12 +325,20 @@ func (rc requestContext) createResponseObservations() []*qosobservations.EVMRequ
 			continue
 		}
 
+		// Skip responses with null IDs - per JSON-RPC 2.0 spec, these indicate error responses
+		// where the server couldn't parse the request ID. We can't correlate these with specific
+		// requests, so we skip observation creation for them.
+		if jsonrpcResponse.ID.IsEmpty() {
+			rc.logger.Debug().Msg("Skipping observation creation for response with null ID (JSON-RPC error response)")
+			continue
+		}
+
 		// Look up the original JSON-RPC request using the response ID
 		// This correlation is critical for batch requests where multiple requests/responses
 		// need to be properly matched
 		servicePayload, ok := rc.findServicePayload(jsonrpcResponse.ID)
 		if !ok {
-			rc.logger.Error().Msgf("SHOULD RARELY HAPPEN: requestContext.createResponseObservations() should never fail to find the JSONRPC request for response ID: %s", jsonrpcResponse.ID.String())
+			rc.logger.Warn().Msgf("Could not find JSONRPC request for response ID: %s (endpoint may have modified the ID)", jsonrpcResponse.ID.String())
 			continue
 		}
 
