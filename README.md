@@ -29,7 +29,7 @@ For Bug Reports and Enhancement Requests, please open an [Issue](https://github.
 
 ## Portal DB
 
-The portal DB is the source of truth for running a SaaS using PATH to deploya services.
+The portal DB is the source of truth for running a SaaS using PATH to deploy RPC endpoints and related services.
 
 See the following docs for more information:
 
