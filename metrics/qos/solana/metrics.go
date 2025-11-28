@@ -14,11 +14,13 @@ const (
 	pathProcess = "path"
 
 	// The list of metrics being tracked for Solana QoS
-	requestsTotalMetric = "solana_requests_total"
+	requestsTotalMetric    = "solana_requests_total"
+	batchRequestSizeMetric = "solana_batch_request_size"
 )
 
 func init() {
 	prometheus.MustRegister(requestsTotal)
+	prometheus.MustRegister(batchRequestSize)
 }
 
 var (
@@ -59,11 +61,32 @@ var (
 			Name:      requestsTotalMetric,
 			Help:      "Total number of requests processed by Solana QoS instance(s)",
 		},
-		[]string{"chain_id", "service_id", "request_origin", "request_method", "success", "error_type", "http_status_code", "endpoint_domain"},
+		[]string{"chain_id", "service_id", "request_origin", "request_method", "is_batch_request", "success", "error_type", "http_status_code", "endpoint_domain"},
 	)
 
 	// TODO_TECHDEBT(@adshmh): Add a new metric to export JSONRPC responses error codes:
 	// Consistent with Cosmos and EVM metrics.
+
+	// batchRequestSize tracks the distribution of batch request sizes.
+	// Only recorded for batch requests (requests with more than one JSON-RPC method).
+	//
+	// Labels:
+	//   - chain_id: Target Solana chain identifier
+	//   - service_id: Service ID of the Solana QoS instance
+	//
+	// Use to analyze:
+	//   - Batch request size patterns
+	//   - Average batch sizes per chain/service
+	//   - Capacity planning based on batch request patterns
+	batchRequestSize = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Subsystem: pathProcess,
+			Name:      batchRequestSizeMetric,
+			Help:      "Distribution of batch request sizes (number of JSON-RPC methods per batch)",
+			Buckets:   []float64{1, 2, 5, 10, 25, 50, 100},
+		},
+		[]string{"chain_id", "service_id"},
+	)
 )
 
 // PublishMetrics:
@@ -85,16 +108,49 @@ func PublishMetrics(logger polylog.Logger, observations *qos.SolanaRequestObserv
 		Observations: observations,
 	}
 
-	// Increment request counters with all corresponding labels
-	requestsTotal.With(
-		prometheus.Labels{
-			"chain_id":         interpreter.GetChainID(),
-			"service_id":       interpreter.GetServiceID(),
-			"request_origin":   observations.GetRequestOrigin().String(),
-			"request_method":   interpreter.GetRequestMethod(),
-			"success":          fmt.Sprintf("%t", interpreter.IsRequestSuccessful()),
-			"error_type":       interpreter.GetRequestErrorType(),
-			"http_status_code": fmt.Sprintf("%d", interpreter.GetRequestHTTPStatus()),
-			"endpoint_domain":  interpreter.GetEndpointDomain(),
-		}).Inc()
+	// Extract request methods
+	methods := extractRequestMethods(logger, interpreter)
+
+	// Record if this is a batch request (more than one method).
+	isBatchRequest := len(methods) > 1
+
+	// Record batch size for batch requests
+	if isBatchRequest {
+		batchRequestSize.With(
+			prometheus.Labels{
+				"chain_id":   interpreter.GetChainID(),
+				"service_id": interpreter.GetServiceID(),
+			}).Observe(float64(len(methods)))
+	}
+
+	// Count each method as a separate request.
+	// This is required for batch requests.
+	for _, method := range methods {
+		// Increment request counters with all corresponding labels
+		requestsTotal.With(
+			prometheus.Labels{
+				"chain_id":         interpreter.GetChainID(),
+				"service_id":       interpreter.GetServiceID(),
+				"request_origin":   observations.GetRequestOrigin().String(),
+				"request_method":   method,
+				"is_batch_request": fmt.Sprintf("%t", isBatchRequest),
+				"success":          fmt.Sprintf("%t", interpreter.IsRequestSuccessful()),
+				"error_type":       interpreter.GetRequestErrorType(),
+				"http_status_code": fmt.Sprintf("%d", interpreter.GetRequestHTTPStatus()),
+				"endpoint_domain":  interpreter.GetEndpointDomain(),
+			}).Inc()
+	}
+}
+
+// extractRequestMethods extracts the request methods from the interpreter.
+// Returns empty slice if methods cannot be determined.
+func extractRequestMethods(logger polylog.Logger, interpreter *qos.SolanaObservationInterpreter) []string {
+	methods, methodsFound := interpreter.GetRequestMethods()
+	if !methodsFound {
+		// For clarity in metrics, use empty slice as the default value when method can't be determined
+		methods = []string{}
+		// This can happen for invalid requests, but we should still log it
+		logger.Debug().Msgf("Should happen very rarely: Unable to determine request method for Solana metrics: %+v", interpreter)
+	}
+	return methods
 }

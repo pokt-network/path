@@ -52,6 +52,33 @@ func (i *SolanaObservationInterpreter) GetRequestMethod() string {
 	return i.Observations.JsonrpcRequest.Method
 }
 
+// GetRequestMethods extracts all JSON-RPC methods from the request observations.
+// Returns (methods, true) if extraction succeeded
+// Returns (nil, false) if requests are invalid or missing
+//
+// TODO_TECHDEBT(@adshmh): Update to support batch requests once separate proto messages
+// for single and batch JSONRPC requests are added.
+func (i *SolanaObservationInterpreter) GetRequestMethods() ([]string, bool) {
+	if i.Observations == nil {
+		i.Logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msg("SHOULD RARELY HAPPEN: Cannot get request methods: nil observations")
+		return nil, false
+	}
+
+	// JsonrpcRequest can be nil in case of internal errors or parsing errors - this is expected
+	if i.Observations.JsonrpcRequest == nil {
+		return nil, false
+	}
+
+	method := i.Observations.JsonrpcRequest.Method
+	if method == "" {
+		return nil, false
+	}
+
+	// Currently only single requests are supported in observations.
+	// Batch request support will be added when the proto is updated.
+	return []string{method}, true
+}
+
 // IsRequestSuccessful determines if the request completed without errors.
 func (i *SolanaObservationInterpreter) IsRequestSuccessful() bool {
 	if i.Observations == nil {

@@ -21,6 +21,7 @@ const (
 	validEndpointsMetric           = "evm_valid_endpoints"
 	endpointValidationsTotalMetric = "evm_endpoint_validations_total"
 	jsonrpcErrorsTotalMetric       = "evm_jsonrpc_errors_total"
+	batchRequestSizeMetric         = "evm_batch_request_size"
 )
 
 func init() {
@@ -29,6 +30,7 @@ func init() {
 	prometheus.MustRegister(validEndpoints)
 	prometheus.MustRegister(endpointValidationsTotal)
 	prometheus.MustRegister(jsonrpcErrorsTotal)
+	prometheus.MustRegister(batchRequestSize)
 }
 
 var (
@@ -177,6 +179,27 @@ var (
 		},
 		[]string{"chain_id", "service_id", "request_method", "endpoint_domain", "jsonrpc_error_code"},
 	)
+
+	// batchRequestSize tracks the distribution of batch request sizes.
+	// Only recorded for batch requests (requests with more than one JSON-RPC method).
+	//
+	// Labels:
+	//   - chain_id: Target EVM chain identifier
+	//   - service_id: Service ID of the EVM QoS instance
+	//
+	// Use to analyze:
+	//   - Batch request size patterns
+	//   - Average batch sizes per chain/service
+	//   - Capacity planning based on batch request patterns
+	batchRequestSize = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Subsystem: pathProcess,
+			Name:      batchRequestSizeMetric,
+			Help:      "Distribution of batch request sizes (number of JSON-RPC methods per batch)",
+			Buckets:   []float64{1, 2, 5, 10, 25, 50, 100},
+		},
+		[]string{"chain_id", "service_id"},
+	)
 )
 
 // PublishMetrics exports all EVM-related Prometheus metrics using observations reported by EVM QoS service.
@@ -209,6 +232,15 @@ func PublishMetrics(logger polylog.Logger, observations *qos.EVMRequestObservati
 
 	// Record if this is a batch request.
 	isBatchRequest := len(methods) > 1
+
+	// Record batch size for batch requests
+	if isBatchRequest {
+		batchRequestSize.With(
+			prometheus.Labels{
+				"chain_id":   chainID,
+				"service_id": serviceID,
+			}).Observe(float64(len(methods)))
+	}
 
 	// Extract endpoint selection metadata
 	endpointSelectionMetadata := extractEndpointSelectionMetadata(interpreter)
