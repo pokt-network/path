@@ -1,31 +1,25 @@
 <div align="center">
 <h1>PATH<br/>Path API & Toolkit Harness</h1>
-<img src="https://storage.googleapis.com/grove-brand-assets/Presskit/Logo%20Joined-2.png" alt="Grove logo" width="500"/>
-
 </div>
 <br/>
 
-![Static Badge](https://img.shields.io/badge/Maintained_by-Grove-green)
+![Static Badge](https://img.shields.io/badge/Maintained_by-Pocket_Network-blue)
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/pokt-network/path/main-build.yml)
-![GitHub last commit](https://img.shields.io/github/last-commit/buildwithgrove/path)
-![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/buildwithgrove/path)
-![GitHub Release](https://img.shields.io/github/v/release/buildwithgrove/path)
+![GitHub last commit](https://img.shields.io/github/last-commit/pokt-network/path)
+![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/pokt-network/path)
+![GitHub Release](https://img.shields.io/github/v/release/pokt-network/path)
 ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/pokt-network/path/total)
-![GitHub Issues or Pull Requests](https://img.shields.io/github/issues/buildwithgrove/path)
-![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-pr/buildwithgrove/path)
-![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-closed/buildwithgrove/path)
+![GitHub Issues or Pull Requests](https://img.shields.io/github/issues/pokt-network/path)
+![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-pr/pokt-network/path)
+![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-closed/pokt-network/path)
 
 ## Overview
 
-**PATH** (Path API & Toolkit Harness) is an open source framework for enabling
-access to a decentralized supply network.
+**PATH** (Path API & Toolkit Harness) is an open source framework for enabling access to a decentralized supply network. It provides various tools and libraries to streamline the integration and interaction with decentralized protocols.
 
-It provides various tools and libraries to streamline the integration and
-interaction with decentralized protocols.
+This repo is maintained by the Pocket Network community, and is used to service the [free Public RPC endpoints](https://api.pocket.network) The backend and portal should be considered opinionated examples of interfacing with the Pocket Network protocol. You are welcome to fork and remix however you like.
 
 ## Documentation
-
-Please visit [path.grove.city](https://path.grove.city) for documentation.
 
 The source code for the documentation is available in the `docs` directory.
 
@@ -33,11 +27,9 @@ The source code for the documentation is available in the `docs` directory.
 
 For Bug Reports and Enhancement Requests, please open an [Issue](https://github.com/pokt-network/path/issues).
 
-For Technical Support please open a ticket in [Grove's Discord](https://discord.gg/build-with-grove).
-
 ## Portal DB
 
-The portal DB is the source of truth for running a SaaS using PATH to deploya service similar to [Grove's Portal](https://portal.grove.city)
+The portal DB is the source of truth for running a SaaS using PATH to deploya services.
 
 See the following docs for more information:
 
