@@ -17,7 +17,7 @@
 
 **PATH** (Path API & Toolkit Harness) is an open source framework for enabling access to a decentralized supply network. It provides various tools and libraries to streamline the integration and interaction with decentralized protocols.
 
-This repo is maintained by the Pocket Network community, and is used to service the [free Public RPC endpoints](https://api.pocket.network) The backend and portal should be considered opinionated examples of interfacing with the Pocket Network protocol. You are welcome to fork and remix however you like.
+This repo is maintained by the Pocket Network community, and is used to service the [free Public RPC endpoints](https://api.pocket.network). The backend and portal should be considered opinionated examples of interfacing with the Pocket Network protocol. You are welcome to fork and remix however you like.
 
 ## Documentation
 
