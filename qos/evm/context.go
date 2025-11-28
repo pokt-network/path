@@ -51,6 +51,8 @@ type endpointResponse struct {
 	protocol.EndpointAddr
 	response
 	unmarshalErr error
+	// httpStatusCode is the original HTTP status code from the backend endpoint.
+	httpStatusCode int
 }
 
 // requestContext implements the functionality for EVM-based blockchain services.
@@ -109,7 +111,7 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 }
 
 // UpdateWithResponse is NOT safe for concurrent use
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte) {
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
 	rc.logger = rc.logger.With(
 		"endpoint_addr", endpointAddr,
 		"endpoint_response_len", len(responseBz),
@@ -124,9 +126,10 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 	)
 
 	rc.endpointResponses = append(rc.endpointResponses, endpointResponse{
-		EndpointAddr: endpointAddr,
-		response:     response,
-		unmarshalErr: err,
+		EndpointAddr:   endpointAddr,
+		response:       response,
+		unmarshalErr:   err,
+		httpStatusCode: httpStatusCode,
 	})
 }
 
@@ -174,7 +177,12 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 
 	// Non-batch requests.
 	// Return the only endpoint response reported to the context for single requests.
-	return rc.endpointResponses[0].GetHTTPResponse()
+	resp := rc.endpointResponses[0].GetHTTPResponse()
+	// Use the original HTTP status code from the backend if available
+	if rc.endpointResponses[0].httpStatusCode != 0 {
+		resp.HTTPStatusCode = rc.endpointResponses[0].httpStatusCode
+	}
+	return resp
 }
 
 // getBatchHTTPResponse handles batch requests by combining individual JSON-RPC responses
@@ -213,11 +221,14 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 		return errorResponse.GetHTTPResponse()
 	}
 
+	// Use original HTTP status from backend if available, otherwise default to 200 OK
+	httpStatusCode := http.StatusOK
+	if len(rc.endpointResponses) > 0 && rc.endpointResponses[0].httpStatusCode != 0 {
+		httpStatusCode = rc.endpointResponses[0].httpStatusCode
+	}
 	return jsonrpc.HTTPResponse{
 		ResponsePayload: batchResponse,
-		// According to the JSON-RPC 2.0 specification, even if individual responses
-		// in a batch contain errors, the entire batch should still return HTTP 200 OK.
-		HTTPStatusCode: http.StatusOK,
+		HTTPStatusCode:  httpStatusCode,
 	}
 }
 

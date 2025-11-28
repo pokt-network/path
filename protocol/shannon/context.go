@@ -628,12 +628,13 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// Hydrate the response with the endpoint address
 	deserializedResponse.EndpointAddr = selectedEndpoint.Addr()
 
-	// Ensure that serialized response contains a valid HTTP status code.
-	// Do not return non 2xx responses from the endpoint to the client.
+	// Log non-2xx HTTP status codes for visibility, but passthrough the response
+	// to preserve the backend's original HTTP status code for the client.
 	responseHTTPStatusCode := deserializedResponse.HTTPStatusCode
 	if err := pathhttp.EnsureHTTPSuccess(responseHTTPStatusCode); err != nil {
-		errMsg := fmt.Sprintf("Backend service returned status non-2xx: %d", responseHTTPStatusCode)
-		return defaultResponse, fmt.Errorf("%w: %s", err, errMsg)
+		rc.logger.Debug().
+			Int("http_status_code", responseHTTPStatusCode).
+			Msg("Backend returned non-2xx HTTP status - passing through to client")
 	}
 
 	return deserializedResponse, nil

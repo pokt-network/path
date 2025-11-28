@@ -51,8 +51,8 @@ func (rec *RequestErrorContext) GetHTTPResponse() pathhttp.HTTPResponse {
 	httpStatusCode := rec.Response.GetRecommendedHTTPStatusCode()
 
 	return HTTPResponse{
-		responsePayload: bz,
-		httpStatusCode:  httpStatusCode,
+		ResponsePayload: bz,
+		HTTPStatusCode:  httpStatusCode,
 	}
 }
 
@@ -76,10 +76,11 @@ func (rec *RequestErrorContext) GetServicePayloads() []protocol.Payload {
 // UpdateWithResponse should never be called.
 // Only logs a warning.
 // Implements the gateway.RequestQoSContext interface.
-func (rec *RequestErrorContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte) {
+func (rec *RequestErrorContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int) {
 	rec.Logger.With(
 		"endpoint_addr", endpointAddr,
 		"endpoint_response_len", len(endpointSerializedResponse),
+		"http_status_code", httpStatusCode,
 	).Warn().Msg("SHOULD NEVER HAPPEN: RequestErrorContext.UpdateWithResponse() should never be called.")
 }
 

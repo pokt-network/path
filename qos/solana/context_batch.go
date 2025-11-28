@@ -77,7 +77,7 @@ func (brc batchJSONRPCRequestContext) GetServicePayloads() []protocol.Payload {
 
 // TODO_TECHDEBT(@adshmh): Refactor once the QoS context interface is updated to receive an array of responses.
 // UpdateWithResponse is NOT safe for concurrent use
-func (brc *batchJSONRPCRequestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte) {
+func (brc *batchJSONRPCRequestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
 	// TODO_TECHDEBT(@adshmh): Refactor this once the QoS context interface is updated to accept all endpoint responses at once.
 	// This would make it possible to map each JSONRPC request of a batch to its corresponding endpoint response.
 	// This is required to enable request method-specific esponse validation: e.g. format of result field in response to a `getHealth` request.

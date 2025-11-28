@@ -59,10 +59,11 @@ func (rc *requestContext) GetServicePayloads() []protocol.Payload {
 // UpdateWithResponse is used to inform the requestContext of the response to its underlying service request, returned from an endpoint.
 // UpdateWithResponse is NOT safe for concurrent use
 // Implements the gateway.RequestQoSContext interface.
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte) {
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int) {
 	rc.receivedResponses = append(rc.receivedResponses, endpointResponse{
-		EndpointAddr:  endpointAddr,
-		ResponseBytes: endpointSerializedResponse,
+		EndpointAddr:   endpointAddr,
+		ResponseBytes:  endpointSerializedResponse,
+		HTTPStatusCode: httpStatusCode,
 	})
 }
 
@@ -79,9 +80,15 @@ func (rc *requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 		return getNoEndpointResponse()
 	}
 
+	latestResponse := rc.receivedResponses[len(rc.receivedResponses)-1]
+	// Use original HTTP status from backend if available, otherwise default to 200 OK
+	statusCode := http.StatusOK
+	if latestResponse.HTTPStatusCode != 0 {
+		statusCode = latestResponse.HTTPStatusCode
+	}
 	return &HTTPResponse{
-		httpStatusCode: http.StatusOK,
-		payload:        rc.receivedResponses[len(rc.receivedResponses)-1].ResponseBytes,
+		httpStatusCode: statusCode,
+		payload:        latestResponse.ResponseBytes,
 	}
 }
 

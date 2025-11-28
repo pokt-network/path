@@ -13,4 +13,6 @@ type endpointResponse struct {
 	EndpointAddr protocol.EndpointAddr
 	// ResponseBytes is the raw response received from an endpoint.
 	ResponseBytes []byte
+	// HTTPStatusCode is the original HTTP status code from the backend endpoint.
+	HTTPStatusCode int
 }

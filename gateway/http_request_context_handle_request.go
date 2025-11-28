@@ -89,7 +89,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	// - Remove the individual endpoint response handling from the gateway package.
 	//
 	for _, endpointResponse := range endpointResponses {
-		rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes)
+		rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
 	}
 
 	return nil
@@ -174,7 +174,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		// 2. Simplify the parallel requests feature: it may be best to fully encapsulate it in the protocol/shannon package.
 		qosContextMutex.Lock()
 		for _, response := range responses {
-			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes)
+			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
 		}
 		qosContextMutex.Unlock()
 	}
@@ -233,7 +233,7 @@ func (rc *requestContext) handleSuccessfulResponse(
 			Msgf("Parallel request success: endpoint %d/%d responded in %dms",
 				result.index+1, metrics.numRequestsToAttempt, overallDuration.Milliseconds())
 
-		rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes)
+		rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
 	}
 
 	return nil
