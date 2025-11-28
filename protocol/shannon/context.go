@@ -978,11 +978,10 @@ func (rc *requestContext) sendHTTPRequest(
 	url string,
 	requestData []byte,
 ) ([]byte, int, error) {
-	// Prepare a timeout context for the request
+	// Prepare a timeout context for the request.
+	// Use rc.context as parent to respect request-level cancellation signals.
 	timeout := time.Duration(gateway.RelayRequestTimeout) * time.Millisecond
-
-	// TODO_INVESTIGATE: Evaluate `rc.context` vs `context.TODO` and pick the right one for timeouts.
-	ctxWithTimeout, cancelFn := context.WithTimeout(context.TODO(), timeout)
+	ctxWithTimeout, cancelFn := context.WithTimeout(rc.context, timeout)
 	defer cancelFn()
 
 	// Build headers including RPCType header

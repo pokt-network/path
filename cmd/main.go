@@ -82,8 +82,12 @@ func main() {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start metrics server"}`, err)
 	}
 
-	// Setup the pprof server
-	setupPprofServer(context.TODO(), logger, pprofAddr)
+	// Create a context for background services (pprof, hydrator) that can be canceled during shutdown.
+	// This context is used to signal graceful shutdown to all background goroutines.
+	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
+
+	// Setup the pprof server with the background context for graceful shutdown
+	setupPprofServer(backgroundCtx, logger, pprofAddr)
 
 	// Setup the data reporter
 	dataReporter, err := setupHTTPDataReporter(logger, config.DataReporterConfig)
@@ -91,14 +95,11 @@ func main() {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start the configured HTTP data reporter"}`, err)
 	}
 
-	// Create a context for the hydrator that can be canceled during shutdown
-	hydratorCtx, hydratorCancel := context.WithCancel(context.Background())
-
 	// TODO_IMPROVE: consider using a separate protocol instance for the hydrator,
 	// to enable configuring separate worker pools for the user requests
 	// and the endpoint hydrator requests.
 	hydrator, err := setupEndpointHydrator(
-		hydratorCtx,
+		backgroundCtx,
 		logger,
 		protocol,
 		qosInstances,
@@ -187,8 +188,8 @@ func main() {
 
 	logger.Info().Msg("Shutting down PATH...")
 
-	// Cancel hydrator context to stop hydrator goroutines
-	hydratorCancel()
+	// Cancel background context to stop all background services (pprof, hydrator)
+	backgroundCancel()
 
 	// TODO_IMPROVE: Make shutdown timeout configurable and add graceful shutdown of dependencies
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
