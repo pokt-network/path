@@ -379,8 +379,7 @@ func (p *Protocol) ApplyHTTPObservations(observations *protocolobservations.Obse
 	// hand over the observations to the sanctioned endpoints store for adding any applicable sanctions.
 	sanctionedEndpointsStore, ok := p.sanctionedEndpointsStores[sharedtypes.RPCType_JSON_RPC]
 	if !ok {
-		p.logger.Error().Msgf("SHOULD NEVER HAPPEN: sanctioned endpoints store not found for RPC type: %s", sharedtypes.RPCType_JSON_RPC)
-		return nil
+		return fmt.Errorf("INVARIANT VIOLATION: sanctioned endpoints store not initialized for RPC type: %s", sharedtypes.RPCType_JSON_RPC)
 	}
 	sanctionedEndpointsStore.ApplyObservations(shannonObservations)
 
