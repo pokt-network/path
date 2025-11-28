@@ -1,7 +1,6 @@
 package evm
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -89,7 +88,7 @@ func (r responseGeneric) getResponsePayload() []byte {
 		return []byte{} // "nothing at all" per JSON-RPC batch specification
 	}
 
-	bz, err := json.Marshal(r.jsonrpcResponse)
+	bz, err := marshalJSONPooled(r.jsonrpcResponse)
 	if err != nil {
 		// This should never happen: log an entry but return the response anyway.
 		r.logger.Warn().Err(err).Msg("responseGeneric: Marshaling JSONRPC response failed.")

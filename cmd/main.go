@@ -119,11 +119,12 @@ func main() {
 
 	// NOTE: the gateway uses the requestParser to get the correct QoS instance for any incoming request.
 	gtw := &gateway.Gateway{
-		Logger:            logger,
-		HTTPRequestParser: requestParser,
-		Protocol:          protocol,
-		MetricsReporter:   metricsReporter,
-		DataReporter:      dataReporter,
+		Logger:                     logger,
+		HTTPRequestParser:          requestParser,
+		Protocol:                   protocol,
+		MetricsReporter:            metricsReporter,
+		DataReporter:               dataReporter,
+		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
 	}
 
 	// Until all components are ready, the `/healthz` endpoint will return a 503 Service

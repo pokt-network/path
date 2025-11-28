@@ -67,6 +67,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				WriteTimeout:                    defaultHTTPServerWriteTimeout,
 				IdleTimeout:                     defaultHTTPServerIdleTimeout,
 				SystemOverheadAllowanceDuration: defaultSystemOverheadAllowanceDuration,
+				WebsocketMessageBufferSize:      defaultWebsocketMessageBufferSize,
 			},
 			wantErr: false,
 		},
@@ -82,6 +83,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				WriteTimeout:                    defaultHTTPServerWriteTimeout,
 				IdleTimeout:                     defaultHTTPServerIdleTimeout,
 				SystemOverheadAllowanceDuration: defaultSystemOverheadAllowanceDuration,
+				WebsocketMessageBufferSize:      defaultWebsocketMessageBufferSize,
 			},
 			wantErr: false,
 		},
@@ -102,6 +104,22 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				SystemOverheadAllowanceDuration: 10 * time.Second,
 			},
 			wantErr: true,
+		},
+		{
+			name: "should not override custom websocket buffer size",
+			cfg: RouterConfig{
+				WebsocketMessageBufferSize: 500,
+			},
+			want: RouterConfig{
+				Port:                            defaultPort,
+				MaxRequestHeaderBytes:           defaultMaxRequestHeaderBytes,
+				ReadTimeout:                     defaultHTTPServerReadTimeout,
+				WriteTimeout:                    defaultHTTPServerWriteTimeout,
+				IdleTimeout:                     defaultHTTPServerIdleTimeout,
+				SystemOverheadAllowanceDuration: defaultSystemOverheadAllowanceDuration,
+				WebsocketMessageBufferSize:      500, // Custom value should be preserved
+			},
+			wantErr: false,
 		},
 	}
 
