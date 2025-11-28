@@ -37,7 +37,7 @@ var (
 const defaultConfigPath = "config/.config.yaml"
 
 func main() {
-	log.Printf(`{"level":"info","message":"PATH 🌿 gtw starting..."}`)
+	log.Printf(`{"level":"info","message":"PATH 🌿 gateway starting..."}`)
 
 	// Initialize version metrics for Prometheus monitoring
 	metrics.SetVersionInfo(Version, Commit, BuildDate)
@@ -116,7 +116,7 @@ func main() {
 		QoSServices: qosInstances,
 	}
 
-	// NOTE: the gtw uses the requestParser to get the correct QoS instance for any incoming request.
+	// NOTE: the gateway uses the requestParser to get the correct QoS instance for any incoming request.
 	gtw := &gateway.Gateway{
 		Logger:            logger,
 		HTTPRequestParser: requestParser,
