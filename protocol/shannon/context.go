@@ -43,7 +43,7 @@ const maxEndpointPayloadLenForLogging = 100
 // MaxConcurrentRelaysPerRequest limits the number of concurrent relay goroutines per request.
 // This prevents DoS attacks via large batch requests that could spawn unbounded goroutines.
 // TODO_IMPROVE: Make this configurable via gateway settings.
-const MaxConcurrentRelaysPerRequest = 10
+const MaxConcurrentRelaysPerRequest = 60
 
 // requestContext provides all the functionality required by the gateway package
 // for handling a single service request.
@@ -156,7 +156,7 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 	}
 
 	if len(payloads) > MaxConcurrentRelaysPerRequest {
-		response, err := rc.handleInternalError(fmt.Errorf("HandleServiceRequest: batch of payloads larger than allowed: %d", MaxConcurrentRelaysPerRequest))
+		response, err := rc.handleInternalError(fmt.Errorf("HandleServiceRequest: batch of payloads larger than allowed: %d, received: %d ", MaxConcurrentRelaysPerRequest, len(payloads)))
 		return []protocol.Response{response}, err
 	}
 
