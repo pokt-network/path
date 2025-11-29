@@ -43,7 +43,7 @@ const maxEndpointPayloadLenForLogging = 100
 // MaxConcurrentRelaysPerRequest limits the number of concurrent relay goroutines per request.
 // This prevents DoS attacks via large batch requests that could spawn unbounded goroutines.
 // TODO_IMPROVE: Make this configurable via gateway settings.
-const MaxConcurrentRelaysPerRequest = 60
+const MaxConcurrentRelaysPerRequest = 100
 
 // requestContext provides all the functionality required by the gateway package
 // for handling a single service request.
