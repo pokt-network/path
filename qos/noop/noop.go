@@ -14,6 +14,10 @@ import (
 	"github.com/pokt-network/path/protocol"
 )
 
+// maxRequestBodySize is the maximum allowed size for HTTP request bodies (100MB).
+// This prevents OOM attacks from unbounded io.ReadAll calls.
+const maxRequestBodySize = 100 * 1024 * 1024
+
 var _ gateway.QoSService = NoOpQoS{}
 
 type NoOpQoS struct{}
@@ -22,8 +26,14 @@ type NoOpQoS struct{}
 // It intentionally avoids performing any validation on the request, as is the designed behavior of the noop QoS.
 // Implements the gateway.QoSService interface.
 func (NoOpQoS) ParseHTTPRequest(_ context.Context, httpRequest *http.Request) (gateway.RequestQoSContext, bool) {
-	bz, err := io.ReadAll(httpRequest.Body)
+	// Apply size limit to prevent OOM attacks from unbounded io.ReadAll calls
+	limitedBody := http.MaxBytesReader(nil, httpRequest.Body, maxRequestBodySize)
+	bz, err := io.ReadAll(limitedBody)
 	if err != nil {
+		// Check if the error is due to body size limit exceeded
+		if err.Error() == "http: request body too large" {
+			err = fmt.Errorf("request body exceeds %d bytes limit", maxRequestBodySize)
+		}
 		return requestContextFromError(fmt.Errorf("error reading the HTTP request body: %w", err)), false
 	}
 

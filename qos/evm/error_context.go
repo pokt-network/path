@@ -96,10 +96,11 @@ func (ec *errorContext) GetServicePayloads() []protocol.Payload {
 // UpdateWithResponse should never be called.
 // Only logs a warning.
 // Implements the gateway.RequestQoSContext interface.
-func (ec *errorContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte) {
+func (ec *errorContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int) {
 	ec.logger.With(
 		"endpoint_addr", endpointAddr,
 		"endpoint_response_len", len(endpointSerializedResponse),
+		"http_status_code", httpStatusCode,
 	).Warn().Msg("SHOULD NEVER HAPPEN: errorContext.UpdateWithResponse() should never be called.")
 }
 

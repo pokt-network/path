@@ -146,7 +146,9 @@ func blockNumberToHex(blockNumber uint64) string {
 func (as *archivalState) updateExpectedBalanceLocked(updatedEndpoints map[protocol.EndpointAddr]endpoint) {
 	// Parallelize balance fetching and consensus because some chains have very low block latencies (e.g. arb-one).
 	balanceCh := make(chan string, len(updatedEndpoints))
-	timeout := time.After(5 * time.Second)
+	// Use time.NewTimer instead of time.After to allow cleanup on early return
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
 	var wg sync.WaitGroup
 
 	// Loop over all updated endpoints and fetch their balance.
@@ -189,7 +191,7 @@ func (as *archivalState) updateExpectedBalanceLocked(updatedEndpoints map[protoc
 				as.balanceConsensus = make(map[string]int)
 				return
 			}
-		case <-timeout:
+		case <-timer.C:
 			as.logger.Warn().Msg("Timeout while waiting for archival balance consensus")
 			return
 		}

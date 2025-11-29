@@ -35,33 +35,38 @@ func LoadGatewayConfigFromYAML(path string) (GatewayConfig, error) {
 		return GatewayConfig{}, err
 	}
 
-	config.hydrateDefaults()
+	if err = config.hydrateDefaults(); err != nil {
+		return GatewayConfig{}, err
+	}
 
 	return config, config.validate()
 }
 
 /* --------------------------------- Gateway Config Methods -------------------------------- */
 
-func (c GatewayConfig) GetGatewayConfig() *shannon.ShannonGatewayConfig {
+func (c *GatewayConfig) GetGatewayConfig() *shannon.ShannonGatewayConfig {
 	return c.ShannonConfig
 }
 
-func (c GatewayConfig) GetRouterConfig() RouterConfig {
+func (c *GatewayConfig) GetRouterConfig() RouterConfig {
 	return c.Router
 }
 
 /* --------------------------------- Gateway Config Hydration Helpers -------------------------------- */
 
-func (c *GatewayConfig) hydrateDefaults() {
-	c.Router.hydrateRouterDefaults()
+func (c *GatewayConfig) hydrateDefaults() error {
+	if err := c.Router.hydrateRouterDefaults(); err != nil {
+		return fmt.Errorf("invalid router config: %w", err)
+	}
 	c.Logger.hydrateLoggerDefaults()
 	c.HydratorConfig.hydrateHydratorDefaults()
 	c.ShannonConfig.FullNodeConfig.HydrateDefaults()
+	return nil
 }
 
 /* --------------------------------- Gateway Config Validation Helpers -------------------------------- */
 
-func (c GatewayConfig) validate() error {
+func (c *GatewayConfig) validate() error {
 	if err := c.validateProtocolConfig(); err != nil {
 		return err
 	}
@@ -73,7 +78,7 @@ func (c GatewayConfig) validate() error {
 
 // validateProtocolConfig checks if the protocol configuration is valid, by both performing validation on the
 // protocol specific config and ensuring that the correct protocol specific config is set.
-func (c GatewayConfig) validateProtocolConfig() error {
+func (c *GatewayConfig) validateProtocolConfig() error {
 	if c.ShannonConfig == nil {
 		return fmt.Errorf("protocol configuration is required")
 	}

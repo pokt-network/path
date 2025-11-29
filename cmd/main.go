@@ -82,8 +82,12 @@ func main() {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start metrics server"}`, err)
 	}
 
-	// Setup the pprof server
-	setupPprofServer(context.TODO(), logger, pprofAddr)
+	// Create a context for background services (pprof, hydrator) that can be canceled during shutdown.
+	// This context is used to signal graceful shutdown to all background goroutines.
+	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
+
+	// Setup the pprof server with the background context for graceful shutdown
+	setupPprofServer(backgroundCtx, logger, pprofAddr)
 
 	// Setup the data reporter
 	dataReporter, err := setupHTTPDataReporter(logger, config.DataReporterConfig)
@@ -95,6 +99,7 @@ func main() {
 	// to enable configuring separate worker pools for the user requests
 	// and the endpoint hydrator requests.
 	hydrator, err := setupEndpointHydrator(
+		backgroundCtx,
 		logger,
 		protocol,
 		qosInstances,
@@ -113,12 +118,13 @@ func main() {
 	}
 
 	// NOTE: the gateway uses the requestParser to get the correct QoS instance for any incoming request.
-	gateway := &gateway.Gateway{
-		Logger:            logger,
-		HTTPRequestParser: requestParser,
-		Protocol:          protocol,
-		MetricsReporter:   metricsReporter,
-		DataReporter:      dataReporter,
+	gtw := &gateway.Gateway{
+		Logger:                     logger,
+		HTTPRequestParser:          requestParser,
+		Protocol:                   protocol,
+		MetricsReporter:            metricsReporter,
+		DataReporter:               dataReporter,
+		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
 	}
 
 	// Until all components are ready, the `/healthz` endpoint will return a 503 Service
@@ -152,7 +158,7 @@ func main() {
 	// Initialize the API router to serve requests to the PATH API.
 	apiRouter := router.NewRouter(
 		logger,
-		gateway,
+		gtw,
 		disqualifiedEndpointsReporter,
 		healthChecker,
 		config.GetRouterConfig(),
@@ -182,6 +188,9 @@ func main() {
 	<-stop
 
 	logger.Info().Msg("Shutting down PATH...")
+
+	// Cancel background context to stop all background services (pprof, hydrator)
+	backgroundCancel()
 
 	// TODO_IMPROVE: Make shutdown timeout configurable and add graceful shutdown of dependencies
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

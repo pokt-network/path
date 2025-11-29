@@ -112,7 +112,7 @@ func (r responseToGetBalance) GetHTTPResponse() jsonrpc.HTTPResponse {
 
 // getResponsePayload returns the JSON-RPC response payload as a byte slice.
 func (r responseToGetBalance) getResponsePayload() []byte {
-	responseBz, err := json.Marshal(r.jsonrpcResponse)
+	responseBz, err := marshalJSONPooled(r.jsonrpcResponse)
 	if err != nil {
 		r.logger.Warn().Err(err).Msg("responseToGetBalance: Marshaling JSONRPC response failed.")
 	}

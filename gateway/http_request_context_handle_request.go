@@ -89,7 +89,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	// - Remove the individual endpoint response handling from the gateway package.
 	//
 	for _, endpointResponse := range endpointResponses {
-		rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes)
+		rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
 	}
 
 	return nil
@@ -117,9 +117,9 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 	ctx, cancel := context.WithTimeout(rc.context, RelayRequestTimeout)
 	defer cancel()
 
-	resultChan := rc.launchParallelRequests(ctx, logger)
+	resultChan, qosContextMutex := rc.launchParallelRequests(ctx, logger)
 
-	return rc.waitForFirstSuccessfulResponse(ctx, logger, resultChan, metrics)
+	return rc.waitForFirstSuccessfulResponse(ctx, logger, resultChan, metrics, qosContextMutex)
 }
 
 // updateParallelRequestMetrics updates gateway observations with parallel request metrics
@@ -133,18 +133,18 @@ func (rc *requestContext) updateParallelRequestMetrics(metrics *parallelRequestM
 	)
 }
 
-// launchParallelRequests starts all parallel relay requests and returns a result channel
-func (rc *requestContext) launchParallelRequests(ctx context.Context, logger polylog.Logger) <-chan parallelRelayResult {
+// launchParallelRequests starts all parallel relay requests and returns a result channel and mutex for QoS context operations
+func (rc *requestContext) launchParallelRequests(ctx context.Context, logger polylog.Logger) (<-chan parallelRelayResult, *sync.Mutex) {
 	resultChan := make(chan parallelRelayResult, len(rc.protocolContexts))
 
 	// Ensures thread-safety of QoS context operations.
-	qosContextMutex := sync.Mutex{}
+	qosContextMutex := &sync.Mutex{}
 
 	for protocolCtxIdx, protocolCtx := range rc.protocolContexts {
-		go rc.executeOneOfParallelRequests(ctx, logger, protocolCtx, protocolCtxIdx, resultChan, &qosContextMutex)
+		go rc.executeOneOfParallelRequests(ctx, logger, protocolCtx, protocolCtxIdx, resultChan, qosContextMutex)
 	}
 
-	return resultChan
+	return resultChan, qosContextMutex
 }
 
 // executeOneOfParallelRequests handles a single relay request in a goroutine
@@ -174,7 +174,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		// 2. Simplify the parallel requests feature: it may be best to fully encapsulate it in the protocol/shannon package.
 		qosContextMutex.Lock()
 		for _, response := range responses {
-			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes)
+			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
 		}
 		qosContextMutex.Unlock()
 	}
@@ -193,6 +193,7 @@ func (rc *requestContext) waitForFirstSuccessfulResponse(
 	logger polylog.Logger,
 	resultChan <-chan parallelRelayResult,
 	metrics *parallelRequestMetrics,
+	qosContextMutex *sync.Mutex,
 ) error {
 	var lastErr error
 	var responseTimings []string
@@ -203,7 +204,7 @@ func (rc *requestContext) waitForFirstSuccessfulResponse(
 			responseTimings = append(responseTimings, rc.formatTimingLog(result))
 
 			if result.err == nil {
-				return rc.handleSuccessfulResponse(logger, result, metrics)
+				return rc.handleSuccessfulResponse(logger, result, metrics, qosContextMutex)
 			} else {
 				rc.handleFailedResponse(logger, result, metrics, &lastErr)
 			}
@@ -221,9 +222,13 @@ func (rc *requestContext) handleSuccessfulResponse(
 	logger polylog.Logger,
 	result parallelRelayResult,
 	metrics *parallelRequestMetrics,
+	qosContextMutex *sync.Mutex,
 ) error {
 	metrics.numCompletedSuccessfully++
 	overallDuration := time.Since(metrics.overallStartTime)
+
+	qosContextMutex.Lock()
+	defer qosContextMutex.Unlock()
 
 	for _, response := range result.responses {
 		endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(response.EndpointAddr))
@@ -233,7 +238,7 @@ func (rc *requestContext) handleSuccessfulResponse(
 			Msgf("Parallel request success: endpoint %d/%d responded in %dms",
 				result.index+1, metrics.numRequestsToAttempt, overallDuration.Milliseconds())
 
-		rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes)
+		rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
 	}
 
 	return nil

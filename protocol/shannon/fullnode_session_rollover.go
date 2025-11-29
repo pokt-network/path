@@ -33,6 +33,8 @@ const (
 type sessionRolloverState struct {
 	logger polylog.Logger // Logger for rollover operations
 
+	ctx context.Context // Context for graceful shutdown of the monitor loop
+
 	blockClient *sdk.BlockClient // Block client for getting current block height
 
 	sessionRolloverBlocks int64 // Grace period after session end where rollover issues may occur
@@ -46,10 +48,12 @@ type sessionRolloverState struct {
 	rolloverStateMu sync.RWMutex // Protects all fields above
 }
 
-// newSessionRolloverState creates a new sessionRolloverState with the provided logger, block client, and rollover blocks
-func newSessionRolloverState(logger polylog.Logger, blockClient *sdk.BlockClient, sessionRolloverBlocks int64) *sessionRolloverState {
+// newSessionRolloverState creates a new sessionRolloverState with the provided logger, block client, and rollover blocks.
+// The provided context is used for graceful shutdown of the block height monitor loop.
+func newSessionRolloverState(ctx context.Context, logger polylog.Logger, blockClient *sdk.BlockClient, sessionRolloverBlocks int64) *sessionRolloverState {
 	srs := &sessionRolloverState{
 		logger:                logger.With("component", "session_rollover_state"),
+		ctx:                   ctx,
 		blockClient:           blockClient,
 		sessionRolloverBlocks: sessionRolloverBlocks,
 	}
@@ -72,7 +76,8 @@ func (srs *sessionRolloverState) getSessionRolloverState() bool {
 	return srs.isInSessionRollover
 }
 
-// blockHeightMonitorLoop continuously checks block height to detect session rollovers
+// blockHeightMonitorLoop continuously checks block height to detect session rollovers.
+// The loop exits when the context is canceled, enabling graceful shutdown.
 func (srs *sessionRolloverState) blockHeightMonitorLoop() {
 	srs.logger.Info().
 		Bool("block_client_available", srs.blockClient != nil).
@@ -82,8 +87,14 @@ func (srs *sessionRolloverState) blockHeightMonitorLoop() {
 	ticker := time.NewTicker(blockCheckInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		srs.updateBlockHeight()
+	for {
+		select {
+		case <-srs.ctx.Done():
+			srs.logger.Info().Msg("Block height monitor loop shutting down")
+			return
+		case <-ticker.C:
+			srs.updateBlockHeight()
+		}
 	}
 }
 

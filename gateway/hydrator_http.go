@@ -3,11 +3,17 @@ package gateway
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
 	"github.com/pokt-network/path/protocol"
 )
+
+// hydratorOperationTimeout is the maximum time allowed for hydrator operations
+// (endpoint lookup, context building, relay requests). This prevents hanging
+// operations from accumulating and causing OOM.
+const hydratorOperationTimeout = 30 * time.Second
 
 // runHTTPChecks performs HTTP-based QoS checks for all services and endpoints.
 func (eph *EndpointHydrator) runHTTPChecks() {
@@ -60,7 +66,9 @@ func (eph *EndpointHydrator) performHTTPChecks(serviceID protocol.ServiceID, ser
 	// This implies there is no need to specify a specific app.
 	// TODO_TECHDEBT(@adshmh): support specifying the app(s) used for sending/signing synthetic relay requests by the hydrator.
 	// TODO_FUTURE(@adshmh): consider publishing observations if endpoint lookup fails.
-	availableEndpoints, _, err := eph.AvailableHTTPEndpoints(context.TODO(), serviceID, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), hydratorOperationTimeout)
+	defer cancel()
+	availableEndpoints, _, err := eph.AvailableHTTPEndpoints(ctx, serviceID, nil)
 	if err != nil || len(availableEndpoints) == 0 {
 		// No session found or no endpoints available for service: skip.
 		logger.Warn().Msg("no session found or no endpoints available for service when running HTTP hydrator checks.")
@@ -142,7 +150,9 @@ func (eph *EndpointHydrator) performSingleQoSCheck(
 	// which means there is no need for specifying a specific app.
 	// TODO_FUTURE(@adshmh): support specifying the app(s) used for sending/signing synthetic relay requests by the hydrator.
 	// TODO_FUTURE(@adshmh): consider publishing observations here.
-	hydratorRequestCtx, _, err := eph.BuildHTTPRequestContextForEndpoint(context.TODO(), serviceID, endpointAddr, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), hydratorOperationTimeout)
+	defer cancel()
+	hydratorRequestCtx, _, err := eph.BuildHTTPRequestContextForEndpoint(ctx, serviceID, endpointAddr, nil)
 	if err != nil {
 		endpointLogger.Error().Err(err).Msg("Failed to build a protocol request context for the endpoint")
 		return
@@ -151,7 +161,7 @@ func (eph *EndpointHydrator) performSingleQoSCheck(
 	// Prepare a request context to submit a synthetic relay request to the endpoint on behalf of the gateway for QoS purposes.
 	gatewayRequestCtx := requestContext{
 		logger:  endpointLogger,
-		context: context.TODO(),
+		context: ctx, // Use the timeout context created above
 		// TODO_MVP(@adshmh): populate the fields of gatewayObservations struct.
 		// Mark the request as Synthetic using the following steps:
 		// 	1. Define a `gatewayObserver` function as a field in the `requestContext` struct.

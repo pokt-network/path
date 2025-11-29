@@ -16,11 +16,13 @@ const (
 	// The list of metrics being tracked for Cosmos SDK QoS
 	requestsTotalMetric      = "cosmos_sdk_requests_total"
 	jsonrpcErrorsTotalMetric = "cosmos_jsonrpc_errors_total"
+	batchRequestSizeMetric   = "cosmos_batch_request_size"
 )
 
 func init() {
 	prometheus.MustRegister(requestsTotal)
 	prometheus.MustRegister(jsonrpcErrorsTotal)
+	prometheus.MustRegister(batchRequestSize)
 }
 
 var (
@@ -63,7 +65,7 @@ var (
 			Name:      requestsTotalMetric,
 			Help:      "Total number of requests processed by Cosmos SDK QoS instance(s)",
 		},
-		[]string{"cosmos_chain_id", "evm_chain_id", "service_id", "request_origin", "rpc_type", "request_method", "success", "error_type", "http_status_code", "endpoint_domain"},
+		[]string{"cosmos_chain_id", "evm_chain_id", "service_id", "request_origin", "rpc_type", "request_method", "is_batch_request", "success", "error_type", "http_status_code", "endpoint_domain"},
 	)
 
 	// TODO_TECHDEBT(@adshmh): Consider using buckets of JSONRPC error codes as the number of distinct values could be a Prometheus metric cardinality concern.
@@ -94,6 +96,28 @@ var (
 		},
 		[]string{"cosmos_chain_id", "evm_chain_id", "service_id", "request_method", "endpoint_domain", "jsonrpc_error_code"},
 	)
+
+	// batchRequestSize tracks the distribution of batch request sizes.
+	// Only recorded for batch requests (requests with more than one JSON-RPC method).
+	//
+	// Labels:
+	//   - cosmos_chain_id: Target Cosmos chain identifier
+	//   - evm_chain_id: Target EVM chain identifier for Cosmos chains with native EVM support
+	//   - service_id: Service ID of the Cosmos SDK QoS instance
+	//
+	// Use to analyze:
+	//   - Batch request size patterns
+	//   - Average batch sizes per chain/service
+	//   - Capacity planning based on batch request patterns
+	batchRequestSize = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Subsystem: pathProcess,
+			Name:      batchRequestSizeMetric,
+			Help:      "Distribution of batch request sizes (number of JSON-RPC methods per batch)",
+			Buckets:   []float64{1, 2, 5, 10, 25, 50, 100},
+		},
+		[]string{"cosmos_chain_id", "evm_chain_id", "service_id"},
+	)
 )
 
 // PublishMetrics:
@@ -117,6 +141,19 @@ func PublishMetrics(logger polylog.Logger, observations *qos.CosmosRequestObserv
 
 	methods := extractRequestMethods(logger, interpreter)
 
+	// Record if this is a batch request (more than one method).
+	isBatchRequest := len(methods) > 1
+
+	// Record batch size for batch requests
+	if isBatchRequest {
+		batchRequestSize.With(
+			prometheus.Labels{
+				"cosmos_chain_id": interpreter.GetCosmosChainID(),
+				"evm_chain_id":    interpreter.GetEVMChainID(),
+				"service_id":      interpreter.GetServiceID(),
+			}).Observe(float64(len(methods)))
+	}
+
 	// TODO_TECHDEBT(@adshmh): Refactor this block once separate proto messages for single and batch JSONRPC requests are added.
 	//
 	for _, method := range methods {
@@ -129,6 +166,7 @@ func PublishMetrics(logger polylog.Logger, observations *qos.CosmosRequestObserv
 				"request_origin":   observations.GetRequestOrigin().String(),
 				"rpc_type":         interpreter.GetRPCType(),
 				"request_method":   method,
+				"is_batch_request": fmt.Sprintf("%t", isBatchRequest),
 				"success":          fmt.Sprintf("%t", interpreter.IsRequestSuccessful()),
 				"error_type":       interpreter.GetRequestErrorType(),
 				"http_status_code": fmt.Sprintf("%d", interpreter.GetRequestHTTPStatus()),

@@ -1,6 +1,7 @@
 package cosmos
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -14,6 +15,10 @@ import (
 	"github.com/pokt-network/path/qos"
 	"github.com/pokt-network/path/qos/jsonrpc"
 )
+
+// maxRequestBodySize is the maximum allowed size for HTTP request bodies (100MB).
+// This prevents OOM attacks from unbounded io.ReadAll calls.
+const maxRequestBodySize = 100 * 1024 * 1024
 
 // requestValidator handles validation for all Cosmos service requests
 // Coordinates between different protocol validators (JSONRPC, REST)
@@ -36,11 +41,16 @@ func (rv *requestValidator) validateHTTPRequest(req *http.Request) (gateway.Requ
 		"http_method", req.Method,
 	)
 
-	// Read the request body.
+	// Read the request body with a size limit to prevent OOM attacks.
 	// This is necessary to distinguish REST vs. JSONRPC on request with POST HTTP method.
-	body, err := io.ReadAll(req.Body)
+	limitedBody := http.MaxBytesReader(nil, req.Body, maxRequestBodySize)
+	body, err := io.ReadAll(limitedBody)
 	if err != nil {
-		logger.Error().Err(err).Msg("Failed to parse JSONRPC request")
+		// Check if the error is due to body size limit exceeded
+		if err.Error() == "http: request body too large" {
+			err = fmt.Errorf("request body exceeds %d bytes limit", maxRequestBodySize)
+		}
+		logger.Error().Err(err).Msg("Failed to read request body")
 		// Return a context with a JSONRPC-formatted response, as we cannot detect the request type.
 		return rv.createHTTPBodyReadFailureContext(err), false
 	}

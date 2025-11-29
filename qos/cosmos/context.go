@@ -62,6 +62,8 @@ type requestContext struct {
 type endpointResponse struct {
 	endpointAddr protocol.EndpointAddr
 	response     response
+	// httpStatusCode is the original HTTP status code from the backend endpoint.
+	httpStatusCode int
 }
 
 // response interface defines what endpoint response validators must return
@@ -83,7 +85,7 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 // UpdateWithResponse processes a response from an endpoint
 // Uses the existing response unmarshaling system
 // NOT safe for concurrent use
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte) {
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
 	logger := rc.logger.With(
 		"method", "UpdateWithResponse",
 		"endpoint_addr", endpointAddr,
@@ -93,8 +95,9 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 	parsedEndpointResponse := rc.endpointResponseValidator(logger, responseBz)
 
 	rc.endpointResponses = append(rc.endpointResponses, endpointResponse{
-		endpointAddr: endpointAddr,
-		response:     parsedEndpointResponse,
+		endpointAddr:   endpointAddr,
+		response:       parsedEndpointResponse,
+		httpStatusCode: httpStatusCode,
 	})
 }
 
@@ -114,7 +117,33 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 	}
 
 	// Handle single requests
-	return rc.endpointResponses[0].response.GetHTTPResponse()
+	resp := rc.endpointResponses[0].response.GetHTTPResponse()
+	// Use the original HTTP status code from the backend if available
+	if rc.endpointResponses[0].httpStatusCode != 0 {
+		return &httpResponseWithStatus{
+			wrapped:    resp,
+			statusCode: rc.endpointResponses[0].httpStatusCode,
+		}
+	}
+	return resp
+}
+
+// httpResponseWithStatus wraps an HTTPResponse and overrides its status code
+type httpResponseWithStatus struct {
+	wrapped    pathhttp.HTTPResponse
+	statusCode int
+}
+
+func (r *httpResponseWithStatus) GetPayload() []byte {
+	return r.wrapped.GetPayload()
+}
+
+func (r *httpResponseWithStatus) GetHTTPStatusCode() int {
+	return r.statusCode
+}
+
+func (r *httpResponseWithStatus) GetHTTPHeaders() map[string]string {
+	return r.wrapped.GetHTTPHeaders()
 }
 
 // getBatchHTTPResponse handles batch requests by combining individual JSON-RPC responses
@@ -153,11 +182,14 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 		return errorResponse.GetHTTPResponse()
 	}
 
+	// Use original HTTP status from backend if available, otherwise default to 200 OK
+	httpStatusCode := http.StatusOK
+	if len(rc.endpointResponses) > 0 && rc.endpointResponses[0].httpStatusCode != 0 {
+		httpStatusCode = rc.endpointResponses[0].httpStatusCode
+	}
 	return jsonrpc.HTTPResponse{
 		ResponsePayload: batchResponse,
-		// According to the JSON-RPC 2.0 specification, even if individual responses
-		// in a batch contain errors, the entire batch should still return HTTP 200 OK.
-		HTTPStatusCode: http.StatusOK,
+		HTTPStatusCode:  httpStatusCode,
 	}
 }
 

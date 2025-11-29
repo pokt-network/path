@@ -51,6 +51,8 @@ type endpointResponse struct {
 	protocol.EndpointAddr
 	response
 	unmarshalErr error
+	// httpStatusCode is the original HTTP status code from the backend endpoint.
+	httpStatusCode int
 }
 
 // requestContext implements the functionality for EVM-based blockchain services.
@@ -109,7 +111,7 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 }
 
 // UpdateWithResponse is NOT safe for concurrent use
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte) {
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
 	rc.logger = rc.logger.With(
 		"endpoint_addr", endpointAddr,
 		"endpoint_response_len", len(responseBz),
@@ -124,9 +126,10 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 	)
 
 	rc.endpointResponses = append(rc.endpointResponses, endpointResponse{
-		EndpointAddr: endpointAddr,
-		response:     response,
-		unmarshalErr: err,
+		EndpointAddr:   endpointAddr,
+		response:       response,
+		unmarshalErr:   err,
+		httpStatusCode: httpStatusCode,
 	})
 }
 
@@ -174,7 +177,12 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 
 	// Non-batch requests.
 	// Return the only endpoint response reported to the context for single requests.
-	return rc.endpointResponses[0].GetHTTPResponse()
+	resp := rc.endpointResponses[0].GetHTTPResponse()
+	// Use the original HTTP status code from the backend if available
+	if rc.endpointResponses[0].httpStatusCode != 0 {
+		resp.HTTPStatusCode = rc.endpointResponses[0].httpStatusCode
+	}
+	return resp
 }
 
 // getBatchHTTPResponse handles batch requests by combining individual JSON-RPC responses
@@ -213,11 +221,14 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 		return errorResponse.GetHTTPResponse()
 	}
 
+	// Use original HTTP status from backend if available, otherwise default to 200 OK
+	httpStatusCode := http.StatusOK
+	if len(rc.endpointResponses) > 0 && rc.endpointResponses[0].httpStatusCode != 0 {
+		httpStatusCode = rc.endpointResponses[0].httpStatusCode
+	}
 	return jsonrpc.HTTPResponse{
 		ResponsePayload: batchResponse,
-		// According to the JSON-RPC 2.0 specification, even if individual responses
-		// in a batch contain errors, the entire batch should still return HTTP 200 OK.
-		HTTPStatusCode: http.StatusOK,
+		HTTPStatusCode:  httpStatusCode,
 	}
 }
 
@@ -311,6 +322,9 @@ func (rc requestContext) createNoResponseObservations() []*qosobservations.EVMRe
 //
 // For batch requests: multiple responses are correlated with multiple requests
 // For single requests: one response is correlated with one request
+//
+// Per JSON-RPC 2.0 spec, responses with null IDs are valid for error cases when the server
+// couldn't parse the request ID. These are skipped during observation creation.
 func (rc requestContext) createResponseObservations() []*qosobservations.EVMRequestObservation {
 	var observations []*qosobservations.EVMRequestObservation
 
@@ -322,12 +336,20 @@ func (rc requestContext) createResponseObservations() []*qosobservations.EVMRequ
 			continue
 		}
 
+		// Skip responses with null IDs - per JSON-RPC 2.0 spec, these indicate error responses
+		// where the server couldn't parse the request ID. We can't correlate these with specific
+		// requests, so we skip observation creation for them.
+		if jsonrpcResponse.ID.IsEmpty() {
+			rc.logger.Debug().Msg("Skipping observation creation for response with null ID (JSON-RPC error response)")
+			continue
+		}
+
 		// Look up the original JSON-RPC request using the response ID
 		// This correlation is critical for batch requests where multiple requests/responses
 		// need to be properly matched
 		servicePayload, ok := rc.findServicePayload(jsonrpcResponse.ID)
 		if !ok {
-			rc.logger.Error().Msgf("SHOULD RARELY HAPPEN: requestContext.createResponseObservations() should never fail to find the JSONRPC request for response ID: %s", jsonrpcResponse.ID.String())
+			rc.logger.Warn().Msgf("Could not find JSONRPC request for response ID: %s (endpoint may have modified the ID)", jsonrpcResponse.ID.String())
 			continue
 		}
 

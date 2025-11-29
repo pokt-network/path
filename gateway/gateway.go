@@ -24,6 +24,11 @@ import (
 	"github.com/pokt-network/path/observation"
 )
 
+// DefaultWebsocketMessageBufferSize is the default buffer size for websocket message observations.
+// This should match the default in config/router.go.
+// At 100: 100 × ~3KB × 100 connections = ~30MB.
+const DefaultWebsocketMessageBufferSize = 100
+
 // Gateway handles end-to-end service requests via HandleHTTPServiceRequest:
 // - Receives user request
 // - Processes request
@@ -51,6 +56,11 @@ type Gateway struct {
 	// It is declared separately from the `MetricsReporter` to be consistent with the gateway package's role
 	// of explicitly defining PATH gateway's components and their interactions.
 	DataReporter RequestResponseReporter
+
+	// WebsocketMessageBufferSize is the buffer size for websocket message observation channels.
+	// Configurable to balance memory usage vs throughput for websocket connections.
+	// Default: DefaultWebsocketMessageBufferSize (100)
+	WebsocketMessageBufferSize int
 }
 
 // HandleServiceRequest implements PATH gateway's service request processing.
@@ -171,6 +181,12 @@ func (g Gateway) handleWebSocketRequest(
 	// The bridge will handle its own context lifecycle management.
 	websocketCtx := context.Background()
 
+	// Determine the websocket message buffer size
+	websocketBufferSize := g.WebsocketMessageBufferSize
+	if websocketBufferSize <= 0 {
+		websocketBufferSize = DefaultWebsocketMessageBufferSize
+	}
+
 	// Build a websocketRequestContext with components necessary to process websocket requests.
 	websocketRequestCtx := &websocketRequestContext{
 		logger:              g.Logger,
@@ -182,10 +198,7 @@ func (g Gateway) handleWebSocketRequest(
 		dataReporter:        g.DataReporter,
 		// Note: We do NOT close messageObservationsChan here because Websocket connections
 		// outlive the HTTP handler. The channel will be closed when the Websocket actually disconnects.
-		// TODO_CONFIG: Add configuration for message channel buffer sizes
-		// Current: Hardcoded buffer size (1000 for observations)
-		// Suggestion: Make configurable based on expected load
-		messageObservationsChan: make(chan *observation.RequestResponseObservations, 1_000),
+		messageObservationsChan: make(chan *observation.RequestResponseObservations, websocketBufferSize),
 	}
 
 	// Initialize the websocket request context using the HTTP request.

@@ -30,7 +30,8 @@ type RequestQoSContext interface {
 	// UpdateWithResponse:
 	// - Informs the request QoS context of the payload returned by a specific endpoint.
 	// - Response is for the service payload produced by GetServicePayload.
-	UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte)
+	// - httpStatusCode is the original HTTP status code from the backend endpoint.
+	UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int)
 
 	// GetHTTPResponse:
 	// - Returns the user-facing HTTP response.

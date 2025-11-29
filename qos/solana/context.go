@@ -35,6 +35,8 @@ type response interface {
 type endpointResponse struct {
 	protocol.EndpointAddr
 	response
+	// httpStatusCode is the original HTTP status code from the backend endpoint.
+	httpStatusCode int
 }
 
 // requestContext provides the functionality required
@@ -93,7 +95,7 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 }
 
 // UpdateWithResponse is NOT safe for concurrent use
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte) {
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
 	// TODO_IMPROVE: check whether the request was valid, and return an error if it was not.
 	// This would be an extra safety measure, as the caller should have checked the returned value
 	// indicating the validity of the request when calling on QoS instance's ParseHTTPRequest
@@ -105,8 +107,9 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 	// 2. Return a generic but valid JSONRPC response to the user.
 	rc.endpointResponses = append(rc.endpointResponses,
 		endpointResponse{
-			EndpointAddr: endpointAddr,
-			response:     response,
+			EndpointAddr:   endpointAddr,
+			response:       response,
+			httpStatusCode: httpStatusCode,
 		},
 	)
 }
@@ -125,8 +128,14 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 
 	// Use the most recent endpoint response.
 	// As of PR #253 there is no retry, meaning there is at most 1 endpoint response.
-	selectedResponse := rc.endpointResponses[len(rc.endpointResponses)-1].GetJSONRPCResponse()
-	return qos.BuildHTTPResponseFromJSONRPCResponse(rc.logger, selectedResponse)
+	latestResponse := rc.endpointResponses[len(rc.endpointResponses)-1]
+	selectedResponse := latestResponse.GetJSONRPCResponse()
+	resp := qos.BuildHTTPResponseFromJSONRPCResponse(rc.logger, selectedResponse)
+	// Use the original HTTP status code from the backend if available
+	if latestResponse.httpStatusCode != 0 {
+		resp.HTTPStatusCode = latestResponse.httpStatusCode
+	}
+	return resp
 }
 
 // GetObservations returns all the observations contained in the request context.

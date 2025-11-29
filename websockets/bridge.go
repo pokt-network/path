@@ -97,15 +97,19 @@ func StartBridge(
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ error upgrading client websocket connection")
 		cancelCtx() // Clean up context on error
-		return nil, fmt.Errorf("createWebsocketBridge: %s", err.Error())
+		return nil, fmt.Errorf("createWebsocketBridge: %w", err)
 	}
 
 	// Connect to the Relay Miner endpoint
 	endpointConn, err := ConnectWebsocketEndpoint(logger, websocketURL, headers)
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ error connecting to websocket endpoint")
+		// Clean up the client connection that was successfully upgraded
+		if closeErr := clientConn.Close(); closeErr != nil {
+			logger.Warn().Err(closeErr).Msg("error closing client connection after endpoint connection failure")
+		}
 		cancelCtx() // Clean up context on error
-		return nil, fmt.Errorf("createWebsocketBridge: %s", err.Error())
+		return nil, fmt.Errorf("createWebsocketBridge: %w", err)
 	}
 
 	// Create a channel to pass messages between the Client and Endpoint

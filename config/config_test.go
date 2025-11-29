@@ -91,6 +91,7 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 					WriteTimeout:                    defaultHTTPServerWriteTimeout,
 					IdleTimeout:                     defaultHTTPServerIdleTimeout,
 					SystemOverheadAllowanceDuration: defaultSystemOverheadAllowanceDuration,
+					WebsocketMessageBufferSize:      defaultWebsocketMessageBufferSize,
 				},
 				Logger: LoggerConfig{
 					Level: "error",
@@ -187,6 +188,7 @@ logger_config:
 					WriteTimeout:                    defaultHTTPServerWriteTimeout,
 					IdleTimeout:                     defaultHTTPServerIdleTimeout,
 					SystemOverheadAllowanceDuration: defaultSystemOverheadAllowanceDuration,
+					WebsocketMessageBufferSize:      defaultWebsocketMessageBufferSize,
 				},
 				Logger: LoggerConfig{
 					Level: "debug",

@@ -2,6 +2,7 @@ package solana
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -13,6 +14,10 @@ import (
 	"github.com/pokt-network/path/qos"
 	"github.com/pokt-network/path/qos/jsonrpc"
 )
+
+// maxRequestBodySize is the maximum allowed size for HTTP request bodies (100MB).
+// This prevents OOM attacks from unbounded io.ReadAll calls.
+const maxRequestBodySize = 100 * 1024 * 1024
 
 // Maximum length for error messages stored in validation failure logs/observations.
 // - Prevents overly verbose error messages in logs/metrics
@@ -46,9 +51,14 @@ func (rv *requestValidator) validateHTTPRequest(req *http.Request) (gateway.Requ
 		"method", "validateHTTPRequest",
 	)
 
-	// Read the HTTP request body
-	body, err := io.ReadAll(req.Body)
+	// Read the HTTP request body with a size limit to prevent OOM attacks
+	limitedBody := http.MaxBytesReader(nil, req.Body, maxRequestBodySize)
+	body, err := io.ReadAll(limitedBody)
 	if err != nil {
+		// Check if the error is due to body size limit exceeded
+		if err.Error() == "http: request body too large" {
+			err = fmt.Errorf("request body exceeds %d bytes limit", maxRequestBodySize)
+		}
 		logger.Warn().Err(err).Msg("HTTP request body read failed - returning generic error response")
 		return rv.createHTTPBodyReadFailureContext(err), false
 	}

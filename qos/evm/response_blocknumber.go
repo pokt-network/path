@@ -110,7 +110,7 @@ func (r responseToBlockNumber) GetHTTPResponse() jsonrpc.HTTPResponse {
 // getResponsePayload returns the raw byte slice payload to be returned as the response to the JSONRPC request.
 func (r responseToBlockNumber) getResponsePayload() []byte {
 	// TODO_MVP(@adshmh): return a JSONRPC response indicating the error if unmarshaling failed.
-	bz, err := json.Marshal(r.jsonrpcResponse)
+	bz, err := marshalJSONPooled(r.jsonrpcResponse)
 	if err != nil {
 		// This should never happen: log an entry but return the response anyway.
 		r.logger.Warn().Err(err).Msg("responseToBlockNumber: Marshaling JSONRPC response failed.")

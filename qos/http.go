@@ -30,9 +30,9 @@ func BuildHTTPResponseFromJSONRPCResponse(
 	}
 
 	return HTTPResponse{
-		responsePayload: bz,
+		ResponsePayload: bz,
 		// Use the HTTP status code recommended by the JSONRPC response.
-		httpStatusCode: jsonrpcResp.GetRecommendedHTTPStatusCode(),
+		HTTPStatusCode: jsonrpcResp.GetRecommendedHTTPStatusCode(),
 	}
 }
 
@@ -41,25 +41,25 @@ func BuildHTTPResponseFromBytes(
 	httpStatusCode int,
 ) HTTPResponse {
 	return HTTPResponse{
-		responsePayload: responsePayload,
-		httpStatusCode:  httpStatusCode,
+		ResponsePayload: responsePayload,
+		HTTPStatusCode:  httpStatusCode,
 	}
 }
 
 // HTTPResponse encapsulates an HTTP response to be returned to the client
 // including payload data and status code.
 type HTTPResponse struct {
-	// responsePayload contains the serialized response body.
-	responsePayload []byte
+	// ResponsePayload contains the serialized response body.
+	ResponsePayload []byte
 
-	// httpStatusCode is the HTTP status code to be returned.
+	// HTTPStatusCode is the HTTP status code to be returned.
 	// If not explicitly set, defaults to http.StatusOK (200).
-	httpStatusCode int
+	HTTPStatusCode int
 }
 
 // GetPayload returns the response payload as a byte slice.
 func (hr HTTPResponse) GetPayload() []byte {
-	return hr.responsePayload
+	return hr.ResponsePayload
 }
 
 // GetHTTPStatusCode returns the HTTP status code for this response.
@@ -67,8 +67,8 @@ func (hr HTTPResponse) GetPayload() []byte {
 // StatusOK is returned by default from QoS because it is the responsibility of the QoS service to decide on the HTTP status code returned to the client.
 func (hr HTTPResponse) GetHTTPStatusCode() int {
 	// Return the custom status code if set, otherwise default to 200 OK
-	if hr.httpStatusCode != 0 {
-		return hr.httpStatusCode
+	if hr.HTTPStatusCode != 0 {
+		return hr.HTTPStatusCode
 	}
 
 	// Default to 200 OK HTTP status code.

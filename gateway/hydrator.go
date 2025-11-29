@@ -3,6 +3,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -70,7 +71,8 @@ type EndpointHydrator struct {
 // Start should be called to signal this instance of the hydrator
 // to start generating and sending endpoint check requests.
 // It starts two separate goroutines: one for HTTP checks and one for Websocket checks.
-func (eph *EndpointHydrator) Start() error {
+// The ctx parameter allows for graceful shutdown - when ctx is canceled, both goroutines will exit.
+func (eph *EndpointHydrator) Start(ctx context.Context) error {
 	if eph.Protocol == nil {
 		return errors.New("an instance of Protocol must be provided")
 	}
@@ -83,9 +85,16 @@ func (eph *EndpointHydrator) Start() error {
 	go func() {
 		ticker := time.NewTicker(eph.RunInterval)
 		defer ticker.Stop()
+		// Run initial check immediately, then wait for ticker
+		eph.runHTTPChecks()
 		for {
-			eph.runHTTPChecks()
-			<-ticker.C
+			select {
+			case <-ctx.Done():
+				eph.Logger.Info().Msg("Hydrator HTTP check goroutine shutting down")
+				return
+			case <-ticker.C:
+				eph.runHTTPChecks()
+			}
 		}
 	}()
 
@@ -93,9 +102,16 @@ func (eph *EndpointHydrator) Start() error {
 	go func() {
 		ticker := time.NewTicker(websocketCheckInterval)
 		defer ticker.Stop()
+		// Run initial check immediately, then wait for ticker
+		eph.runWebSocketChecks()
 		for {
-			eph.runWebSocketChecks()
-			<-ticker.C
+			select {
+			case <-ctx.Done():
+				eph.Logger.Info().Msg("Hydrator WebSocket check goroutine shutting down")
+				return
+			case <-ticker.C:
+				eph.runWebSocketChecks()
+			}
 		}
 	}()
 

@@ -84,7 +84,8 @@ func NewLazyFullNode(logger polylog.Logger, config FullNodeConfig) (*LazyFullNod
 		blockClient:   blockClient,
 		accountClient: accountClient,
 		sharedClient:  sharedClient,
-		rolloverState: newSessionRolloverState(logger, blockClient, config.SessionRolloverBlocks),
+		// TODO_IMPROVE: Accept context from caller to enable graceful shutdown of the rollover monitor
+		rolloverState: newSessionRolloverState(context.Background(), logger, blockClient, config.SessionRolloverBlocks),
 	}, nil
 }
 
