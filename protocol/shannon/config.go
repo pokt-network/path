@@ -13,6 +13,7 @@ import (
 
 	"github.com/pokt-network/path/network/grpc"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 )
 
 // defaultURLKey is the key for the default URL in the fallback endpoints map.
@@ -82,6 +83,11 @@ type (
 		// Configures the endpoint sanction system parameters.
 		// If not specified, sensible defaults will be used.
 		SanctionConfig SanctionConfig `yaml:"sanction_config"`
+
+		// Optional.
+		// Configures the endpoint reputation system.
+		// If not specified or disabled, binary sanctions will be used instead.
+		ReputationConfig reputation.Config `yaml:"reputation_config"`
 	}
 
 	// TODO_TECHDEBT(@adshmh): Make configuration and implementation explicit:

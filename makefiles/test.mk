@@ -13,6 +13,11 @@ test_all: test_unit
 test_unit: ## Run all unit tests
 	go test ./... -short -count=1
 
+.PHONY: go_fmt
+go_fmt: ## Format all go files with gofmt and goimports
+	gofmt -w .
+	goimports -w .
+
 .PHONY: go_lint
 go_lint: ## Run all go linters
 	golangci-lint run --timeout 5m --build-tags test

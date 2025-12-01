@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -36,7 +37,7 @@ func getShannonFullNode(logger polylog.Logger, config *shannonconfig.ShannonGate
 }
 
 // getShannonProtocol returns an instance of the Shannon protocol using the supplied Shannon-specific configuration.
-func getShannonProtocol(logger polylog.Logger, config *shannonconfig.ShannonGatewayConfig) (gateway.Protocol, error) {
+func getShannonProtocol(ctx context.Context, logger polylog.Logger, config *shannonconfig.ShannonGatewayConfig) (gateway.Protocol, error) {
 	logger.Info().Msg("Starting PATH gateway with Shannon protocol")
 
 	fullNode, err := getShannonFullNode(logger, config)
@@ -44,7 +45,7 @@ func getShannonProtocol(logger polylog.Logger, config *shannonconfig.ShannonGate
 		return nil, fmt.Errorf("failed to create a Shannon full node instance: %w", err)
 	}
 
-	protocol, err := shannon.NewProtocol(logger, config.GatewayConfig, fullNode)
+	protocol, err := shannon.NewProtocol(ctx, logger, config.GatewayConfig, fullNode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create a Shannon protocol instance: %w", err)
 	}
