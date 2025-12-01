@@ -12,6 +12,7 @@ package reputation
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/pokt-network/path/protocol"
@@ -226,4 +227,24 @@ func (s *SyncConfig) HydrateDefaults() {
 	if s.FlushInterval == 0 {
 		s.FlushInterval = DefaultFlushInterval
 	}
+}
+
+// Validate checks that the configuration values are valid.
+// Returns an error if any values are out of bounds or inconsistent.
+func (c *Config) Validate() error {
+	// Check bounds first
+	if c.InitialScore < MinScore || c.InitialScore > MaxScore {
+		return fmt.Errorf("initial_score (%.1f) must be between %.1f and %.1f", c.InitialScore, MinScore, MaxScore)
+	}
+	if c.MinThreshold < MinScore || c.MinThreshold > MaxScore {
+		return fmt.Errorf("min_threshold (%.1f) must be between %.1f and %.1f", c.MinThreshold, MinScore, MaxScore)
+	}
+	// Then check relationship between values
+	if c.InitialScore < c.MinThreshold {
+		return fmt.Errorf("initial_score (%.1f) must be >= min_threshold (%.1f)", c.InitialScore, c.MinThreshold)
+	}
+	if c.RecoveryTimeout < 0 {
+		return fmt.Errorf("recovery_timeout must be non-negative")
+	}
+	return nil
 }

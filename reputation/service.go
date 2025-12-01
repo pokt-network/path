@@ -272,6 +272,7 @@ func (s *service) Start(ctx context.Context) error {
 	// Start background goroutines
 	go s.writeLoop()
 	go s.refreshLoop()
+	go s.cleanupLoop()
 
 	return nil
 }
@@ -356,6 +357,30 @@ func (s *service) refreshLoop() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			_ = s.refreshFromStorage(ctx)
 			cancel()
+
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// cleanupLoop periodically removes expired entries from storage.
+// Only runs if the storage backend implements the Cleaner interface.
+func (s *service) cleanupLoop() {
+	cleaner, ok := s.storage.(Cleaner)
+	if !ok {
+		// Storage doesn't support cleanup, nothing to do
+		return
+	}
+
+	// Use RecoveryTimeout as cleanup interval (reasonable default)
+	ticker := time.NewTicker(s.config.RecoveryTimeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			cleaner.Cleanup()
 
 		case <-s.stopCh:
 			return

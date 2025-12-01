@@ -43,3 +43,11 @@ type Storage interface {
 	// Close releases any resources held by the storage.
 	Close() error
 }
+
+// Cleaner is an optional interface that storage backends can implement
+// to support periodic cleanup of expired entries.
+type Cleaner interface {
+	// Cleanup removes expired entries from storage.
+	// This is called periodically by the service to prevent memory bloat.
+	Cleanup()
+}
