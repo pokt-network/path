@@ -158,12 +158,20 @@ func NewProtocol(
 		reputationLogger := shannonLogger.With("component", "reputation")
 
 		// Create storage based on configuration.
-		// Currently only memory storage is supported; Redis will be added in a future PR.
 		var store reputation.Storage
 		switch config.ReputationConfig.StorageType {
 		case "memory", "":
 			// Use recovery timeout as TTL for entries - expired entries get auto-cleaned
 			store = reputationstorage.NewMemoryStorage(config.ReputationConfig.RecoveryTimeout)
+		case "redis":
+			if config.ReputationConfig.Redis == nil {
+				return nil, fmt.Errorf("redis storage requires redis configuration")
+			}
+			redisStore, err := reputationstorage.NewRedisStorage(ctx, *config.ReputationConfig.Redis, config.ReputationConfig.RecoveryTimeout)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create redis storage: %w", err)
+			}
+			store = redisStore
 		default:
 			return nil, fmt.Errorf("unsupported reputation storage type: %s", config.ReputationConfig.StorageType)
 		}

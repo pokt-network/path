@@ -144,6 +144,78 @@ type Config struct {
 
 	// SyncConfig configures background synchronization behavior.
 	SyncConfig SyncConfig `yaml:"sync_config"`
+
+	// Redis holds Redis-specific configuration (only used when StorageType is "redis").
+	Redis *RedisConfig `yaml:"redis,omitempty"`
+}
+
+// RedisConfig holds Redis-specific configuration.
+type RedisConfig struct {
+	// Address is the Redis server address (host:port).
+	Address string `yaml:"address"`
+
+	// Password for Redis authentication (optional).
+	Password string `yaml:"password"`
+
+	// DB is the Redis database number.
+	DB int `yaml:"db"`
+
+	// KeyPrefix is prepended to all keys stored in Redis.
+	// Default: "path:reputation:"
+	KeyPrefix string `yaml:"key_prefix"`
+
+	// PoolSize is the maximum number of socket connections.
+	// Default: 10
+	PoolSize int `yaml:"pool_size"`
+
+	// DialTimeout is the timeout for establishing new connections.
+	// Default: 5s
+	DialTimeout time.Duration `yaml:"dial_timeout"`
+
+	// ReadTimeout is the timeout for socket reads.
+	// Default: 3s
+	ReadTimeout time.Duration `yaml:"read_timeout"`
+
+	// WriteTimeout is the timeout for socket writes.
+	// Default: 3s
+	WriteTimeout time.Duration `yaml:"write_timeout"`
+}
+
+// DefaultRedisConfig returns a RedisConfig with sensible defaults.
+func DefaultRedisConfig() RedisConfig {
+	return RedisConfig{
+		Address:      "localhost:6379",
+		Password:     "",
+		DB:           0,
+		KeyPrefix:    "path:reputation:",
+		PoolSize:     10,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	}
+}
+
+// HydrateDefaults fills in zero values with defaults.
+func (c *RedisConfig) HydrateDefaults() {
+	defaults := DefaultRedisConfig()
+	if c.Address == "" {
+		c.Address = defaults.Address
+	}
+	if c.KeyPrefix == "" {
+		c.KeyPrefix = defaults.KeyPrefix
+	}
+	if c.PoolSize == 0 {
+		c.PoolSize = defaults.PoolSize
+	}
+	if c.DialTimeout == 0 {
+		c.DialTimeout = defaults.DialTimeout
+	}
+	if c.ReadTimeout == 0 {
+		c.ReadTimeout = defaults.ReadTimeout
+	}
+	if c.WriteTimeout == 0 {
+		c.WriteTimeout = defaults.WriteTimeout
+	}
 }
 
 // SyncConfig configures background synchronization for the reputation system.
