@@ -82,6 +82,10 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 								},
 							},
 						},
+						SanctionConfig: shannonprotocol.SanctionConfig{
+							SessionSanctionDuration: 30 * time.Minute,
+							CacheCleanupInterval:    5 * time.Minute,
+						},
 					},
 				},
 				Router: RouterConfig{
