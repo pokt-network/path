@@ -146,6 +146,7 @@ shannon_config:
 | `gateway_private_key_hex`     | string   | Yes                      | -       | 64-character hex-encoded `secp256k1` gateway private key              |
 | `owned_apps_private_keys_hex` | string[] | Only in centralized mode | -       | List of 64-character hex-encoded `secp256k1` application private keys |
 | `service_fallback`            | array    | No                       | -       | Array of service fallback configurations (see below for details)      |
+| `sanction_config`             | object   | No                       | -       | Configuration for endpoint sanction system (see below for details)    |
 
 **`service_fallback` (optional)**
 
@@ -180,6 +181,33 @@ TODO_DOCUMENT(@adshmh): Update this section to clarify the request distribution 
 - **Send All
 - **Protocol bypass**: Fallback endpoints bypass protocol-level validation and are sent directly to the configured URLs
 - **Service-specific**: Each service ID can have its own set of fallback endpoints
+
+**`sanction_config` (optional)**
+
+Configures the endpoint sanction system parameters. The sanction system temporarily excludes misbehaving endpoints from selection. When an endpoint returns errors or behaves poorly, it receives a "session sanction" that prevents it from being selected for requests until the sanction expires.
+
+```yaml
+gateway_config:
+  # ... other fields ...
+  sanction_config:
+    session_sanction_duration: "30m"  # How long session sanctions last
+    cache_cleanup_interval: "5m"       # How often to purge expired sanctions
+```
+
+| Field                       | Type   | Required | Default | Description                                                                                              |
+| --------------------------- | ------ | -------- | ------- | -------------------------------------------------------------------------------------------------------- |
+| `session_sanction_duration` | string | No       | "1h"    | Duration that session-based sanctions remain active. Format: Go duration string (e.g., "30m", "1h", "2h") |
+| `cache_cleanup_interval`    | string | No       | "10m"   | Interval for purging expired sanction entries from the cache. Format: Go duration string                 |
+
+**Key Features:**
+- **Automatic expiration**: Session sanctions automatically expire after the configured duration
+- **Configurable timing**: Operators can tune sanction duration based on their network conditions
+- **Memory efficient**: Expired sanctions are periodically cleaned up to prevent memory bloat
+
+**Use Cases:**
+- **Shorter durations** (e.g., `15m`): Use when endpoints frequently have temporary issues and you want faster recovery
+- **Longer durations** (e.g., `2h`): Use when you want to more aggressively exclude problematic endpoints
+- **Default** (`1h`): Balanced approach suitable for most deployments
 
 ---
 

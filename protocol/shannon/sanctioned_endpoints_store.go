@@ -33,6 +33,9 @@ const (
 type sanctionedEndpointsStore struct {
 	logger polylog.Logger
 
+	// config holds the configurable parameters for the sanction system.
+	config SanctionConfig
+
 	// permanentSanctions:
 	//   - In-memory map of endpoints with permanent sanctions
 	//   - Persists for process lifetime (not on disk)
@@ -43,18 +46,23 @@ type sanctionedEndpointsStore struct {
 	// sessionSanctionsCache:
 	//   - Stores session-limited sanctions (auto-expire)
 	//   - Key: endpoint address (protocol.EndpointAddr) + session key
-	//   - Expire after defaultSessionSanctionExpiration
+	//   - Expire after config.SessionSanctionDuration (default: 1 hour)
 	//   - Lost on PATH process restart; not shared across instances
 	sessionSanctionsCache *cache.Cache
 }
 
 // newSanctionedEndpointsStore:
 //   - Instantiates a new sanctionedEndpointsStore with logging and caches
-func newSanctionedEndpointsStore(logger polylog.Logger) *sanctionedEndpointsStore {
+//   - Uses the provided SanctionConfig for session sanction duration and cache cleanup interval
+func newSanctionedEndpointsStore(logger polylog.Logger, config SanctionConfig) *sanctionedEndpointsStore {
+	// Hydrate defaults if not set
+	config = config.HydrateDefaults()
+
 	return &sanctionedEndpointsStore{
 		logger:                logger,
+		config:                config,
 		permanentSanctions:    make(map[protocol.EndpointAddr]sanction),
-		sessionSanctionsCache: cache.New(defaultSessionSanctionExpiration, defaultSanctionCacheCleanupInterval),
+		sessionSanctionsCache: cache.New(config.SessionSanctionDuration, config.CacheCleanupInterval),
 	}
 }
 
@@ -200,7 +208,7 @@ func (ses *sanctionedEndpointsStore) addPermanentSanction(
 
 // addSessionSanction:
 //   - Adds a session-based sanction for an endpoint
-//   - Sanction expires after defaultSessionSanctionExpiration
+//   - Sanction expires after config.SessionSanctionDuration (default: 1 hour)
 //   - Used for temporary issues (e.g., timeouts, connection problems)
 func (ses *sanctionedEndpointsStore) addSessionSanction(
 	endpoint endpoint,
@@ -208,7 +216,7 @@ func (ses *sanctionedEndpointsStore) addSessionSanction(
 ) {
 	sessionSanctionKey := buildSessionSanctionKey(endpoint)
 
-	ses.sessionSanctionsCache.Set(sessionSanctionKey.string(), sanction, defaultSessionSanctionExpiration)
+	ses.sessionSanctionsCache.Set(sessionSanctionKey.string(), sanction, ses.config.SessionSanctionDuration)
 }
 
 // isSanctioned checks if an endpoint has any active sanction (permanent or session-based)

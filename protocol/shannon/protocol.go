@@ -123,8 +123,8 @@ func NewProtocol(
 		// tracks sanctioned endpoints per RPC type
 		// currently only JSON_RPC and WEBSOCKET are supported
 		sanctionedEndpointsStores: map[sharedtypes.RPCType]*sanctionedEndpointsStore{
-			sharedtypes.RPCType_JSON_RPC:  newSanctionedEndpointsStore(logger),
-			sharedtypes.RPCType_WEBSOCKET: newSanctionedEndpointsStore(logger),
+			sharedtypes.RPCType_JSON_RPC:  newSanctionedEndpointsStore(logger, config.SanctionConfig),
+			sharedtypes.RPCType_WEBSOCKET: newSanctionedEndpointsStore(logger, config.SanctionConfig),
 		},
 
 		// ownedApps is the list of apps owned by the gateway operator
