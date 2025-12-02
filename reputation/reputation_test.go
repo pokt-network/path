@@ -227,3 +227,106 @@ func TestConfig_HydrateDefaults_IncludesSyncConfig(t *testing.T) {
 	require.Equal(t, DefaultWriteBufferSize, config.SyncConfig.WriteBufferSize)
 	require.Equal(t, DefaultFlushInterval, config.SyncConfig.FlushInterval)
 }
+
+func TestConfig_Validate(t *testing.T) {
+	tests := []struct {
+		name        string
+		config      Config
+		expectError bool
+		errContains string
+	}{
+		{
+			name: "valid config",
+			config: Config{
+				InitialScore:    80,
+				MinThreshold:    30,
+				RecoveryTimeout: 5 * time.Minute,
+			},
+			expectError: false,
+		},
+		{
+			name: "valid config with equal initial and threshold",
+			config: Config{
+				InitialScore: 50,
+				MinThreshold: 50,
+			},
+			expectError: false,
+		},
+		{
+			name: "valid config at boundaries",
+			config: Config{
+				InitialScore: MaxScore,
+				MinThreshold: MinScore,
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid - initial score below threshold",
+			config: Config{
+				InitialScore: 20,
+				MinThreshold: 50,
+			},
+			expectError: true,
+			errContains: "initial_score (20.0) must be >= min_threshold (50.0)",
+		},
+		{
+			name: "invalid - initial score below MinScore",
+			config: Config{
+				InitialScore: -10,
+				MinThreshold: 30,
+			},
+			expectError: true,
+			errContains: "initial_score (-10.0) must be between",
+		},
+		{
+			name: "invalid - initial score above MaxScore",
+			config: Config{
+				InitialScore: 150,
+				MinThreshold: 30,
+			},
+			expectError: true,
+			errContains: "initial_score (150.0) must be between",
+		},
+		{
+			name: "invalid - threshold below MinScore",
+			config: Config{
+				InitialScore: 80,
+				MinThreshold: -5,
+			},
+			expectError: true,
+			errContains: "min_threshold (-5.0) must be between",
+		},
+		{
+			name: "invalid - threshold above MaxScore",
+			config: Config{
+				InitialScore: 80,
+				MinThreshold: 110,
+			},
+			expectError: true,
+			errContains: "min_threshold (110.0) must be between",
+		},
+		{
+			name: "invalid - negative recovery timeout",
+			config: Config{
+				InitialScore:    80,
+				MinThreshold:    30,
+				RecoveryTimeout: -1 * time.Minute,
+			},
+			expectError: true,
+			errContains: "recovery_timeout must be non-negative",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+
+			if tt.expectError {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.errContains)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

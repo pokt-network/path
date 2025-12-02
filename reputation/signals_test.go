@@ -62,7 +62,7 @@ func TestNewRecoverySuccessSignal(t *testing.T) {
 	require.WithinDuration(t, time.Now(), signal.Timestamp, time.Second)
 
 	// Recovery success should have higher impact than regular success
-	require.Greater(t, signal.GetDefaultImpact(), ScoreImpact[SignalTypeSuccess],
+	require.Greater(t, signal.GetDefaultImpact(), GetScoreImpact(SignalTypeSuccess),
 		"recovery success should have higher impact than regular success")
 }
 
@@ -131,14 +131,14 @@ func TestSignal_IsPositive(t *testing.T) {
 	require.False(t, neutralSignal.IsNegative())
 }
 
-func TestScoreImpact_Values(t *testing.T) {
+func TestGetScoreImpact_Values(t *testing.T) {
 	// Verify impact values make sense relative to each other
-	successImpact := ScoreImpact[SignalTypeSuccess]
-	recoveryImpact := ScoreImpact[SignalTypeRecoverySuccess]
-	minorImpact := ScoreImpact[SignalTypeMinorError]
-	majorImpact := ScoreImpact[SignalTypeMajorError]
-	criticalImpact := ScoreImpact[SignalTypeCriticalError]
-	fatalImpact := ScoreImpact[SignalTypeFatalError]
+	successImpact := GetScoreImpact(SignalTypeSuccess)
+	recoveryImpact := GetScoreImpact(SignalTypeRecoverySuccess)
+	minorImpact := GetScoreImpact(SignalTypeMinorError)
+	majorImpact := GetScoreImpact(SignalTypeMajorError)
+	criticalImpact := GetScoreImpact(SignalTypeCriticalError)
+	fatalImpact := GetScoreImpact(SignalTypeFatalError)
 
 	// Success should be positive
 	require.Greater(t, successImpact, float64(0), "success should have positive impact")
@@ -152,4 +152,10 @@ func TestScoreImpact_Values(t *testing.T) {
 	require.Less(t, majorImpact, minorImpact, "major error should be worse than minor")
 	require.Less(t, criticalImpact, majorImpact, "critical error should be worse than major")
 	require.Less(t, fatalImpact, criticalImpact, "fatal error should be worse than critical")
+}
+
+func TestGetScoreImpact_UnknownType(t *testing.T) {
+	// Unknown signal types should return 0
+	require.Equal(t, float64(0), GetScoreImpact(SignalType("unknown")))
+	require.Equal(t, float64(0), GetScoreImpact(SignalType("")))
 }

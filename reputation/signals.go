@@ -111,9 +111,10 @@ func NewRecoverySuccessSignal(latency time.Duration) Signal {
 	}
 }
 
-// ScoreImpact defines the default score changes for each signal type.
-// These can be overridden by service-specific scoring rules.
-var ScoreImpact = map[SignalType]float64{
+// scoreImpact defines the default score changes for each signal type.
+// This map is unexported to prevent runtime modification.
+// Use GetScoreImpact() to retrieve values.
+var scoreImpact = map[SignalType]float64{
 	SignalTypeSuccess:         +1,  // Small positive impact
 	SignalTypeMinorError:      -3,  // Minor penalty
 	SignalTypeMajorError:      -10, // Moderate penalty
@@ -122,12 +123,18 @@ var ScoreImpact = map[SignalType]float64{
 	SignalTypeRecoverySuccess: +15, // Boosted recovery - allows faster climb back
 }
 
-// GetDefaultImpact returns the default score impact for a signal type.
-func (s Signal) GetDefaultImpact() float64 {
-	if impact, ok := ScoreImpact[s.Type]; ok {
+// GetScoreImpact returns the default score impact for a signal type.
+// Returns 0 if the signal type is not recognized.
+func GetScoreImpact(t SignalType) float64 {
+	if impact, ok := scoreImpact[t]; ok {
 		return impact
 	}
 	return 0
+}
+
+// GetDefaultImpact returns the default score impact for this signal.
+func (s Signal) GetDefaultImpact() float64 {
+	return GetScoreImpact(s.Type)
 }
 
 // IsPositive returns true if this signal has a positive impact on score.

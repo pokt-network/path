@@ -18,6 +18,8 @@ import (
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
+	reputationstorage "github.com/pokt-network/path/reputation/storage"
 )
 
 // gateway package's Protocol interface is fulfilled by the Protocol struct
@@ -86,6 +88,11 @@ type Protocol struct {
 	// All relays will be sent to a fixed URL.
 	// Allows measuring performance of PATH and full node(s) in isolation.
 	loadTestingConfig *LoadTestingConfig
+
+	// reputationService tracks endpoint reputation scores.
+	// If enabled, endpoints are filtered by score in addition to binary sanctions.
+	// When nil, only binary sanctions are used for endpoint filtering.
+	reputationService reputation.ReputationService
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -97,6 +104,7 @@ type serviceFallback struct {
 
 // NewProtocol instantiates an instance of the Shannon protocol integration.
 func NewProtocol(
+	ctx context.Context,
 	logger polylog.Logger,
 	config GatewayConfig,
 	fullNode FullNode,
@@ -142,6 +150,39 @@ func NewProtocol(
 
 		// load testing config, if specified.
 		loadTestingConfig: config.LoadTestingConfig,
+	}
+
+	// Initialize reputation service if enabled.
+	// When enabled, endpoints are filtered by reputation score in addition to binary sanctions.
+	if config.ReputationConfig.Enabled {
+		reputationLogger := shannonLogger.With("component", "reputation")
+
+		// Create storage based on configuration.
+		var store reputation.Storage
+		switch config.ReputationConfig.StorageType {
+		case "memory", "":
+			// Use recovery timeout as TTL for entries - expired entries get auto-cleaned
+			store = reputationstorage.NewMemoryStorage(config.ReputationConfig.RecoveryTimeout)
+		case "redis":
+			if config.ReputationConfig.Redis == nil {
+				return nil, fmt.Errorf("redis storage requires redis configuration")
+			}
+			redisStore, err := reputationstorage.NewRedisStorage(ctx, *config.ReputationConfig.Redis, config.ReputationConfig.RecoveryTimeout)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create redis storage: %w", err)
+			}
+			store = redisStore
+		default:
+			return nil, fmt.Errorf("unsupported reputation storage type: %s", config.ReputationConfig.StorageType)
+		}
+
+		reputationSvc := reputation.NewService(config.ReputationConfig, store)
+		if err := reputationSvc.Start(ctx); err != nil {
+			return nil, fmt.Errorf("failed to start reputation service: %w", err)
+		}
+
+		protocolInstance.reputationService = reputationSvc
+		reputationLogger.Info().Msg("Reputation service enabled and started")
 	}
 
 	return protocolInstance, nil
@@ -355,6 +396,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		fallbackEndpoints:  fallbackEndpoints,
 		loadTestingConfig:  p.loadTestingConfig,
 		relayPool:          p.relayPool,
+		reputationService:  p.reputationService,
 	}, protocolobservations.Observations{}, nil
 }
 
@@ -473,7 +515,7 @@ func (p *Protocol) getUniqueEndpoints(
 // If an endpoint matches a serviceID across multiple apps/sessions, only a single
 // entry matching one of the apps/sessions is returned.
 func (p *Protocol) getSessionsUniqueEndpoints(
-	_ context.Context,
+	ctx context.Context,
 	serviceID protocol.ServiceID,
 	activeSessions []sessiontypes.Session,
 	filterByRPCType sharedtypes.RPCType,
@@ -545,6 +587,26 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 			qualifiedEndpoints = filteredEndpoints
 
 			logger.Debug().Msgf("app %s has %d endpoints after filtering sanctioned endpoints.", app.Address, len(qualifiedEndpoints))
+		}
+
+		// Filter out low-reputation endpoints if reputation service is enabled.
+		// This provides gradual exclusion based on score in addition to binary sanctions.
+		if p.reputationService != nil {
+			beforeCount := len(qualifiedEndpoints)
+			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, logger)
+
+			if len(qualifiedEndpoints) == 0 {
+				logger.Warn().Msgf(
+					"⚠️ All %d endpoints below reputation threshold for service %s, app %s. SKIPPING the app.",
+					beforeCount, serviceID, app.Address,
+				)
+				continue
+			}
+
+			if beforeCount != len(qualifiedEndpoints) {
+				logger.Debug().Msgf("app %s has %d endpoints after filtering by reputation (was %d).",
+					app.Address, len(qualifiedEndpoints), beforeCount)
+			}
 		}
 
 		// Log the number of endpoints before and after filtering

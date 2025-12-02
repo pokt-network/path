@@ -64,8 +64,12 @@ func main() {
 	// Log the config path
 	logger.Info().Msgf("Starting PATH using config file: %s", configPath)
 
+	// Create a context for background services (pprof, hydrator, reputation) that can be canceled during shutdown.
+	// This context is used to signal graceful shutdown to all background goroutines.
+	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
+
 	// Create Shannon protocol instance (now the only supported protocol)
-	protocol, err := getShannonProtocol(logger, config.GetGatewayConfig())
+	protocol, err := getShannonProtocol(backgroundCtx, logger, config.GetGatewayConfig())
 	if err != nil {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to create protocol"}`, err)
 	}
@@ -81,10 +85,6 @@ func main() {
 	if err != nil {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start metrics server"}`, err)
 	}
-
-	// Create a context for background services (pprof, hydrator) that can be canceled during shutdown.
-	// This context is used to signal graceful shutdown to all background goroutines.
-	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
 
 	// Setup the pprof server with the background context for graceful shutdown
 	setupPprofServer(backgroundCtx, logger, pprofAddr)
