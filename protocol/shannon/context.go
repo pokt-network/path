@@ -20,9 +20,12 @@ import (
 	sdk "github.com/pokt-network/shannon-sdk"
 
 	"github.com/pokt-network/path/gateway"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
+	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 )
 
 // TODO_IMPROVE(@commoddity): Re-evaluate how much of this code should live in the shannon-sdk package.
@@ -123,6 +126,11 @@ type requestContext struct {
 	// relayPool is the shared worker pool for parallel relay processing.
 	// Passed from Protocol, used to create task groups for batch requests.
 	relayPool pond.Pool
+
+	// reputationService tracks endpoint reputation scores.
+	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
+	// When nil, only binary sanctions are used.
+	reputationService reputation.ReputationService
 }
 
 // HandleServiceRequest:
@@ -927,6 +935,29 @@ func (rc *requestContext) handleEndpointError(
 		rc.endpointObservations = append(rc.endpointObservations, endpointObs)
 	}
 
+	// Record reputation signal if reputation service is enabled.
+	// This provides gradual scoring in addition to binary sanctions.
+	if rc.reputationService != nil {
+		latency := time.Since(endpointQueryTime)
+		signal := mapErrorToSignal(endpointErrorType, recommendedSanctionType, latency)
+		endpointKey := reputation.NewEndpointKey(rc.serviceID, selectedEndpointAddr)
+
+		// Extract domain for metrics
+		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
+		if domainErr != nil {
+			endpointDomain = shannonmetrics.ErrDomain
+		}
+
+		// Fire-and-forget: don't block request on reputation recording
+		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
+			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for error")
+			reputationmetrics.RecordError("record_signal", "storage_error")
+		} else {
+			// Record signal metric on success
+			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
+		}
+	}
+
 	// Return error.
 	return protocol.Response{EndpointAddr: selectedEndpointAddr},
 		fmt.Errorf("relay: error sending relay for service %s endpoint %s: %w",
@@ -965,6 +996,29 @@ func (rc *requestContext) handleEndpointSuccess(
 		rc.observationsChan <- endpointObs
 	} else {
 		rc.endpointObservations = append(rc.endpointObservations, endpointObs)
+	}
+
+	// Record reputation signal if reputation service is enabled.
+	// Success signals have a small positive impact (+1) on score.
+	if rc.reputationService != nil {
+		latency := time.Since(endpointQueryTime)
+		signal := reputation.NewSuccessSignal(latency)
+		endpointKey := reputation.NewEndpointKey(rc.serviceID, selectedEndpoint.Addr())
+
+		// Extract domain for metrics
+		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
+		if domainErr != nil {
+			endpointDomain = shannonmetrics.ErrDomain
+		}
+
+		// Fire-and-forget: don't block request on reputation recording
+		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
+			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for success")
+			reputationmetrics.RecordError("record_signal", "storage_error")
+		} else {
+			// Record signal metric on success
+			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
+		}
 	}
 
 	// Return relay response received from endpoint.
