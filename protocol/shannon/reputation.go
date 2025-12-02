@@ -159,7 +159,7 @@ func (p *Protocol) filterByReputation(
 		return endpoints
 	}
 
-	keyBuilder := p.reputationService.KeyBuilder()
+	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
 
 	// Build endpoint keys for batch lookup
 	keys := make([]reputation.EndpointKey, 0, len(endpoints))

@@ -940,7 +940,7 @@ func (rc *requestContext) handleEndpointError(
 	if rc.reputationService != nil {
 		latency := time.Since(endpointQueryTime)
 		signal := mapErrorToSignal(endpointErrorType, recommendedSanctionType, latency)
-		endpointKey := rc.reputationService.KeyBuilder().BuildKey(rc.serviceID, selectedEndpointAddr)
+		endpointKey := rc.reputationService.KeyBuilderForService(rc.serviceID).BuildKey(rc.serviceID, selectedEndpointAddr)
 
 		// Extract domain for metrics
 		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
@@ -979,6 +979,8 @@ func (rc *requestContext) handleEndpointSuccess(
 	rc.logger.Debug().Msg("Successfully deserialized the response received from the selected endpoint.")
 
 	selectedEndpoint := rc.getSelectedEndpoint()
+	selectedEndpointAddr := selectedEndpoint.Addr()
+
 	// Build success observation with timing data and any RelayMinerError data from request context
 	endpointObs := buildEndpointSuccessObservation(
 		rc.logger,
@@ -1003,7 +1005,7 @@ func (rc *requestContext) handleEndpointSuccess(
 	if rc.reputationService != nil {
 		latency := time.Since(endpointQueryTime)
 		signal := reputation.NewSuccessSignal(latency)
-		endpointKey := rc.reputationService.KeyBuilder().BuildKey(rc.serviceID, selectedEndpoint.Addr())
+		endpointKey := rc.reputationService.KeyBuilderForService(rc.serviceID).BuildKey(rc.serviceID, selectedEndpointAddr)
 
 		// Extract domain for metrics
 		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())

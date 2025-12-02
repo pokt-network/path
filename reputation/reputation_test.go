@@ -131,14 +131,14 @@ func TestConfig_HydrateDefaults(t *testing.T) {
 			expectedGranularity: KeyGranularityEndpoint,
 		},
 		{
-			name: "per-service granularity preserved",
+			name: "per-domain granularity preserved",
 			input: Config{
-				KeyGranularity: KeyGranularityService,
+				KeyGranularity: KeyGranularityDomain,
 			},
 			expectedInit:        InitialScore,
 			expectedMin:         DefaultMinThreshold,
 			expectedType:        "memory",
-			expectedGranularity: KeyGranularityService,
+			expectedGranularity: KeyGranularityDomain,
 		},
 	}
 
@@ -348,7 +348,7 @@ func TestConfig_Validate(t *testing.T) {
 	}
 }
 
-func TestService_KeyBuilder(t *testing.T) {
+func TestService_KeyBuilderForService(t *testing.T) {
 	tests := []struct {
 		name               string
 		keyGranularity     string
@@ -365,9 +365,9 @@ func TestService_KeyBuilder(t *testing.T) {
 			expectedBuilderTyp: &SupplierKeyBuilder{},
 		},
 		{
-			name:               "per-service granularity",
-			keyGranularity:     KeyGranularityService,
-			expectedBuilderTyp: &ServiceKeyBuilder{},
+			name:               "per-domain granularity",
+			keyGranularity:     KeyGranularityDomain,
+			expectedBuilderTyp: &DomainKeyBuilder{},
 		},
 		{
 			name:               "empty defaults to per-endpoint",
@@ -391,8 +391,35 @@ func TestService_KeyBuilder(t *testing.T) {
 			store := newMockStorage()
 			svc := NewService(config, store)
 
-			builder := svc.KeyBuilder()
+			// KeyBuilderForService returns the default builder when no service overrides
+			builder := svc.KeyBuilderForService(protocol.ServiceID("eth"))
 			require.IsType(t, tt.expectedBuilderTyp, builder)
 		})
 	}
+}
+
+func TestService_KeyBuilderForService_WithOverrides(t *testing.T) {
+	// Test that service-specific overrides work correctly
+	config := Config{
+		Enabled:        true,
+		KeyGranularity: KeyGranularityEndpoint, // Default is per-endpoint
+		ServiceOverrides: map[string]ServiceConfig{
+			"eth": {KeyGranularity: KeyGranularityDomain},     // eth uses per-domain
+			"sol": {KeyGranularity: KeyGranularitySupplier},   // sol uses per-supplier
+		},
+	}
+	store := newMockStorage()
+	svc := NewService(config, store)
+
+	// eth should use per-domain
+	ethBuilder := svc.KeyBuilderForService(protocol.ServiceID("eth"))
+	require.IsType(t, &DomainKeyBuilder{}, ethBuilder)
+
+	// sol should use per-supplier
+	solBuilder := svc.KeyBuilderForService(protocol.ServiceID("sol"))
+	require.IsType(t, &SupplierKeyBuilder{}, solBuilder)
+
+	// poly (no override) should use default per-endpoint
+	polyBuilder := svc.KeyBuilderForService(protocol.ServiceID("poly"))
+	require.IsType(t, &EndpointKeyBuilder{}, polyBuilder)
 }

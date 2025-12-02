@@ -846,8 +846,8 @@ func TestReputation_KeyGranularityPerSupplier(t *testing.T) {
 	// One endpoint from a DIFFERENT supplier
 	endpoint3Addr := protocol.EndpointAddr("pokt1supplier2-https://node3.example.com")
 
-	// Get the key builder
-	keyBuilder := svc.KeyBuilder()
+	// Get the key builder for the service
+	keyBuilder := svc.KeyBuilderForService(serviceID)
 	require.IsType(t, &reputation.SupplierKeyBuilder{}, keyBuilder)
 
 	// Build keys - endpoints 1 and 2 should have the SAME key
@@ -891,20 +891,20 @@ func TestReputation_KeyGranularityPerSupplier(t *testing.T) {
 	t.Log("Verified: Per-supplier granularity correctly shares scores between endpoints from same supplier")
 }
 
-// TestReputation_KeyGranularityPerService verifies that when using per-service
-// granularity, all endpoints for a service share a single score.
-func TestReputation_KeyGranularityPerService(t *testing.T) {
+// TestReputation_KeyGranularityPerDomain verifies that when using per-domain
+// granularity, all endpoints from the same hosting domain share a single score.
+func TestReputation_KeyGranularityPerDomain(t *testing.T) {
 	ctx := context.Background()
 	logger := polyzero.NewLogger()
 
-	// Create reputation service with per-service granularity
+	// Create reputation service with per-domain granularity
 	config := reputation.Config{
 		Enabled:         true,
 		InitialScore:    80,
 		MinThreshold:    30,
 		RecoveryTimeout: 5 * time.Minute,
 		StorageType:     "memory",
-		KeyGranularity:  reputation.KeyGranularityService, // Per-service (coarsest)
+		KeyGranularity:  reputation.KeyGranularityDomain, // Per-domain
 	}
 	config.HydrateDefaults()
 
@@ -920,41 +920,37 @@ func TestReputation_KeyGranularityPerService(t *testing.T) {
 	}
 
 	serviceID := protocol.ServiceID("eth")
-	anotherServiceID := protocol.ServiceID("poly")
 
-	// Multiple endpoints from DIFFERENT suppliers for the SAME service
-	endpoint1Addr := protocol.EndpointAddr("pokt1supplier1-https://node1.example.com")
-	endpoint2Addr := protocol.EndpointAddr("pokt1supplier2-https://node2.example.com")
-	endpoint3Addr := protocol.EndpointAddr("pokt1supplier3-https://node3.example.com")
+	// Multiple endpoints from DIFFERENT suppliers but SAME hosting domain (nodefleet.net)
+	endpoint1Addr := protocol.EndpointAddr("pokt1supplier1-https://rm-01.eu.nodefleet.net")
+	endpoint2Addr := protocol.EndpointAddr("pokt1supplier2-https://rm-02.us.nodefleet.net")
+	// One endpoint from a DIFFERENT domain
+	endpoint3Addr := protocol.EndpointAddr("pokt1supplier3-https://relay.pokt.network")
 
-	// Get the key builder
-	keyBuilder := svc.KeyBuilder()
-	require.IsType(t, &reputation.ServiceKeyBuilder{}, keyBuilder)
+	// Get the key builder for the service
+	keyBuilder := svc.KeyBuilderForService(serviceID)
+	require.IsType(t, &reputation.DomainKeyBuilder{}, keyBuilder)
 
-	// Build keys - ALL endpoints for eth service should have the SAME key
+	// Build keys - endpoints 1 and 2 should have the SAME key (same domain)
 	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr)
 	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr)
 	key3 := keyBuilder.BuildKey(serviceID, endpoint3Addr)
-	keyOtherService := keyBuilder.BuildKey(anotherServiceID, endpoint1Addr)
 
-	// Verify all keys for the same service are equal
-	require.Equal(t, key1, key2, "All endpoints for same service should have same key")
-	require.Equal(t, key1, key3, "All endpoints for same service should have same key")
-	require.NotEqual(t, key1, keyOtherService, "Different services should have different keys")
+	// Verify keys 1 and 2 are the same (same domain: nodefleet.net)
+	require.Equal(t, key1, key2, "Endpoints from same domain should have same key")
+	require.NotEqual(t, key1, key3, "Endpoints from different domains should have different keys")
 
-	// Record critical errors on one endpoint - should affect ALL endpoints for the service
+	// Record critical errors on endpoint1 - this should affect endpoint2's score too (same domain)
 	for i := 0; i < 3; i++ {
 		err := svc.RecordSignal(ctx, key1, reputation.NewCriticalErrorSignal("service_error", 200*time.Millisecond))
 		require.NoError(t, err)
 	}
 
-	// Verify all endpoints share the same low score
-	score1, _ := svc.GetScore(ctx, key1)
-	score2, _ := svc.GetScore(ctx, key2)
-	score3, _ := svc.GetScore(ctx, key3)
-	require.Equal(t, score1.Value, score2.Value, "All service endpoints should share score")
-	require.Equal(t, score1.Value, score3.Value, "All service endpoints should share score")
-	require.Less(t, score1.Value, reputation.DefaultMinThreshold, "Score should be below threshold")
+	// Verify that endpoint2's score is also affected (since they share the domain key)
+	score2, err := svc.GetScore(ctx, key2)
+	require.NoError(t, err)
+	require.Less(t, score2.Value, reputation.DefaultMinThreshold,
+		"Endpoint2 should have low score because it shares domain with endpoint1")
 
 	// Create test endpoints for filtering
 	endpoints := map[protocol.EndpointAddr]endpoint{
@@ -966,10 +962,14 @@ func TestReputation_KeyGranularityPerService(t *testing.T) {
 	// Filter by reputation
 	filtered := p.filterByReputation(ctx, serviceID, endpoints, logger)
 
-	// ALL endpoints should be filtered out since they all share the same low score
-	require.Len(t, filtered, 0, "All endpoints should be filtered (share same service score)")
+	// Both endpoint1 and endpoint2 should be filtered out (same domain, same low score)
+	// endpoint3 should pass (different domain, new endpoint, initial score)
+	require.Len(t, filtered, 1)
+	require.Contains(t, filtered, endpoint3Addr, "Endpoint from different domain should pass")
+	require.NotContains(t, filtered, endpoint1Addr, "Endpoint1 should be filtered")
+	require.NotContains(t, filtered, endpoint2Addr, "Endpoint2 should be filtered (shares score via domain)")
 
-	t.Log("Verified: Per-service granularity correctly shares scores across all service endpoints")
+	t.Log("Verified: Per-domain granularity correctly shares scores between endpoints from same hosting domain")
 }
 
 // TestReputation_KeyGranularityDefault verifies that the default granularity
@@ -1007,8 +1007,8 @@ func TestReputation_KeyGranularityDefault(t *testing.T) {
 	endpoint1Addr := protocol.EndpointAddr("pokt1supplier1-https://node1.example.com")
 	endpoint2Addr := protocol.EndpointAddr("pokt1supplier1-https://node2.example.com")
 
-	// Get the key builder
-	keyBuilder := svc.KeyBuilder()
+	// Get the key builder for the service
+	keyBuilder := svc.KeyBuilderForService(serviceID)
 	require.IsType(t, &reputation.EndpointKeyBuilder{}, keyBuilder)
 
 	// Build keys - each endpoint should have a DIFFERENT key
