@@ -433,7 +433,12 @@ func (c *Config) Validate() error {
 }
 
 // Validate checks that the TieredSelectionConfig values are valid.
+// If tiered selection is disabled, no validation is performed.
 func (t *TieredSelectionConfig) Validate(minThreshold float64) error {
+	// Skip validation if tiered selection is disabled
+	if !t.Enabled {
+		return nil
+	}
 	if t.Tier1Threshold < MinScore || t.Tier1Threshold > MaxScore {
 		return fmt.Errorf("tier1_threshold (%.1f) must be between %.1f and %.1f", t.Tier1Threshold, MinScore, MaxScore)
 	}

@@ -2,7 +2,6 @@ package shannon
 
 import (
 	"context"
-	"math/rand"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -13,9 +12,6 @@ import (
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
 )
-
-// randIntn is a wrapper for math/rand.Intn to allow mocking in tests.
-var randIntn = rand.Intn
 
 // mapErrorToSignal maps a Shannon endpoint error type and sanction type to a reputation signal.
 // This bridges the existing error classification system with the new reputation system.
@@ -226,69 +222,6 @@ func extractEndpointDomain(url string, logger polylog.Logger) string {
 	return domain
 }
 
-// selectByTier selects an endpoint using tiered selection based on reputation scores.
-// It prefers endpoints from higher tiers (better reputation) and cascades down if needed.
-// If tiered selection is disabled or the reputation service is unavailable, falls back to random selection.
-// Returns the selected endpoint address and the endpoint struct.
-func (p *Protocol) selectByTier(
-	ctx context.Context,
-	serviceID protocol.ServiceID,
-	endpoints map[protocol.EndpointAddr]endpoint,
-	logger polylog.Logger,
-) (protocol.EndpointAddr, endpoint, error) {
-	// If no endpoints available, return error
-	if len(endpoints) == 0 {
-		return "", nil, reputation.ErrNoEndpointsAvailable
-	}
-
-	// If reputation service is not enabled, use random selection
-	if p.reputationService == nil {
-		return p.selectRandomEndpoint(endpoints)
-	}
-
-	// Get the tiered selector
-	selector := p.getTieredSelector()
-	if selector == nil || !selector.Config().Enabled {
-		// Tiered selection disabled, use random
-		addr, ep, err := p.selectRandomEndpoint(endpoints)
-		if err == nil {
-			reputationmetrics.RecordTierSelection(string(serviceID), 0)
-		}
-		return addr, ep, err
-	}
-
-	// Get scores for all endpoints
-	endpointScores, err := p.getEndpointScores(ctx, serviceID, endpoints, logger)
-	if err != nil {
-		// Fall back to random selection on error
-		logger.Warn().Err(err).Msg("Failed to get endpoint scores for tiered selection, using random")
-		addr, ep, err := p.selectRandomEndpoint(endpoints)
-		if err == nil {
-			reputationmetrics.RecordTierSelection(string(serviceID), 0)
-		}
-		return addr, ep, err
-	}
-
-	// Use tiered selector to pick an endpoint
-	selectedKey, tier, err := selector.SelectEndpoint(endpointScores)
-	if err != nil {
-		// No endpoints available in any tier (all below threshold)
-		logger.Warn().Err(err).Msg("No endpoints available in any tier")
-		return "", nil, err
-	}
-
-	// Record tier selection metric
-	reputationmetrics.RecordTierSelection(string(serviceID), tier)
-
-	// Log the selection
-	logger.Debug().
-		Str("endpoint", string(selectedKey.EndpointAddr)).
-		Int("tier", tier).
-		Msg("Selected endpoint using tiered selection")
-
-	return selectedKey.EndpointAddr, endpoints[selectedKey.EndpointAddr], nil
-}
-
 // getEndpointScores retrieves reputation scores for all endpoints and returns them
 // as a map suitable for the TieredSelector.
 func (p *Protocol) getEndpointScores(
@@ -323,32 +256,6 @@ func (p *Protocol) getEndpointScores(
 	}
 
 	return result, nil
-}
-
-// selectRandomEndpoint selects a random endpoint from the map.
-func (p *Protocol) selectRandomEndpoint(endpoints map[protocol.EndpointAddr]endpoint) (protocol.EndpointAddr, endpoint, error) {
-	if len(endpoints) == 0 {
-		return "", nil, reputation.ErrNoEndpointsAvailable
-	}
-
-	// Collect keys
-	addrs := make([]protocol.EndpointAddr, 0, len(endpoints))
-	for addr := range endpoints {
-		addrs = append(addrs, addr)
-	}
-
-	// Random selection (using math/rand)
-	idx := randIntn(len(addrs))
-	addr := addrs[idx]
-	return addr, endpoints[addr], nil
-}
-
-// getTieredSelector returns the tiered selector if reputation is enabled and configured.
-func (p *Protocol) getTieredSelector() *reputation.TieredSelector {
-	if p.reputationService == nil {
-		return nil
-	}
-	return p.tieredSelector
 }
 
 // getReputationMinThreshold returns the configured minimum reputation threshold.

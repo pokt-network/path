@@ -1046,3 +1046,182 @@ func TestReputation_KeyGranularityDefault(t *testing.T) {
 
 	t.Log("Verified: Per-endpoint granularity treats each endpoint independently")
 }
+
+// =============================================================================
+// determineReputationSignal Tests
+// =============================================================================
+
+// TestDetermineReputationSignal_SingleSuccess verifies that a successful
+// JSON-RPC response returns a success signal.
+func TestDetermineReputationSignal_SingleSuccess(t *testing.T) {
+	logger := polyzero.NewLogger()
+	rc := &requestContext{logger: logger}
+
+	// Valid JSON-RPC success response
+	responseBytes := []byte(`{"jsonrpc":"2.0","id":1,"result":"0x1234"}`)
+	latency := 100 * time.Millisecond
+
+	signal := rc.determineReputationSignal(responseBytes, latency)
+	require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
+	require.Equal(t, latency, signal.Latency)
+}
+
+// TestDetermineReputationSignal_SingleError verifies that a JSON-RPC error
+// response returns a minor error signal.
+func TestDetermineReputationSignal_SingleError(t *testing.T) {
+	logger := polyzero.NewLogger()
+	rc := &requestContext{logger: logger}
+
+	// JSON-RPC error response
+	responseBytes := []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}`)
+	latency := 100 * time.Millisecond
+
+	signal := rc.determineReputationSignal(responseBytes, latency)
+	require.Equal(t, reputation.SignalTypeMinorError, signal.Type)
+	require.Equal(t, "jsonrpc_error", signal.Reason)
+}
+
+// TestDetermineReputationSignal_BatchAllSuccess verifies that a batch
+// response with all successful items returns a success signal.
+func TestDetermineReputationSignal_BatchAllSuccess(t *testing.T) {
+	logger := polyzero.NewLogger()
+	rc := &requestContext{logger: logger}
+
+	// Batch JSON-RPC success response
+	responseBytes := []byte(`[
+		{"jsonrpc":"2.0","id":1,"result":"0x1234"},
+		{"jsonrpc":"2.0","id":2,"result":"0x5678"},
+		{"jsonrpc":"2.0","id":3,"result":"0x9abc"}
+	]`)
+	latency := 150 * time.Millisecond
+
+	signal := rc.determineReputationSignal(responseBytes, latency)
+	require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
+	require.Equal(t, latency, signal.Latency)
+}
+
+// TestDetermineReputationSignal_BatchWithError verifies that a batch
+// response containing any error returns a minor error signal.
+func TestDetermineReputationSignal_BatchWithError(t *testing.T) {
+	logger := polyzero.NewLogger()
+	rc := &requestContext{logger: logger}
+
+	// Batch with one error
+	responseBytes := []byte(`[
+		{"jsonrpc":"2.0","id":1,"result":"0x1234"},
+		{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Invalid params"}},
+		{"jsonrpc":"2.0","id":3,"result":"0x9abc"}
+	]`)
+	latency := 150 * time.Millisecond
+
+	signal := rc.determineReputationSignal(responseBytes, latency)
+	require.Equal(t, reputation.SignalTypeMinorError, signal.Type)
+	require.Equal(t, "jsonrpc_batch_error", signal.Reason)
+}
+
+// TestDetermineReputationSignal_BatchAllErrors verifies that a batch
+// response with all errors returns a minor error signal.
+func TestDetermineReputationSignal_BatchAllErrors(t *testing.T) {
+	logger := polyzero.NewLogger()
+	rc := &requestContext{logger: logger}
+
+	// Batch with all errors
+	responseBytes := []byte(`[
+		{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}},
+		{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Invalid params"}}
+	]`)
+	latency := 150 * time.Millisecond
+
+	signal := rc.determineReputationSignal(responseBytes, latency)
+	require.Equal(t, reputation.SignalTypeMinorError, signal.Type)
+	require.Equal(t, "jsonrpc_batch_error", signal.Reason)
+}
+
+// TestDetermineReputationSignal_EmptyResponse verifies that an empty
+// response is treated as success (HTTP worked).
+func TestDetermineReputationSignal_EmptyResponse(t *testing.T) {
+	logger := polyzero.NewLogger()
+	rc := &requestContext{logger: logger}
+
+	latency := 50 * time.Millisecond
+
+	tests := []struct {
+		name     string
+		response []byte
+	}{
+		{"nil response", nil},
+		{"empty slice", []byte{}},
+		{"whitespace only", []byte("   \n\t  ")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signal := rc.determineReputationSignal(tt.response, latency)
+			require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
+		})
+	}
+}
+
+// TestDetermineReputationSignal_NonJSONResponse verifies that non-JSON
+// responses are treated as success (HTTP worked, format is different).
+func TestDetermineReputationSignal_NonJSONResponse(t *testing.T) {
+	logger := polyzero.NewLogger()
+	rc := &requestContext{logger: logger}
+
+	latency := 75 * time.Millisecond
+
+	tests := []struct {
+		name     string
+		response []byte
+	}{
+		{"plain text", []byte("Hello, World!")},
+		{"html", []byte("<html><body>Error</body></html>")},
+		{"invalid json", []byte("{invalid json")},
+		{"partial json", []byte(`{"key": "value`)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signal := rc.determineReputationSignal(tt.response, latency)
+			require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
+		})
+	}
+}
+
+// TestDetermineReputationSignal_ValidJSONNotJSONRPC verifies that valid JSON
+// that is not a JSON-RPC response is treated as success.
+func TestDetermineReputationSignal_ValidJSONNotJSONRPC(t *testing.T) {
+	logger := polyzero.NewLogger()
+	rc := &requestContext{logger: logger}
+
+	latency := 100 * time.Millisecond
+
+	tests := []struct {
+		name     string
+		response []byte
+	}{
+		{"generic object", []byte(`{"status":"ok","data":123}`)},
+		{"array of numbers", []byte(`[1, 2, 3, 4, 5]`)},
+		{"nested object", []byte(`{"outer":{"inner":"value"}}`)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signal := rc.determineReputationSignal(tt.response, latency)
+			require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
+		})
+	}
+}
+
+// TestDetermineReputationSignal_EmptyBatch verifies that an empty batch
+// response is treated as success.
+func TestDetermineReputationSignal_EmptyBatch(t *testing.T) {
+	logger := polyzero.NewLogger()
+	rc := &requestContext{logger: logger}
+
+	responseBytes := []byte(`[]`)
+	latency := 100 * time.Millisecond
+
+	signal := rc.determineReputationSignal(responseBytes, latency)
+	require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
+}
