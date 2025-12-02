@@ -76,6 +76,24 @@ const (
 	DefaultMinThreshold float64 = 30
 )
 
+// Key granularity options determine how endpoints are grouped for scoring.
+const (
+	// KeyGranularityEndpoint scores each endpoint URL separately (finest granularity).
+	// Key format: serviceID:supplierAddr-endpointURL
+	// This is the default behavior.
+	KeyGranularityEndpoint = "per-endpoint"
+
+	// KeyGranularitySupplier scores all endpoints from the same supplier together.
+	// Key format: serviceID:supplierAddr
+	// Use when a supplier's overall reliability matters more than individual endpoints.
+	KeyGranularitySupplier = "per-supplier"
+
+	// KeyGranularityService scores all endpoints for a service together (coarsest).
+	// Key format: serviceID
+	// Use for services with few endpoints or when treating the service as a unit.
+	KeyGranularityService = "per-service"
+)
+
 // ReputationService provides endpoint reputation tracking and querying.
 // Implementations must be safe for concurrent use.
 //
@@ -110,6 +128,10 @@ type ReputationService interface {
 	// Used for administrative purposes or testing.
 	ResetScore(ctx context.Context, key EndpointKey) error
 
+	// KeyBuilder returns the KeyBuilder configured for this service.
+	// Use this to create EndpointKeys with the appropriate granularity.
+	KeyBuilder() KeyBuilder
+
 	// Start begins background sync processes (e.g., Redis pub/sub, periodic refresh).
 	// Should be called once during initialization.
 	Start(ctx context.Context) error
@@ -141,6 +163,11 @@ type Config struct {
 	// StorageType specifies the storage backend ("memory" or "redis").
 	// Default: "memory"
 	StorageType string `yaml:"storage_type"`
+
+	// KeyGranularity determines how endpoints are grouped for scoring.
+	// Options: "per-endpoint" (default), "per-supplier", "per-service"
+	// Default: "per-endpoint"
+	KeyGranularity string `yaml:"key_granularity"`
 
 	// SyncConfig configures background synchronization behavior.
 	SyncConfig SyncConfig `yaml:"sync_config"`
@@ -258,6 +285,7 @@ func DefaultConfig() Config {
 		MinThreshold:    DefaultMinThreshold,
 		RecoveryTimeout: DefaultRecoveryTimeout,
 		StorageType:     "memory",
+		KeyGranularity:  KeyGranularityEndpoint,
 		SyncConfig:      DefaultSyncConfig(),
 	}
 }
@@ -284,6 +312,9 @@ func (c *Config) HydrateDefaults() {
 	}
 	if c.StorageType == "" {
 		c.StorageType = "memory"
+	}
+	if c.KeyGranularity == "" {
+		c.KeyGranularity = KeyGranularityEndpoint
 	}
 	c.SyncConfig.HydrateDefaults()
 }

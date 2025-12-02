@@ -10,8 +10,9 @@ import (
 // All reads are served from local cache (<1μs), writes update cache immediately
 // and queue async writes to backend storage.
 type service struct {
-	config  Config
-	storage Storage
+	config     Config
+	storage    Storage
+	keyBuilder KeyBuilder
 
 	// Local cache for fast reads
 	mu    sync.RWMutex
@@ -38,12 +39,13 @@ func NewService(config Config, store Storage) ReputationService {
 	config.HydrateDefaults()
 
 	return &service{
-		config:    config,
-		storage:   store,
-		cache:     make(map[string]Score),
-		writeCh:   make(chan writeRequest, config.SyncConfig.WriteBufferSize),
-		stopCh:    make(chan struct{}),
-		stoppedCh: make(chan struct{}),
+		config:     config,
+		storage:    store,
+		keyBuilder: NewKeyBuilder(config.KeyGranularity),
+		cache:      make(map[string]Score),
+		writeCh:    make(chan writeRequest, config.SyncConfig.WriteBufferSize),
+		stopCh:     make(chan struct{}),
+		stoppedCh:  make(chan struct{}),
 	}
 }
 
@@ -247,6 +249,12 @@ func (s *service) ResetScore(ctx context.Context, key EndpointKey) error {
 	}
 
 	return nil
+}
+
+// KeyBuilder returns the KeyBuilder configured for this service.
+// Use this to create EndpointKeys with the appropriate granularity.
+func (s *service) KeyBuilder() KeyBuilder {
+	return s.keyBuilder
 }
 
 // Start begins background sync processes.

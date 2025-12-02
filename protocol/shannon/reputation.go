@@ -159,10 +159,12 @@ func (p *Protocol) filterByReputation(
 		return endpoints
 	}
 
+	keyBuilder := p.reputationService.KeyBuilder()
+
 	// Build endpoint keys for batch lookup
 	keys := make([]reputation.EndpointKey, 0, len(endpoints))
 	for addr := range endpoints {
-		keys = append(keys, reputation.NewEndpointKey(serviceID, addr))
+		keys = append(keys, keyBuilder.BuildKey(serviceID, addr))
 	}
 
 	// Get scores for all endpoints in a single call
@@ -176,7 +178,7 @@ func (p *Protocol) filterByReputation(
 	// Filter endpoints below threshold
 	filtered := make(map[protocol.EndpointAddr]endpoint, len(endpoints))
 	for addr, ep := range endpoints {
-		key := reputation.NewEndpointKey(serviceID, addr)
+		key := keyBuilder.BuildKey(serviceID, addr)
 		score, exists := scores[key]
 
 		// Extract domain for metrics

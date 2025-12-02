@@ -93,6 +93,7 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 							InitialScore:    80,
 							MinThreshold:    30,
 							RecoveryTimeout: 5 * time.Minute,
+							KeyGranularity:  reputation.KeyGranularityEndpoint,
 						},
 					},
 				},

@@ -940,7 +940,7 @@ func (rc *requestContext) handleEndpointError(
 	if rc.reputationService != nil {
 		latency := time.Since(endpointQueryTime)
 		signal := mapErrorToSignal(endpointErrorType, recommendedSanctionType, latency)
-		endpointKey := reputation.NewEndpointKey(rc.serviceID, selectedEndpointAddr)
+		endpointKey := rc.reputationService.KeyBuilder().BuildKey(rc.serviceID, selectedEndpointAddr)
 
 		// Extract domain for metrics
 		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
@@ -1003,7 +1003,7 @@ func (rc *requestContext) handleEndpointSuccess(
 	if rc.reputationService != nil {
 		latency := time.Since(endpointQueryTime)
 		signal := reputation.NewSuccessSignal(latency)
-		endpointKey := reputation.NewEndpointKey(rc.serviceID, selectedEndpoint.Addr())
+		endpointKey := rc.reputationService.KeyBuilder().BuildKey(rc.serviceID, selectedEndpoint.Addr())
 
 		// Extract domain for metrics
 		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())

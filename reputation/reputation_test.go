@@ -92,38 +92,53 @@ func TestScore_IsValid(t *testing.T) {
 
 func TestConfig_HydrateDefaults(t *testing.T) {
 	tests := []struct {
-		name         string
-		input        Config
-		expectedInit float64
-		expectedMin  float64
-		expectedType string
+		name                string
+		input               Config
+		expectedInit        float64
+		expectedMin         float64
+		expectedType        string
+		expectedGranularity string
 	}{
 		{
-			name:         "empty config gets all defaults",
-			input:        Config{},
-			expectedInit: InitialScore,
-			expectedMin:  DefaultMinThreshold,
-			expectedType: "memory",
+			name:                "empty config gets all defaults",
+			input:               Config{},
+			expectedInit:        InitialScore,
+			expectedMin:         DefaultMinThreshold,
+			expectedType:        "memory",
+			expectedGranularity: KeyGranularityEndpoint,
 		},
 		{
 			name: "custom values preserved",
 			input: Config{
-				InitialScore: 90,
-				MinThreshold: 40,
-				StorageType:  "redis",
+				InitialScore:   90,
+				MinThreshold:   40,
+				StorageType:    "redis",
+				KeyGranularity: KeyGranularitySupplier,
 			},
-			expectedInit: 90,
-			expectedMin:  40,
-			expectedType: "redis",
+			expectedInit:        90,
+			expectedMin:         40,
+			expectedType:        "redis",
+			expectedGranularity: KeyGranularitySupplier,
 		},
 		{
 			name: "partial config - only initial score set",
 			input: Config{
 				InitialScore: 75,
 			},
-			expectedInit: 75,
-			expectedMin:  DefaultMinThreshold,
-			expectedType: "memory",
+			expectedInit:        75,
+			expectedMin:         DefaultMinThreshold,
+			expectedType:        "memory",
+			expectedGranularity: KeyGranularityEndpoint,
+		},
+		{
+			name: "per-service granularity preserved",
+			input: Config{
+				KeyGranularity: KeyGranularityService,
+			},
+			expectedInit:        InitialScore,
+			expectedMin:         DefaultMinThreshold,
+			expectedType:        "memory",
+			expectedGranularity: KeyGranularityService,
 		},
 	}
 
@@ -134,6 +149,7 @@ func TestConfig_HydrateDefaults(t *testing.T) {
 			require.Equal(t, tt.expectedInit, tt.input.InitialScore)
 			require.Equal(t, tt.expectedMin, tt.input.MinThreshold)
 			require.Equal(t, tt.expectedType, tt.input.StorageType)
+			require.Equal(t, tt.expectedGranularity, tt.input.KeyGranularity)
 		})
 	}
 }
@@ -146,6 +162,7 @@ func TestDefaultConfig(t *testing.T) {
 	require.Equal(t, DefaultMinThreshold, config.MinThreshold)
 	require.Equal(t, DefaultRecoveryTimeout, config.RecoveryTimeout)
 	require.Equal(t, "memory", config.StorageType)
+	require.Equal(t, KeyGranularityEndpoint, config.KeyGranularity)
 
 	// Verify SyncConfig defaults are included
 	require.Equal(t, DefaultRefreshInterval, config.SyncConfig.RefreshInterval)
@@ -327,6 +344,55 @@ func TestConfig_Validate(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+		})
+	}
+}
+
+func TestService_KeyBuilder(t *testing.T) {
+	tests := []struct {
+		name               string
+		keyGranularity     string
+		expectedBuilderTyp interface{}
+	}{
+		{
+			name:               "per-endpoint granularity",
+			keyGranularity:     KeyGranularityEndpoint,
+			expectedBuilderTyp: &EndpointKeyBuilder{},
+		},
+		{
+			name:               "per-supplier granularity",
+			keyGranularity:     KeyGranularitySupplier,
+			expectedBuilderTyp: &SupplierKeyBuilder{},
+		},
+		{
+			name:               "per-service granularity",
+			keyGranularity:     KeyGranularityService,
+			expectedBuilderTyp: &ServiceKeyBuilder{},
+		},
+		{
+			name:               "empty defaults to per-endpoint",
+			keyGranularity:     "",
+			expectedBuilderTyp: &EndpointKeyBuilder{},
+		},
+		{
+			name:               "invalid defaults to per-endpoint",
+			keyGranularity:     "invalid-value",
+			expectedBuilderTyp: &EndpointKeyBuilder{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := Config{
+				Enabled:        true,
+				KeyGranularity: tt.keyGranularity,
+			}
+			// Use the existing mockStorage from service_test.go
+			store := newMockStorage()
+			svc := NewService(config, store)
+
+			builder := svc.KeyBuilder()
+			require.IsType(t, tt.expectedBuilderTyp, builder)
 		})
 	}
 }
