@@ -92,7 +92,8 @@ shannon_config:
       # Default: false (only binary sanctions are used)
       enabled: true
       # Storage backend for reputation data
-      # Currently only "memory" is supported
+      # Options: "memory" (single instance) or "redis" (multi-instance deployments)
+      # Default: "memory"
       storage_type: "memory"
       # Starting score for new endpoints (0-100 scale)
       # Default: 80
@@ -104,6 +105,16 @@ shannon_config:
       # Time after which inactive endpoint scores can be re-evaluated
       # Default: 5m
       recovery_timeout: 5m
+      # Redis configuration (only used when storage_type is "redis")
+      # redis:
+      #   address: "localhost:6379"
+      #   password: ""
+      #   db: 0
+      #   key_prefix: "path:reputation:"
+      #   pool_size: 10
+      #   dial_timeout: 5s
+      #   read_timeout: 3s
+      #   write_timeout: 3s
 
 # Optional logger configuration
 logger_config:

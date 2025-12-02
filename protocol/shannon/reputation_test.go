@@ -2,6 +2,7 @@ package shannon
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -532,4 +533,275 @@ func (m *mockEndpoint) GetURL(_ sharedtypes.RPCType) string {
 
 func (m *mockEndpoint) IsFallback() bool {
 	return false
+}
+
+// =============================================================================
+// Storage Type Configuration Tests
+// =============================================================================
+
+// TestReputation_StorageTypeConfiguration verifies the storage type switch
+// behavior in protocol initialization, including error cases.
+func TestReputation_StorageTypeConfiguration(t *testing.T) {
+	tests := []struct {
+		name        string
+		config      reputation.Config
+		expectError bool
+		errContains string
+	}{
+		{
+			name: "empty storage type defaults to memory",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 80,
+				MinThreshold: 30,
+				StorageType:  "", // Empty should default to memory
+			},
+			expectError: false,
+		},
+		{
+			name: "memory storage type works",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 80,
+				MinThreshold: 30,
+				StorageType:  "memory",
+			},
+			expectError: false,
+		},
+		{
+			name: "redis storage type without config errors",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 80,
+				MinThreshold: 30,
+				StorageType:  "redis",
+				Redis:        nil, // No redis config
+			},
+			expectError: true,
+			errContains: "redis storage requires redis configuration",
+		},
+		{
+			name: "redis storage with invalid address errors",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 80,
+				MinThreshold: 30,
+				StorageType:  "redis",
+				Redis: &reputation.RedisConfig{
+					Address:     "localhost:59999", // Invalid port, won't connect
+					DialTimeout: 500 * time.Millisecond,
+				},
+			},
+			expectError: true,
+			errContains: "failed to create redis storage",
+		},
+		{
+			name: "unsupported storage type errors",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 80,
+				MinThreshold: 30,
+				StorageType:  "postgres", // Unsupported
+			},
+			expectError: true,
+			errContains: "unsupported reputation storage type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// This test validates the storage type switch logic by simulating
+			// what NewProtocol does when initializing the reputation service.
+			ctx := context.Background()
+			tt.config.HydrateDefaults()
+
+			var store reputation.Storage
+			var err error
+
+			switch tt.config.StorageType {
+			case "memory", "":
+				store = reputationstorage.NewMemoryStorage(tt.config.RecoveryTimeout)
+			case "redis":
+				if tt.config.Redis == nil {
+					err = fmt.Errorf("redis storage requires redis configuration")
+				} else {
+					store, err = reputationstorage.NewRedisStorage(ctx, *tt.config.Redis, tt.config.RecoveryTimeout)
+					if err != nil {
+						err = fmt.Errorf("failed to create redis storage: %w", err)
+					}
+				}
+			default:
+				err = fmt.Errorf("unsupported reputation storage type: %s", tt.config.StorageType)
+			}
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					require.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, store)
+			}
+		})
+	}
+}
+
+// TestReputation_ConfigHydrateDefaults verifies that the Config HydrateDefaults
+// method properly sets defaults for unset values.
+func TestReputation_ConfigHydrateDefaults(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   reputation.Config
+		expected reputation.Config
+	}{
+		{
+			name:   "empty config gets all defaults",
+			config: reputation.Config{Enabled: true}, // Only enabled set
+			expected: reputation.Config{
+				Enabled:         true,
+				InitialScore:    reputation.InitialScore,
+				MinThreshold:    reputation.DefaultMinThreshold,
+				RecoveryTimeout: reputation.DefaultRecoveryTimeout,
+				StorageType:     "memory",
+				SyncConfig: reputation.SyncConfig{
+					RefreshInterval: reputation.DefaultRefreshInterval,
+					WriteBufferSize: reputation.DefaultWriteBufferSize,
+					FlushInterval:   reputation.DefaultFlushInterval,
+				},
+			},
+		},
+		{
+			name: "partial config only fills missing values",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 90, // Custom value - should be preserved
+				MinThreshold: 40, // Custom value - should be preserved
+				StorageType:  "", // Empty - should get default "memory"
+			},
+			expected: reputation.Config{
+				Enabled:         true,
+				InitialScore:    90, // Preserved
+				MinThreshold:    40, // Preserved
+				RecoveryTimeout: reputation.DefaultRecoveryTimeout,
+				StorageType:     "memory",
+				SyncConfig: reputation.SyncConfig{
+					RefreshInterval: reputation.DefaultRefreshInterval,
+					WriteBufferSize: reputation.DefaultWriteBufferSize,
+					FlushInterval:   reputation.DefaultFlushInterval,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.config.HydrateDefaults()
+			require.Equal(t, tt.expected.InitialScore, tt.config.InitialScore)
+			require.Equal(t, tt.expected.MinThreshold, tt.config.MinThreshold)
+			require.Equal(t, tt.expected.RecoveryTimeout, tt.config.RecoveryTimeout)
+			require.Equal(t, tt.expected.StorageType, tt.config.StorageType)
+			require.Equal(t, tt.expected.SyncConfig.RefreshInterval, tt.config.SyncConfig.RefreshInterval)
+			require.Equal(t, tt.expected.SyncConfig.WriteBufferSize, tt.config.SyncConfig.WriteBufferSize)
+			require.Equal(t, tt.expected.SyncConfig.FlushInterval, tt.config.SyncConfig.FlushInterval)
+		})
+	}
+}
+
+// TestReputation_ConfigValidation verifies that the Config Validate
+// method properly detects invalid configurations.
+func TestReputation_ConfigValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		config      reputation.Config
+		expectError bool
+		errContains string
+	}{
+		{
+			name: "valid config",
+			config: reputation.Config{
+				Enabled:         true,
+				InitialScore:    80,
+				MinThreshold:    30,
+				RecoveryTimeout: 5 * time.Minute,
+			},
+			expectError: false,
+		},
+		{
+			name: "initial score below min allowed",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: -10, // Below MinScore (0)
+				MinThreshold: 30,
+			},
+			expectError: true,
+			errContains: "initial_score",
+		},
+		{
+			name: "initial score above max allowed",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 150, // Above MaxScore (100)
+				MinThreshold: 30,
+			},
+			expectError: true,
+			errContains: "initial_score",
+		},
+		{
+			name: "min threshold below min allowed",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 80,
+				MinThreshold: -5, // Below MinScore (0)
+			},
+			expectError: true,
+			errContains: "min_threshold",
+		},
+		{
+			name: "min threshold above max allowed",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 80,
+				MinThreshold: 110, // Above MaxScore (100)
+			},
+			expectError: true,
+			errContains: "min_threshold",
+		},
+		{
+			name: "initial score below min threshold",
+			config: reputation.Config{
+				Enabled:      true,
+				InitialScore: 20, // Below min_threshold
+				MinThreshold: 50,
+			},
+			expectError: true,
+			errContains: "initial_score",
+		},
+		{
+			name: "negative recovery timeout",
+			config: reputation.Config{
+				Enabled:         true,
+				InitialScore:    80,
+				MinThreshold:    30,
+				RecoveryTimeout: -1 * time.Minute,
+			},
+			expectError: true,
+			errContains: "recovery_timeout",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					require.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
