@@ -273,7 +273,8 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		err = fmt.Errorf("%w: selected endpoint does not support websocket RPC type: %s", errCreatingWebSocketConnection, err.Error())
 		wrc.logger.Error().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
 
-		// Record critical error signal - endpoint doesn't support required RPC type
+		// Record critical error signal - endpoint doesn't support required RPC type.
+		// Latency=0 indicates this is a setup/configuration error, not a response time measurement.
 		wrc.recordWebsocketSignal(reputation.NewCriticalErrorSignal("ws_url_not_supported", 0))
 		connectionObservationChan <- getWebsocketConnectionErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, err)
 
@@ -287,7 +288,8 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		err = fmt.Errorf("%w: failed to get websocket connection headers: %s", errCreatingWebSocketConnection, err.Error())
 		wrc.logger.Error().Err(err).Msg("❌ Failed to get websocket connection headers")
 
-		// Record major error signal - header construction failed
+		// Record major error signal - header construction failed.
+		// Latency=0 indicates this is a setup error, not a response time measurement.
 		wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_headers_failed", 0))
 		connectionObservationChan <- getWebsocketConnectionErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, err)
 
@@ -310,7 +312,8 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		err = fmt.Errorf("%w: failed to start websocket bridge: %s", errCreatingWebSocketConnection, err.Error())
 		wrc.logger.Error().Err(err).Msg("❌ Failed to start Websocket bridge")
 
-		// Record major error signal - connection establishment failed
+		// Record major error signal - connection establishment failed.
+		// Latency=0 indicates this is a connection setup error, not a response time measurement.
 		wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_connection_failed", 0))
 		connectionObservationChan <- getWebsocketConnectionErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, err)
 

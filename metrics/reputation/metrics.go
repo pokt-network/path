@@ -44,6 +44,10 @@ var (
 	//   - signal_type: Type of signal (success, minor_error, major_error, critical_error, fatal_error)
 	//   - endpoint_domain: Effective TLD+1 domain extracted from endpoint URL
 	//
+	// CARDINALITY WARNING: The endpoint_domain label can have high cardinality
+	// in deployments with many unique supplier domains. Monitor Prometheus memory
+	// usage and consider aggregating metrics if cardinality exceeds ~1000 unique domains.
+	//
 	// Use to analyze:
 	//   - Signal distribution by type and service
 	//   - Endpoint reliability patterns

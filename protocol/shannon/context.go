@@ -1,6 +1,7 @@
 package shannon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -444,6 +445,11 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 	shannonEndpoint := rc.getSelectedEndpoint()
 	startTime := time.Now()
 
+	// Create a cancellable context for the Shannon relay.
+	// This allows us to cancel the request if we timeout and fallback,
+	// preventing double signal recording (timeout + error from cancelled request).
+	shannonCtx, cancelShannon := context.WithCancel(rc.context)
+
 	// Setup Shannon endpoint request:
 	// - Create channel for async response
 	// - Initialize response variables
@@ -457,7 +463,11 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 	// - Execute request asynchronously
 	// - Signal completion via channel
 	go func() {
+		// Use the cancellable context for the relay
+		originalCtx := rc.context
+		rc.context = shannonCtx
 		endpointResponse, endpointErr = rc.sendProtocolRelay(payload)
+		rc.context = originalCtx
 		// Signal the completion of Shannon Network relay.
 		endpointResponseReceivedChan <- endpointErr
 	}()
@@ -469,6 +479,7 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 
 	// RelayMiner responded (success or failure)
 	case err := <-endpointResponseReceivedChan:
+		cancelShannon() // Clean up context
 		// Successfully received and validated a response from the shannon endpoint.
 		// No need to use the fallback endpoint's response.
 		if err == nil {
@@ -484,6 +495,12 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 
 	// RelayMiner timed out. Use a random fallback endpoint.
 	case <-time.After(relayTimeout):
+		// Cancel the Shannon relay context to stop the in-flight request.
+		// This prevents double signal recording: the timeout signal is recorded here,
+		// and the cancelled request won't record an additional error signal because
+		// context cancellation errors are not the endpoint's fault.
+		cancelShannon()
+
 		rc.logger.Info().Msg("Timed out waiting for Pocket Network to respond. Using a fallback endpoint.")
 
 		// Record timeout signal for the Shannon endpoint that didn't respond in time.
@@ -1053,9 +1070,30 @@ func (rc *requestContext) handleEndpointSuccess(
 // determineReputationSignal analyzes the response content to determine the appropriate reputation signal.
 // HTTP transport succeeded, but the response may contain a JSON-RPC error that should affect reputation.
 // Returns a success signal if no JSON-RPC error is detected, or a minor error signal for JSON-RPC errors.
+// Handles both single JSON-RPC responses and batch responses (array of responses).
 func (rc *requestContext) determineReputationSignal(responseBytes []byte, latency time.Duration) reputation.Signal {
-	// Try to parse as JSON-RPC response to check for application-level errors.
-	// If parsing fails, treat as success since HTTP transport worked.
+	// Skip empty responses
+	if len(responseBytes) == 0 {
+		return reputation.NewSuccessSignal(latency)
+	}
+
+	// Trim whitespace to check the first character
+	trimmed := bytes.TrimSpace(responseBytes)
+	if len(trimmed) == 0 {
+		return reputation.NewSuccessSignal(latency)
+	}
+
+	// Check if this is a batch response (starts with '[')
+	if trimmed[0] == '[' {
+		return rc.determineBatchReputationSignal(responseBytes, latency)
+	}
+
+	// Try to parse as single JSON-RPC response
+	return rc.determineSingleReputationSignal(responseBytes, latency)
+}
+
+// determineSingleReputationSignal handles a single JSON-RPC response.
+func (rc *requestContext) determineSingleReputationSignal(responseBytes []byte, latency time.Duration) reputation.Signal {
 	var jsonrpcResp jsonrpc.Response
 	if err := json.Unmarshal(responseBytes, &jsonrpcResp); err != nil {
 		// Can't parse as JSON-RPC - treat as success (HTTP worked, response format may be different)
@@ -1072,6 +1110,36 @@ func (rc *requestContext) determineReputationSignal(responseBytes []byte, latenc
 	}
 
 	// No JSON-RPC error detected - return success signal
+	return reputation.NewSuccessSignal(latency)
+}
+
+// determineBatchReputationSignal handles a batch JSON-RPC response (array of responses).
+// Returns minor error if ANY response in the batch contains an error.
+func (rc *requestContext) determineBatchReputationSignal(responseBytes []byte, latency time.Duration) reputation.Signal {
+	var batchResp []jsonrpc.Response
+	if err := json.Unmarshal(responseBytes, &batchResp); err != nil {
+		// Can't parse as batch JSON-RPC - treat as success
+		return reputation.NewSuccessSignal(latency)
+	}
+
+	// Check each response in the batch for errors
+	errorCount := 0
+	for _, resp := range batchResp {
+		if resp.IsError() {
+			errorCount++
+		}
+	}
+
+	// If any response has an error, record minor error
+	if errorCount > 0 {
+		rc.logger.Debug().
+			Int("batch_size", len(batchResp)).
+			Int("error_count", errorCount).
+			Msg("Batch response contains JSON-RPC errors, recording minor error signal for reputation")
+		return reputation.NewMinorErrorSignal("jsonrpc_batch_error")
+	}
+
+	// All responses in batch succeeded
 	return reputation.NewSuccessSignal(latency)
 }
 
