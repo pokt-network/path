@@ -177,6 +177,10 @@ type Config struct {
 	// SyncConfig configures background synchronization behavior.
 	SyncConfig SyncConfig `yaml:"sync_config"`
 
+	// TieredSelection configures tiered endpoint selection.
+	// When enabled, high-reputation endpoints are preferred over lower-reputation ones.
+	TieredSelection TieredSelectionConfig `yaml:"tiered_selection"`
+
 	// Redis holds Redis-specific configuration (only used when StorageType is "redis").
 	Redis *RedisConfig `yaml:"redis,omitempty"`
 }
@@ -273,6 +277,31 @@ type SyncConfig struct {
 	FlushInterval time.Duration `yaml:"flush_interval"`
 }
 
+// TieredSelectionConfig configures tiered endpoint selection.
+// When enabled, endpoints are grouped into tiers based on their reputation score,
+// and selection prefers higher-tier endpoints using cascade-down logic.
+type TieredSelectionConfig struct {
+	// Enabled determines if tiered selection is active.
+	// When false, random selection is used among all endpoints above MinThreshold.
+	// Default: true (when reputation is enabled)
+	Enabled bool `yaml:"enabled"`
+
+	// Tier1Threshold is the minimum score for Premium tier (Tier 1).
+	// Endpoints with scores >= Tier1Threshold are selected first.
+	// Default: 70
+	Tier1Threshold float64 `yaml:"tier1_threshold"`
+
+	// Tier2Threshold is the minimum score for Good tier (Tier 2).
+	// Endpoints with scores >= Tier2Threshold but < Tier1Threshold are selected
+	// only if no Tier 1 endpoints are available.
+	// Default: 50
+	Tier2Threshold float64 `yaml:"tier2_threshold"`
+
+	// Tier 3 (Fair tier) uses Config.MinThreshold as its minimum score.
+	// Endpoints with scores >= MinThreshold but < Tier2Threshold are selected
+	// only if no Tier 1 or Tier 2 endpoints are available.
+}
+
 // Recovery and SyncConfig defaults.
 const (
 	// DefaultRecoveryTimeout is the duration after which low-scoring endpoints
@@ -289,6 +318,17 @@ const (
 	DefaultFlushInterval = 100 * time.Millisecond
 )
 
+// Tiered selection defaults.
+const (
+	// DefaultTier1Threshold is the minimum score for Premium tier endpoints.
+	DefaultTier1Threshold float64 = 70
+
+	// DefaultTier2Threshold is the minimum score for Good tier endpoints.
+	DefaultTier2Threshold float64 = 50
+
+	// Tier 3 uses MinThreshold (default: 30) as the minimum score.
+)
+
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
@@ -299,6 +339,16 @@ func DefaultConfig() Config {
 		StorageType:     "memory",
 		KeyGranularity:  KeyGranularityEndpoint,
 		SyncConfig:      DefaultSyncConfig(),
+		TieredSelection: DefaultTieredSelectionConfig(),
+	}
+}
+
+// DefaultTieredSelectionConfig returns a TieredSelectionConfig with sensible defaults.
+func DefaultTieredSelectionConfig() TieredSelectionConfig {
+	return TieredSelectionConfig{
+		Enabled:        true, // Enabled by default when reputation is enabled
+		Tier1Threshold: DefaultTier1Threshold,
+		Tier2Threshold: DefaultTier2Threshold,
 	}
 }
 
@@ -329,6 +379,20 @@ func (c *Config) HydrateDefaults() {
 		c.KeyGranularity = KeyGranularityEndpoint
 	}
 	c.SyncConfig.HydrateDefaults()
+	c.TieredSelection.HydrateDefaults()
+}
+
+// HydrateDefaults fills in zero values with defaults for TieredSelectionConfig.
+func (t *TieredSelectionConfig) HydrateDefaults() {
+	// Note: Enabled defaults to false (zero value), but we want it to default to true
+	// when reputation is enabled. This is handled at a higher level (service creation).
+	// Here we only hydrate the thresholds.
+	if t.Tier1Threshold == 0 {
+		t.Tier1Threshold = DefaultTier1Threshold
+	}
+	if t.Tier2Threshold == 0 {
+		t.Tier2Threshold = DefaultTier2Threshold
+	}
 }
 
 // HydrateDefaults fills in zero values with defaults.
@@ -360,6 +424,28 @@ func (c *Config) Validate() error {
 	}
 	if c.RecoveryTimeout < 0 {
 		return fmt.Errorf("recovery_timeout must be non-negative")
+	}
+	// Validate tiered selection config
+	if err := c.TieredSelection.Validate(c.MinThreshold); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Validate checks that the TieredSelectionConfig values are valid.
+func (t *TieredSelectionConfig) Validate(minThreshold float64) error {
+	if t.Tier1Threshold < MinScore || t.Tier1Threshold > MaxScore {
+		return fmt.Errorf("tier1_threshold (%.1f) must be between %.1f and %.1f", t.Tier1Threshold, MinScore, MaxScore)
+	}
+	if t.Tier2Threshold < MinScore || t.Tier2Threshold > MaxScore {
+		return fmt.Errorf("tier2_threshold (%.1f) must be between %.1f and %.1f", t.Tier2Threshold, MinScore, MaxScore)
+	}
+	// Tier thresholds must be in descending order: Tier1 > Tier2 > MinThreshold
+	if t.Tier1Threshold <= t.Tier2Threshold {
+		return fmt.Errorf("tier1_threshold (%.1f) must be > tier2_threshold (%.1f)", t.Tier1Threshold, t.Tier2Threshold)
+	}
+	if t.Tier2Threshold <= minThreshold {
+		return fmt.Errorf("tier2_threshold (%.1f) must be > min_threshold (%.1f)", t.Tier2Threshold, minThreshold)
 	}
 	return nil
 }

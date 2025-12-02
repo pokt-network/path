@@ -94,6 +94,11 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 							MinThreshold:    30,
 							RecoveryTimeout: 5 * time.Minute,
 							KeyGranularity:  reputation.KeyGranularityEndpoint,
+							TieredSelection: reputation.TieredSelectionConfig{
+								Enabled:        true,
+								Tier1Threshold: 70,
+								Tier2Threshold: 50,
+							},
 						},
 					},
 				},

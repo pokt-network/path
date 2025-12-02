@@ -20,6 +20,12 @@ const (
 
 	// Reputation service health metrics
 	reputationErrorsTotalMetric = "shannon_reputation_errors_total"
+
+	// Tiered selection metrics
+	reputationTierSelectionMetric = "shannon_reputation_tier_selection_total"
+
+	// Tier distribution metrics (gauge showing endpoints per tier)
+	reputationTierDistributionMetric = "shannon_reputation_tier_distribution"
 )
 
 func init() {
@@ -27,6 +33,8 @@ func init() {
 	prometheus.MustRegister(reputationEndpointsFiltered)
 	prometheus.MustRegister(reputationScoreDistribution)
 	prometheus.MustRegister(reputationErrorsTotal)
+	prometheus.MustRegister(reputationTierSelection)
+	prometheus.MustRegister(reputationTierDistribution)
 }
 
 var (
@@ -109,6 +117,42 @@ var (
 		},
 		[]string{"operation", "error_type"},
 	)
+
+	// reputationTierSelection tracks endpoint selections by tier.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - tier: Selected tier (1=Premium, 2=Good, 3=Fair, 0=Random/disabled)
+	//
+	// Use to analyze:
+	//   - Tier distribution across services
+	//   - How often cascade-down occurs (tier 2/3 selections)
+	//   - Effectiveness of tiered selection
+	reputationTierSelection = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: pathProcess,
+			Name:      reputationTierSelectionMetric,
+			Help:      "Total endpoint selections by tier",
+		},
+		[]string{"service_id", "tier"},
+	)
+
+	// reputationTierDistribution tracks the current distribution of endpoints across tiers.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - tier: Tier number (1=Premium, 2=Good, 3=Fair)
+	//
+	// Use to analyze:
+	//   - Real-time health of endpoint pool
+	//   - How endpoints are distributed across reputation tiers
+	//   - Identify services with poor endpoint quality
+	reputationTierDistribution = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: pathProcess,
+			Name:      reputationTierDistributionMetric,
+			Help:      "Current number of endpoints in each tier",
+		},
+		[]string{"service_id", "tier"},
+	)
 )
 
 // RecordSignal records a reputation signal metric.
@@ -151,4 +195,45 @@ func RecordError(operation, errorType string) {
 		"operation":  operation,
 		"error_type": errorType,
 	}).Inc()
+}
+
+// RecordTierSelection records which tier an endpoint was selected from.
+func RecordTierSelection(serviceID string, tier int) {
+	reputationTierSelection.With(prometheus.Labels{
+		"service_id": serviceID,
+		"tier":       tierToString(tier),
+	}).Inc()
+}
+
+// RecordTierDistribution records the current distribution of endpoints across tiers.
+// This should be called whenever tiered selection is performed to show real-time tier health.
+func RecordTierDistribution(serviceID string, tier1Count, tier2Count, tier3Count int) {
+	reputationTierDistribution.With(prometheus.Labels{
+		"service_id": serviceID,
+		"tier":       "1",
+	}).Set(float64(tier1Count))
+
+	reputationTierDistribution.With(prometheus.Labels{
+		"service_id": serviceID,
+		"tier":       "2",
+	}).Set(float64(tier2Count))
+
+	reputationTierDistribution.With(prometheus.Labels{
+		"service_id": serviceID,
+		"tier":       "3",
+	}).Set(float64(tier3Count))
+}
+
+// tierToString converts tier number to string label.
+func tierToString(tier int) string {
+	switch tier {
+	case 1:
+		return "1"
+	case 2:
+		return "2"
+	case 3:
+		return "3"
+	default:
+		return "0"
+	}
 }
