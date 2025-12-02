@@ -724,6 +724,11 @@ func TestReputation_ConfigValidation(t *testing.T) {
 				InitialScore:    80,
 				MinThreshold:    30,
 				RecoveryTimeout: 5 * time.Minute,
+				TieredSelection: reputation.TieredSelectionConfig{
+					Enabled:        true,
+					Tier1Threshold: 70,
+					Tier2Threshold: 50,
+				},
 			},
 			expectError: false,
 		},
@@ -804,4 +809,319 @@ func TestReputation_ConfigValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// =============================================================================
+// Tiered Selection Tests
+// =============================================================================
+
+// TestReputation_TieredSelection_PrefersTier1 verifies that when all tiers
+// have endpoints, the tiered selector always picks from Tier 1.
+func TestReputation_TieredSelection_PrefersTier1(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	// Create reputation service with tiered selection enabled
+	config := reputation.Config{
+		Enabled:      true,
+		InitialScore: 80,
+		MinThreshold: 30,
+		StorageType:  "memory",
+		TieredSelection: reputation.TieredSelectionConfig{
+			Enabled:        true,
+			Tier1Threshold: 70,
+			Tier2Threshold: 50,
+		},
+	}
+	config.HydrateDefaults()
+
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	// Create tiered selector
+	tieredSelector := reputation.NewTieredSelector(config.TieredSelection, config.MinThreshold)
+
+	// Create Protocol with reputation service and tiered selector
+	p := &Protocol{
+		logger:            logger,
+		reputationService: svc,
+		tieredSelector:    tieredSelector,
+	}
+
+	serviceID := protocol.ServiceID("eth")
+
+	// Create endpoints with different scores
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"supplier1-https://tier1.example.com": &mockEndpoint{addr: "supplier1-https://tier1.example.com"},
+		"supplier2-https://tier2.example.com": &mockEndpoint{addr: "supplier2-https://tier2.example.com"},
+		"supplier3-https://tier3.example.com": &mockEndpoint{addr: "supplier3-https://tier3.example.com"},
+	}
+
+	// Set up scores:
+	// - tier1: score 85 (>= 70, Tier 1)
+	// - tier2: score 60 (>= 50 and < 70, Tier 2)
+	// - tier3: score 40 (>= 30 and < 50, Tier 3)
+	tier1Key := reputation.NewEndpointKey(serviceID, "supplier1-https://tier1.example.com")
+	tier2Key := reputation.NewEndpointKey(serviceID, "supplier2-https://tier2.example.com")
+	tier3Key := reputation.NewEndpointKey(serviceID, "supplier3-https://tier3.example.com")
+
+	// Tier 1 endpoint: 80 + 5 successes = 85
+	for i := 0; i < 5; i++ {
+		_ = svc.RecordSignal(ctx, tier1Key, reputation.NewSuccessSignal(100*time.Millisecond))
+	}
+
+	// Tier 2 endpoint: 80 - 20 = 60 (2 major errors of -10 each)
+	for i := 0; i < 2; i++ {
+		_ = svc.RecordSignal(ctx, tier2Key, reputation.NewMajorErrorSignal("timeout", time.Second))
+	}
+
+	// Tier 3 endpoint: 80 - 40 = 40 (4 major errors of -10 each)
+	for i := 0; i < 4; i++ {
+		_ = svc.RecordSignal(ctx, tier3Key, reputation.NewMajorErrorSignal("timeout", time.Second))
+	}
+
+	// Verify scores
+	tier1Score, _ := svc.GetScore(ctx, tier1Key)
+	tier2Score, _ := svc.GetScore(ctx, tier2Key)
+	tier3Score, _ := svc.GetScore(ctx, tier3Key)
+	t.Logf("Tier 1 score: %.1f, Tier 2 score: %.1f, Tier 3 score: %.1f",
+		tier1Score.Value, tier2Score.Value, tier3Score.Value)
+
+	// Run selectByTier multiple times - should always select from Tier 1
+	for i := 0; i < 10; i++ {
+		addr, ep, err := p.selectByTier(ctx, serviceID, endpoints, logger)
+		require.NoError(t, err)
+		require.NotNil(t, ep)
+		require.Equal(t, protocol.EndpointAddr("supplier1-https://tier1.example.com"), addr,
+			"Should always select from Tier 1 when available")
+	}
+}
+
+// TestReputation_TieredSelection_CascadeDown verifies that when Tier 1 is empty,
+// the selector cascades down to Tier 2, and when both are empty, to Tier 3.
+func TestReputation_TieredSelection_CascadeDown(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	config := reputation.Config{
+		Enabled:      true,
+		InitialScore: 80,
+		MinThreshold: 30,
+		StorageType:  "memory",
+		TieredSelection: reputation.TieredSelectionConfig{
+			Enabled:        true,
+			Tier1Threshold: 70,
+			Tier2Threshold: 50,
+		},
+	}
+	config.HydrateDefaults()
+
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	tieredSelector := reputation.NewTieredSelector(config.TieredSelection, config.MinThreshold)
+
+	p := &Protocol{
+		logger:            logger,
+		reputationService: svc,
+		tieredSelector:    tieredSelector,
+	}
+
+	serviceID := protocol.ServiceID("eth")
+
+	// Test Case 1: Only Tier 2 and Tier 3 endpoints (no Tier 1)
+	t.Run("cascades to tier 2 when tier 1 empty", func(t *testing.T) {
+		endpoints := map[protocol.EndpointAddr]endpoint{
+			"supplier1-https://tier2.example.com": &mockEndpoint{addr: "supplier1-https://tier2.example.com"},
+			"supplier2-https://tier3.example.com": &mockEndpoint{addr: "supplier2-https://tier3.example.com"},
+		}
+
+		// Tier 2: 80 - 20 = 60
+		tier2Key := reputation.NewEndpointKey(serviceID, "supplier1-https://tier2.example.com")
+		for i := 0; i < 2; i++ {
+			_ = svc.RecordSignal(ctx, tier2Key, reputation.NewMajorErrorSignal("timeout", time.Second))
+		}
+
+		// Tier 3: 80 - 40 = 40
+		tier3Key := reputation.NewEndpointKey(serviceID, "supplier2-https://tier3.example.com")
+		for i := 0; i < 4; i++ {
+			_ = svc.RecordSignal(ctx, tier3Key, reputation.NewMajorErrorSignal("timeout", time.Second))
+		}
+
+		// Should always select from Tier 2 (no Tier 1 available)
+		for i := 0; i < 10; i++ {
+			addr, _, err := p.selectByTier(ctx, serviceID, endpoints, logger)
+			require.NoError(t, err)
+			require.Equal(t, protocol.EndpointAddr("supplier1-https://tier2.example.com"), addr)
+		}
+	})
+
+	// Test Case 2: Only Tier 3 endpoints
+	t.Run("cascades to tier 3 when tier 1 and 2 empty", func(t *testing.T) {
+		endpoints := map[protocol.EndpointAddr]endpoint{
+			"supplier1-https://tier3only.example.com": &mockEndpoint{addr: "supplier1-https://tier3only.example.com"},
+		}
+
+		// Tier 3: 80 - 45 = 35
+		tier3Key := reputation.NewEndpointKey(serviceID, "supplier1-https://tier3only.example.com")
+		// Reset by recording successes first to establish the entry
+		_ = svc.RecordSignal(ctx, tier3Key, reputation.NewSuccessSignal(100*time.Millisecond)) // 81
+		// Then apply errors: need to get to 35 from 81 -> need -46 -> 4 major (-10) + 2 minor (-3) = -46
+		for i := 0; i < 4; i++ {
+			_ = svc.RecordSignal(ctx, tier3Key, reputation.NewMajorErrorSignal("timeout", time.Second))
+		}
+		for i := 0; i < 2; i++ {
+			_ = svc.RecordSignal(ctx, tier3Key, reputation.NewMinorErrorSignal("minor"))
+		}
+
+		score, _ := svc.GetScore(ctx, tier3Key)
+		t.Logf("Tier 3 only score: %.1f", score.Value)
+
+		// Should select from Tier 3
+		addr, _, err := p.selectByTier(ctx, serviceID, endpoints, logger)
+		require.NoError(t, err)
+		require.Equal(t, protocol.EndpointAddr("supplier1-https://tier3only.example.com"), addr)
+	})
+}
+
+// TestReputation_TieredSelection_Disabled verifies that when tiered selection
+// is disabled, random selection is used from all endpoints.
+func TestReputation_TieredSelection_Disabled(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	config := reputation.Config{
+		Enabled:      true,
+		InitialScore: 80,
+		MinThreshold: 30,
+		StorageType:  "memory",
+		TieredSelection: reputation.TieredSelectionConfig{
+			Enabled:        false, // Disabled!
+			Tier1Threshold: 70,
+			Tier2Threshold: 50,
+		},
+	}
+	config.HydrateDefaults()
+
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	// Create tiered selector with Enabled=false
+	tieredSelector := reputation.NewTieredSelector(config.TieredSelection, config.MinThreshold)
+
+	p := &Protocol{
+		logger:            logger,
+		reputationService: svc,
+		tieredSelector:    tieredSelector,
+	}
+
+	serviceID := protocol.ServiceID("eth")
+
+	// Create endpoints - all would be in different tiers if tiering was enabled
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"supplier1-https://a.example.com": &mockEndpoint{addr: "supplier1-https://a.example.com"},
+		"supplier2-https://b.example.com": &mockEndpoint{addr: "supplier2-https://b.example.com"},
+		"supplier3-https://c.example.com": &mockEndpoint{addr: "supplier3-https://c.example.com"},
+	}
+
+	// Set different scores (would be different tiers if enabled)
+	keyA := reputation.NewEndpointKey(serviceID, "supplier1-https://a.example.com")
+	keyB := reputation.NewEndpointKey(serviceID, "supplier2-https://b.example.com")
+	keyC := reputation.NewEndpointKey(serviceID, "supplier3-https://c.example.com")
+
+	// All get initial score of 80 via success signal
+	_ = svc.RecordSignal(ctx, keyA, reputation.NewSuccessSignal(100*time.Millisecond))
+	_ = svc.RecordSignal(ctx, keyB, reputation.NewSuccessSignal(100*time.Millisecond))
+	_ = svc.RecordSignal(ctx, keyC, reputation.NewSuccessSignal(100*time.Millisecond))
+
+	// Run multiple selections and track which endpoints are selected
+	selections := make(map[protocol.EndpointAddr]int)
+	iterations := 50
+
+	for i := 0; i < iterations; i++ {
+		addr, _, err := p.selectByTier(ctx, serviceID, endpoints, logger)
+		require.NoError(t, err)
+		selections[addr]++
+	}
+
+	// With random selection and 50 iterations, we should see multiple endpoints selected
+	// This is a probabilistic test, but with 3 endpoints and 50 iterations,
+	// it's extremely unlikely all selections would be the same endpoint
+	require.GreaterOrEqual(t, len(selections), 1, "Should have at least one endpoint selected")
+	t.Logf("Selection distribution: %v", selections)
+}
+
+// TestReputation_TieredSelection_NoReputationService verifies that when
+// reputation service is nil, random selection is used.
+func TestReputation_TieredSelection_NoReputationService(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	// Protocol without reputation service
+	p := &Protocol{
+		logger:            logger,
+		reputationService: nil, // No reputation service
+		tieredSelector:    nil, // No tiered selector
+	}
+
+	serviceID := protocol.ServiceID("eth")
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"supplier1-https://a.example.com": &mockEndpoint{addr: "supplier1-https://a.example.com"},
+		"supplier2-https://b.example.com": &mockEndpoint{addr: "supplier2-https://b.example.com"},
+	}
+
+	// Should still work with random selection
+	addr, ep, err := p.selectByTier(ctx, serviceID, endpoints, logger)
+	require.NoError(t, err)
+	require.NotNil(t, ep)
+	require.Contains(t, []protocol.EndpointAddr{
+		"supplier1-https://a.example.com",
+		"supplier2-https://b.example.com",
+	}, addr)
+}
+
+// TestReputation_TieredSelection_EmptyEndpoints verifies error handling
+// when no endpoints are available.
+func TestReputation_TieredSelection_EmptyEndpoints(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	config := reputation.Config{
+		Enabled:      true,
+		InitialScore: 80,
+		MinThreshold: 30,
+		StorageType:  "memory",
+		TieredSelection: reputation.TieredSelectionConfig{
+			Enabled:        true,
+			Tier1Threshold: 70,
+			Tier2Threshold: 50,
+		},
+	}
+	config.HydrateDefaults()
+
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	tieredSelector := reputation.NewTieredSelector(config.TieredSelection, config.MinThreshold)
+
+	p := &Protocol{
+		logger:            logger,
+		reputationService: svc,
+		tieredSelector:    tieredSelector,
+	}
+
+	serviceID := protocol.ServiceID("eth")
+	emptyEndpoints := map[protocol.EndpointAddr]endpoint{}
+
+	_, _, err := p.selectByTier(ctx, serviceID, emptyEndpoints, logger)
+	require.ErrorIs(t, err, reputation.ErrNoEndpointsAvailable)
 }

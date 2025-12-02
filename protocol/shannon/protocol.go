@@ -93,6 +93,10 @@ type Protocol struct {
 	// If enabled, endpoints are filtered by score in addition to binary sanctions.
 	// When nil, only binary sanctions are used for endpoint filtering.
 	reputationService reputation.ReputationService
+
+	// tieredSelector selects endpoints using cascade-down tier logic.
+	// Created when reputation service is enabled with tiered selection enabled.
+	tieredSelector *reputation.TieredSelector
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -182,6 +186,20 @@ func NewProtocol(
 		}
 
 		protocolInstance.reputationService = reputationSvc
+
+		// Create tiered selector if tiered selection is enabled
+		if config.ReputationConfig.TieredSelection.Enabled {
+			protocolInstance.tieredSelector = reputation.NewTieredSelector(
+				config.ReputationConfig.TieredSelection,
+				config.ReputationConfig.MinThreshold,
+			)
+			reputationLogger.Info().
+				Float64("tier1_threshold", config.ReputationConfig.TieredSelection.Tier1Threshold).
+				Float64("tier2_threshold", config.ReputationConfig.TieredSelection.Tier2Threshold).
+				Float64("min_threshold", config.ReputationConfig.MinThreshold).
+				Msg("Tiered endpoint selection enabled")
+		}
+
 		reputationLogger.Info().Msg("Reputation service enabled and started")
 	}
 
@@ -622,6 +640,11 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 
 	// Return session endpoints if available.
 	if len(endpoints) > 0 {
+		// Apply tiered selection if enabled - only return endpoints from the highest available tier
+		if p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
+			endpoints = p.filterToHighestTier(ctx, serviceID, endpoints, logger)
+		}
+
 		logger.Info().Msgf("Successfully fetched %d session endpoints for active sessions.", len(endpoints))
 		return endpoints, nil
 	}

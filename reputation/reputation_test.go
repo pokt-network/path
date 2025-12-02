@@ -241,6 +241,10 @@ func TestConfig_Validate(t *testing.T) {
 				InitialScore:    80,
 				MinThreshold:    30,
 				RecoveryTimeout: 5 * time.Minute,
+				TieredSelection: TieredSelectionConfig{
+					Tier1Threshold: 70,
+					Tier2Threshold: 50,
+				},
 			},
 			expectError: false,
 		},
@@ -249,6 +253,10 @@ func TestConfig_Validate(t *testing.T) {
 			config: Config{
 				InitialScore: 50,
 				MinThreshold: 50,
+				TieredSelection: TieredSelectionConfig{
+					Tier1Threshold: 90,
+					Tier2Threshold: 60,
+				},
 			},
 			expectError: false,
 		},
@@ -257,6 +265,10 @@ func TestConfig_Validate(t *testing.T) {
 			config: Config{
 				InitialScore: MaxScore,
 				MinThreshold: MinScore,
+				TieredSelection: TieredSelectionConfig{
+					Tier1Threshold: 70,
+					Tier2Threshold: 50,
+				},
 			},
 			expectError: false,
 		},

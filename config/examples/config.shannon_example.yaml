@@ -105,6 +105,24 @@ shannon_config:
       # Time after which inactive endpoint scores can be re-evaluated
       # Default: 5m
       recovery_timeout: 5m
+      # Tiered endpoint selection configuration
+      # When enabled, endpoints are grouped into tiers based on reputation score
+      # and selection prefers higher-tier endpoints using cascade-down logic
+      tiered_selection:
+        # Enable/disable tiered selection
+        # Default: true (when reputation is enabled)
+        enabled: true
+        # Minimum score for Tier 1 (Premium tier)
+        # Endpoints with scores >= tier1_threshold are selected first
+        # Default: 70
+        tier1_threshold: 70
+        # Minimum score for Tier 2 (Good tier)
+        # Endpoints with scores >= tier2_threshold but < tier1_threshold
+        # are selected only if no Tier 1 endpoints are available
+        # Default: 50
+        tier2_threshold: 50
+        # Tier 3 (Fair tier) uses min_threshold as its minimum score
+        # Endpoints in Tier 3 are selected only if Tier 1 and 2 are empty
       # Redis configuration (only used when storage_type is "redis")
       # redis:
       #   address: "localhost:6379"
