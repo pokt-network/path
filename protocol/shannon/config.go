@@ -13,6 +13,7 @@ import (
 
 	"github.com/pokt-network/path/network/grpc"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 )
 
 // defaultURLKey is the key for the default URL in the fallback endpoints map.
@@ -78,6 +79,15 @@ type (
 		// All relays will be sent to a fixed URL.
 		// Allows measuring performance of PATH and full node(s) in isolation.
 		LoadTestingConfig *LoadTestingConfig `yaml:"load_testing_config"`
+		// Optional.
+		// Configures the endpoint sanction system parameters.
+		// If not specified, sensible defaults will be used.
+		SanctionConfig SanctionConfig `yaml:"sanction_config"`
+
+		// Optional.
+		// Configures the endpoint reputation system.
+		// If not specified or disabled, binary sanctions will be used instead.
+		ReputationConfig reputation.Config `yaml:"reputation_config"`
 	}
 
 	// TODO_TECHDEBT(@adshmh): Make configuration and implementation explicit:
@@ -122,6 +132,19 @@ type (
 		// - The supplier address is fixed.
 		// - A single RelayMiner will receive all the relays.
 		SupplierAddr string `yaml:"supplier_addr"`
+	}
+
+	// SanctionConfig holds configurable parameters for the endpoint sanction system.
+	// All fields are optional and will use sensible defaults if not specified.
+	SanctionConfig struct {
+		// SessionSanctionDuration is the TTL for session-based sanctions.
+		// Endpoints with session sanctions will be excluded from selection for this duration.
+		// Default: 1 hour
+		SessionSanctionDuration time.Duration `yaml:"session_sanction_duration"`
+
+		// CacheCleanupInterval is the interval for purging expired sanction entries from the cache.
+		// Default: 10 minutes
+		CacheCleanupInterval time.Duration `yaml:"cache_cleanup_interval"`
 	}
 )
 
@@ -299,6 +322,17 @@ func (c *CacheConfig) hydrateDefaults() CacheConfig {
 		c.SessionTTL = defaultSessionCacheTTL
 	}
 	return *c
+}
+
+// HydrateDefaults applies default values to SanctionConfig
+func (sc *SanctionConfig) HydrateDefaults() SanctionConfig {
+	if sc.SessionSanctionDuration == 0 {
+		sc.SessionSanctionDuration = defaultSessionSanctionExpiration
+	}
+	if sc.CacheCleanupInterval == 0 {
+		sc.CacheCleanupInterval = defaultSanctionCacheCleanupInterval
+	}
+	return *sc
 }
 
 // isValidURL returns true if the supplied URL string can be parsed into a valid URL accepted by the Shannon SDK.

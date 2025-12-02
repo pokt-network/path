@@ -149,6 +149,19 @@ properties:
                   description: "Whether to send all traffic to fallback endpoints for this service, regardless of protocol endpoint health."
                   type: boolean
                   default: false
+          sanction_config:
+            description: "Configuration for the endpoint sanction system. Controls how long misbehaving endpoints are excluded from selection."
+            type: object
+            additionalProperties: false
+            properties:
+              session_sanction_duration:
+                description: "Duration that session-based sanctions remain active. Endpoints with session sanctions will be excluded from selection for this duration. Format: Go duration string (e.g., '30m', '1h', '2h'). Default: 1h"
+                type: string
+                pattern: "^[0-9]+[smh]$"
+              cache_cleanup_interval:
+                description: "Interval for purging expired sanction entries from the cache. Format: Go duration string (e.g., '5m', '10m'). Default: 10m"
+                type: string
+                pattern: "^[0-9]+[smh]$"
   # Logger Configuration (optional)
   logger_config:
     description: "Optional configuration for the logger. If not specified, info level will be used."

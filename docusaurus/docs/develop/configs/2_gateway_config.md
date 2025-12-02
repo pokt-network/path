@@ -46,6 +46,13 @@ shannon_config:
         fallback_urls:
           - "https://eth.rpc.grove.city/v1/1a2b3c4d"
           - "https://eth.rpc.grove.city/v1/5e6f7a8b"
+    # (Optional) Endpoint reputation system
+    reputation_config:
+      enabled: true
+      storage_type: "memory"
+      initial_score: 80
+      min_threshold: 30
+      recovery_timeout: "5m"
 
 # (Optional) Logger Configuration
 logger_config:
@@ -146,6 +153,8 @@ shannon_config:
 | `gateway_private_key_hex`     | string   | Yes                      | -       | 64-character hex-encoded `secp256k1` gateway private key              |
 | `owned_apps_private_keys_hex` | string[] | Only in centralized mode | -       | List of 64-character hex-encoded `secp256k1` application private keys |
 | `service_fallback`            | array    | No                       | -       | Array of service fallback configurations (see below for details)      |
+| `sanction_config`             | object   | No                       | -       | Configuration for endpoint sanction system (see below for details)    |
+| `reputation_config`           | object   | No                       | -       | Configuration for endpoint reputation system (see below for details)  |
 
 **`service_fallback` (optional)**
 
@@ -180,6 +189,94 @@ TODO_DOCUMENT(@adshmh): Update this section to clarify the request distribution 
 - **Send All
 - **Protocol bypass**: Fallback endpoints bypass protocol-level validation and are sent directly to the configured URLs
 - **Service-specific**: Each service ID can have its own set of fallback endpoints
+
+**`sanction_config` (optional)**
+
+Configures the endpoint sanction system parameters. The sanction system temporarily excludes misbehaving endpoints from selection. When an endpoint returns errors or behaves poorly, it receives a "session sanction" that prevents it from being selected for requests until the sanction expires.
+
+```yaml
+gateway_config:
+  # ... other fields ...
+  sanction_config:
+    session_sanction_duration: "30m"  # How long session sanctions last
+    cache_cleanup_interval: "5m"       # How often to purge expired sanctions
+```
+
+| Field                       | Type   | Required | Default | Description                                                                                              |
+| --------------------------- | ------ | -------- | ------- | -------------------------------------------------------------------------------------------------------- |
+| `session_sanction_duration` | string | No       | "1h"    | Duration that session-based sanctions remain active. Format: Go duration string (e.g., "30m", "1h", "2h") |
+| `cache_cleanup_interval`    | string | No       | "10m"   | Interval for purging expired sanction entries from the cache. Format: Go duration string                 |
+
+**Key Features:**
+- **Automatic expiration**: Session sanctions automatically expire after the configured duration
+- **Configurable timing**: Operators can tune sanction duration based on their network conditions
+- **Memory efficient**: Expired sanctions are periodically cleaned up to prevent memory bloat
+
+**Use Cases:**
+- **Shorter durations** (e.g., `15m`): Use when endpoints frequently have temporary issues and you want faster recovery
+- **Longer durations** (e.g., `2h`): Use when you want to more aggressively exclude problematic endpoints
+- **Default** (`1h`): Balanced approach suitable for most deployments
+
+**`reputation_config` (optional)**
+
+Configures the endpoint reputation system. Unlike binary sanctions that simply exclude or include endpoints, the reputation system provides **gradual scoring** based on endpoint reliability patterns over time. This allows for more nuanced endpoint selection and softer handling of temporarily degraded endpoints.
+
+```yaml
+gateway_config:
+  # ... other fields ...
+  reputation_config:
+    enabled: true                    # Enable the reputation system
+    storage_type: "memory"           # Storage backend (currently only "memory" supported)
+    initial_score: 80                # Starting score for new endpoints
+    min_threshold: 30                # Score below which endpoints are filtered out
+    recovery_timeout: "5m"           # Time after which inactive endpoints can be re-evaluated
+```
+
+| Field              | Type    | Required | Default | Description                                                                                        |
+| ------------------ | ------- | -------- | ------- | -------------------------------------------------------------------------------------------------- |
+| `enabled`          | boolean | No       | false   | Whether to enable the reputation system. When false, only binary sanctions are used.               |
+| `storage_type`     | string  | No       | "memory"| Storage backend for reputation data. Currently only "memory" is supported.                         |
+| `initial_score`    | float64 | No       | 80      | Starting reputation score for new endpoints (0-100 scale).                                         |
+| `min_threshold`    | float64 | No       | 30      | Minimum score required for an endpoint to be considered for selection.                             |
+| `recovery_timeout` | string  | No       | "5m"    | Duration after which inactive endpoint scores can be re-evaluated. Format: Go duration string.     |
+
+**How Reputation Scoring Works:**
+
+The reputation system records **signals** for each endpoint interaction:
+
+| Signal Type      | Impact | Description                                                    |
+| ---------------- | ------ | -------------------------------------------------------------- |
+| Success          | +1     | Successful request/response                                    |
+| Minor Error      | -3     | Client errors, unknown errors (not endpoint's fault)           |
+| Major Error      | -10    | Timeouts, connection issues (recoverable)                      |
+| Critical Error   | -25    | HTTP 5xx, validation errors (service degradation)              |
+| Fatal Error      | -50    | Service misconfiguration (previously "permanent sanction")     |
+
+**Key Features:**
+- **Gradual scoring**: Endpoints build or lose reputation over time based on actual performance
+- **Soft degradation**: Instead of immediately excluding endpoints, scores gradually decrease
+- **Recovery path**: Endpoints can recover reputation through consistent successful responses
+- **Works with sanctions**: Reputation filtering is applied **in addition to** binary sanctions, not as a replacement
+
+**Prometheus Metrics:**
+
+When reputation is enabled, the following metrics are exported:
+
+| Metric Name                                  | Type      | Description                                              |
+| -------------------------------------------- | --------- | -------------------------------------------------------- |
+| `path_shannon_reputation_signals_total`      | Counter   | Total signals by service_id, signal_type, endpoint_domain |
+| `path_shannon_reputation_endpoints_filtered_total` | Counter | Endpoints filtered vs allowed by service_id, action, domain |
+| `path_shannon_reputation_score_distribution` | Histogram | Distribution of endpoint scores by service_id            |
+| `path_shannon_reputation_errors_total`       | Counter   | Errors in the reputation system by operation, error_type |
+
+**Use Cases:**
+- **Production deployments**: Enable to get gradual endpoint scoring and better resilience
+- **Debugging**: Use metrics to identify consistently problematic endpoints or domains
+- **Tuning**: Adjust `min_threshold` based on your network's reliability patterns
+
+:::warning E2E Testing
+When running E2E tests with reputation enabled, ensure `reputation_config.enabled: true` is set in your test configuration (e.g., `e2e/config/.shannon.config.yaml`). Without this, E2E tests will not exercise the reputation code path.
+:::
 
 ---
 

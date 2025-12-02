@@ -11,6 +11,7 @@ import (
 	"github.com/pokt-network/path/network/grpc"
 	"github.com/pokt-network/path/protocol"
 	shannonprotocol "github.com/pokt-network/path/protocol/shannon"
+	"github.com/pokt-network/path/reputation"
 )
 
 // getTestDefaultGRPCConfig returns a GRPCConfig with default values applied
@@ -81,6 +82,17 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 									},
 								},
 							},
+						},
+						SanctionConfig: shannonprotocol.SanctionConfig{
+							SessionSanctionDuration: 30 * time.Minute,
+							CacheCleanupInterval:    5 * time.Minute,
+						},
+						ReputationConfig: reputation.Config{
+							Enabled:         true,
+							StorageType:     "memory",
+							InitialScore:    80,
+							MinThreshold:    30,
+							RecoveryTimeout: 5 * time.Minute,
 						},
 					},
 				},
