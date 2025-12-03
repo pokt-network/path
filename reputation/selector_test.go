@@ -178,10 +178,15 @@ func TestTieredSelector_GroupByTier(t *testing.T) {
 }
 
 func TestTieredSelector_GroupByTier_BoundaryValues(t *testing.T) {
+	// Create selector with probation threshold at 5 to test excluded scores
 	selector := NewTieredSelector(TieredSelectionConfig{
 		Enabled:        true,
 		Tier1Threshold: 70,
 		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:   true,
+			Threshold: 5, // Set to 5 so we can test excluded scores below
+		},
 	}, 30)
 
 	tests := []struct {
@@ -197,8 +202,11 @@ func TestTieredSelector_GroupByTier_BoundaryValues(t *testing.T) {
 		{"just below tier2 threshold", 49.9, 3},
 		{"exactly min threshold", 30, 3},
 		{"just above min threshold", 30.1, 3},
-		{"just below min threshold", 29.9, 0},
-		{"zero score", 0, 0},
+		{"just below min threshold in probation", 29.9, TierProbation},
+		{"in probation zone", 10, TierProbation},
+		{"at probation threshold", 5, TierProbation},
+		{"below probation threshold", 4.9, 0},
+		{"zero score excluded", 0, 0},
 		{"max score", 100, 1},
 	}
 
@@ -215,10 +223,15 @@ func TestTieredSelector_GroupByTier_BoundaryValues(t *testing.T) {
 // =============================================================================
 
 func TestTieredSelector_TierForScore(t *testing.T) {
+	// Create selector with explicit probation threshold to test excluded scores
 	selector := NewTieredSelector(TieredSelectionConfig{
 		Enabled:        true,
 		Tier1Threshold: 70,
 		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:   true,
+			Threshold: 5, // Set to 5 to test fully excluded scores
+		},
 	}, 30)
 
 	require.Equal(t, 1, selector.TierForScore(100))
@@ -230,8 +243,11 @@ func TestTieredSelector_TierForScore(t *testing.T) {
 	require.Equal(t, 3, selector.TierForScore(49))
 	require.Equal(t, 3, selector.TierForScore(40))
 	require.Equal(t, 3, selector.TierForScore(30))
-	require.Equal(t, 0, selector.TierForScore(29))
-	require.Equal(t, 0, selector.TierForScore(0))
+	require.Equal(t, TierProbation, selector.TierForScore(29)) // Below min threshold but >= probation threshold
+	require.Equal(t, TierProbation, selector.TierForScore(10)) // In probation zone
+	require.Equal(t, TierProbation, selector.TierForScore(5))  // At probation threshold
+	require.Equal(t, 0, selector.TierForScore(4))              // Below probation threshold (excluded)
+	require.Equal(t, 0, selector.TierForScore(0))              // Fully excluded
 }
 
 // =============================================================================
@@ -282,4 +298,251 @@ func TestTieredSelector_RandomWithinTier(t *testing.T) {
 	// All endpoints should be selected at least once (with high probability)
 	// This is a statistical test, so we use a lenient check
 	require.GreaterOrEqual(t, len(selections), 2, "Should select from multiple endpoints")
+}
+
+// =============================================================================
+// Probation Tests
+// =============================================================================
+
+func TestTieredSelector_GroupByTierWithProbation(t *testing.T) {
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:            true,
+			Threshold:          10,
+			TrafficPercent:     10,
+			RecoveryMultiplier: 2.0,
+		},
+	}, 30)
+
+	endpoints := map[EndpointKey]float64{
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t1")): 80, // Tier 1
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t2")): 60, // Tier 2
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t3")): 40, // Tier 3
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("p1")): 20, // Probation
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("p2")): 10, // Probation (at threshold)
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("ex")): 5,  // Excluded (below probation threshold)
+	}
+
+	tier1, tier2, tier3, probation := selector.GroupByTierWithProbation(endpoints)
+
+	require.Len(t, tier1, 1, "Should have 1 endpoint in Tier 1")
+	require.Len(t, tier2, 1, "Should have 1 endpoint in Tier 2")
+	require.Len(t, tier3, 1, "Should have 1 endpoint in Tier 3")
+	require.Len(t, probation, 2, "Should have 2 endpoints in Probation")
+}
+
+func TestTieredSelector_TierForScore_WithProbation(t *testing.T) {
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:   true,
+			Threshold: 10,
+		},
+	}, 30)
+
+	require.Equal(t, 1, selector.TierForScore(80), "Score 80 should be Tier 1")
+	require.Equal(t, 2, selector.TierForScore(60), "Score 60 should be Tier 2")
+	require.Equal(t, 3, selector.TierForScore(40), "Score 40 should be Tier 3")
+	require.Equal(t, TierProbation, selector.TierForScore(20), "Score 20 should be Probation")
+	require.Equal(t, TierProbation, selector.TierForScore(10), "Score 10 (at threshold) should be Probation")
+	require.Equal(t, 0, selector.TierForScore(9), "Score 9 should be Excluded")
+	require.Equal(t, 0, selector.TierForScore(0), "Score 0 should be Excluded")
+}
+
+func TestTieredSelector_IsInProbation(t *testing.T) {
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:   true,
+			Threshold: 10,
+		},
+	}, 30)
+
+	require.False(t, selector.IsInProbation(80), "Score 80 is not in probation (Tier 1)")
+	require.False(t, selector.IsInProbation(50), "Score 50 is not in probation (Tier 2)")
+	require.False(t, selector.IsInProbation(30), "Score 30 is not in probation (Tier 3)")
+	require.True(t, selector.IsInProbation(29), "Score 29 is in probation")
+	require.True(t, selector.IsInProbation(20), "Score 20 is in probation")
+	require.True(t, selector.IsInProbation(10), "Score 10 (at threshold) is in probation")
+	require.False(t, selector.IsInProbation(9), "Score 9 is not in probation (excluded)")
+}
+
+func TestTieredSelector_SelectEndpointWithProbation_NormalTiers(t *testing.T) {
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:        true,
+			Threshold:      10,
+			TrafficPercent: 100, // Even with 100%, normal tiers should be preferred
+		},
+	}, 30)
+
+	endpoints := map[EndpointKey]float64{
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier1")): 80,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("prob")):  20, // Probation
+	}
+
+	// Should always select from Tier 1 when available
+	for i := 0; i < 10; i++ {
+		selected, tier, err := selector.SelectEndpointWithProbation(endpoints)
+		require.NoError(t, err)
+		require.Equal(t, 1, tier, "Should prefer Tier 1 over probation")
+		require.Equal(t, "tier1", string(selected.EndpointAddr))
+	}
+}
+
+func TestTieredSelector_SelectEndpointWithProbation_OnlyProbation_100Percent(t *testing.T) {
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:        true,
+			Threshold:      10,
+			TrafficPercent: 100, // Always allow probation when normal tiers empty
+		},
+	}, 30)
+
+	// Only probation endpoints
+	endpoints := map[EndpointKey]float64{
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("prob-a")): 25,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("prob-b")): 15,
+	}
+
+	// Should always select from probation with 100% traffic
+	for i := 0; i < 10; i++ {
+		selected, tier, err := selector.SelectEndpointWithProbation(endpoints)
+		require.NoError(t, err)
+		require.Equal(t, TierProbation, tier, "Should select from probation when normal tiers empty")
+		require.Contains(t, string(selected.EndpointAddr), "prob")
+	}
+}
+
+func TestTieredSelector_SelectEndpointWithProbation_OnlyProbation_0Percent(t *testing.T) {
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:        true,
+			Threshold:      10,
+			TrafficPercent: 0, // Never allow probation
+		},
+	}, 30)
+
+	// Only probation endpoints
+	endpoints := map[EndpointKey]float64{
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("prob-a")): 25,
+	}
+
+	// Should always fail since traffic percent is 0
+	for i := 0; i < 10; i++ {
+		_, _, err := selector.SelectEndpointWithProbation(endpoints)
+		require.ErrorIs(t, err, ErrNoEndpointsAvailable, "Should fail with 0% traffic percent")
+	}
+}
+
+func TestTieredSelector_SelectEndpointWithProbation_Disabled(t *testing.T) {
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:        false, // Probation disabled
+			Threshold:      10,
+			TrafficPercent: 100,
+		},
+	}, 30)
+
+	// Only probation-level endpoints
+	endpoints := map[EndpointKey]float64{
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("prob")): 25,
+	}
+
+	// Should fail since probation is disabled
+	_, _, err := selector.SelectEndpointWithProbation(endpoints)
+	require.ErrorIs(t, err, ErrNoEndpointsAvailable, "Should fail when probation is disabled")
+}
+
+func TestTieredSelector_SelectEndpointWithProbation_BelowProbationThreshold(t *testing.T) {
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:        true,
+			Threshold:      10,
+			TrafficPercent: 100,
+		},
+	}, 30)
+
+	// All endpoints below probation threshold (completely excluded)
+	endpoints := map[EndpointKey]float64{
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("excluded-a")): 5,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("excluded-b")): 0,
+	}
+
+	_, _, err := selector.SelectEndpointWithProbation(endpoints)
+	require.ErrorIs(t, err, ErrNoEndpointsAvailable, "Should fail when all endpoints below probation threshold")
+}
+
+func TestTieredSelector_ProbationConfig(t *testing.T) {
+	probConfig := ProbationConfig{
+		Enabled:            true,
+		Threshold:          15,
+		TrafficPercent:     20,
+		RecoveryMultiplier: 3.0,
+	}
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation:      probConfig,
+	}, 30)
+
+	require.Equal(t, probConfig, selector.ProbationConfig())
+}
+
+func TestTieredSelector_SelectEndpointWithProbation_Sampling(t *testing.T) {
+	// This test verifies that probation sampling works statistically
+	// With 50% traffic percent, roughly half of requests should use probation
+	selector := NewTieredSelector(TieredSelectionConfig{
+		Enabled:        true,
+		Tier1Threshold: 70,
+		Tier2Threshold: 50,
+		Probation: ProbationConfig{
+			Enabled:        true,
+			Threshold:      10,
+			TrafficPercent: 50, // 50% chance
+		},
+	}, 30)
+
+	// Only probation endpoints
+	endpoints := map[EndpointKey]float64{
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("prob")): 20,
+	}
+
+	successes := 0
+	iterations := 1000
+
+	for i := 0; i < iterations; i++ {
+		_, tier, err := selector.SelectEndpointWithProbation(endpoints)
+		if err == nil && tier == TierProbation {
+			successes++
+		}
+	}
+
+	// With 50% sampling, we expect ~500 successes. Allow for statistical variance.
+	// 95% CI for binomial distribution with n=1000, p=0.5 is roughly 450-550
+	require.Greater(t, successes, 350, "Should have significant probation selections with 50% traffic")
+	require.Less(t, successes, 650, "Should not have too many probation selections")
 }

@@ -361,6 +361,7 @@ func (p *Protocol) getReputationMinThreshold() float64 {
 // filterToHighestTier filters endpoints to only return those from the highest available tier.
 // This implements the cascade-down selection: if Tier 1 has endpoints, only return Tier 1.
 // If Tier 1 is empty, return Tier 2. If both are empty, return Tier 3.
+// If all normal tiers are empty and probation is enabled, probabilistically include probation endpoints.
 // This allows the QoS layer to still do its validation and selection, but only within the best tier.
 func (p *Protocol) filterToHighestTier(
 	ctx context.Context,
@@ -379,9 +380,9 @@ func (p *Protocol) filterToHighestTier(
 		return endpoints
 	}
 
-	// Group endpoints by tier
-	tier1, tier2, tier3 := p.tieredSelector.GroupByTier(endpointScores)
-	tier1Count, tier2Count, tier3Count := len(tier1), len(tier2), len(tier3)
+	// Group endpoints by tier including probation
+	tier1, tier2, tier3, probation := p.tieredSelector.GroupByTierWithProbation(endpointScores)
+	tier1Count, tier2Count, tier3Count, probationCount := len(tier1), len(tier2), len(tier3), len(probation)
 
 	// Record tier distribution metrics (gauge showing current state)
 	reputationmetrics.RecordTierDistribution(string(serviceID), tier1Count, tier2Count, tier3Count)
@@ -391,10 +392,12 @@ func (p *Protocol) filterToHighestTier(
 		Int("tier1_count", tier1Count).
 		Int("tier2_count", tier2Count).
 		Int("tier3_count", tier3Count).
+		Int("probation_count", probationCount).
 		Int("total_endpoints", len(endpoints)).
 		Float64("tier1_threshold", p.tieredSelector.Config().Tier1Threshold).
 		Float64("tier2_threshold", p.tieredSelector.Config().Tier2Threshold).
 		Float64("min_threshold", p.tieredSelector.MinThreshold()).
+		Float64("probation_threshold", p.tieredSelector.ProbationConfig().Threshold).
 		Msg("Tiered selection: endpoint distribution across tiers")
 
 	// Determine which tier to use and record metric
@@ -411,6 +414,22 @@ func (p *Protocol) filterToHighestTier(
 	case tier3Count > 0:
 		selectedTier = 3
 		selectedKeys = tier3
+	case probationCount > 0 && p.shouldUseProbation():
+		// All normal tiers empty, check probation with sampling
+		if p.rollProbationSampling(serviceID) {
+			selectedTier = reputation.TierProbation
+			selectedKeys = probation
+			reputationmetrics.RecordProbationSelection(string(serviceID), true)
+		} else {
+			// Skipped probation sampling
+			logger.Debug().
+				Int("probation_available", probationCount).
+				Float64("traffic_percent", p.tieredSelector.ProbationConfig().TrafficPercent).
+				Msg("Skipped probation endpoints due to sampling")
+			reputationmetrics.RecordProbationSelection(string(serviceID), false)
+			reputationmetrics.RecordTierSelection(string(serviceID), 0)
+			return make(map[protocol.EndpointAddr]endpoint)
+		}
 	default:
 		// No endpoints in any tier (all below threshold) - return empty
 		logger.Warn().Msg("No endpoints available in any tier after tiered filtering")
@@ -429,13 +448,37 @@ func (p *Protocol) filterToHighestTier(
 		}
 	}
 
+	tierName := "normal"
+	if selectedTier == reputation.TierProbation {
+		tierName = "probation"
+	}
+
 	logger.Info().
 		Int("selected_tier", selectedTier).
+		Str("tier_name", tierName).
 		Int("endpoints_in_selected_tier", len(result)).
 		Int("tier1_available", tier1Count).
 		Int("tier2_available", tier2Count).
 		Int("tier3_available", tier3Count).
+		Int("probation_available", probationCount).
 		Msg("Tiered selection: returning endpoints from highest available tier")
 
 	return result
+}
+
+// shouldUseProbation returns true if probation is enabled.
+func (p *Protocol) shouldUseProbation() bool {
+	if p.tieredSelector == nil {
+		return false
+	}
+	return p.tieredSelector.ProbationConfig().Enabled
+}
+
+// rollProbationSampling returns true if we should use probation endpoints
+// based on the configured traffic percentage.
+func (p *Protocol) rollProbationSampling(serviceID protocol.ServiceID) bool {
+	trafficPercent := p.tieredSelector.ProbationConfig().TrafficPercent
+	// Roll dice: random float [0, 100) < traffic_percent means use probation
+	roll := float64(randIntn(100))
+	return roll < trafficPercent
 }

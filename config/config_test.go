@@ -97,6 +97,12 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 								Enabled:        true,
 								Tier1Threshold: 70,
 								Tier2Threshold: 50,
+								Probation: reputation.ProbationConfig{
+									Enabled:            true,
+									Threshold:          10,
+									TrafficPercent:     10,
+									RecoveryMultiplier: 2.0,
+								},
 							},
 						},
 					},

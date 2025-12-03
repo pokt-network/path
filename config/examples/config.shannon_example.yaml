@@ -123,6 +123,35 @@ shannon_config:
         tier2_threshold: 50
         # Tier 3 (Fair tier) uses min_threshold as its minimum score
         # Endpoints in Tier 3 are selected only if Tier 1 and 2 are empty
+        # Probation system configuration
+        # Gives endpoints below min_threshold a chance to recover
+        # by receiving limited traffic instead of being fully filtered
+        #
+        # Score hierarchy (with defaults):
+        #   Tier 1: score >= 70 (tier1_threshold)
+        #   Tier 2: score >= 50 (tier2_threshold)
+        #   Tier 3: score >= 30 (min_threshold)
+        #   Probation: score >= 10 (probation.threshold) but < min_threshold
+        #   Excluded: score < 10 (probation.threshold)
+        #
+        # NOTE: probation.threshold MUST be less than min_threshold
+        probation:
+          # Enable/disable probation system
+          # Default: true (when tiered selection is enabled)
+          enabled: true
+          # Minimum score for the probation zone
+          # Endpoints with scores >= threshold but < min_threshold are in probation
+          # Endpoints below this are completely excluded
+          # Default: 10
+          threshold: 10
+          # Percentage of requests that consider probation endpoints
+          # Only this % of requests will potentially use probation endpoints
+          # Default: 10 (10% of traffic)
+          traffic_percent: 10
+          # Multiplier applied to positive signals for probation endpoints
+          # Accelerates recovery by making each success count more
+          # Default: 2.0 (success signals are doubled)
+          recovery_multiplier: 2.0
       # Redis configuration (only used when storage_type is "redis")
       # redis:
       #   address: "localhost:6379"

@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 )
 
 // service implements ReputationService with local cache + async backend sync.
@@ -49,6 +51,8 @@ func NewService(config Config, store Storage) ReputationService {
 
 // RecordSignal records a signal event for an endpoint.
 // Updates local cache immediately and queues async write to backend storage.
+// When probation is enabled and the endpoint is in the probation zone,
+// positive signals are boosted by the recovery multiplier to accelerate recovery.
 func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Signal) error {
 	if !s.config.Enabled {
 		return nil
@@ -63,6 +67,13 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 			Value:       s.config.InitialScore,
 			LastUpdated: time.Now(),
 		}
+	}
+
+	// Apply recovery multiplier for positive signals when endpoint is in probation
+	if impact > 0 && s.isInProbation(score.Value) {
+		impact *= s.config.TieredSelection.Probation.RecoveryMultiplier
+		// Record metric for recovery multiplier application
+		reputationmetrics.RecordRecoveryMultiplierApplied(string(key.ServiceID), string(key.EndpointAddr))
 	}
 
 	// Apply impact and clamp to valid range
@@ -422,4 +433,14 @@ func clamp(value, min, max float64) float64 {
 		return max
 	}
 	return value
+}
+
+// isInProbation returns true if the score is in the probation zone.
+// Probation zone: score >= probation threshold AND score < min threshold.
+func (s *service) isInProbation(score float64) bool {
+	probationConfig := s.config.TieredSelection.Probation
+	if !probationConfig.Enabled {
+		return false
+	}
+	return score >= probationConfig.Threshold && score < s.config.MinThreshold
 }

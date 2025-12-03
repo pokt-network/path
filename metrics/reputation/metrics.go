@@ -26,6 +26,12 @@ const (
 
 	// Tier distribution metrics (gauge showing endpoints per tier)
 	reputationTierDistributionMetric = "shannon_reputation_tier_distribution"
+
+	// Probation selection metrics
+	reputationProbationSelectionMetric = "shannon_reputation_probation_selection_total"
+
+	// Recovery multiplier applied metrics
+	reputationRecoveryMultiplierAppliedMetric = "shannon_reputation_recovery_multiplier_applied_total"
 )
 
 func init() {
@@ -35,6 +41,8 @@ func init() {
 	prometheus.MustRegister(reputationErrorsTotal)
 	prometheus.MustRegister(reputationTierSelection)
 	prometheus.MustRegister(reputationTierDistribution)
+	prometheus.MustRegister(reputationProbationSelection)
+	prometheus.MustRegister(reputationRecoveryMultiplierApplied)
 }
 
 var (
@@ -157,6 +165,42 @@ var (
 		},
 		[]string{"service_id", "tier"},
 	)
+
+	// reputationProbationSelection tracks probation endpoint selection outcomes.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - outcome: "selected" (endpoint from probation was used) or "skipped" (sampling rejected)
+	//
+	// Use to analyze:
+	//   - How often probation endpoints are being considered
+	//   - Effectiveness of probation traffic sampling
+	//   - Endpoint recovery patterns
+	reputationProbationSelection = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: pathProcess,
+			Name:      reputationProbationSelectionMetric,
+			Help:      "Total probation endpoint selection outcomes",
+		},
+		[]string{"service_id", "outcome"},
+	)
+
+	// reputationRecoveryMultiplierApplied tracks when recovery multiplier is applied to probation endpoints.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - endpoint_domain: Effective TLD+1 domain extracted from endpoint URL
+	//
+	// Use to analyze:
+	//   - How often probation endpoints receive boosted positive signals
+	//   - Recovery activity across services
+	//   - Endpoint recovery patterns
+	reputationRecoveryMultiplierApplied = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: pathProcess,
+			Name:      reputationRecoveryMultiplierAppliedMetric,
+			Help:      "Total times recovery multiplier was applied to probation endpoints",
+		},
+		[]string{"service_id", "endpoint_domain"},
+	)
 )
 
 // RecordSignal records a reputation signal metric.
@@ -228,6 +272,26 @@ func RecordTierDistribution(serviceID string, tier1Count, tier2Count, tier3Count
 	}).Set(float64(tier3Count))
 }
 
+// RecordProbationSelection records whether a probation endpoint was selected or skipped.
+func RecordProbationSelection(serviceID string, selected bool) {
+	outcome := "skipped"
+	if selected {
+		outcome = "selected"
+	}
+	reputationProbationSelection.With(prometheus.Labels{
+		"service_id": serviceID,
+		"outcome":    outcome,
+	}).Inc()
+}
+
+// RecordRecoveryMultiplierApplied records when a recovery multiplier is applied to a probation endpoint.
+func RecordRecoveryMultiplierApplied(serviceID, endpointDomain string) {
+	reputationRecoveryMultiplierApplied.With(prometheus.Labels{
+		"service_id":      serviceID,
+		"endpoint_domain": endpointDomain,
+	}).Inc()
+}
+
 // tierToString converts tier number to string label.
 func tierToString(tier int) string {
 	switch tier {
@@ -237,6 +301,8 @@ func tierToString(tier int) string {
 		return "2"
 	case 3:
 		return "3"
+	case 4:
+		return "probation"
 	default:
 		return "0"
 	}

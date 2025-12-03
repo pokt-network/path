@@ -261,6 +261,39 @@ type TieredSelectionConfig struct {
 	// Tier 3 (Fair tier) uses Config.MinThreshold as its minimum score.
 	// Endpoints with scores >= MinThreshold but < Tier2Threshold are selected
 	// only if no Tier 1 or Tier 2 endpoints are available.
+
+	// Probation configures the probation system for endpoints below MinThreshold.
+	// When enabled, endpoints that drop below MinThreshold enter a "probation zone"
+	// where they receive limited traffic instead of being completely filtered.
+	Probation ProbationConfig `yaml:"probation"`
+}
+
+// ProbationConfig configures the probation system for low-reputation endpoints.
+// Endpoints that drop below MinThreshold but stay above ProbationThreshold enter
+// a "probation zone" where they receive limited traffic, giving them a chance to recover.
+type ProbationConfig struct {
+	// Enabled determines if the probation system is active.
+	// When false, endpoints below MinThreshold are completely filtered.
+	// Default: true (when tiered selection is enabled)
+	Enabled bool `yaml:"enabled"`
+
+	// Threshold is the minimum score for the probation zone.
+	// Endpoints with scores >= Threshold but < MinThreshold are in probation.
+	// Endpoints below this threshold are completely filtered.
+	// Default: 10
+	Threshold float64 `yaml:"threshold"`
+
+	// TrafficPercent is the percentage of requests that consider probation endpoints.
+	// For example, if set to 10, only 10% of requests will consider endpoints in probation.
+	// This limits the impact of potentially unreliable endpoints while allowing recovery.
+	// Default: 10
+	TrafficPercent float64 `yaml:"traffic_percent"`
+
+	// RecoveryMultiplier boosts positive signal impact for endpoints in probation.
+	// This accelerates recovery by making each successful request count more.
+	// For example, a multiplier of 2.0 makes a +1 success signal worth +2.
+	// Default: 2.0
+	RecoveryMultiplier float64 `yaml:"recovery_multiplier"`
 }
 
 // Recovery and SyncConfig defaults.
@@ -290,6 +323,22 @@ const (
 	// Tier 3 uses MinThreshold (default: 30) as the minimum score.
 )
 
+// Probation defaults.
+const (
+	// DefaultProbationThreshold is the minimum score for the probation zone.
+	// Endpoints with scores >= this but < MinThreshold are in probation.
+	DefaultProbationThreshold float64 = 10
+
+	// DefaultProbationTrafficPercent is the percentage of requests that consider
+	// probation endpoints. Only this percentage of requests will potentially use
+	// endpoints in the probation zone.
+	DefaultProbationTrafficPercent float64 = 10
+
+	// DefaultProbationRecoveryMultiplier is the multiplier applied to positive signals
+	// for endpoints in probation. This accelerates recovery by boosting success signals.
+	DefaultProbationRecoveryMultiplier float64 = 2.0
+)
+
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
@@ -309,6 +358,17 @@ func DefaultTieredSelectionConfig() TieredSelectionConfig {
 		Enabled:        true, // Enabled by default when reputation is enabled
 		Tier1Threshold: DefaultTier1Threshold,
 		Tier2Threshold: DefaultTier2Threshold,
+		Probation:      DefaultProbationConfig(),
+	}
+}
+
+// DefaultProbationConfig returns a ProbationConfig with sensible defaults.
+func DefaultProbationConfig() ProbationConfig {
+	return ProbationConfig{
+		Enabled:            true, // Enabled by default when tiered selection is enabled
+		Threshold:          DefaultProbationThreshold,
+		TrafficPercent:     DefaultProbationTrafficPercent,
+		RecoveryMultiplier: DefaultProbationRecoveryMultiplier,
 	}
 }
 
@@ -349,6 +409,23 @@ func (t *TieredSelectionConfig) HydrateDefaults() {
 	}
 	if t.Tier2Threshold == 0 {
 		t.Tier2Threshold = DefaultTier2Threshold
+	}
+	t.Probation.HydrateDefaults()
+}
+
+// HydrateDefaults fills in zero values with defaults for ProbationConfig.
+func (p *ProbationConfig) HydrateDefaults() {
+	// Note: Enabled defaults to false (zero value), but we want it to default to true
+	// when tiered selection is enabled. This is handled at a higher level.
+	// Here we only hydrate the other fields.
+	if p.Threshold == 0 {
+		p.Threshold = DefaultProbationThreshold
+	}
+	if p.TrafficPercent == 0 {
+		p.TrafficPercent = DefaultProbationTrafficPercent
+	}
+	if p.RecoveryMultiplier == 0 {
+		p.RecoveryMultiplier = DefaultProbationRecoveryMultiplier
 	}
 }
 
@@ -403,6 +480,33 @@ func (t *TieredSelectionConfig) Validate(minThreshold float64) error {
 	}
 	if t.Tier2Threshold <= minThreshold {
 		return fmt.Errorf("tier2_threshold (%.1f) must be > min_threshold (%.1f)", t.Tier2Threshold, minThreshold)
+	}
+	// Validate probation config
+	if err := t.Probation.Validate(minThreshold); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Validate checks that the ProbationConfig values are valid.
+// Only validates when probation is enabled.
+func (p *ProbationConfig) Validate(minThreshold float64) error {
+	// Skip validation if probation is not enabled
+	if !p.Enabled {
+		return nil
+	}
+	if p.Threshold < MinScore || p.Threshold > MaxScore {
+		return fmt.Errorf("probation.threshold (%.1f) must be between %.1f and %.1f", p.Threshold, MinScore, MaxScore)
+	}
+	// Probation threshold must be below MinThreshold
+	if p.Threshold >= minThreshold {
+		return fmt.Errorf("probation.threshold (%.1f) must be < min_threshold (%.1f)", p.Threshold, minThreshold)
+	}
+	if p.TrafficPercent < 0 || p.TrafficPercent > 100 {
+		return fmt.Errorf("probation.traffic_percent (%.1f) must be between 0 and 100", p.TrafficPercent)
+	}
+	if p.RecoveryMultiplier < 1.0 {
+		return fmt.Errorf("probation.recovery_multiplier (%.1f) must be >= 1.0", p.RecoveryMultiplier)
 	}
 	return nil
 }
