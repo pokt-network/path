@@ -105,6 +105,13 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 								},
 							},
 						},
+						RetryConfig: shannonprotocol.RetryConfig{
+							Enabled:           true,
+							MaxRetries:        1,
+							RetryOn5xx:        true,
+							RetryOnTimeout:    true,
+							RetryOnConnection: true,
+						},
 					},
 				},
 				Router: RouterConfig{

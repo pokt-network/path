@@ -43,6 +43,10 @@ const (
 	endpointLatencyMetric       = "shannon_endpoint_latency_seconds"
 	relayMinerErrorsTotalMetric = "shannon_relay_miner_errors_total"
 
+	// Retry metrics
+	retryAttemptsTotalMetric = "shannon_retry_attempts_total"
+	retrySuccessTotalMetric  = "shannon_retry_success_total"
+
 	// The default value for a domain if it cannot be extracted from an endpoint URL
 	ErrDomain = "error_extracting_domain"
 )
@@ -79,6 +83,10 @@ func init() {
 	prometheus.MustRegister(endpointLatency)
 	prometheus.MustRegister(endpointResponseSize)
 	prometheus.MustRegister(relayMinerErrorsTotal)
+
+	// Retry metrics
+	prometheus.MustRegister(retryAttemptsTotal)
+	prometheus.MustRegister(retrySuccessTotal)
 }
 
 var (
@@ -359,6 +367,43 @@ var (
 			Help:      "Total RelayMinerError occurrences by service, endpoint domain, endpoint error type, and relay miner details",
 		},
 		[]string{"service_id", "endpoint_domain", "endpoint_error_type", "relay_miner_codespace", "relay_miner_code"},
+	)
+
+	// retryAttemptsTotal tracks the total number of retry attempts.
+	// A retry attempt is counted each time a request is retried on a different endpoint.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - error_type: Type of error that triggered the retry
+	//
+	// Use to analyze:
+	//   - Retry frequency by service and error type
+	//   - Impact of transient errors on request processing
+	//   - Effectiveness of retry mechanism
+	retryAttemptsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: pathProcess,
+			Name:      retryAttemptsTotalMetric,
+			Help:      "Total number of retry attempts by service and error type",
+		},
+		[]string{"service_id", "error_type"},
+	)
+
+	// retrySuccessTotal tracks requests that succeeded after at least one retry.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - attempt_number: The attempt number that succeeded (2 = first retry, 3 = second retry, etc.)
+	//
+	// Use to analyze:
+	//   - Success rate of retry mechanism
+	//   - How many retries are typically needed for recovery
+	//   - Value added by retry feature (requests saved from failure)
+	retrySuccessTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: pathProcess,
+			Name:      retrySuccessTotalMetric,
+			Help:      "Total requests that succeeded after retry by service and attempt number",
+		},
+		[]string{"service_id", "attempt_number"},
 	)
 )
 
@@ -1114,4 +1159,22 @@ func recordWebsocketConnectionDuration(
 		"success":         fmt.Sprintf("%t", success),
 		"close_reason":    closeReason,
 	}).Observe(duration)
+}
+
+// RecordRetryAttempt records a retry attempt with the error type that triggered it.
+// This is called each time a request is retried on a different endpoint.
+func RecordRetryAttempt(serviceID, errorType string) {
+	retryAttemptsTotal.With(prometheus.Labels{
+		"service_id": serviceID,
+		"error_type": errorType,
+	}).Inc()
+}
+
+// RecordRetrySuccess records a request that succeeded after at least one retry.
+// The attemptNumber indicates which attempt succeeded (2 = first retry, 3 = second retry, etc.)
+func RecordRetrySuccess(serviceID string, attemptNumber int) {
+	retrySuccessTotal.With(prometheus.Labels{
+		"service_id":     serviceID,
+		"attempt_number": fmt.Sprintf("%d", attemptNumber),
+	}).Inc()
 }
