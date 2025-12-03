@@ -171,6 +171,23 @@ func Test_PATH_E2E(t *testing.T) {
 	printServiceSummaries(serviceSummaries)
 }
 
+func testGatewayConfigViaEnv(t *testing.T, ctx context.Context, ts *TestService) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("Failed to read fs: %v", err)
+	}
+
+	yamlString := string(data)
+
+	if err = os.Setenv("GATEWAY_CONFIG", yamlString); err != nil {
+		t.Fatalf("Failed to set env variable: %v", err)
+	}
+
+	if err = LoadGatewayConfigFromEnv(); err != nil {
+		t.Fatalf("Failed to get config from yaml: %v", err)
+	}
+}
+
 // runAllServiceTests orchestrates either HTTP or Websocket tests based on test mode.
 // This function runs either HTTP tests OR Websocket tests, never both.
 func runAllServiceTests(t *testing.T, ctx context.Context, ts *TestService) {
