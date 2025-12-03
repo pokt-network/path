@@ -162,6 +162,8 @@ func TestIsRetryableErrorType_TimeoutErrors(t *testing.T) {
 		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_HTTP_IO_TIMEOUT,
 		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_HTTP_CONTEXT_DEADLINE_EXCEEDED,
 		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_HTTP_CONNECTION_TIMEOUT,
+		// RelayMiner timeout from poktroll (code 10)
+		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_TIMEOUT,
 	}
 
 	// With timeout retry enabled
