@@ -447,7 +447,7 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 
 	// Create a cancellable context for the Shannon relay.
 	// This allows us to cancel the request if we timeout and fallback,
-	// preventing double signal recording (timeout + error from cancelled request).
+	// preventing double signal recording (timeout + error from canceled request).
 	shannonCtx, cancelShannon := context.WithCancel(rc.context)
 
 	// Setup Shannon endpoint request:
