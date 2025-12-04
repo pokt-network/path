@@ -292,6 +292,62 @@ func classifyMalformedEndpointPayload(logger polylog.Logger, payloadContent stri
 		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_HTTP_TRANSPORT, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION
 	}
 
+	// ============================================================================
+	// RelayMiner-specific errors (from poktroll/pkg/relayer/proxy/errors.go)
+	// These match the exact error messages returned by the RelayMiner
+	// ============================================================================
+
+	// RelayMiner timeout (code 10) - RETRYABLE: transient error, may succeed on different endpoint
+	if strings.Contains(payloadContent, "relayer proxy request timed out") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_TIMEOUT, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION
+	}
+
+	// RelayMiner invalid session (code 1) - session validation failed
+	if strings.Contains(payloadContent, "invalid session in relayer request") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_INVALID_SESSION, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION
+	}
+
+	// RelayMiner services configs undefined (code 2) - configuration error
+	if strings.Contains(payloadContent, "services configurations are undefined") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_SERVICE_CONFIG_UNDEFINED, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_PERMANENT
+	}
+
+	// RelayMiner unsupported transport type (code 4) - configuration error
+	if strings.Contains(payloadContent, "unsupported proxy transport type") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_UNSUPPORTED_TRANSPORT, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_PERMANENT
+	}
+
+	// RelayMiner internal error (code 5) - internal relay miner error
+	// Note: This runs specifically on RelayMiner malformed payloads, so "internal error" is unambiguous
+	if strings.Contains(payloadContent, "internal error") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_INTERNAL_ERROR, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION
+	}
+
+	// RelayMiner unknown session (code 6) - session not found
+	if strings.Contains(payloadContent, "relayer proxy encountered unknown session") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_UNKNOWN_SESSION, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION
+	}
+
+	// RelayMiner rate limited (code 7) - offchain rate limit hit
+	if strings.Contains(payloadContent, "offchain rate limit hit by relayer proxy") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_RATE_LIMITED, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION
+	}
+
+	// RelayMiner relay cost calculation failed (code 8)
+	if strings.Contains(payloadContent, "failed to calculate relay cost") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_RELAY_COST_CALCULATION, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION
+	}
+
+	// RelayMiner request limit exceeded (code 13)
+	if strings.Contains(payloadContent, "request limit exceed") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_REQUEST_LIMIT_EXCEEDED, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_DO_NOT_SANCTION
+	}
+
+	// RelayMiner unmarshal relay request failed (code 14)
+	if strings.Contains(payloadContent, "failed to unmarshal relay request") {
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_UNMARSHAL_REQUEST, protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION
+	}
+
 	// If we can't classify the malformed payload, it's an internal error
 	logger.With(
 		"endpoint_payload_preview", payloadContent[:min(100, len(payloadContent))],

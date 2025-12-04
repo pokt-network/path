@@ -134,6 +134,13 @@ type requestContext struct {
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
 	// When nil, only binary sanctions are used.
 	reputationService reputation.ReputationService
+
+	// protocol is a reference to the parent Protocol for retry and other operations.
+	protocol *Protocol
+
+	// availableEndpoints contains all endpoints available for the request.
+	// Used for retry to select a different endpoint after failure.
+	availableEndpoints map[protocol.EndpointAddr]endpoint
 }
 
 // HandleServiceRequest:
@@ -177,7 +184,99 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 
 // sendSingleRelay handles a single relay request with full error handling and observation tracking.
 // Extracted from original HandleServiceRequest logic for reuse in parallel processing.
+// Supports automatic retry on transient errors when retry is enabled in the protocol config.
 func (rc *requestContext) sendSingleRelay(payload protocol.Payload) (protocol.Response, error) {
+	// If retry is disabled or protocol is not available, use the simple path
+	if rc.protocol == nil || !rc.protocol.retryConfig.Enabled {
+		return rc.attemptSingleRelay(payload)
+	}
+
+	// Retry is enabled - implement retry loop
+	retryConfig := rc.protocol.retryConfig
+	maxAttempts := 1 + retryConfig.MaxRetries
+	excludedEndpoints := make(map[protocol.EndpointAddr]struct{})
+
+	var lastResponse protocol.Response
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Record endpoint for this attempt
+		currentEndpoint := rc.getSelectedEndpoint()
+		if currentEndpoint == nil {
+			return rc.handleInternalError(fmt.Errorf("sendSingleRelay: no endpoint selected for attempt %d", attempt))
+		}
+
+		// Execute the relay attempt
+		response, err := rc.attemptSingleRelay(payload)
+
+		// Success - return immediately
+		if err == nil {
+			// If this was a retry attempt (not the first attempt), record success
+			if attempt > 1 {
+				shannonmetrics.RecordRetrySuccess(string(rc.serviceID), attempt)
+			}
+			return response, nil
+		}
+
+		// Failure - check if we should retry
+		lastResponse = response
+		lastErr = err
+
+		// Mark this endpoint as excluded for future retries
+		excludedEndpoints[currentEndpoint.Addr()] = struct{}{}
+
+		// Classify the error to determine if it's retryable
+		errorType, _ := classifyRelayError(rc.logger, err)
+		if !isRetryableErrorType(errorType, retryConfig) {
+			// Non-retryable error - return immediately
+			rc.logger.Debug().
+				Err(err).
+				Str("error_type", errorType.String()).
+				Int("attempt", attempt).
+				Msg("Non-retryable error encountered, not retrying")
+			return lastResponse, lastErr
+		}
+
+		// Check if we have more retries available
+		if attempt >= maxAttempts {
+			rc.logger.Debug().
+				Err(err).
+				Int("attempt", attempt).
+				Int("max_attempts", maxAttempts).
+				Msg("Max retry attempts reached")
+			break
+		}
+
+		// Try to select a new endpoint for retry
+		newEndpoint := rc.selectRetryEndpoint(excludedEndpoints)
+		if newEndpoint == nil {
+			rc.logger.Debug().
+				Err(err).
+				Int("attempt", attempt).
+				Int("excluded_count", len(excludedEndpoints)).
+				Msg("No available endpoints for retry")
+			break
+		}
+
+		// Record retry attempt metric
+		shannonmetrics.RecordRetryAttempt(string(rc.serviceID), errorType.String())
+
+		// Switch to the new endpoint and retry
+		rc.setSelectedEndpoint(newEndpoint)
+		rc.logger.Debug().
+			Err(err).
+			Str("error_type", errorType.String()).
+			Int("attempt", attempt).
+			Str("new_endpoint", string(newEndpoint.Addr())).
+			Msg("Retrying request on different endpoint")
+	}
+
+	return lastResponse, lastErr
+}
+
+// attemptSingleRelay performs a single relay attempt without retry logic.
+// This is the core relay logic extracted for use by sendSingleRelay's retry loop.
+func (rc *requestContext) attemptSingleRelay(payload protocol.Payload) (protocol.Response, error) {
 	// Record endpoint query time.
 	endpointQueryTime := time.Now()
 
@@ -194,6 +293,32 @@ func (rc *requestContext) sendSingleRelay(payload protocol.Payload) (protocol.Re
 	// - Return response received from endpoint.
 	err = rc.handleEndpointSuccess(endpointQueryTime, &relayResponse)
 	return relayResponse, err
+}
+
+// selectRetryEndpoint selects a different endpoint for retry, excluding already-failed endpoints.
+// Returns nil if no suitable endpoint is available.
+func (rc *requestContext) selectRetryEndpoint(excludedEndpoints map[protocol.EndpointAddr]struct{}) endpoint {
+	// Build a list of candidate endpoints, excluding already-failed ones
+	var candidates []endpoint
+	for addr, ep := range rc.availableEndpoints {
+		if _, excluded := excludedEndpoints[addr]; !excluded {
+			candidates = append(candidates, ep)
+		}
+	}
+
+	// Also check fallback endpoints if available
+	for addr, ep := range rc.fallbackEndpoints {
+		if _, excluded := excludedEndpoints[addr]; !excluded {
+			candidates = append(candidates, ep)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Select a random endpoint from candidates for load distribution
+	return candidates[rand.Intn(len(candidates))]
 }
 
 // TODO_TECHDEBT(@adshmh): Set and enforce a cap on the number of concurrent parallel requests for a single method call.

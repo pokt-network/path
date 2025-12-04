@@ -163,6 +163,27 @@ shannon_config:
       #   read_timeout: 3s
       #   write_timeout: 3s
 
+    # Optional retry configuration
+    # Enables automatic retry of failed requests on different endpoints
+    # Useful for recovering from transient errors without client intervention
+    retry_config:
+      # Enable/disable automatic retry
+      # Default: false (requests are not retried)
+      enabled: true
+      # Maximum number of retry attempts after the initial request fails
+      # Total attempts = 1 (initial) + max_retries
+      # Default: 1
+      max_retries: 1
+      # Retry on HTTP 5xx server errors from endpoints
+      # Default: true
+      retry_on_5xx: true
+      # Retry on timeout errors (connection timeout, read timeout, etc.)
+      # Default: true
+      retry_on_timeout: true
+      # Retry on connection errors (refused, reset, unreachable)
+      # Default: true
+      retry_on_connection: true
+
 # Optional logger configuration
 logger_config:
   # Valid values are: debug, info, warn, error

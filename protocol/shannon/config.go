@@ -88,6 +88,11 @@ type (
 		// Configures the endpoint reputation system.
 		// If not specified or disabled, binary sanctions will be used instead.
 		ReputationConfig reputation.Config `yaml:"reputation_config"`
+
+		// Optional.
+		// Configures automatic retry on endpoint failure.
+		// If not specified or disabled, failed requests will not be retried.
+		RetryConfig RetryConfig `yaml:"retry_config"`
 	}
 
 	// TODO_TECHDEBT(@adshmh): Make configuration and implementation explicit:

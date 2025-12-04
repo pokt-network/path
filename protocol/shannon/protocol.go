@@ -97,6 +97,10 @@ type Protocol struct {
 	// tieredSelector selects endpoints using cascade-down tier logic.
 	// Created when reputation service is enabled with tiered selection enabled.
 	tieredSelector *reputation.TieredSelector
+
+	// retryConfig holds the configuration for automatic request retry.
+	// When enabled, failed requests are retried on different endpoints.
+	retryConfig RetryConfig
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -154,6 +158,9 @@ func NewProtocol(
 
 		// load testing config, if specified.
 		loadTestingConfig: config.LoadTestingConfig,
+
+		// retry config, with defaults applied
+		retryConfig: config.RetryConfig.HydrateDefaults(),
 	}
 
 	// Initialize reputation service if enabled.
@@ -415,6 +422,8 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		loadTestingConfig:  p.loadTestingConfig,
 		relayPool:          p.relayPool,
 		reputationService:  p.reputationService,
+		protocol:           p,
+		availableEndpoints: endpoints,
 	}, protocolobservations.Observations{}, nil
 }
 
