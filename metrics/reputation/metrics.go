@@ -21,11 +21,14 @@ const (
 	// Reputation service health metrics
 	reputationErrorsTotalMetric = "shannon_reputation_errors_total"
 
-	// Tiered selection metrics
-	reputationTierSelectionMetric = "shannon_reputation_tier_selection_total"
+	// Probation metrics
+	probationEndpointsGaugeMetric     = "shannon_probation_endpoints"
+	probationTransitionsTotalMetric   = "shannon_probation_transitions_total"
+	probationTrafficRoutedTotalMetric = "shannon_probation_traffic_routed_total"
 
-	// Tier distribution metrics (gauge showing endpoints per tier)
-	reputationTierDistributionMetric = "shannon_reputation_tier_distribution"
+	// Tier selection metrics
+	tierDistributionGaugeMetric  = "shannon_reputation_tier_endpoints"
+	tierSelectionTotalMetric     = "shannon_reputation_tier_selection_total"
 )
 
 func init() {
@@ -33,8 +36,11 @@ func init() {
 	prometheus.MustRegister(reputationEndpointsFiltered)
 	prometheus.MustRegister(reputationScoreDistribution)
 	prometheus.MustRegister(reputationErrorsTotal)
-	prometheus.MustRegister(reputationTierSelection)
-	prometheus.MustRegister(reputationTierDistribution)
+	prometheus.MustRegister(probationEndpointsGauge)
+	prometheus.MustRegister(probationTransitionsTotal)
+	prometheus.MustRegister(probationTrafficRoutedTotal)
+	prometheus.MustRegister(tierDistributionGauge)
+	prometheus.MustRegister(tierSelectionTotal)
 }
 
 var (
@@ -42,23 +48,21 @@ var (
 	// Labels:
 	//   - service_id: Target service identifier
 	//   - signal_type: Type of signal (success, minor_error, major_error, critical_error, fatal_error)
+	//   - endpoint_type: Type of endpoint (http, websocket, unknown)
 	//   - endpoint_domain: Effective TLD+1 domain extracted from endpoint URL
-	//
-	// CARDINALITY WARNING: The endpoint_domain label can have high cardinality
-	// in deployments with many unique supplier domains. Monitor Prometheus memory
-	// usage and consider aggregating metrics if cardinality exceeds ~1000 unique domains.
 	//
 	// Use to analyze:
 	//   - Signal distribution by type and service
 	//   - Endpoint reliability patterns
 	//   - Error rate trends over time
+	//   - HTTP vs WebSocket reliability differences
 	reputationSignalsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: pathProcess,
 			Name:      reputationSignalsTotalMetric,
 			Help:      "Total number of reputation signals recorded by type",
 		},
-		[]string{"service_id", "signal_type", "endpoint_domain"},
+		[]string{"service_id", "signal_type", "endpoint_type", "endpoint_domain"},
 	)
 
 	// reputationEndpointsFiltered tracks endpoints filtered due to low reputation.
@@ -122,48 +126,102 @@ var (
 		[]string{"operation", "error_type"},
 	)
 
-	// reputationTierSelection tracks endpoint selections by tier.
+	// probationEndpointsGauge tracks the current number of endpoints in probation.
 	// Labels:
 	//   - service_id: Target service identifier
-	//   - tier: Selected tier (1=Premium, 2=Good, 3=Fair, 0=Random/disabled)
 	//
 	// Use to analyze:
-	//   - Tier distribution across services
-	//   - How often cascade-down occurs (tier 2/3 selections)
-	//   - Effectiveness of tiered selection
-	reputationTierSelection = prometheus.NewCounterVec(
+	//   - Current probation pool size per service
+	//   - Trends in endpoint health
+	probationEndpointsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: pathProcess,
+			Name:      probationEndpointsGaugeMetric,
+			Help:      "Current number of endpoints in probation per service",
+		},
+		[]string{"service_id"},
+	)
+
+	// probationTransitionsTotal tracks probation state transitions.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - endpoint_domain: Effective TLD+1 domain extracted from endpoint URL
+	//   - transition: Type of transition (entered, exited, recovered, demoted)
+	//
+	// Use to analyze:
+	//   - How often endpoints enter/exit probation
+	//   - Recovery success rates
+	//   - Domain-level reliability patterns
+	probationTransitionsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: pathProcess,
-			Name:      reputationTierSelectionMetric,
-			Help:      "Total endpoint selections by tier",
+			Name:      probationTransitionsTotalMetric,
+			Help:      "Total probation state transitions by type",
+		},
+		[]string{"service_id", "endpoint_domain", "transition"},
+	)
+
+	// probationTrafficRoutedTotal tracks traffic routed to probation endpoints.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - endpoint_domain: Effective TLD+1 domain extracted from endpoint URL
+	//   - success: Whether the request was successful (true/false)
+	//
+	// Use to analyze:
+	//   - Success rate of probation traffic
+	//   - Whether probation endpoints are recovering
+	probationTrafficRoutedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: pathProcess,
+			Name:      probationTrafficRoutedTotalMetric,
+			Help:      "Total traffic routed to endpoints in probation",
+		},
+		[]string{"service_id", "endpoint_domain", "success"},
+	)
+
+	// tierDistributionGauge tracks the current number of endpoints in each tier.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - tier: Tier number (1, 2, or 3)
+	tierDistributionGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: pathProcess,
+			Name:      tierDistributionGaugeMetric,
+			Help:      "Current number of endpoints in each reputation tier",
 		},
 		[]string{"service_id", "tier"},
 	)
 
-	// reputationTierDistribution tracks the current distribution of endpoints across tiers.
+	// tierSelectionTotal tracks tier selections during endpoint filtering.
 	// Labels:
 	//   - service_id: Target service identifier
-	//   - tier: Tier number (1=Premium, 2=Good, 3=Fair)
-	//
-	// Use to analyze:
-	//   - Real-time health of endpoint pool
-	//   - How endpoints are distributed across reputation tiers
-	//   - Identify services with poor endpoint quality
-	reputationTierDistribution = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
+	//   - tier: Selected tier (0 = no tier available, 1, 2, or 3)
+	tierSelectionTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
 			Subsystem: pathProcess,
-			Name:      reputationTierDistributionMetric,
-			Help:      "Current number of endpoints in each tier",
+			Name:      tierSelectionTotalMetric,
+			Help:      "Total tier selections by tier number",
 		},
 		[]string{"service_id", "tier"},
 	)
 )
 
+// EndpointType constants for metrics labeling.
+// These match the RPC types used for endpoint filtering (sharedtypes.RPCType).
+const (
+	EndpointTypeJSONRPC   = "jsonrpc"
+	EndpointTypeREST      = "rest"
+	EndpointTypeWebSocket = "websocket"
+	EndpointTypeGRPC      = "grpc"
+	EndpointTypeUnknown   = "unknown"
+)
+
 // RecordSignal records a reputation signal metric.
-func RecordSignal(serviceID, signalType, endpointDomain string) {
+func RecordSignal(serviceID, signalType, endpointType, endpointDomain string) {
 	reputationSignalsTotal.With(prometheus.Labels{
 		"service_id":      serviceID,
 		"signal_type":     signalType,
+		"endpoint_type":   endpointType,
 		"endpoint_domain": endpointDomain,
 	}).Inc()
 }
@@ -201,36 +259,72 @@ func RecordError(operation, errorType string) {
 	}).Inc()
 }
 
-// RecordTierSelection records which tier an endpoint was selected from.
-func RecordTierSelection(serviceID string, tier int) {
-	reputationTierSelection.With(prometheus.Labels{
+// Probation transition types for metrics labeling.
+const (
+	ProbationTransitionEntered   = "entered"
+	ProbationTransitionExited    = "exited"
+	ProbationTransitionRecovered = "recovered"
+	ProbationTransitionDemoted   = "demoted"
+)
+
+// SetProbationEndpointsCount sets the current count of endpoints in probation for a service.
+func SetProbationEndpointsCount(serviceID string, count int) {
+	probationEndpointsGauge.With(prometheus.Labels{
 		"service_id": serviceID,
-		"tier":       tierToString(tier),
+	}).Set(float64(count))
+}
+
+// RecordProbationTransition records a probation state transition.
+func RecordProbationTransition(serviceID, endpointDomain, transition string) {
+	probationTransitionsTotal.With(prometheus.Labels{
+		"service_id":      serviceID,
+		"endpoint_domain": endpointDomain,
+		"transition":      transition,
 	}).Inc()
 }
 
-// RecordTierDistribution records the current distribution of endpoints across tiers.
-// This should be called whenever tiered selection is performed to show real-time tier health.
+// RecordProbationTraffic records traffic routed to probation endpoints.
+func RecordProbationTraffic(serviceID, endpointDomain string, success bool) {
+	successStr := "false"
+	if success {
+		successStr = "true"
+	}
+	probationTrafficRoutedTotal.With(prometheus.Labels{
+		"service_id":      serviceID,
+		"endpoint_domain": endpointDomain,
+		"success":         successStr,
+	}).Inc()
+}
+
+// RecordTierDistribution records the current endpoint distribution across tiers.
 func RecordTierDistribution(serviceID string, tier1Count, tier2Count, tier3Count int) {
-	reputationTierDistribution.With(prometheus.Labels{
+	tierDistributionGauge.With(prometheus.Labels{
 		"service_id": serviceID,
 		"tier":       "1",
 	}).Set(float64(tier1Count))
-
-	reputationTierDistribution.With(prometheus.Labels{
+	tierDistributionGauge.With(prometheus.Labels{
 		"service_id": serviceID,
 		"tier":       "2",
 	}).Set(float64(tier2Count))
-
-	reputationTierDistribution.With(prometheus.Labels{
+	tierDistributionGauge.With(prometheus.Labels{
 		"service_id": serviceID,
 		"tier":       "3",
 	}).Set(float64(tier3Count))
 }
 
-// tierToString converts tier number to string label.
+// RecordTierSelection records which tier was selected for endpoint filtering.
+func RecordTierSelection(serviceID string, tier int) {
+	tierSelectionTotal.With(prometheus.Labels{
+		"service_id": serviceID,
+		"tier":       tierToString(tier),
+	}).Inc()
+}
+
+// tierToString converts a tier number to its string representation.
 func tierToString(tier int) string {
 	switch tier {
+	case 0:
+		return "0"
 	case 1:
 		return "1"
 	case 2:
@@ -238,6 +332,6 @@ func tierToString(tier int) string {
 	case 3:
 		return "3"
 	default:
-		return "0"
+		return "unknown"
 	}
 }

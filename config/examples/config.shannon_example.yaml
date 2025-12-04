@@ -13,142 +13,98 @@
 # DEV_NOTE: The `gateway_private_key_hex` and `owned_apps_private_keys_hex`
 # fields in this file are just random hex codes to bypass schema validation.
 
-shannon_config:
-  full_node_config:
-    # If this config is used for Shannon E2E tests, do not change rpc_url
-    # Otherwise, replace with the correct full node RPC url.
-    rpc_url: https://shannon-grove-rpc.mainnet.poktroll.com
-    grpc_config:
-      # If this config is used for Shannon E2E tests, do not change host_port
-      # Otherwise, replace with the correct full node GRPC host:port.
-      host_port: shannon-grove-grpc.mainnet.poktroll.com:443
-    # Setting this to true disables all caching of full node data.
-    lazy_mode: false
-    # Session rollover blocks is a temporary fix to handle session rollover issues.
-    # Should be removed when the rollover issue is solved at the protocol level.
-    session_rollover_blocks: 10
-    # If lazy_mode is true, the cache_config may not be set.
-    cache_config:
-      # The TTL for the session cache.
-      #  TODO_NEXT(@commoddity): Session refresh handling should be significantly reworked as part of the next changes following PATH PR #297.
-      # The proposed change is to align session refreshes with actual session expiry time,
-      # using the session expiry block and the Shannon SDK's block client.
-      # When this is done, session cache TTL can be removed altogether.
-      session_ttl: 30s
+full_node_config:
+  # If this config is used for Shannon E2E tests, do not change rpc_url
+  # Otherwise, replace with the correct full node RPC url.
+  rpc_url: https://shannon-grove-rpc.mainnet.poktroll.com
+  grpc_config:
+    # If this config is used for Shannon E2E tests, do not change host_port
+    # Otherwise, replace with the correct full node GRPC host:port.
+    host_port: shannon-grove-grpc.mainnet.poktroll.com:443
+  # Setting this to true disables all caching of full node data.
+  lazy_mode: false
+  # Session rollover blocks is a temporary fix to handle session rollover issues.
+  # Should be removed when the rollover issue is solved at the protocol level.
+  session_rollover_blocks: 10
+  # If lazy_mode is true, the cache_config may not be set.
+  cache_config:
+    # The TTL for the session cache.
+    #  TODO_NEXT(@commoddity): Session refresh handling should be significantly reworked as part of the next changes following PATH PR #297.
+    # The proposed change is to align session refreshes with actual session expiry time,
+    # using the session expiry block and the Shannon SDK's block client.
+    # When this is done, session cache TTL can be removed altogether.
+    session_ttl: 30s
 
-  gateway_config:
-    # If this config is used for Shannon E2E tests, do not change gateway_mode
-    # Otherwise, replace with the correct gateway mode: centralized|delegated|permissionless
-    gateway_mode: "centralized"
+gateway_config:
+  # If this config is used for Shannon E2E tests, do not change gateway_mode
+  # Otherwise, replace with the correct gateway mode: centralized|delegated|permissionless
+  gateway_mode: "centralized"
 
-    # README: gateway_address MUST BE replaced with the correct gateway address.
-    gateway_address: pokt1up7zlytnmvlsuxzpzvlrta95347w322adsxslw
+  # README: gateway_address MUST BE replaced with the correct gateway address.
+  gateway_address: pokt1up7zlytnmvlsuxzpzvlrta95347w322adsxslw
 
-    # README: gateway_private_key_hex MUST BE replaced with the correct gateway private key secret
-    # See the following link for instructions on creating a Shannon gateway.
-    # https://dev.poktroll.com/operate/quickstart/docker_compose_walkthrough#d-creating-a-gateway-deploying-an-gateway-server
-    gateway_private_key_hex: 40af4e7e1b311c76a573610fe115cd2adf1eeade709cd77ca31ad4472509d388
+  # README: gateway_private_key_hex MUST BE replaced with the correct gateway private key secret
+  # See the following link for instructions on creating a Shannon gateway.
+  # https://dev.poktroll.com/operate/quickstart/docker_compose_walkthrough#d-creating-a-gateway-deploying-an-gateway-server
+  gateway_private_key_hex: 40af4e7e1b311c76a573610fe115cd2adf1eeade709cd77ca31ad4472509d388
 
-    owned_apps_private_keys_hex:
-      # README: the application private key MUST BE replaced with the correct application private key secret
-      - 40af4e7e1b311c76a573610fe115cd2adf1eeade709cd77ca31ad4472509d388
-    
-    # service_fallback is an array of service fallback configurations.
-    # One service may have multiple fallback endpoint URLs for each RPC type.
-    service_fallback:
-      - service_id: xrplevm
-        send_all_traffic: false
-        fallback_endpoints:
-        # In the case of services that supports multiple RPC types,
-        # all RPC type URLs must be specified, including the default URL.
-        # However, only RPC-type specific URLs are used for requests.
-        - default_url: "http://12.34.56.78"
-          json_rpc: "http://12.34.56.78:8545"
-          rest: "http://12.34.56.78:1317"
-          comet_bft: "http://12.34.56.78:26657"
-          websocket: "http://12.34.56.78:8546"
-      - service_id: eth
-        send_all_traffic: false
-        fallback_endpoints:
-        # In the case of services that support only one RPC type,
-        # only `default_url` is specified and the other RPC type URLs are omitted.
-        - default_url: "https://eth.rpc.backup.io"
+  owned_apps_private_keys_hex:
+    # README: the application private key MUST BE replaced with the correct application private key secret
+    - 40af4e7e1b311c76a573610fe115cd2adf1eeade709cd77ca31ad4472509d388
 
-    # Optional sanction configuration
-    # Controls how long misbehaving endpoints are excluded from selection
-    sanction_config:
-      # How long session-based sanctions last before the endpoint can be selected again
-      # Default: 1h (1 hour)
-      session_sanction_duration: 30m
-      # How often expired sanctions are cleaned up from memory
-      # Default: 10m (10 minutes)
-      cache_cleanup_interval: 5m
+  # service_fallback is an array of service fallback configurations.
+  # One service may have multiple fallback endpoint URLs for each RPC type.
+  service_fallback:
+    - service_id: xrplevm
+      send_all_traffic: false
+      fallback_endpoints:
+      # In the case of services that supports multiple RPC types,
+      # all RPC type URLs must be specified, including the default URL.
+      # However, only RPC-type specific URLs are used for requests.
+      - default_url: "http://12.34.56.78"
+        json_rpc: "http://12.34.56.78:8545"
+        rest: "http://12.34.56.78:1317"
+        comet_bft: "http://12.34.56.78:26657"
+        websocket: "http://12.34.56.78:8546"
+    - service_id: eth
+      send_all_traffic: false
+      fallback_endpoints:
+      # In the case of services that support only one RPC type,
+      # only `default_url` is specified and the other RPC type URLs are omitted.
+      - default_url: "https://eth.rpc.backup.io"
 
-    # Optional reputation configuration
-    # Provides gradual endpoint scoring based on reliability patterns
-    # Works in addition to binary sanctions, not as a replacement
-    reputation_config:
-      # Enable/disable the reputation system
-      # Default: false (only binary sanctions are used)
-      enabled: true
-      # Storage backend for reputation data
-      # Options: "memory" (single instance) or "redis" (multi-instance deployments)
-      # Default: "memory"
-      storage_type: "memory"
-      # Starting score for new endpoints (0-100 scale)
-      # Default: 80
-      initial_score: 80
-      # Minimum score required for endpoint selection
-      # Endpoints below this threshold are filtered out
-      # Default: 30
-      min_threshold: 30
-      # Time after which inactive endpoint scores can be re-evaluated
-      # Default: 5m
-      recovery_timeout: 5m
-      # How endpoints are grouped for scoring (global default)
-      # Options:
-      #   "per-endpoint" - Each endpoint URL scored independently (finest granularity, default)
-      #   "per-domain"   - Endpoints from the same hosting domain share a score (e.g., nodefleet.net)
-      #   "per-supplier" - All endpoint URLs from the same supplier share a score
-      # Default: "per-endpoint"
-      key_granularity: "per-endpoint"
-      # Per-service overrides for key granularity
-      # Allows different services to use different scoring strategies
-      # service_overrides:
-      #   eth:
-      #     # Use per-domain for eth to group endpoints by hosting provider
-      #     key_granularity: "per-domain"
-      #   sol:
-      #     # Use per-supplier for sol to group by supplier
-      #     key_granularity: "per-supplier"
-      # Tiered endpoint selection configuration
-      # When enabled, endpoints are grouped into tiers based on reputation score
-      # and selection prefers higher-tier endpoints using cascade-down logic
-      tiered_selection:
-        # Enable/disable tiered selection
-        # Default: true (when reputation is enabled)
-        enabled: true
-        # Minimum score for Tier 1 (Premium tier)
-        # Endpoints with scores >= tier1_threshold are selected first
-        # Default: 70
-        tier1_threshold: 70
-        # Minimum score for Tier 2 (Good tier)
-        # Endpoints with scores >= tier2_threshold but < tier1_threshold
-        # are selected only if no Tier 1 endpoints are available
-        # Default: 50
-        tier2_threshold: 50
-        # Tier 3 (Fair tier) uses min_threshold as its minimum score
-        # Endpoints in Tier 3 are selected only if Tier 1 and 2 are empty
-      # Redis configuration (only used when storage_type is "redis")
-      # redis:
-      #   address: "localhost:6379"
-      #   password: ""
-      #   db: 0
-      #   key_prefix: "path:reputation:"
-      #   pool_size: 10
-      #   dial_timeout: 5s
-      #   read_timeout: 3s
-      #   write_timeout: 3s
+  # Reputation configuration
+  # The primary endpoint quality system - tracks endpoint reliability via scores (0-100).
+  # Scores are updated by both user requests and health check probes.
+  # Endpoints below min_threshold are filtered out but can recover via successful requests/health checks.
+  reputation_config:
+    # Enable/disable the reputation system
+    # Default: true (reputation is enabled by default)
+    enabled: true
+    # Storage backend for reputation data
+    # Options: "memory" (single instance) or "redis" (multi-instance deployments)
+    # Default: "memory"
+    storage_type: "memory"
+    # Starting score for new endpoints (0-100 scale)
+    # Default: 80
+    initial_score: 80
+    # Minimum score required for endpoint selection
+    # Endpoints below this threshold are filtered out
+    # Default: 30
+    min_threshold: 30
+    # Time after which inactive endpoint scores can be re-evaluated
+    # Default: 5m
+    recovery_timeout: 5m
+    # Redis configuration (only used when storage_type is "redis")
+    # redis:
+    #   address: "localhost:6379"
+    #   password: ""
+    #   db: 0
+    #   key_prefix: "path:reputation:"
+    #   pool_size: 10
+    #   dial_timeout: 5s
+    #   read_timeout: 3s
+    #   write_timeout: 3s
 
 # Optional logger configuration
 logger_config:

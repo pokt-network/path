@@ -69,7 +69,7 @@ func main() {
 	// Log the config path
 	logger.Info().Msgf("Starting PATH using config file: %s", configPath)
 
-	// Create a context for background services (pprof, hydrator, reputation) that can be canceled during shutdown.
+	// Create a context for background services (pprof, health checks, reputation) that can be canceled during shutdown.
 	// This context is used to signal graceful shutdown to all background goroutines.
 	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
 
@@ -85,7 +85,7 @@ func main() {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to setup QoS instances"}`, err)
 	}
 
-	// Setup metrics reporter, to be used by Gateway and Hydrator
+	// Setup metrics reporter, to be used by Gateway and Health Checks
 	metricsReporter, err := setupMetricsServer(logger, prometheusMetricsServerAddr)
 	if err != nil {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start metrics server"}`, err)
@@ -100,21 +100,18 @@ func main() {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start the configured HTTP data reporter"}`, err)
 	}
 
-	// TODO_IMPROVE: consider using a separate protocol instance for the hydrator,
-	// to enable configuring separate worker pools for the user requests
-	// and the endpoint hydrator requests.
-	hydrator, err := setupEndpointHydrator(
+	// Setup the health check executor for YAML-configurable health checks.
+	// This runs health checks against endpoints and records results to the reputation system.
+	healthCheckConfig := &config.GetGatewayConfig().GatewayConfig.ActiveHealthChecksConfig
+	setupHealthCheckExecutor(
 		backgroundCtx,
 		logger,
 		protocol,
-		qosInstances,
+		healthCheckConfig,
 		metricsReporter,
 		dataReporter,
-		config.HydratorConfig,
+		qosInstances,
 	)
-	if err != nil {
-		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to setup endpoint hydrator"}`, err)
-	}
 
 	// Setup the request parser which maps requests to the correct QoS instance.
 	requestParser := &request.Parser{
@@ -137,9 +134,6 @@ func main() {
 	// health check components must implement the health.Check interface
 	// to be able to signal they are ready to service requests.
 	components := []health.Check{protocol}
-	if hydrator != nil {
-		components = append(components, hydrator)
-	}
 	healthChecker := &health.Checker{
 		Logger:            logger,
 		Components:        components,
@@ -194,7 +188,7 @@ func main() {
 
 	logger.Info().Msg("Shutting down PATH...")
 
-	// Cancel background context to stop all background services (pprof, hydrator)
+	// Cancel background context to stop all background services (pprof, health checks)
 	backgroundCancel()
 
 	// TODO_IMPROVE: Make shutdown timeout configurable and add graceful shutdown of dependencies

@@ -7,19 +7,30 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/pokt-network/path/config/shannon"
+	shannonprotocol "github.com/pokt-network/path/protocol/shannon"
+	"github.com/pokt-network/path/reputation"
 )
 
 /* ---------------------------------  Gateway Config Struct -------------------------------- */
 
 // GatewayConfig contains all configuration details needed to operate a gateway,
 // parsed from a YAML config file.
+// The config structure is flattened - full_node_config and gateway_config are at root level.
 type GatewayConfig struct {
-	ShannonConfig      *shannon.ShannonGatewayConfig `yaml:"shannon_config"`
-	Router             RouterConfig                  `yaml:"router_config"`
-	Logger             LoggerConfig                  `yaml:"logger_config"`
-	HydratorConfig     EndpointHydratorConfig        `yaml:"hydrator_config"`
-	MessagingConfig    MessagingConfig               `yaml:"messaging_config"`
-	DataReporterConfig HTTPDataReporterConfig        `yaml:"data_reporter_config"`
+	// Shannon protocol configuration (flattened from previous shannon_config wrapper)
+	FullNodeConfig    shannonprotocol.FullNodeConfig `yaml:"full_node_config"`
+	GatewayModeConfig shannonprotocol.GatewayConfig  `yaml:"gateway_config"`
+
+	// Other gateway configurations
+	Router             RouterConfig           `yaml:"router_config"`
+	Logger             LoggerConfig           `yaml:"logger_config"`
+	HydratorConfig     EndpointHydratorConfig `yaml:"hydrator_config"`
+	MessagingConfig    MessagingConfig        `yaml:"messaging_config"`
+	DataReporterConfig HTTPDataReporterConfig `yaml:"data_reporter_config"`
+
+	// Global Redis configuration - used by reputation storage (when storage_type is "redis")
+	// and leader election for health checks.
+	RedisConfig *reputation.RedisConfig `yaml:"redis_config,omitempty"`
 }
 
 type EnvConfigError struct {
@@ -72,8 +83,20 @@ func LoadGatewayConfigFromEnv() (GatewayConfig, error) {
 
 /* --------------------------------- Gateway Config Methods -------------------------------- */
 
+// GetShannonConfig returns a ShannonGatewayConfig constructed from the flattened config fields.
+// This maintains compatibility with code that expects the old nested structure.
+func (c *GatewayConfig) GetShannonConfig() *shannon.ShannonGatewayConfig {
+	return &shannon.ShannonGatewayConfig{
+		FullNodeConfig: c.FullNodeConfig,
+		GatewayConfig:  c.GatewayModeConfig,
+		RedisConfig:    c.RedisConfig,
+	}
+}
+
+// GetGatewayConfig is an alias for GetShannonConfig for backward compatibility.
+// Deprecated: Use GetShannonConfig instead.
 func (c *GatewayConfig) GetGatewayConfig() *shannon.ShannonGatewayConfig {
-	return c.ShannonConfig
+	return c.GetShannonConfig()
 }
 
 func (c *GatewayConfig) GetRouterConfig() RouterConfig {
@@ -88,7 +111,7 @@ func (c *GatewayConfig) hydrateDefaults() error {
 	}
 	c.Logger.hydrateLoggerDefaults()
 	c.HydratorConfig.hydrateHydratorDefaults()
-	c.ShannonConfig.FullNodeConfig.HydrateDefaults()
+	c.FullNodeConfig.HydrateDefaults()
 	return nil
 }
 
@@ -104,11 +127,13 @@ func (c *GatewayConfig) validate() error {
 	return nil
 }
 
-// validateProtocolConfig checks if the protocol configuration is valid, by both performing validation on the
-// protocol specific config and ensuring that the correct protocol specific config is set.
+// validateProtocolConfig checks if the protocol configuration is valid.
 func (c *GatewayConfig) validateProtocolConfig() error {
-	if c.ShannonConfig == nil {
-		return fmt.Errorf("protocol configuration is required")
+	if err := c.FullNodeConfig.Validate(); err != nil {
+		return err
 	}
-	return c.ShannonConfig.Validate()
+	if err := c.GatewayModeConfig.Validate(); err != nil {
+		return err
+	}
+	return nil
 }

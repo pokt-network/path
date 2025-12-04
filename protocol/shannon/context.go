@@ -1,9 +1,7 @@
 package shannon
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -27,7 +25,6 @@ import (
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
-	"github.com/pokt-network/path/qos/jsonrpc"
 	"github.com/pokt-network/path/reputation"
 )
 
@@ -65,7 +62,6 @@ type RelayRequestSigner interface {
 }
 
 // requestContext captures all data required for handling a single service request.
-// TODO_TECHDEBT(@adshmh): add sanctionedEndpointsStore to the request context.
 type requestContext struct {
 	logger polylog.Logger
 
@@ -157,8 +153,12 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 
 	// TODO_TECHDEBT: Account for different payloads having different RPC types
 	// OR refactor the single/parallel code flow altogether
-	// Store the current RPC type for use in observations
-	rc.currentRPCType = payloads[0].RPCType
+	// Store the current RPC type for use in observations.
+	// Only override if payload has an explicit RPC type (non-zero value).
+	// This preserves the default set in BuildHTTPRequestContextForEndpoint for health checks.
+	if payloads[0].RPCType != sharedtypes.RPCType_UNKNOWN_RPC {
+		rc.currentRPCType = payloads[0].RPCType
+	}
 
 	// For single payload, handle directly without additional overhead.
 	if len(payloads) == 1 {
@@ -440,16 +440,6 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 	// Convert timeout to time.Duration
 	relayTimeout := time.Duration(maxWaitBeforeFallbackMillisecond) * time.Millisecond
 
-	// Capture Shannon endpoint before async relay for timeout reputation tracking.
-	// The selected endpoint may change when fallback is used.
-	shannonEndpoint := rc.getSelectedEndpoint()
-	startTime := time.Now()
-
-	// Create a cancellable context for the Shannon relay.
-	// This allows us to cancel the request if we timeout and fallback,
-	// preventing double signal recording (timeout + error from canceled request).
-	shannonCtx, cancelShannon := context.WithCancel(rc.context)
-
 	// Setup Shannon endpoint request:
 	// - Create channel for async response
 	// - Initialize response variables
@@ -463,11 +453,7 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 	// - Execute request asynchronously
 	// - Signal completion via channel
 	go func() {
-		// Use the cancellable context for the relay
-		originalCtx := rc.context
-		rc.context = shannonCtx
 		endpointResponse, endpointErr = rc.sendProtocolRelay(payload)
-		rc.context = originalCtx
 		// Signal the completion of Shannon Network relay.
 		endpointResponseReceivedChan <- endpointErr
 	}()
@@ -479,7 +465,6 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 
 	// RelayMiner responded (success or failure)
 	case err := <-endpointResponseReceivedChan:
-		cancelShannon() // Clean up context
 		// Successfully received and validated a response from the shannon endpoint.
 		// No need to use the fallback endpoint's response.
 		if err == nil {
@@ -487,7 +472,7 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 		}
 
 		// TODO_TECHDEBT(@adshmh): Verify correct observations/sanctions when using fallback due to endpoint error.
-		// Note: Error signal already recorded by handleEndpointError in sendProtocolRelay path.
+		//
 		rc.logger.Info().Err(err).Msg("Got a response from Pocket Network, but it contained an error. Using a fallback endpoint instead")
 
 		// Shannon endpoint failed, use fallback
@@ -495,17 +480,7 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 
 	// RelayMiner timed out. Use a random fallback endpoint.
 	case <-time.After(relayTimeout):
-		// Cancel the Shannon relay context to stop the in-flight request.
-		// This prevents double signal recording: the timeout signal is recorded here,
-		// and the canceled request won't record an additional error signal because
-		// context cancellation errors are not the endpoint's fault.
-		cancelShannon()
-
 		rc.logger.Info().Msg("Timed out waiting for Pocket Network to respond. Using a fallback endpoint.")
-
-		// Record timeout signal for the Shannon endpoint that didn't respond in time.
-		// This is a major error as it indicates endpoint unresponsiveness.
-		rc.recordTimeoutSignal(shannonEndpoint, startTime)
 
 		// Use a random fallback endpoint
 		return rc.sendRelayToARandomFallbackEndpoint(payload)
@@ -830,8 +805,6 @@ func (rc *requestContext) sendFallbackRelay(
 	fallbackEndpoint endpoint,
 	payload protocol.Payload,
 ) (protocol.Response, error) {
-	startTime := time.Now()
-
 	// Get the fallback URL for the fallback endpoint.
 	// If the RPC type is unknown or not configured, it will default URL.
 	endpointFallbackURL := fallbackEndpoint.GetURL(payload.RPCType)
@@ -847,8 +820,6 @@ func (rc *requestContext) sendFallbackRelay(
 	)
 
 	if err != nil {
-		// Record error signal for fallback endpoint HTTP failure (connection error, timeout, etc.)
-		rc.recordFallbackEndpointSignal(fallbackEndpoint, startTime, reputation.NewMajorErrorSignal("http_error", time.Since(startTime)))
 		return protocol.Response{
 			EndpointAddr: fallbackEndpoint.Addr(),
 		}, err
@@ -859,17 +830,10 @@ func (rc *requestContext) sendFallbackRelay(
 	//
 	// Non-2xx HTTP status code: build and return an error.
 	if httpStatusCode != http.StatusOK {
-		// Record error signal for non-2xx HTTP status code
-		rc.recordFallbackEndpointSignal(fallbackEndpoint, startTime, reputation.NewCriticalErrorSignal("http_non_2xx", time.Since(startTime)))
 		return protocol.Response{
 			EndpointAddr: fallbackEndpoint.Addr(),
 		}, fmt.Errorf("%w %w: %d", errSendHTTPRelay, errEndpointNon2XXHTTPStatusCode, httpStatusCode)
 	}
-
-	// Check for JSON-RPC errors in successful HTTP responses
-	latency := time.Since(startTime)
-	signal := rc.determineReputationSignal(httpResponseBz, latency)
-	rc.recordFallbackEndpointSignal(fallbackEndpoint, startTime, signal)
 
 	// Build and return the fallback response
 	return protocol.Response{
@@ -993,7 +957,8 @@ func (rc *requestContext) handleEndpointError(
 			reputationmetrics.RecordError("record_signal", "storage_error")
 		} else {
 			// Record signal metric on success
-			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
+			endpointType := rc.getEndpointTypeForMetrics()
+			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointType, endpointDomain)
 		}
 	}
 
@@ -1040,9 +1005,10 @@ func (rc *requestContext) handleEndpointSuccess(
 	}
 
 	// Record reputation signal if reputation service is enabled.
-	// Check for JSON-RPC errors in the response to record the appropriate signal type.
+	// Success signals have a small positive impact (+1) on score.
 	if rc.reputationService != nil {
 		latency := time.Since(endpointQueryTime)
+		signal := reputation.NewSuccessSignal(latency)
 		endpointKey := rc.reputationService.KeyBuilderForService(rc.serviceID).BuildKey(rc.serviceID, selectedEndpointAddr)
 
 		// Extract domain for metrics
@@ -1051,17 +1017,14 @@ func (rc *requestContext) handleEndpointSuccess(
 			endpointDomain = shannonmetrics.ErrDomain
 		}
 
-		// Determine signal type based on response content.
-		// HTTP transport succeeded, but check if the response contains a JSON-RPC error.
-		signal := rc.determineReputationSignal(endpointResponse.Bytes, latency)
-
 		// Fire-and-forget: don't block request on reputation recording
 		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
-			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal")
+			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for success")
 			reputationmetrics.RecordError("record_signal", "storage_error")
 		} else {
 			// Record signal metric on success
-			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
+			endpointType := rc.getEndpointTypeForMetrics()
+			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointType, endpointDomain)
 		}
 	}
 
@@ -1069,144 +1032,20 @@ func (rc *requestContext) handleEndpointSuccess(
 	return nil
 }
 
-// determineReputationSignal analyzes the response content to determine the appropriate reputation signal.
-// HTTP transport succeeded, but the response may contain a JSON-RPC error that should affect reputation.
-// Returns a success signal if no JSON-RPC error is detected, or a minor error signal for JSON-RPC errors.
-// Handles both single JSON-RPC responses and batch responses (array of responses).
-func (rc *requestContext) determineReputationSignal(responseBytes []byte, latency time.Duration) reputation.Signal {
-	// Skip empty responses
-	if len(responseBytes) == 0 {
-		return reputation.NewSuccessSignal(latency)
-	}
-
-	// Trim whitespace to check the first character
-	trimmed := bytes.TrimSpace(responseBytes)
-	if len(trimmed) == 0 {
-		return reputation.NewSuccessSignal(latency)
-	}
-
-	// Check if this is a batch response (starts with '[')
-	if trimmed[0] == '[' {
-		return rc.determineBatchReputationSignal(responseBytes, latency)
-	}
-
-	// Try to parse as single JSON-RPC response
-	return rc.determineSingleReputationSignal(responseBytes, latency)
-}
-
-// determineSingleReputationSignal handles a single JSON-RPC response.
-func (rc *requestContext) determineSingleReputationSignal(responseBytes []byte, latency time.Duration) reputation.Signal {
-	var jsonrpcResp jsonrpc.Response
-	if err := json.Unmarshal(responseBytes, &jsonrpcResp); err != nil {
-		// Can't parse as JSON-RPC - treat as success (HTTP worked, response format may be different)
-		return reputation.NewSuccessSignal(latency)
-	}
-
-	// Check for JSON-RPC error in the response
-	if jsonrpcResp.IsError() {
-		rc.logger.Debug().
-			Int("jsonrpc_error_code", jsonrpcResp.Error.Code).
-			Str("jsonrpc_error_message", jsonrpcResp.Error.Message).
-			Msg("Response contains JSON-RPC error, recording minor error signal for reputation")
-		return reputation.NewMinorErrorSignal("jsonrpc_error")
-	}
-
-	// No JSON-RPC error detected - return success signal
-	return reputation.NewSuccessSignal(latency)
-}
-
-// determineBatchReputationSignal handles a batch JSON-RPC response (array of responses).
-// Returns minor error if ANY response in the batch contains an error.
-func (rc *requestContext) determineBatchReputationSignal(responseBytes []byte, latency time.Duration) reputation.Signal {
-	var batchResp []jsonrpc.Response
-	if err := json.Unmarshal(responseBytes, &batchResp); err != nil {
-		// Can't parse as batch JSON-RPC - treat as success
-		return reputation.NewSuccessSignal(latency)
-	}
-
-	// Check each response in the batch for errors
-	errorCount := 0
-	for _, resp := range batchResp {
-		if resp.IsError() {
-			errorCount++
-		}
-	}
-
-	// If any response has an error, record minor error
-	if errorCount > 0 {
-		rc.logger.Debug().
-			Int("batch_size", len(batchResp)).
-			Int("error_count", errorCount).
-			Msg("Batch response contains JSON-RPC errors, recording minor error signal for reputation")
-		return reputation.NewMinorErrorSignal("jsonrpc_batch_error")
-	}
-
-	// All responses in batch succeeded
-	return reputation.NewSuccessSignal(latency)
-}
-
-// recordTimeoutSignal records a reputation signal for an endpoint that timed out.
-// This is used when a Shannon endpoint doesn't respond within the fallback timeout window.
-func (rc *requestContext) recordTimeoutSignal(timedOutEndpoint endpoint, startTime time.Time) {
-	if rc.reputationService == nil || timedOutEndpoint == nil {
-		return
-	}
-
-	latency := time.Since(startTime)
-	endpointKey := reputation.NewEndpointKey(rc.serviceID, timedOutEndpoint.Addr())
-
-	// Extract domain for metrics
-	endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(timedOutEndpoint.PublicURL())
-	if domainErr != nil {
-		endpointDomain = shannonmetrics.ErrDomain
-	}
-
-	// Timeout is a major error - indicates endpoint unresponsiveness
-	signal := reputation.NewMajorErrorSignal("timeout", latency)
-
-	rc.logger.Debug().
-		Str("endpoint_addr", string(timedOutEndpoint.Addr())).
-		Str("endpoint_domain", endpointDomain).
-		Dur("latency", latency).
-		Msg("Recording timeout signal for unresponsive Shannon endpoint")
-
-	// Fire-and-forget: don't block request on reputation recording
-	if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
-		rc.logger.Warn().Err(err).Msg("Failed to record timeout reputation signal")
-		reputationmetrics.RecordError("record_signal", "storage_error")
-	} else {
-		reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
-	}
-}
-
-// recordFallbackEndpointSignal records a reputation signal for a fallback endpoint.
-// This tracks the health of fallback endpoints used during session rollover or when Shannon endpoints fail.
-func (rc *requestContext) recordFallbackEndpointSignal(fallbackEndpoint endpoint, startTime time.Time, signal reputation.Signal) {
-	if rc.reputationService == nil || fallbackEndpoint == nil {
-		return
-	}
-
-	endpointKey := reputation.NewEndpointKey(rc.serviceID, fallbackEndpoint.Addr())
-
-	// Extract domain for metrics - use the fallback URL
-	endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(fallbackEndpoint.PublicURL())
-	if domainErr != nil {
-		endpointDomain = shannonmetrics.ErrDomain
-	}
-
-	rc.logger.Debug().
-		Str("endpoint_addr", string(fallbackEndpoint.Addr())).
-		Str("endpoint_domain", endpointDomain).
-		Str("signal_type", string(signal.Type)).
-		Bool("is_fallback", true).
-		Msg("Recording signal for fallback endpoint")
-
-	// Fire-and-forget: don't block request on reputation recording
-	if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
-		rc.logger.Warn().Err(err).Msg("Failed to record fallback endpoint reputation signal")
-		reputationmetrics.RecordError("record_signal", "storage_error")
-	} else {
-		reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
+// getEndpointTypeForMetrics returns the endpoint type string for metrics labeling.
+// Maps the current RPC type to a metrics-friendly string that matches the check_type values.
+func (rc *requestContext) getEndpointTypeForMetrics() string {
+	switch rc.currentRPCType {
+	case sharedtypes.RPCType_JSON_RPC:
+		return reputationmetrics.EndpointTypeJSONRPC
+	case sharedtypes.RPCType_REST:
+		return reputationmetrics.EndpointTypeREST
+	case sharedtypes.RPCType_GRPC:
+		return reputationmetrics.EndpointTypeGRPC
+	case sharedtypes.RPCType_WEBSOCKET:
+		return reputationmetrics.EndpointTypeWebSocket
+	default:
+		return reputationmetrics.EndpointTypeUnknown
 	}
 }
 

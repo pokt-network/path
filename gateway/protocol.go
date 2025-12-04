@@ -9,6 +9,7 @@ import (
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 	"github.com/pokt-network/path/websockets"
 )
 
@@ -113,6 +114,15 @@ type Protocol interface {
 
 	// CheckWebsocketConnection checks if the websocket connection to the endpoint is established.
 	CheckWebsocketConnection(context.Context, protocol.ServiceID, protocol.EndpointAddr) *protocolobservations.Observations
+
+	// GetReputationService returns the reputation service instance used by the protocol.
+	// This is used by the health check executor to record health check results.
+	GetReputationService() reputation.ReputationService
+
+	// GetEndpointsForHealthCheck returns a function that gets endpoints for health checks.
+	// The returned function takes a service ID and returns endpoint info suitable for health checks.
+	// Note: This does NOT filter by reputation - health checks should run against all endpoints.
+	GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]EndpointInfo, error)
 
 	// health.Check interface is used to verify protocol instance's health status.
 	health.Check

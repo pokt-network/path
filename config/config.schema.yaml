@@ -11,157 +11,367 @@ description: "PATH Gateway Configuration YAML: this file is used to configure a 
 type: object
 additionalProperties: false
 required:
-  - shannon_config
+  - full_node_config
+  - gateway_config
 
 properties:
-  # Shannon Configuration
-  shannon_config:
-    description: "Configuration for the Shannon gateway; if specified, the PATH instance will use the Shannon version of the Pocket protocol."
+  # Full Node Configuration
+  full_node_config:
+    description: "Configuration for the Shannon full node. This configuration is used to connect to the Shannon full node to get data from the Pocket blockchain."
     type: object
     additionalProperties: false
     required:
-      - full_node_config
-      - gateway_config
+      - rpc_url
+      - grpc_config
     properties:
-      full_node_config:
-        description: "Configuration for the Shannon full node. This configuration is used to connect to the Shannon full node to get data from the Pocket blockchain."
+      rpc_url:
+        description: "HTTP URL for the Shannon full node."
+        type: string
+        pattern: "^(tcp|http|https)://.*$"
+      grpc_config:
+        description: "gRPC configuration for the Shannon full node."
         type: object
         additionalProperties: false
         required:
-          - rpc_url
-          - grpc_config
+          - host_port
         properties:
-          rpc_url:
-            description: "HTTP URL for the Shannon full node."
+          host_port:
+            description: "Host and port for gRPC connections, eg. 127.0.0.1:4040"
             type: string
-            pattern: "^(tcp|http|https)://.*$"
-          grpc_config:
-            description: "gRPC configuration for the Shannon full node."
-            type: object
-            additionalProperties: false
-            required:
-              - host_port
-            properties:
-              host_port:
-                description: "Host and port for gRPC connections, eg. 127.0.0.1:4040"
-                type: string
-                pattern: "^[^:]+:[0-9]+$"
-              insecure:
-                description: "Indicates if the gRPC connection is insecure. Must be specified if the full node is notusing TLS."
-                type: boolean
-                default: false
-              base_delay:
-                description: "Base delay for gRPC retries."
-                type: string
-              max_delay:
-                description: "Maximum delay for gRPC retries."
-                type: string
-              min_connect_timeout:
-                description: "Minimum connection timeout for gRPC."
-                type: string
-              keep_alive_time:
-                description: "Keep-alive time for gRPC connections."
-                type: string
-              keep_alive_timeout:
-                description: "Keep-alive timeout for gRPC connections."
-                type: string
-          lazy_mode:
-            description: "Indicates if lazy mode is enabled for full node connections."
+            pattern: "^[^:]+:[0-9]+$"
+          insecure:
+            description: "Indicates if the gRPC connection is insecure. Must be specified if the full node is not using TLS."
+            type: boolean
+            default: false
+          base_delay:
+            description: "Base delay for gRPC retries."
+            type: string
+          max_delay:
+            description: "Maximum delay for gRPC retries."
+            type: string
+          min_connect_timeout:
+            description: "Minimum connection timeout for gRPC."
+            type: string
+          keep_alive_time:
+            description: "Keep-alive time for gRPC connections."
+            type: string
+          keep_alive_timeout:
+            description: "Keep-alive timeout for gRPC connections."
+            type: string
+      lazy_mode:
+        description: "Indicates if lazy mode is enabled for full node connections."
+        type: boolean
+        default: true
+      session_rollover_blocks:
+        description: "Grace period after session end where rollover issues may occur (in blocks)."
+        type: integer
+        minimum: 1
+      cache_config:
+        description: "Configuration for the cache."
+        type: object
+        additionalProperties: false
+        properties:
+          app_ttl:
+            description: "TTL for the app cache."
+            type: string
+            pattern: "^[0-9]+[smh]$"
+          session_ttl:
+            description: "TTL for the session cache."
+            type: string
+            pattern: "^[0-9]+[smh]$"
+
+  # Gateway Configuration
+  gateway_config:
+    description: "Configuration for the Shannon gateway, including all required addresses and private keys for all Shannon actors."
+    type: object
+    additionalProperties: false
+    required:
+      - gateway_mode
+      - gateway_address
+      - gateway_private_key_hex
+    properties:
+      gateway_mode:
+        description: "Mode of the gateway operation."
+        type: string
+        enum: ["centralized", "delegated", "permissionless"]
+      gateway_address:
+        description: "Address of the Shannon gateway."
+        type: string
+        pattern: "^pokt1[0-9a-zA-Z]{38}$"
+      gateway_private_key_hex:
+        description: "Private key of the Shannon gateway in hexadecimal format."
+        type: string
+        pattern: "^[0-9a-fA-F]{64}$"
+      owned_apps_private_keys_hex:
+        type: array
+        description: "Private keys of Shannon Applications owned by the Gateway in hexadecimal format."
+        items:
+          type: string
+          pattern: "^[0-9a-fA-F]{64}$"
+      service_fallback:
+        description: "Fallback endpoints for the Shannon gateway. An array of service fallback configurations."
+        type: array
+        uniqueItems: true
+        items:
+          type: object
+          additionalProperties: false
+          required:
+            - service_id
+            - fallback_endpoints
+          properties:
+            service_id:
+              description: "The service ID for this fallback configuration."
+              type: string
+            fallback_endpoints:
+              description: "Array of fallback endpoint configurations for this service."
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                required:
+                  - default_url
+                patternProperties:
+                  "^(default_url|json_rpc|rest|comet_bft|websocket)$":
+                    type: string
+                    anyOf:
+                      - pattern: "^(http|https)://.*$"
+                      - pattern: "^(http|https|ws|wss)://.*$"
+            send_all_traffic:
+              description: "Whether to send all traffic to fallback endpoints for this service."
+              type: boolean
+              default: false
+
+      # Reputation Configuration
+      reputation_config:
+        description: "Configuration for the endpoint reputation system. Tracks endpoint reliability via scores (0-100). When disabled, requests are relayed to any endpoint in the session without quality filtering."
+        type: object
+        additionalProperties: false
+        properties:
+          enabled:
+            description: "Enable/disable the reputation system. When false, PATH operates in simple relay mode without endpoint quality tracking. Default: true"
             type: boolean
             default: true
-          session_rollover_blocks:
-            description: "Grace period after session end where rollover issues may occur (in blocks)."
+          storage_type:
+            description: "Storage backend for reputation data. Options: 'memory' or 'redis'."
+            type: string
+            enum: ["memory", "redis"]
+            default: "memory"
+          initial_score:
+            description: "Starting score for new endpoints (0-100 scale). Default: 80"
             type: integer
-            minimum: 1
-          cache_config:
-            description: "Configuration for the cache."
+            minimum: 0
+            maximum: 100
+            default: 80
+          min_threshold:
+            description: "Minimum score required for endpoint selection. Default: 30"
+            type: integer
+            minimum: 0
+            maximum: 100
+            default: 30
+          recovery_timeout:
+            description: "Time after which inactive endpoint scores can be re-evaluated. Default: 5m"
+            type: string
+            pattern: "^[0-9]+[smh]$"
+          tiered_selection:
+            description: "Configuration for tiered endpoint selection based on reputation scores."
             type: object
             additionalProperties: false
             properties:
-              app_ttl:
-                description: "TTL for the app cache."
-                type: string
-                pattern: "^[0-9]+[smh]$"
-              session_ttl:
-                description: "TTL for the session cache."
-                type: string
-                pattern: "^[0-9]+[smh]$"
+              enabled:
+                description: "Enable/disable tiered selection."
+                type: boolean
+                default: false
+              tier1_threshold:
+                description: "Minimum score for tier 1 (highest priority). Default: 70"
+                type: integer
+                minimum: 0
+                maximum: 100
+              tier2_threshold:
+                description: "Minimum score for tier 2. Default: 50"
+                type: integer
+                minimum: 0
+                maximum: 100
+              probation:
+                description: "Configuration for probation system for recovering endpoints."
+                type: object
+                additionalProperties: false
+                properties:
+                  enabled:
+                    description: "Enable/disable probation system."
+                    type: boolean
+                    default: false
+                  threshold:
+                    description: "Score threshold below which endpoints enter probation."
+                    type: integer
+                    minimum: 0
+                    maximum: 100
+                  traffic_percent:
+                    description: "Percentage of traffic to route to probation endpoints."
+                    type: integer
+                    minimum: 0
+                    maximum: 100
+                  recovery_multiplier:
+                    description: "Multiplier for score recovery during probation."
+                    type: number
+                    minimum: 1.0
 
-      gateway_config:
-        description: "Configuration for the Shannon gateway, including all required addresses and private keys for all Shannon actors."
+      # Retry Configuration
+      retry_config:
+        description: "Configuration for automatic retry on transient errors."
         type: object
         additionalProperties: false
-        required:
-          - gateway_mode
-          - gateway_address
-          - gateway_private_key_hex
         properties:
-          gateway_mode:
-            description: "Mode of the gateway operation."
-            type: string
-            enum: ["centralized", "delegated", "permissionless"]
-          gateway_address:
-            description: "Address of the Shannon gateway."
-            type: string
-            pattern: "^pokt1[0-9a-zA-Z]{38}$"
-          gateway_private_key_hex:
-            description: "Private key of the Shannon gateway in hexadecimal format."
-            type: string
-            pattern: "^[0-9a-fA-F]{64}$"
-          owned_apps_private_keys_hex:
+          enabled:
+            description: "Enable/disable automatic retry."
+            type: boolean
+            default: false
+          max_retries:
+            description: "Maximum number of retry attempts."
+            type: integer
+            minimum: 0
+            default: 1
+          retry_on_5xx:
+            description: "Retry on 5xx server errors."
+            type: boolean
+            default: true
+          retry_on_timeout:
+            description: "Retry on timeout errors."
+            type: boolean
+            default: true
+          retry_on_connection:
+            description: "Retry on connection errors."
+            type: boolean
+            default: true
+
+      # Observation Pipeline Configuration
+      observation_pipeline:
+        description: "Configuration for the async observation processing pipeline."
+        type: object
+        additionalProperties: false
+        properties:
+          enabled:
+            description: "Enable/disable the observation pipeline for async processing."
+            type: boolean
+            default: false
+          sample_rate:
+            description: "Percentage of requests to sample for deep parsing (0.0 to 1.0)."
+            type: number
+            minimum: 0.0
+            maximum: 1.0
+            default: 0.1
+          worker_count:
+            description: "Number of async parser workers."
+            type: integer
+            minimum: 1
+            default: 4
+          queue_size:
+            description: "Max pending observations before dropping (non-blocking)."
+            type: integer
+            minimum: 1
+            default: 1000
+
+      # Active Health Checks Configuration
+      active_health_checks:
+        description: "Configuration for active health checks - proactive endpoint monitoring."
+        type: object
+        additionalProperties: false
+        properties:
+          enabled:
+            description: "Enable/disable health checks."
+            type: boolean
+            default: false
+          coordination:
+            description: "Leader election configuration for multi-instance deployments."
+            type: object
+            additionalProperties: false
+            properties:
+              type:
+                description: "Coordination type: 'none' or 'leader_election'."
+                type: string
+                enum: ["none", "leader_election"]
+                default: "none"
+              lease_duration:
+                description: "Leader lease duration."
+                type: string
+              renew_interval:
+                description: "Leader lease renew interval."
+                type: string
+              key:
+                description: "Redis key for leader election."
+                type: string
+          external:
+            description: "External URL for health check rules. Local rules override external rules on conflict."
+            type: object
+            additionalProperties: false
+            properties:
+              url:
+                description: "URL to fetch health check rules from (e.g., GitHub raw file)."
+                type: string
+              refresh_interval:
+                description: "How often to re-fetch the external config. 0 means only fetch at startup."
+                type: string
+              timeout:
+                description: "HTTP timeout for fetching the external config."
+                type: string
+                default: "30s"
+          local:
+            description: "Local health check configurations per service. These override any checks from external with the same service_id + name."
             type: array
-            description: "Private keys of Shannon Applications owned by the Gateway in hexadecimal format."
-            items:
-              type: string
-              pattern: "^[0-9a-fA-F]{64}$"
-          # TODO_CONSIDERATION(@adshmh): Consider renaming this to gateway_owned_endpoints to enable other use-cases.
-          # E.g. A gateway that uses Shannon as a fallback rather than its own URLs as a fallback.
-          # Note that this would require renaming all instances of fallback in the codebase.
-          service_fallback:
-            description: "Fallback endpoints for the Shannon gateway. An array of service fallback configurations. Each service_id must be unique within the array."
-            type: array
-            uniqueItems: true
             items:
               type: object
               additionalProperties: false
               required:
                 - service_id
-                - fallback_endpoints
               properties:
                 service_id:
-                  description: "The service ID for this fallback configuration. Must be unique within the service_fallback array."
+                  description: "Service ID to run health checks for."
                   type: string
-                fallback_endpoints:
-                  description: "Array of fallback endpoint configurations for this service. Each endpoint can define URLs for different RPC types."
+                check_interval:
+                  description: "Interval between health checks."
+                  type: string
+                enabled:
+                  description: "Enable/disable health checks for this service."
+                  type: boolean
+                  default: true
+                checks:
+                  description: "List of health check configurations."
                   type: array
                   items:
                     type: object
                     additionalProperties: false
                     required:
-                      - default_url
-                    patternProperties:
-                      "^(default_url|json_rpc|rest|comet_bft|websocket)$":
+                      - name
+                      - type
+                    properties:
+                      name:
+                        description: "Name of the health check."
                         type: string
-                        anyOf:
-                          - pattern: "^(http|https)://.*$"
-                          - pattern: "^(http|https|ws|wss)://.*$"
-                send_all_traffic:
-                  description: "Whether to send all traffic to fallback endpoints for this service, regardless of protocol endpoint health."
-                  type: boolean
-                  default: false
-          sanction_config:
-            description: "Configuration for the endpoint sanction system. Controls how long misbehaving endpoints are excluded from selection."
-            type: object
-            additionalProperties: false
-            properties:
-              session_sanction_duration:
-                description: "Duration that session-based sanctions remain active. Endpoints with session sanctions will be excluded from selection for this duration. Format: Go duration string (e.g., '30m', '1h', '2h'). Default: 1h"
-                type: string
-                pattern: "^[0-9]+[smh]$"
-              cache_cleanup_interval:
-                description: "Interval for purging expired sanction entries from the cache. Format: Go duration string (e.g., '5m', '10m'). Default: 10m"
-                type: string
-                pattern: "^[0-9]+[smh]$"
+                      type:
+                        description: "Type of health check (e.g., 'jsonrpc')."
+                        type: string
+                      method:
+                        description: "HTTP method (GET, POST)."
+                        type: string
+                      path:
+                        description: "Request path."
+                        type: string
+                      body:
+                        description: "Request body (for POST)."
+                        type: string
+                      expected_status_code:
+                        description: "Expected HTTP status code."
+                        type: integer
+                      expected_response_contains:
+                        description: "String that response should contain."
+                        type: string
+                      timeout:
+                        description: "Request timeout."
+                        type: string
+                      reputation_signal:
+                        description: "Reputation signal to emit on failure."
+                        type: string
+                        enum: ["minor_error", "major_error", "critical_error"]
+
   # Logger Configuration (optional)
   logger_config:
     description: "Optional configuration for the logger. If not specified, info level will be used."
@@ -195,6 +405,9 @@ properties:
       idle_timeout:
         description: "Idle timeout duration for the router."
         type: string
+      websocket_message_buffer_size:
+        description: "Buffer size for websocket messages."
+        type: integer
 
   # Hydrator Configuration (optional)
   hydrator_config:
@@ -207,19 +420,19 @@ properties:
         type: string
         pattern: "^[0-9]+ms$"
         default: "10000ms"
-      max_concurrent_endpoint_check_workers:
+      max_endpoint_check_workers:
         description: "Maximum number of workers that will concurrently check endpoints."
         type: integer
         default: 100
       qos_disabled_service_ids:
-        description: "List of service IDs for which QoS checks will be disabled. By default all configured services will have QoS checks enabled. Primarily just used for testing & development."
+        description: "List of service IDs for which QoS checks will be disabled."
         type: array
         items:
           type: string
 
   # Data Reporter Configuration (optional)
   data_reporter_config:
-    description: "Configuration for the HTTP data reporter that accepts JSON via POST and feeds into pipelines writing to services like BigQuery (e.g., Fluentd with HTTP input and BigQuery output plugins)."
+    description: "Configuration for the HTTP data reporter."
     type: object
     additionalProperties: false
     required:
@@ -230,6 +443,48 @@ properties:
         type: string
         pattern: "^(http|https)://.*$"
       post_timeout_ms:
-        description: "Timeout in milliseconds for HTTP POST operations. If zero or negative, a default timeout of 10000ms (10s) is used."
+        description: "Timeout in milliseconds for HTTP POST operations."
         type: integer
         default: 10000
+
+  # Messaging Configuration (optional)
+  messaging_config:
+    description: "Configuration for messaging/pubsub."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable messaging."
+        type: boolean
+        default: false
+
+  # Redis Configuration (optional)
+  redis_config:
+    description: "Global Redis configuration. Used by reputation storage (when storage_type is 'redis') and leader election for health checks."
+    type: object
+    additionalProperties: false
+    properties:
+      address:
+        description: "Redis server address (host:port)."
+        type: string
+        default: "localhost:6379"
+      password:
+        description: "Redis password (optional)."
+        type: string
+      db:
+        description: "Redis database number."
+        type: integer
+        default: 0
+      pool_size:
+        description: "Connection pool size."
+        type: integer
+        default: 10
+      dial_timeout:
+        description: "Connection timeout."
+        type: string
+      read_timeout:
+        description: "Read operation timeout."
+        type: string
+      write_timeout:
+        description: "Write operation timeout."
+        type: string

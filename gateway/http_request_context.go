@@ -1,10 +1,13 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -76,6 +79,10 @@ type requestContext struct {
 	// of explicitly defining PATH gateway's components and their interactions.
 	dataReporter RequestResponseReporter
 
+	// observationQueue handles async, sampled observation processing.
+	// If nil, no async observation processing occurs.
+	observationQueue *ObservationQueue
+
 	// QoS related request context
 	serviceID  protocol.ServiceID
 	serviceQoS QoSService
@@ -101,6 +108,14 @@ type requestContext struct {
 	// Tracks whether the request was rejected by the QoS.
 	// This is needed for handling the observations: there will be no protocol context/observations in this case.
 	requestRejectedByQoS bool
+
+	// HTTP request metadata for async observation processing.
+	// These are captured from the original HTTP request for use in QueuedObservation.
+	httpRequestPath    string
+	httpRequestMethod  string
+	httpRequestHeaders map[string]string
+	httpRequestBody    []byte
+	httpRequestTime    time.Time
 }
 
 // InitFromHTTPRequest builds the required context for serving an HTTP request.
@@ -476,4 +491,79 @@ func (rc *requestContext) updateGatewayObservationsWithParallelRequests(numReque
 		NumFailed:     int32(numFailed),
 		NumCanceled:   int32(numCanceled),
 	}
+}
+
+// captureHTTPRequestMetadata captures the HTTP request metadata for async observation processing.
+// This method reads the request body and restores it so it can be read again by downstream processing.
+// It should be called early in the request lifecycle before the body is consumed.
+//
+// The captured metadata is stored in the requestContext for later use when queuing observations.
+func (rc *requestContext) captureHTTPRequestMetadata(httpReq *http.Request) {
+	rc.httpRequestTime = time.Now()
+	rc.httpRequestPath = httpReq.URL.Path
+	rc.httpRequestMethod = httpReq.Method
+
+	// Capture headers (excluding sensitive ones)
+	rc.httpRequestHeaders = make(map[string]string)
+	for key, values := range httpReq.Header {
+		if len(values) > 0 {
+			// Skip sensitive headers (case-insensitive check)
+			lowerKey := strings.ToLower(key)
+			if lowerKey == "authorization" || lowerKey == "cookie" || lowerKey == "x-api-key" {
+				continue
+			}
+			rc.httpRequestHeaders[key] = values[0]
+		}
+	}
+
+	// Read and restore the request body
+	if httpReq.Body != nil {
+		bodyBytes, err := io.ReadAll(httpReq.Body)
+		if err != nil {
+			rc.logger.Debug().Err(err).Msg("Failed to read request body for observation queue")
+			return
+		}
+		// Store the body bytes
+		rc.httpRequestBody = bodyBytes
+		// Restore the body so it can be read again
+		httpReq.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
+}
+
+// tryQueueObservation attempts to queue an observation for async processing.
+// This method is non-blocking - if the queue is full or disabled, it silently skips.
+// It creates a QueuedObservation with all the captured request/response context.
+//
+// This should be called after UpdateWithResponse() to include the response data.
+func (rc *requestContext) tryQueueObservation(endpointAddr protocol.EndpointAddr, responseBody []byte, httpStatusCode int) {
+	// Skip if observation queue is not configured
+	if rc.observationQueue == nil {
+		return
+	}
+
+	// Skip if the queue is not enabled
+	if !rc.observationQueue.IsEnabled() {
+		return
+	}
+
+	// Calculate latency from request start time
+	latency := time.Since(rc.httpRequestTime)
+
+	// Create the queued observation with all context
+	obs := &QueuedObservation{
+		ServiceID:          rc.serviceID,
+		EndpointAddr:       endpointAddr,
+		Source:             SourceUserRequest,
+		Timestamp:          time.Now(),
+		Latency:            latency,
+		RequestPath:        rc.httpRequestPath,
+		RequestHTTPMethod:  rc.httpRequestMethod,
+		RequestHeaders:     rc.httpRequestHeaders,
+		RequestBody:        rc.httpRequestBody,
+		ResponseStatusCode: httpStatusCode,
+		ResponseBody:       responseBody,
+	}
+
+	// Try to queue (non-blocking, sampled)
+	rc.observationQueue.TryQueue(obs)
 }

@@ -220,36 +220,6 @@ func buildEndpointObservationFromSession(
 	}
 }
 
-// builds a Shannon endpoint from an endpoint observation.
-// Used to identify an endpoint for applying sanctions.
-func buildEndpointFromObservation(
-	observation *protocolobservations.ShannonEndpointObservation,
-) endpoint {
-	session := buildSessionFromObservation(observation)
-	return &protocolEndpoint{
-		session:  session,
-		supplier: observation.GetSupplier(),
-		url:      observation.GetEndpointUrl(),
-	}
-}
-
-// builds the details of a session from an endpoint observation.
-// Used to identify an endpoint for applying sanctions.
-func buildSessionFromObservation(
-	observation *protocolobservations.ShannonEndpointObservation,
-) sessiontypes.Session {
-	return sessiontypes.Session{
-		// Only Session Header is required for processing observations.
-		Header: &sessiontypes.SessionHeader{
-			ApplicationAddress:      observation.GetEndpointAppAddress(),
-			ServiceId:               observation.GetSessionServiceId(),
-			SessionId:               observation.GetSessionId(),
-			SessionStartBlockHeight: observation.GetSessionStartHeight(),
-			SessionEndBlockHeight:   observation.GetSessionEndHeight(),
-		},
-	}
-}
-
 // builds and returns a request error observation for the supplied internal error.
 func buildInternalRequestProcessingErrorObservation(internalErr error) *protocolobservations.ShannonRequestError {
 	return &protocolobservations.ShannonRequestError{

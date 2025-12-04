@@ -325,32 +325,41 @@ func TestService_ResetScore(t *testing.T) {
 	require.Equal(t, 80.0, score.Value)
 }
 
-func TestService_DisabledMode(t *testing.T) {
+// TestService_WorksWithDefaultConfig verifies that a service created with
+// minimal config works correctly when enabled.
+func TestService_WorksWithDefaultConfig(t *testing.T) {
 	ctx := context.Background()
 	store := newMockStorage()
 	defer store.Close()
 
+	// Create service with minimal config - Enabled must be true for service to record signals
 	config := Config{
-		Enabled:      false,
+		Enabled:      true,
 		InitialScore: 80,
 	}
 
 	svc := NewService(config, store)
 	key := NewEndpointKey("eth", "endpoint1")
 
-	// All operations should succeed but be no-ops
+	// Service should record signals normally
 	err := svc.RecordSignal(ctx, key, NewFatalErrorSignal("critical"))
 	require.NoError(t, err)
 
+	// Score should be affected by the signal
 	score, err := svc.GetScore(ctx, key)
 	require.NoError(t, err)
-	require.Equal(t, 80.0, score.Value) // Returns initial score
+	// InitialScore (80) + FatalError impact (-50) = 30
+	require.Equal(t, 30.0, score.Value, "signals should be recorded")
 
-	// Filter should pass all endpoints when disabled
+	// Filtering should work normally based on scores
 	keys := []EndpointKey{key}
-	passed, err := svc.FilterByScore(ctx, keys, 100)
+	passed, err := svc.FilterByScore(ctx, keys, 50) // Threshold above current score
 	require.NoError(t, err)
-	require.Len(t, passed, 1) // All pass when disabled
+	require.Len(t, passed, 0, "low-scoring endpoint should be filtered out")
+
+	passed, err = svc.FilterByScore(ctx, keys, 20) // Threshold below current score
+	require.NoError(t, err)
+	require.Len(t, passed, 1, "endpoint should pass with lower threshold")
 }
 
 func TestService_AsyncWriteToStorage(t *testing.T) {

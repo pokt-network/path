@@ -157,7 +157,7 @@ func TestConfig_HydrateDefaults(t *testing.T) {
 func TestDefaultConfig(t *testing.T) {
 	config := DefaultConfig()
 
-	require.False(t, config.Enabled, "should be disabled by default")
+	require.True(t, config.Enabled, "should be enabled by default")
 	require.Equal(t, InitialScore, config.InitialScore)
 	require.Equal(t, DefaultMinThreshold, config.MinThreshold)
 	require.Equal(t, DefaultRecoveryTimeout, config.RecoveryTimeout)

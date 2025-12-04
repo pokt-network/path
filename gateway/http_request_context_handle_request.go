@@ -90,6 +90,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	//
 	for _, endpointResponse := range endpointResponses {
 		rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+
+		// Queue observation for async parsing (sampled, non-blocking)
+		rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
 	}
 
 	return nil
@@ -175,6 +178,9 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		qosContextMutex.Lock()
 		for _, response := range responses {
 			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+
+			// Queue observation for async parsing (sampled, non-blocking)
+			rc.tryQueueObservation(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
 		}
 		qosContextMutex.Unlock()
 	}
@@ -239,6 +245,9 @@ func (rc *requestContext) handleSuccessfulResponse(
 				result.index+1, metrics.numRequestsToAttempt, overallDuration.Milliseconds())
 
 		rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+
+		// Queue observation for async parsing (sampled, non-blocking)
+		rc.tryQueueObservation(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
 	}
 
 	return nil

@@ -61,6 +61,11 @@ type Gateway struct {
 	// Configurable to balance memory usage vs throughput for websocket connections.
 	// Default: DefaultWebsocketMessageBufferSize (100)
 	WebsocketMessageBufferSize int
+
+	// ObservationQueue handles async, sampled observation processing for QoS data extraction.
+	// When enabled, sampled requests are queued for deep parsing (block height, chain ID, etc.)
+	// without blocking the hot path. This is optional - if nil, no async observation processing occurs.
+	ObservationQueue *ObservationQueue
 }
 
 // HandleServiceRequest implements PATH gateway's service request processing.
@@ -113,6 +118,7 @@ func (g Gateway) handleHTTPServiceRequest(
 		httpRequestParser:   g.HTTPRequestParser,
 		metricsReporter:     g.MetricsReporter,
 		dataReporter:        g.DataReporter,
+		observationQueue:    g.ObservationQueue,
 	}
 
 	defer func() {
@@ -122,6 +128,10 @@ func (g Gateway) handleHTTPServiceRequest(
 		// Broadcast all observations, e.g. protocol-level, QoS-level, etc. contained in the gateway request context.
 		gatewayRequestCtx.BroadcastAllObservations()
 	}()
+
+	// Capture HTTP request metadata early for async observation processing.
+	// This must happen before the body is consumed by downstream parsing.
+	gatewayRequestCtx.captureHTTPRequestMetadata(httpReq)
 
 	// Initialize the GatewayRequestContext struct using the HTTP request.
 	// e.g. extract the target service ID from the HTTP request.

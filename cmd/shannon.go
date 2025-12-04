@@ -45,7 +45,11 @@ func getShannonProtocol(ctx context.Context, logger polylog.Logger, config *shan
 		return nil, fmt.Errorf("failed to create a Shannon full node instance: %w", err)
 	}
 
-	protocol, err := shannon.NewProtocol(ctx, logger, config.GatewayConfig, fullNode)
+	// Copy global RedisConfig to the GatewayConfig for use by the protocol
+	gatewayConfig := config.GatewayConfig
+	gatewayConfig.RedisConfig = config.RedisConfig
+
+	protocol, err := shannon.NewProtocol(ctx, logger, gatewayConfig, fullNode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create a Shannon protocol instance: %w", err)
 	}

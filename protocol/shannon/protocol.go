@@ -57,13 +57,6 @@ type Protocol struct {
 	// ownedApps is the list of apps owned by the gateway operator
 	ownedApps map[protocol.ServiceID][]string
 
-	// TODO_TECHDEBT(@adshmh,@commoddity,@olshansk): JSON_RPC RPC type should more correctly be called HTTP
-	// when used in this context. Add an HTTP RPC-type to the enum in poktroll and update this map when it is done.
-	//
-	// sanctionedEndpointsStores tracks sanctioned endpoints per RPC type
-	// currently only JSON_RPC (stand-in for HTTP) and WEBSOCKET are supported
-	sanctionedEndpointsStores map[sharedtypes.RPCType]*sanctionedEndpointsStore
-
 	// HTTP client used for sending relay requests to endpoints while also capturing & publishing various debug metrics.
 	httpClient *pathhttp.HTTPClientWithDebugMetrics
 
@@ -132,12 +125,6 @@ func NewProtocol(
 		gatewayAddr:          config.GatewayAddress,
 		gatewayPrivateKeyHex: config.GatewayPrivateKeyHex,
 		gatewayMode:          config.GatewayMode,
-		// tracks sanctioned endpoints per RPC type
-		// currently only JSON_RPC and WEBSOCKET are supported
-		sanctionedEndpointsStores: map[sharedtypes.RPCType]*sanctionedEndpointsStore{
-			sharedtypes.RPCType_JSON_RPC:  newSanctionedEndpointsStore(logger, config.SanctionConfig),
-			sharedtypes.RPCType_WEBSOCKET: newSanctionedEndpointsStore(logger, config.SanctionConfig),
-		},
 
 		// ownedApps is the list of apps owned by the gateway operator
 		ownedApps: ownedApps,
@@ -157,8 +144,11 @@ func NewProtocol(
 	}
 
 	// Initialize reputation service if enabled.
-	// When enabled, endpoints are filtered by reputation score in addition to binary sanctions.
+	// Reputation is the primary endpoint quality system - it tracks endpoint scores
+	// based on both user requests and health check probes (hydrator).
+	// When disabled, requests are relayed to any endpoint in the session without quality filtering.
 	if config.ReputationConfig.Enabled {
+		config.ReputationConfig.HydrateDefaults()
 		reputationLogger := shannonLogger.With("component", "reputation")
 
 		// Create storage based on configuration.
@@ -168,10 +158,10 @@ func NewProtocol(
 			// Use recovery timeout as TTL for entries - expired entries get auto-cleaned
 			store = reputationstorage.NewMemoryStorage(config.ReputationConfig.RecoveryTimeout)
 		case "redis":
-			if config.ReputationConfig.Redis == nil {
-				return nil, fmt.Errorf("redis storage requires redis configuration")
+			if config.RedisConfig == nil {
+				return nil, fmt.Errorf("redis storage requires global redis_config to be set")
 			}
-			redisStore, err := reputationstorage.NewRedisStorage(ctx, *config.ReputationConfig.Redis, config.ReputationConfig.RecoveryTimeout)
+			redisStore, err := reputationstorage.NewRedisStorage(ctx, *config.RedisConfig, config.ReputationConfig.RecoveryTimeout)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create redis storage: %w", err)
 			}
@@ -415,13 +405,13 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		loadTestingConfig:  p.loadTestingConfig,
 		relayPool:          p.relayPool,
 		reputationService:  p.reputationService,
+		currentRPCType:     sharedtypes.RPCType_JSON_RPC, // Health checks use JSON-RPC by default
 	}, protocolobservations.Observations{}, nil
 }
 
 // ApplyHTTPObservations updates protocol instance state based on endpoint observations.
-// Examples:
-// - Mark endpoints as invalid based on response quality
-// - Disqualify endpoints for a time period
+// Records reputation signals from hydrator (synthetic) health check observations,
+// allowing endpoints to recover from failures via successful health checks.
 //
 // Implements gateway.Protocol interface.
 func (p *Protocol) ApplyHTTPObservations(observations *protocolobservations.Observations) error {
@@ -436,12 +426,12 @@ func (p *Protocol) ApplyHTTPObservations(observations *protocolobservations.Obse
 		p.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msg("SHOULD RARELY HAPPEN: ApplyHTTPObservations called with nil set of Shannon request observations.")
 		return nil
 	}
-	// hand over the observations to the sanctioned endpoints store for adding any applicable sanctions.
-	sanctionedEndpointsStore, ok := p.sanctionedEndpointsStores[sharedtypes.RPCType_JSON_RPC]
-	if !ok {
-		return fmt.Errorf("INVARIANT VIOLATION: sanctioned endpoints store not initialized for RPC type: %s", sharedtypes.RPCType_JSON_RPC)
+
+	// Record reputation signals from observations.
+	// This allows health check results (from hydrator) to update endpoint reputation scores.
+	if p.reputationService != nil {
+		p.recordReputationSignalsFromObservations(shannonObservations)
 	}
-	sanctionedEndpointsStore.ApplyObservations(shannonObservations)
 
 	return nil
 }
@@ -580,35 +570,12 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		}
 
 		// Initialize the qualified endpoints as the full set of session endpoints.
-		// Sanctioned endpoints will be filtered out below if a valid RPC type is provided.
+		// Low-reputation endpoints will be filtered out below if reputation service is enabled.
 		qualifiedEndpoints := sessionEndpoints
 
-		// Filter out sanctioned endpoints if a valid RPC type is provided.
-		// If no valid RPC type is provided, don't filter out sanctioned endpoints.
-		// As of PR #424 the only supported RPC types are JSON_RPC and WEBSOCKET.
-		if sanctionedEndpointsStore, ok := p.sanctionedEndpointsStores[filterByRPCType]; ok {
-			logger.Debug().Msgf(
-				"app %s has %d endpoints before filtering sanctioned endpoints.",
-				app.Address, len(sessionEndpoints),
-			)
-
-			// Filter out any sanctioned endpoints
-			filteredEndpoints := sanctionedEndpointsStore.FilterSanctionedEndpoints(qualifiedEndpoints)
-			// All endpoints are sanctioned: log a warning and skip this app.
-			if len(filteredEndpoints) == 0 {
-				logger.Error().Msgf(
-					"❌ All %d session endpoints are sanctioned for service %s, app %s. SKIPPING the app.",
-					len(sessionEndpoints), serviceID, app.Address,
-				)
-				continue
-			}
-			qualifiedEndpoints = filteredEndpoints
-
-			logger.Debug().Msgf("app %s has %d endpoints after filtering sanctioned endpoints.", app.Address, len(qualifiedEndpoints))
-		}
-
 		// Filter out low-reputation endpoints if reputation service is enabled.
-		// This provides gradual exclusion based on score in addition to binary sanctions.
+		// Reputation is the primary endpoint quality system - it provides gradual
+		// exclusion based on score and allows recovery via health checks.
 		if p.reputationService != nil {
 			beforeCount := len(qualifiedEndpoints)
 			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, logger)
@@ -697,9 +664,145 @@ func (p *Protocol) GetTotalServiceEndpointsCount(serviceID protocol.ServiceID, h
 func (p *Protocol) HydrateDisqualifiedEndpointsResponse(serviceID protocol.ServiceID, details *devtools.DisqualifiedEndpointResponse) {
 	p.logger.Info().Msgf("hydrating disqualified endpoints response for service ID: %s", serviceID)
 
+	// Protocol-level disqualified endpoints are now managed by the reputation system.
+	// Low-reputation endpoints are filtered out during selection, not permanently banned.
 	details.ProtocolLevelDisqualifiedEndpoints = make(map[string]devtools.ProtocolLevelDataResponse)
 
-	for rpcType, sanctionedEndpointsStore := range p.sanctionedEndpointsStores {
-		details.ProtocolLevelDisqualifiedEndpoints[rpcType.String()] = sanctionedEndpointsStore.getSanctionDetails(serviceID)
+	// TODO_FUTURE: Add reputation-based endpoint status reporting here
+	// This could show endpoints below threshold and their current scores
+}
+
+// recordReputationSignalsFromObservations maps protocol observations to reputation signals.
+// This is called by ApplyHTTPObservations to update endpoint reputation scores based on
+// health check results from the hydrator or any other observation source.
+func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations []*protocolobservations.ShannonRequestObservations) {
+	for _, observationSet := range shannonObservations {
+		httpObservations := observationSet.GetHttpObservations()
+		if httpObservations == nil {
+			continue
+		}
+
+		serviceID := protocol.ServiceID(observationSet.GetServiceId())
+
+		for _, endpointObs := range httpObservations.GetEndpointObservations() {
+			p.recordSignalFromObservation(serviceID, endpointObs)
+		}
 	}
+}
+
+// recordSignalFromObservation records a reputation signal for a single endpoint observation.
+// It maps the observation's error type and sanction type to a reputation signal and records it.
+func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonEndpointObservation) {
+	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
+
+	// Build endpoint key for reputation service
+	key := reputation.NewEndpointKey(serviceID, endpointAddr)
+
+	// Map observation to signal using the existing mapping function
+	errorType := obs.GetErrorType()
+	sanctionType := obs.GetRecommendedSanction()
+
+	var signal reputation.Signal
+
+	// No error = success
+	if errorType == protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED {
+		signal = reputation.NewSuccessSignal(0)
+	} else {
+		// Map error type and sanction type to a reputation signal
+		signal = mapErrorToSignal(errorType, sanctionType, 0)
+	}
+
+	// Record signal (fire-and-forget, non-blocking)
+	ctx := context.Background()
+	if err := p.reputationService.RecordSignal(ctx, key, signal); err != nil {
+		p.logger.Warn().Err(err).
+			Str("endpoint", string(endpointAddr)).
+			Str("service", string(serviceID)).
+			Str("error_type", errorType.String()).
+			Msg("Failed to record reputation signal from observation")
+	}
+}
+
+// ** Health Check Integration **
+
+// GetEndpointsForHealthCheck returns a function that provides endpoint information
+// for health checks. This is used by the HealthCheckExecutor.RunAllChecks method.
+//
+// The returned function:
+//   - Gets sessions for the service from all owned apps
+//   - Extracts endpoints from sessions with HTTP and WebSocket URLs
+//   - Returns []gateway.EndpointInfo suitable for health checks
+//
+// Note: This does NOT filter by reputation - health checks should run against
+// all endpoints to allow recovery of low-scoring endpoints.
+func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gateway.EndpointInfo, error) {
+	return func(serviceID protocol.ServiceID) ([]gateway.EndpointInfo, error) {
+		ctx := context.Background()
+
+		// Get active sessions for this service (without filtering by reputation)
+		activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get sessions for service %s: %w", serviceID, err)
+		}
+
+		if len(activeSessions) == 0 {
+			p.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Msg("No active sessions for service")
+			return nil, nil
+		}
+
+		// Collect all unique endpoints from all sessions
+		allEndpoints := make(map[protocol.EndpointAddr]endpoint)
+
+		for _, session := range activeSessions {
+			sessionEndpoints, err := endpointsFromSession(session, "")
+			if err != nil {
+				p.logger.Warn().
+					Err(err).
+					Str("service_id", string(serviceID)).
+					Str("session_id", session.SessionId).
+					Msg("Failed to get endpoints from session")
+				continue
+			}
+			maps.Copy(allEndpoints, sessionEndpoints)
+		}
+
+		// Also include fallback endpoints if configured
+		fallbackEndpoints, _ := p.getServiceFallbackEndpoints(serviceID)
+		maps.Copy(allEndpoints, fallbackEndpoints)
+
+		if len(allEndpoints) == 0 {
+			return nil, nil
+		}
+
+		// Convert to gateway.EndpointInfo
+		result := make([]gateway.EndpointInfo, 0, len(allEndpoints))
+		for _, ep := range allEndpoints {
+			info := gateway.EndpointInfo{
+				Addr:    ep.Addr(),
+				HTTPURL: ep.PublicURL(),
+			}
+
+			// Get WebSocket URL if available
+			if wsURL, err := ep.WebsocketURL(); err == nil {
+				info.WebSocketURL = wsURL
+			}
+
+			result = append(result, info)
+		}
+
+		p.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Int("endpoint_count", len(result)).
+			Msg("Retrieved endpoints for health checks")
+
+		return result, nil
+	}
+}
+
+// GetReputationService returns the reputation service instance used by the protocol.
+// This is used by the health check executor to record health check results.
+func (p *Protocol) GetReputationService() reputation.ReputationService {
+	return p.reputationService
 }

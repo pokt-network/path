@@ -224,9 +224,8 @@ func (p *Protocol) getPreSelectedEndpoint(
 }
 
 // ApplyWebSocketObservations updates protocol instance state based on endpoint observations.
-// Examples:
-// - Mark endpoints as invalid based on response quality
-// - Disqualify endpoints for a time period
+// Records reputation signals from WebSocket health check observations,
+// allowing endpoints to recover from failures via successful health checks.
 //
 // Implements gateway.Protocol interface.
 func (p *Protocol) ApplyWebSocketObservations(observations *protocolobservations.Observations) error {
@@ -241,15 +240,61 @@ func (p *Protocol) ApplyWebSocketObservations(observations *protocolobservations
 		p.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msg("SHOULD RARELY HAPPEN: ApplyWebSocketObservations called with nil set of Shannon request observations.")
 		return nil
 	}
-	// hand over the observations to the sanctioned endpoints store for adding any applicable sanctions.
-	sanctionedEndpointsStore, ok := p.sanctionedEndpointsStores[sharedtypes.RPCType_WEBSOCKET]
-	if !ok {
-		p.logger.Error().Msgf("SHOULD NEVER HAPPEN: sanctioned endpoints store not found for RPC type: %s", sharedtypes.RPCType_WEBSOCKET)
-		return nil
+
+	// Record reputation signals from observations.
+	// This allows health check results (from hydrator) to update endpoint reputation scores.
+	if p.reputationService != nil {
+		p.recordReputationSignalsFromWebsocketObservations(shannonObservations)
 	}
-	sanctionedEndpointsStore.ApplyObservations(shannonObservations)
 
 	return nil
+}
+
+// recordReputationSignalsFromWebsocketObservations maps websocket protocol observations to reputation signals.
+// This is called by ApplyWebSocketObservations to update endpoint reputation scores based on
+// health check results from the hydrator or any other observation source.
+func (p *Protocol) recordReputationSignalsFromWebsocketObservations(shannonObservations []*protocolobservations.ShannonRequestObservations) {
+	for _, observationSet := range shannonObservations {
+		serviceID := protocol.ServiceID(observationSet.GetServiceId())
+
+		// Process connection observations
+		connObs := observationSet.GetWebsocketConnectionObservation()
+		if connObs != nil {
+			p.recordSignalFromWebsocketConnectionObservation(serviceID, connObs)
+		}
+	}
+}
+
+// recordSignalFromWebsocketConnectionObservation records a reputation signal for a websocket connection observation.
+func (p *Protocol) recordSignalFromWebsocketConnectionObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonWebsocketConnectionObservation) {
+	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
+
+	// Build endpoint key for reputation service
+	key := reputation.NewEndpointKey(serviceID, endpointAddr)
+
+	// Map observation to signal using the existing mapping function
+	errorType := obs.GetErrorType()
+	sanctionType := obs.GetRecommendedSanction()
+
+	var signal reputation.Signal
+
+	// No error = success
+	if errorType == protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED {
+		signal = reputation.NewSuccessSignal(0)
+	} else {
+		// Map error type and sanction type to a reputation signal
+		signal = mapErrorToSignal(errorType, sanctionType, 0)
+	}
+
+	// Record signal (fire-and-forget, non-blocking)
+	ctx := context.Background()
+	if err := p.reputationService.RecordSignal(ctx, key, signal); err != nil {
+		p.logger.Warn().Err(err).
+			Str("endpoint", string(endpointAddr)).
+			Str("service", string(serviceID)).
+			Str("error_type", errorType.String()).
+			Msg("Failed to record reputation signal from websocket observation")
+	}
 }
 
 // ---------- Connection Establishment ----------
@@ -567,6 +612,6 @@ func (wrc *websocketRequestContext) recordWebsocketSignal(signal reputation.Sign
 		wrc.logger.Warn().Err(err).Msg("Failed to record websocket reputation signal")
 		reputationmetrics.RecordError("record_signal", "storage_error")
 	} else {
-		reputationmetrics.RecordSignal(string(wrc.serviceID), string(signal.Type), endpointDomain)
+		reputationmetrics.RecordSignal(string(wrc.serviceID), string(signal.Type), reputationmetrics.EndpointTypeWebSocket, endpointDomain)
 	}
 }
