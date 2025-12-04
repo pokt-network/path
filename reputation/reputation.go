@@ -76,6 +76,25 @@ const (
 	DefaultMinThreshold float64 = 30
 )
 
+// Key granularity options determine how endpoints are grouped for scoring.
+// Ordered from finest to coarsest granularity.
+const (
+	// KeyGranularityEndpoint scores each endpoint URL separately (finest granularity).
+	// Key format: serviceID:supplierAddr-endpointURL
+	// This is the default behavior.
+	KeyGranularityEndpoint = "per-endpoint"
+
+	// KeyGranularityDomain scores all endpoints from the same hosting domain together.
+	// Key format: serviceID:domain (e.g., eth:nodefleet.net)
+	// Use when a hosting provider's overall reliability matters.
+	KeyGranularityDomain = "per-domain"
+
+	// KeyGranularitySupplier scores all endpoints from the same supplier together.
+	// Key format: serviceID:supplierAddr
+	// Use when a supplier's overall reliability matters more than individual endpoints.
+	KeyGranularitySupplier = "per-supplier"
+)
+
 // ReputationService provides endpoint reputation tracking and querying.
 // Implementations must be safe for concurrent use.
 //
@@ -110,6 +129,10 @@ type ReputationService interface {
 	// Used for administrative purposes or testing.
 	ResetScore(ctx context.Context, key EndpointKey) error
 
+	// KeyBuilderForService returns the KeyBuilder for the given service.
+	// Uses service-specific config if available, otherwise falls back to global default.
+	KeyBuilderForService(serviceID protocol.ServiceID) KeyBuilder
+
 	// Start begins background sync processes (e.g., Redis pub/sub, periodic refresh).
 	// Should be called once during initialization.
 	Start(ctx context.Context) error
@@ -142,11 +165,27 @@ type Config struct {
 	// Default: "memory"
 	StorageType string `yaml:"storage_type"`
 
+	// KeyGranularity determines how endpoints are grouped for scoring (global default).
+	// Options: "per-endpoint" (default), "per-domain", "per-supplier"
+	// Default: "per-endpoint"
+	KeyGranularity string `yaml:"key_granularity"`
+
+	// ServiceOverrides allows per-service configuration overrides.
+	// Use this to apply different granularity rules to specific services.
+	ServiceOverrides map[string]ServiceConfig `yaml:"service_overrides,omitempty"`
+
 	// SyncConfig configures background synchronization behavior.
 	SyncConfig SyncConfig `yaml:"sync_config"`
 
 	// Redis holds Redis-specific configuration (only used when StorageType is "redis").
 	Redis *RedisConfig `yaml:"redis,omitempty"`
+}
+
+// ServiceConfig holds service-specific reputation configuration overrides.
+type ServiceConfig struct {
+	// KeyGranularity overrides the global key granularity for this service.
+	// Options: "per-endpoint", "per-domain", "per-supplier"
+	KeyGranularity string `yaml:"key_granularity"`
 }
 
 // RedisConfig holds Redis-specific configuration.
@@ -258,6 +297,7 @@ func DefaultConfig() Config {
 		MinThreshold:    DefaultMinThreshold,
 		RecoveryTimeout: DefaultRecoveryTimeout,
 		StorageType:     "memory",
+		KeyGranularity:  KeyGranularityEndpoint,
 		SyncConfig:      DefaultSyncConfig(),
 	}
 }
@@ -284,6 +324,9 @@ func (c *Config) HydrateDefaults() {
 	}
 	if c.StorageType == "" {
 		c.StorageType = "memory"
+	}
+	if c.KeyGranularity == "" {
+		c.KeyGranularity = KeyGranularityEndpoint
 	}
 	c.SyncConfig.HydrateDefaults()
 }

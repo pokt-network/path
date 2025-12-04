@@ -805,3 +805,244 @@ func TestReputation_ConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+// =============================================================================
+// Key Granularity Integration Tests
+// =============================================================================
+
+// TestReputation_KeyGranularityPerSupplier verifies that when using per-supplier
+// granularity, multiple endpoints from the same supplier share a single score.
+func TestReputation_KeyGranularityPerSupplier(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	// Create reputation service with per-supplier granularity
+	config := reputation.Config{
+		Enabled:         true,
+		InitialScore:    80,
+		MinThreshold:    30,
+		RecoveryTimeout: 5 * time.Minute,
+		StorageType:     "memory",
+		KeyGranularity:  reputation.KeyGranularitySupplier, // Per-supplier
+	}
+	config.HydrateDefaults()
+
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	// Create a Protocol with the reputation service
+	p := &Protocol{
+		logger:            logger,
+		reputationService: svc,
+	}
+
+	serviceID := protocol.ServiceID("eth")
+
+	// Two endpoints from the SAME supplier (pokt1supplier1)
+	endpoint1Addr := protocol.EndpointAddr("pokt1supplier1-https://node1.example.com")
+	endpoint2Addr := protocol.EndpointAddr("pokt1supplier1-https://node2.example.com")
+	// One endpoint from a DIFFERENT supplier
+	endpoint3Addr := protocol.EndpointAddr("pokt1supplier2-https://node3.example.com")
+
+	// Get the key builder for the service
+	keyBuilder := svc.KeyBuilderForService(serviceID)
+	require.IsType(t, &reputation.SupplierKeyBuilder{}, keyBuilder)
+
+	// Build keys - endpoints 1 and 2 should have the SAME key
+	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr)
+	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr)
+	key3 := keyBuilder.BuildKey(serviceID, endpoint3Addr)
+
+	// Verify keys 1 and 2 are the same (same supplier)
+	require.Equal(t, key1, key2, "Endpoints from same supplier should have same key")
+	require.NotEqual(t, key1, key3, "Endpoints from different suppliers should have different keys")
+
+	// Record critical errors on endpoint1 - this should affect endpoint2's score too
+	for i := 0; i < 3; i++ {
+		err := svc.RecordSignal(ctx, key1, reputation.NewCriticalErrorSignal("service_error", 200*time.Millisecond))
+		require.NoError(t, err)
+	}
+
+	// Verify that endpoint2's score is also affected (since they share the key)
+	score2, err := svc.GetScore(ctx, key2)
+	require.NoError(t, err)
+	require.Less(t, score2.Value, reputation.DefaultMinThreshold,
+		"Endpoint2 should have low score because it shares key with endpoint1")
+
+	// Create test endpoints for filtering
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		endpoint1Addr: &mockEndpoint{addr: endpoint1Addr},
+		endpoint2Addr: &mockEndpoint{addr: endpoint2Addr},
+		endpoint3Addr: &mockEndpoint{addr: endpoint3Addr},
+	}
+
+	// Filter by reputation
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, logger)
+
+	// Both endpoint1 and endpoint2 should be filtered out (same supplier, same low score)
+	// endpoint3 should pass (new endpoint, initial score)
+	require.Len(t, filtered, 1)
+	require.Contains(t, filtered, endpoint3Addr, "Endpoint from different supplier should pass")
+	require.NotContains(t, filtered, endpoint1Addr, "Endpoint1 should be filtered")
+	require.NotContains(t, filtered, endpoint2Addr, "Endpoint2 should be filtered (shares score with endpoint1)")
+
+	t.Log("Verified: Per-supplier granularity correctly shares scores between endpoints from same supplier")
+}
+
+// TestReputation_KeyGranularityPerDomain verifies that when using per-domain
+// granularity, all endpoints from the same hosting domain share a single score.
+func TestReputation_KeyGranularityPerDomain(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	// Create reputation service with per-domain granularity
+	config := reputation.Config{
+		Enabled:         true,
+		InitialScore:    80,
+		MinThreshold:    30,
+		RecoveryTimeout: 5 * time.Minute,
+		StorageType:     "memory",
+		KeyGranularity:  reputation.KeyGranularityDomain, // Per-domain
+	}
+	config.HydrateDefaults()
+
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	// Create a Protocol with the reputation service
+	p := &Protocol{
+		logger:            logger,
+		reputationService: svc,
+	}
+
+	serviceID := protocol.ServiceID("eth")
+
+	// Multiple endpoints from DIFFERENT suppliers but SAME hosting domain (nodefleet.net)
+	endpoint1Addr := protocol.EndpointAddr("pokt1supplier1-https://rm-01.eu.nodefleet.net")
+	endpoint2Addr := protocol.EndpointAddr("pokt1supplier2-https://rm-02.us.nodefleet.net")
+	// One endpoint from a DIFFERENT domain
+	endpoint3Addr := protocol.EndpointAddr("pokt1supplier3-https://relay.pokt.network")
+
+	// Get the key builder for the service
+	keyBuilder := svc.KeyBuilderForService(serviceID)
+	require.IsType(t, &reputation.DomainKeyBuilder{}, keyBuilder)
+
+	// Build keys - endpoints 1 and 2 should have the SAME key (same domain)
+	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr)
+	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr)
+	key3 := keyBuilder.BuildKey(serviceID, endpoint3Addr)
+
+	// Verify keys 1 and 2 are the same (same domain: nodefleet.net)
+	require.Equal(t, key1, key2, "Endpoints from same domain should have same key")
+	require.NotEqual(t, key1, key3, "Endpoints from different domains should have different keys")
+
+	// Record critical errors on endpoint1 - this should affect endpoint2's score too (same domain)
+	for i := 0; i < 3; i++ {
+		err := svc.RecordSignal(ctx, key1, reputation.NewCriticalErrorSignal("service_error", 200*time.Millisecond))
+		require.NoError(t, err)
+	}
+
+	// Verify that endpoint2's score is also affected (since they share the domain key)
+	score2, err := svc.GetScore(ctx, key2)
+	require.NoError(t, err)
+	require.Less(t, score2.Value, reputation.DefaultMinThreshold,
+		"Endpoint2 should have low score because it shares domain with endpoint1")
+
+	// Create test endpoints for filtering
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		endpoint1Addr: &mockEndpoint{addr: endpoint1Addr},
+		endpoint2Addr: &mockEndpoint{addr: endpoint2Addr},
+		endpoint3Addr: &mockEndpoint{addr: endpoint3Addr},
+	}
+
+	// Filter by reputation
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, logger)
+
+	// Both endpoint1 and endpoint2 should be filtered out (same domain, same low score)
+	// endpoint3 should pass (different domain, new endpoint, initial score)
+	require.Len(t, filtered, 1)
+	require.Contains(t, filtered, endpoint3Addr, "Endpoint from different domain should pass")
+	require.NotContains(t, filtered, endpoint1Addr, "Endpoint1 should be filtered")
+	require.NotContains(t, filtered, endpoint2Addr, "Endpoint2 should be filtered (shares score via domain)")
+
+	t.Log("Verified: Per-domain granularity correctly shares scores between endpoints from same hosting domain")
+}
+
+// TestReputation_KeyGranularityDefault verifies that the default granularity
+// (per-endpoint) treats each endpoint independently.
+func TestReputation_KeyGranularityDefault(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	// Create reputation service with default (per-endpoint) granularity
+	config := reputation.Config{
+		Enabled:         true,
+		InitialScore:    80,
+		MinThreshold:    30,
+		RecoveryTimeout: 5 * time.Minute,
+		StorageType:     "memory",
+		// KeyGranularity not set - should default to per-endpoint
+	}
+	config.HydrateDefaults()
+	require.Equal(t, reputation.KeyGranularityEndpoint, config.KeyGranularity)
+
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	// Create a Protocol with the reputation service
+	p := &Protocol{
+		logger:            logger,
+		reputationService: svc,
+	}
+
+	serviceID := protocol.ServiceID("eth")
+
+	// Two endpoints from the SAME supplier
+	endpoint1Addr := protocol.EndpointAddr("pokt1supplier1-https://node1.example.com")
+	endpoint2Addr := protocol.EndpointAddr("pokt1supplier1-https://node2.example.com")
+
+	// Get the key builder for the service
+	keyBuilder := svc.KeyBuilderForService(serviceID)
+	require.IsType(t, &reputation.EndpointKeyBuilder{}, keyBuilder)
+
+	// Build keys - each endpoint should have a DIFFERENT key
+	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr)
+	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr)
+
+	// Verify keys are different (per-endpoint granularity)
+	require.NotEqual(t, key1, key2, "Each endpoint should have its own key")
+
+	// Record critical errors ONLY on endpoint1
+	for i := 0; i < 3; i++ {
+		err := svc.RecordSignal(ctx, key1, reputation.NewCriticalErrorSignal("service_error", 200*time.Millisecond))
+		require.NoError(t, err)
+	}
+
+	// Verify endpoint1 has low score but endpoint2 is unaffected
+	score1, _ := svc.GetScore(ctx, key1)
+	_, err := svc.GetScore(ctx, key2) // Should not exist yet
+	require.Less(t, score1.Value, reputation.DefaultMinThreshold, "Endpoint1 should have low score")
+	require.ErrorIs(t, err, reputation.ErrNotFound, "Endpoint2 should not have a score yet")
+
+	// Create test endpoints for filtering
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		endpoint1Addr: &mockEndpoint{addr: endpoint1Addr},
+		endpoint2Addr: &mockEndpoint{addr: endpoint2Addr},
+	}
+
+	// Filter by reputation
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, logger)
+
+	// Only endpoint1 should be filtered out
+	require.Len(t, filtered, 1)
+	require.Contains(t, filtered, endpoint2Addr, "Endpoint2 should pass (no score, gets initial)")
+	require.NotContains(t, filtered, endpoint1Addr, "Endpoint1 should be filtered (low score)")
+
+	t.Log("Verified: Per-endpoint granularity treats each endpoint independently")
+}

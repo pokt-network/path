@@ -46,7 +46,7 @@ const maxEndpointPayloadLenForLogging = 100
 // MaxConcurrentRelaysPerRequest limits the number of concurrent relay goroutines per request.
 // This prevents DoS attacks via large batch requests that could spawn unbounded goroutines.
 // TODO_IMPROVE: Make this configurable via gateway settings.
-const MaxConcurrentRelaysPerRequest = 10
+const MaxConcurrentRelaysPerRequest = 5500
 
 // requestContext provides all the functionality required by the gateway package
 // for handling a single service request.
@@ -164,7 +164,7 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 	}
 
 	if len(payloads) > MaxConcurrentRelaysPerRequest {
-		response, err := rc.handleInternalError(fmt.Errorf("HandleServiceRequest: batch of payloads larger than allowed: %d", MaxConcurrentRelaysPerRequest))
+		response, err := rc.handleInternalError(fmt.Errorf("HandleServiceRequest: batch of payloads larger than allowed: %d, received: %d ", MaxConcurrentRelaysPerRequest, len(payloads)))
 		return []protocol.Response{response}, err
 	}
 
@@ -940,7 +940,7 @@ func (rc *requestContext) handleEndpointError(
 	if rc.reputationService != nil {
 		latency := time.Since(endpointQueryTime)
 		signal := mapErrorToSignal(endpointErrorType, recommendedSanctionType, latency)
-		endpointKey := reputation.NewEndpointKey(rc.serviceID, selectedEndpointAddr)
+		endpointKey := rc.reputationService.KeyBuilderForService(rc.serviceID).BuildKey(rc.serviceID, selectedEndpointAddr)
 
 		// Extract domain for metrics
 		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
@@ -979,6 +979,8 @@ func (rc *requestContext) handleEndpointSuccess(
 	rc.logger.Debug().Msg("Successfully deserialized the response received from the selected endpoint.")
 
 	selectedEndpoint := rc.getSelectedEndpoint()
+	selectedEndpointAddr := selectedEndpoint.Addr()
+
 	// Build success observation with timing data and any RelayMinerError data from request context
 	endpointObs := buildEndpointSuccessObservation(
 		rc.logger,
@@ -1003,7 +1005,7 @@ func (rc *requestContext) handleEndpointSuccess(
 	if rc.reputationService != nil {
 		latency := time.Since(endpointQueryTime)
 		signal := reputation.NewSuccessSignal(latency)
-		endpointKey := reputation.NewEndpointKey(rc.serviceID, selectedEndpoint.Addr())
+		endpointKey := rc.reputationService.KeyBuilderForService(rc.serviceID).BuildKey(rc.serviceID, selectedEndpointAddr)
 
 		// Extract domain for metrics
 		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())

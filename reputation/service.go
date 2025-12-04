@@ -4,14 +4,20 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/pokt-network/path/protocol"
 )
 
 // service implements ReputationService with local cache + async backend sync.
 // All reads are served from local cache (<1μs), writes update cache immediately
 // and queue async writes to backend storage.
 type service struct {
-	config  Config
-	storage Storage
+	config            Config
+	storage           Storage
+	defaultKeyBuilder KeyBuilder
+
+	// serviceKeyBuilders caches KeyBuilders for services with overrides
+	serviceKeyBuilders map[string]KeyBuilder
 
 	// Local cache for fast reads
 	mu    sync.RWMutex
@@ -37,13 +43,23 @@ type writeRequest struct {
 func NewService(config Config, store Storage) ReputationService {
 	config.HydrateDefaults()
 
+	// Build service-specific key builders from overrides
+	serviceKeyBuilders := make(map[string]KeyBuilder)
+	for serviceID, svcConfig := range config.ServiceOverrides {
+		if svcConfig.KeyGranularity != "" {
+			serviceKeyBuilders[serviceID] = NewKeyBuilder(svcConfig.KeyGranularity)
+		}
+	}
+
 	return &service{
-		config:    config,
-		storage:   store,
-		cache:     make(map[string]Score),
-		writeCh:   make(chan writeRequest, config.SyncConfig.WriteBufferSize),
-		stopCh:    make(chan struct{}),
-		stoppedCh: make(chan struct{}),
+		config:             config,
+		storage:            store,
+		defaultKeyBuilder:  NewKeyBuilder(config.KeyGranularity),
+		serviceKeyBuilders: serviceKeyBuilders,
+		cache:              make(map[string]Score),
+		writeCh:            make(chan writeRequest, config.SyncConfig.WriteBufferSize),
+		stopCh:             make(chan struct{}),
+		stoppedCh:          make(chan struct{}),
 	}
 }
 
@@ -247,6 +263,17 @@ func (s *service) ResetScore(ctx context.Context, key EndpointKey) error {
 	}
 
 	return nil
+}
+
+// KeyBuilderForService returns the KeyBuilder for the given service.
+// Uses service-specific config if available, otherwise falls back to global default.
+func (s *service) KeyBuilderForService(serviceID protocol.ServiceID) KeyBuilder {
+	// Check for service-specific override
+	if builder, ok := s.serviceKeyBuilders[string(serviceID)]; ok {
+		return builder
+	}
+	// Fall back to default
+	return s.defaultKeyBuilder
 }
 
 // Start begins background sync processes.

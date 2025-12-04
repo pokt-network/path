@@ -105,6 +105,22 @@ shannon_config:
       # Time after which inactive endpoint scores can be re-evaluated
       # Default: 5m
       recovery_timeout: 5m
+      # How endpoints are grouped for scoring (global default)
+      # Options:
+      #   "per-endpoint" - Each endpoint URL scored independently (finest granularity, default)
+      #   "per-domain"   - Endpoints from the same hosting domain share a score (e.g., nodefleet.net)
+      #   "per-supplier" - All endpoint URLs from the same supplier share a score
+      # Default: "per-endpoint"
+      key_granularity: "per-endpoint"
+      # Per-service overrides for key granularity
+      # Allows different services to use different scoring strategies
+      # service_overrides:
+      #   eth:
+      #     # Use per-domain for eth to group endpoints by hosting provider
+      #     key_granularity: "per-domain"
+      #   sol:
+      #     # Use per-supplier for sol to group by supplier
+      #     key_granularity: "per-supplier"
       # Redis configuration (only used when storage_type is "redis")
       # redis:
       #   address: "localhost:6379"
