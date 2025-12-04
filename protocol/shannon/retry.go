@@ -101,11 +101,12 @@ func isRetryableErrorType(errorType protocolobservations.ShannonEndpointErrorTyp
 	}
 
 	switch errorType {
-	// Timeout errors
+	// Timeout errors (including RelayMiner timeout from poktroll)
 	case protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_TIMEOUT,
 		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_HTTP_IO_TIMEOUT,
 		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_HTTP_CONTEXT_DEADLINE_EXCEEDED,
-		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_HTTP_CONNECTION_TIMEOUT:
+		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_HTTP_CONNECTION_TIMEOUT,
+		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_RELAY_MINER_TIMEOUT:
 		return config.RetryOnTimeout
 
 	// Connection errors
