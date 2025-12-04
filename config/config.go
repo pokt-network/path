@@ -22,6 +22,14 @@ type GatewayConfig struct {
 	DataReporterConfig HTTPDataReporterConfig        `yaml:"data_reporter_config"`
 }
 
+type EnvConfigError struct {
+	Description string
+}
+
+func (c EnvConfigError) Error() string {
+	return c.Description
+}
+
 // LoadGatewayConfigFromYAML reads a YAML configuration file from the specified path
 // and unmarshals its content into a GatewayConfig instance.
 func LoadGatewayConfigFromYAML(path string) (GatewayConfig, error) {
@@ -32,6 +40,26 @@ func LoadGatewayConfigFromYAML(path string) (GatewayConfig, error) {
 
 	var config GatewayConfig
 	if err = yaml.Unmarshal(data, &config); err != nil {
+		return GatewayConfig{}, err
+	}
+
+	if err = config.hydrateDefaults(); err != nil {
+		return GatewayConfig{}, err
+	}
+
+	return config, config.validate()
+}
+
+func LoadGatewayConfigFromEnv() (GatewayConfig, error) {
+	conf := os.Getenv("GATEWAY_CONFIG")
+
+	if conf == "" {
+		return GatewayConfig{}, EnvConfigError{Description: "Failed to load config from GATEWAY_CONFIG environment variable"}
+	}
+
+	var config GatewayConfig
+	err := yaml.Unmarshal([]byte(conf), &config)
+	if err != nil {
 		return GatewayConfig{}, err
 	}
 

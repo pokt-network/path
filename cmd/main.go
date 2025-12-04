@@ -51,7 +51,12 @@ func main() {
 	// Load the config
 	config, err := configpkg.LoadGatewayConfigFromYAML(configPath)
 	if err != nil {
-		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to load config"}`, err)
+		log.Printf(`{"level":"info", "error": "%v", "message": "failed to load config from filepath %v. trying GATEWAY_CONFIG environment variable..."}`, err, configPath)
+		conf, err := configpkg.LoadGatewayConfigFromEnv()
+		if err != nil {
+			log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to load config from environment variable and filepath"}`, err)
+		}
+		config = conf
 	}
 
 	// Initialize the logger
