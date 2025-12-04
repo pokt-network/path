@@ -497,7 +497,7 @@ func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (proto
 	case <-time.After(relayTimeout):
 		// Cancel the Shannon relay context to stop the in-flight request.
 		// This prevents double signal recording: the timeout signal is recorded here,
-		// and the cancelled request won't record an additional error signal because
+		// and the canceled request won't record an additional error signal because
 		// context cancellation errors are not the endpoint's fault.
 		cancelShannon()
 

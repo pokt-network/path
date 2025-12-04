@@ -127,19 +127,6 @@ check_path_config:
 path_run: path_build check_path_config ## Run the path binary as a standalone binary
 	(cd bin; ./path -config ../${CONFIG_PATH})
 
-# E2E Shannon config for local development testing
-E2E_SHANNON_CONFIG ?= ./e2e/config/.shannon.config.yaml
-
-.PHONY: path_dev
-path_dev: path_build ## Run PATH with E2E Shannon config for local development testing
-	@echo "Starting PATH with E2E Shannon config..."
-	@echo "  Config: $(E2E_SHANNON_CONFIG)"
-	@echo "  Gateway: http://localhost:3069/v1"
-	@echo "  Health:  http://localhost:3069/healthz"
-	@echo "  Metrics: http://localhost:9090/metrics"
-	@echo ""
-	./bin/path -config $(E2E_SHANNON_CONFIG)
-
 ###############################
 ###  Portal Database Help   ###
 ###############################
