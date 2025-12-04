@@ -112,6 +112,15 @@ shannon_config:
       #   "per-supplier" - All endpoint URLs from the same supplier share a score
       # Default: "per-endpoint"
       key_granularity: "per-endpoint"
+      # Per-service overrides for key granularity
+      # Allows different services to use different scoring strategies
+      # service_overrides:
+      #   eth:
+      #     # Use per-domain for eth to group endpoints by hosting provider
+      #     key_granularity: "per-domain"
+      #   sol:
+      #     # Use per-supplier for sol to group by supplier
+      #     key_granularity: "per-supplier"
       # Tiered endpoint selection configuration
       # When enabled, endpoints are grouped into tiers based on reputation score
       # and selection prefers higher-tier endpoints using cascade-down logic
