@@ -214,6 +214,76 @@ properties:
                     description: "Multiplier for score recovery during probation."
                     type: number
                     minimum: 1.0
+          latency:
+            description: "Configuration for latency-aware reputation scoring. Fast responses get bonuses, slow responses get penalties."
+            type: object
+            additionalProperties: false
+            properties:
+              enabled:
+                description: "Enable/disable latency-aware scoring. Default: true"
+                type: boolean
+                default: true
+              fast_threshold:
+                description: "Maximum latency for 'fast' responses (get bonus). Default: 100ms"
+                type: string
+                pattern: "^[0-9]+m?s$"
+              normal_threshold:
+                description: "Maximum latency for 'normal' responses (standard impact). Default: 500ms"
+                type: string
+                pattern: "^[0-9]+m?s$"
+              slow_threshold:
+                description: "Maximum latency for 'slow' responses (reduced impact). Default: 1000ms"
+                type: string
+                pattern: "^[0-9]+m?s$"
+              penalty_threshold:
+                description: "Latency that triggers slow_response penalty signal. Default: 2000ms"
+                type: string
+                pattern: "^[0-9]+m?s$"
+              severe_threshold:
+                description: "Latency that triggers very_slow_response penalty signal. Default: 5000ms"
+                type: string
+                pattern: "^[0-9]+m?s$"
+              fast_bonus:
+                description: "Multiplier for success impact when response is fast. Default: 2.0"
+                type: number
+                minimum: 1.0
+              slow_penalty:
+                description: "Multiplier for success impact when response is slow. Default: 0.5"
+                type: number
+                minimum: 0.0
+                maximum: 1.0
+              very_slow_penalty:
+                description: "Multiplier for success impact when response is very slow. Default: 0.0"
+                type: number
+                minimum: 0.0
+                maximum: 1.0
+              service_profiles:
+                description: "Service-specific latency profiles. Keys are profile names (evm, cosmos, solana, llm) or service IDs. Values override global thresholds."
+                type: object
+                additionalProperties:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    fast_threshold:
+                      description: "Maximum latency for 'fast' responses for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
+                    normal_threshold:
+                      description: "Maximum latency for 'normal' responses for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
+                    slow_threshold:
+                      description: "Maximum latency for 'slow' responses for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
+                    penalty_threshold:
+                      description: "Latency that triggers penalty for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
+                    severe_threshold:
+                      description: "Latency that triggers severe penalty for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
 
       # Retry Configuration
       retry_config:
@@ -372,6 +442,162 @@ properties:
                         type: string
                         enum: ["minor_error", "major_error", "critical_error"]
 
+      # ====================================
+      # UNIFIED SERVICE CONFIGURATION
+      # ====================================
+      # This section consolidates all per-service settings into a single structure.
+      # Services are defined once and inherit from defaults.
+
+      # Latency Profiles - Named profiles that services can reference
+      latency_profiles:
+        description: "Named latency profiles that services can reference. Built-in profiles (evm, solana, cosmos, llm, generic) are always available."
+        type: object
+        additionalProperties:
+          type: object
+          additionalProperties: false
+          required:
+            - fast_threshold
+            - normal_threshold
+            - slow_threshold
+            - penalty_threshold
+            - severe_threshold
+          properties:
+            fast_threshold:
+              description: "Maximum latency for 'fast' responses (get bonus)."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            normal_threshold:
+              description: "Maximum latency for 'normal' responses."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            slow_threshold:
+              description: "Maximum latency for 'slow' responses."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            penalty_threshold:
+              description: "Latency that triggers penalty signal."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            severe_threshold:
+              description: "Latency that triggers severe penalty signal."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            fast_bonus:
+              description: "Multiplier for success impact when response is fast."
+              type: number
+              minimum: 1.0
+            slow_penalty:
+              description: "Multiplier for success impact when response is slow."
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+            very_slow_penalty:
+              description: "Multiplier for success when response is very slow."
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+
+      # Service Defaults - Settings inherited by all services
+      defaults:
+        description: "Default settings inherited by all services. Per-service overrides only need to specify differences."
+        type: object
+        additionalProperties: false
+        properties:
+          type:
+            description: "Default QoS type. Options: evm, solana, cosmos, generic, passthrough"
+            type: string
+            enum: ["evm", "solana", "cosmos", "generic", "passthrough"]
+            default: "passthrough"
+          rpc_types:
+            description: "Default supported RPC types."
+            type: array
+            items:
+              type: string
+              enum: ["json_rpc", "rest", "websocket", "comet_bft", "grpc"]
+          latency_profile:
+            description: "Default latency profile name (references latency_profiles or built-in)."
+            type: string
+            default: "standard"
+          reputation_config:
+            $ref: "#/definitions/service_reputation_config"
+          latency:
+            $ref: "#/definitions/service_latency_config"
+          tiered_selection:
+            $ref: "#/definitions/service_tiered_selection_config"
+          probation:
+            $ref: "#/definitions/service_probation_config"
+          retry_config:
+            $ref: "#/definitions/service_retry_config"
+          observation_pipeline:
+            $ref: "#/definitions/service_observation_config"
+          active_health_checks:
+            $ref: "#/definitions/service_health_check_override"
+
+      # Services - Array of per-service configurations
+      services:
+        description: "List of configured services. Each service inherits from defaults unless explicitly overridden."
+        type: array
+        uniqueItems: true
+        items:
+          type: object
+          additionalProperties: false
+          required:
+            - id
+          properties:
+            id:
+              description: "Unique service identifier (e.g., 'eth', 'base', 'poly')."
+              type: string
+            type:
+              description: "QoS type for this service. Overrides default."
+              type: string
+              enum: ["evm", "solana", "cosmos", "generic", "passthrough"]
+            rpc_types:
+              description: "Supported RPC types for this service."
+              type: array
+              items:
+                type: string
+                enum: ["json_rpc", "rest", "websocket", "comet_bft", "grpc"]
+            latency_profile:
+              description: "Latency profile name for this service."
+              type: string
+            reputation_config:
+              $ref: "#/definitions/service_reputation_config"
+            latency:
+              $ref: "#/definitions/service_latency_config"
+            tiered_selection:
+              $ref: "#/definitions/service_tiered_selection_config"
+            probation:
+              $ref: "#/definitions/service_probation_config"
+            retry_config:
+              $ref: "#/definitions/service_retry_config"
+            observation_pipeline:
+              $ref: "#/definitions/service_observation_config"
+            fallback:
+              description: "Fallback endpoint configuration (no defaults - must be explicitly set per-service)."
+              type: object
+              additionalProperties: false
+              properties:
+                enabled:
+                  description: "Enable/disable fallback for this service."
+                  type: boolean
+                send_all_traffic:
+                  description: "Send all traffic to fallback endpoints."
+                  type: boolean
+                endpoints:
+                  description: "Fallback endpoint URLs."
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: false
+                    patternProperties:
+                      "^(default_url|json_rpc|rest|comet_bft|websocket)$":
+                        type: string
+                        anyOf:
+                          - pattern: "^(http|https)://.*$"
+                          - pattern: "^(http|https|ws|wss)://.*$"
+            health_checks:
+              $ref: "#/definitions/service_health_check_override"
+
   # Logger Configuration (optional)
   logger_config:
     description: "Optional configuration for the logger. If not specified, info level will be used."
@@ -488,3 +714,223 @@ properties:
       write_timeout:
         description: "Write operation timeout."
         type: string
+
+# ====================================
+# DEFINITIONS - Reusable schema components
+# ====================================
+definitions:
+  # Per-service reputation configuration
+  service_reputation_config:
+    description: "Per-service reputation configuration overrides."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable reputation for this service."
+        type: boolean
+      initial_score:
+        description: "Starting score for new endpoints (0-100)."
+        type: number
+        minimum: 0
+        maximum: 100
+      min_threshold:
+        description: "Minimum score for endpoint selection."
+        type: number
+        minimum: 0
+        maximum: 100
+      key_granularity:
+        description: "How endpoints are grouped for scoring."
+        type: string
+        enum: ["per-endpoint", "per-domain", "per-supplier"]
+      recovery_timeout:
+        description: "Duration after which a low-scoring endpoint can recover (e.g., '5m', '1h')."
+        type: string
+        pattern: "^[0-9]+[smh]$"
+
+  # Per-service latency configuration
+  service_latency_config:
+    description: "Per-service latency configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable latency-aware scoring."
+        type: boolean
+      target_ms:
+        description: "Target response time in milliseconds (for monitoring)."
+        type: integer
+        minimum: 0
+      penalty_weight:
+        description: "Weight of latency penalties (0.0 to 1.0)."
+        type: number
+        minimum: 0.0
+        maximum: 1.0
+
+  # Per-service tiered selection configuration
+  service_tiered_selection_config:
+    description: "Per-service tiered selection configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable tiered selection."
+        type: boolean
+      tier1_threshold:
+        description: "Minimum score for tier 1."
+        type: number
+        minimum: 0
+        maximum: 100
+      tier2_threshold:
+        description: "Minimum score for tier 2."
+        type: number
+        minimum: 0
+        maximum: 100
+
+  # Per-service probation configuration
+  service_probation_config:
+    description: "Per-service probation configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable probation system."
+        type: boolean
+      threshold:
+        description: "Score threshold for probation."
+        type: number
+        minimum: 0
+        maximum: 100
+      traffic_percent:
+        description: "Traffic percentage to probation endpoints."
+        type: number
+        minimum: 0
+        maximum: 100
+      recovery_multiplier:
+        description: "Score recovery multiplier during probation."
+        type: number
+        minimum: 1.0
+
+  # Per-service retry configuration
+  service_retry_config:
+    description: "Per-service retry configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable automatic retries."
+        type: boolean
+      max_retries:
+        description: "Maximum retry attempts."
+        type: integer
+        minimum: 0
+      retry_on_5xx:
+        description: "Retry on 5xx errors."
+        type: boolean
+      retry_on_timeout:
+        description: "Retry on timeout errors."
+        type: boolean
+      retry_on_connection:
+        description: "Retry on connection errors."
+        type: boolean
+
+  # Per-service observation pipeline configuration
+  # Note: worker_count and queue_size are GLOBAL only (gateway_config.observation_pipeline)
+  service_observation_config:
+    description: "Per-service observation pipeline configuration. Only sample_rate can be overridden per-service."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable async observation processing."
+        type: boolean
+      sample_rate:
+        description: "Fraction of requests to deep-parse (0.0 to 1.0)."
+        type: number
+        minimum: 0.0
+        maximum: 1.0
+
+  # Per-service health check configuration
+  service_health_check_override:
+    description: "Per-service health check configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable health checks for this service."
+        type: boolean
+      interval:
+        description: "Health check interval for this service."
+        type: string
+        pattern: "^[0-9]+[smh]$"
+      sync_allowance:
+        description: "Number of blocks behind the latest that an endpoint can be before considered out of sync."
+        type: integer
+        minimum: 0
+      external:
+        description: "External URL for fetching health check rules for this service."
+        type: object
+        additionalProperties: false
+        properties:
+          url:
+            description: "URL to fetch health check rules from."
+            type: string
+            format: uri
+          refresh_interval:
+            description: "How often to re-fetch external config (e.g., '1h', '30m'). 0 means only fetch at startup."
+            type: string
+            pattern: "^[0-9]+[smh]$"
+          timeout:
+            description: "HTTP timeout for fetching external config."
+            type: string
+            pattern: "^[0-9]+[smh]$"
+      local:
+        description: "Local health check rules that override external rules with the same name."
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required:
+            - name
+            - type
+          properties:
+            name:
+              description: "Health check name."
+              type: string
+            type:
+              description: "Check type: jsonrpc, rest, websocket."
+              type: string
+              enum: ["jsonrpc", "rest", "websocket"]
+            enabled:
+              description: "Enable/disable this check."
+              type: boolean
+            method:
+              description: "HTTP method."
+              type: string
+              enum: ["GET", "POST"]
+            path:
+              description: "Request path."
+              type: string
+            headers:
+              description: "Request headers."
+              type: object
+              additionalProperties:
+                type: string
+            body:
+              description: "Request body."
+              type: string
+            expected_status_code:
+              description: "Expected HTTP status code."
+              type: integer
+            expected_response_contains:
+              description: "Expected substring in response."
+              type: string
+            timeout:
+              description: "Request timeout."
+              type: string
+            archival:
+              description: "Is this an archival check."
+              type: boolean
+            reputation_signal:
+              description: "Signal type on failure."
+              type: string
+              enum: ["minor_error", "major_error", "critical_error", "fatal_error"]

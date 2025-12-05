@@ -11,99 +11,93 @@ import (
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/cosmos"
 	"github.com/pokt-network/path/qos/evm"
+	"github.com/pokt-network/path/qos/noop"
 	"github.com/pokt-network/path/qos/solana"
 )
 
 // getServiceQoSInstances returns all QoS instances to be used by the Gateway and the EndpointHydrator.
+// Service types are determined from the unified YAML configuration (gateway_config.services[]).
+// If a service is not configured, it defaults to passthrough/noop QoS.
 func getServiceQoSInstances(
 	logger polylog.Logger,
 	gatewayConfig config.GatewayConfig,
+	unifiedConfig *gateway.UnifiedServicesConfig,
 	protocolInstance gateway.Protocol,
 ) (map[protocol.ServiceID]gateway.QoSService, error) {
-	// TODO_TECHDEBT(@adshmh): refactor this function to remove the
-	// need to manually add entries for every new QoS implementation.
 	qosServices := make(map[protocol.ServiceID]gateway.QoSService)
 
-	// Create a logger for this function's own messages with method-specific context
+	// Create loggers
 	hydratedLogger := logger.With("module", "qos").With("method", "getServiceQoSInstances").With("protocol", protocolInstance.Name())
-
-	// Create a separate logger for QoS instances without method-specific context
 	qosLogger := logger.With("module", "qos").With("protocol", protocolInstance.Name())
 
-	// Wait for the protocol to become healthy BEFORE configuring and starting the hydrator.
-	// - Ensures the protocol instance's configured service IDs are available before hydrator startup.
+	// Wait for the protocol to become healthy before configuring QoS instances.
 	err := waitForProtocolHealth(hydratedLogger, protocolInstance, defaultProtocolHealthTimeout)
 	if err != nil {
 		return nil, err
 	}
 
 	// Get configured service IDs from the protocol instance.
-	// - Used to run hydrator checks on all configured service IDs (except those manually disabled by the user).
 	gatewayServiceIDs := protocolInstance.ConfiguredServiceIDs()
 	logGatewayServiceIDs(hydratedLogger, gatewayServiceIDs)
 
 	// Remove any service IDs that are manually disabled by the user.
 	for _, disabledQoSServiceIDForGateway := range gatewayConfig.HydratorConfig.QoSDisabledServiceIDs {
-		// Throw error if any manually disabled service IDs are not found in the protocol's configured service IDs.
 		if _, found := gatewayServiceIDs[disabledQoSServiceIDForGateway]; !found {
-			return nil, fmt.Errorf("[INVALID CONFIGURATION] QoS manually disabled for service ID: %s BUT NOT not found in protocol's configured service IDs", disabledQoSServiceIDForGateway)
+			return nil, fmt.Errorf("[INVALID CONFIGURATION] QoS manually disabled for service ID: %s BUT NOT found in protocol's configured service IDs", disabledQoSServiceIDForGateway)
 		}
 		hydratedLogger.Info().Msgf("Gateway manually disabled QoS for service ID: %s", disabledQoSServiceIDForGateway)
 		delete(gatewayServiceIDs, disabledQoSServiceIDForGateway)
 	}
 
-	// Get the service configs for the current protocol
-	qosServiceConfigs := config.QoSServiceConfigs.GetServiceConfigs(gatewayConfig)
-	logQoSServiceConfigs(hydratedLogger, qosServiceConfigs)
-
-	// Initialize QoS services for all service IDs with a corresponding QoS
-	// implementation, as defined in the `config/service_qos.go` file.
-	for _, qosServiceConfig := range qosServiceConfigs {
-		serviceID := qosServiceConfig.GetServiceID()
-		// Skip service IDs that are not configured for the PATH instance.
-		if _, found := gatewayServiceIDs[serviceID]; !found {
-			hydratedLogger.Warn().Msgf("⚠️  🔍 Service ID '%s' has QoS configuration defined BUT no owned apps configured! 🚫 This service will fallback to NoOp QoS and likely fail. Configure owned app private keys for this service to enable proper QoS.", serviceID)
-			continue
+	// Initialize QoS services for all gateway service IDs using unified config.
+	for serviceID := range gatewayServiceIDs {
+		// Get service type from unified config (falls back to defaults if not explicitly configured)
+		serviceType := gateway.ServiceTypePassthrough
+		var syncAllowance uint64
+		if unifiedConfig != nil {
+			serviceType = unifiedConfig.GetServiceType(serviceID)
+			syncAllowance = unifiedConfig.GetSyncAllowanceForService(serviceID)
 		}
 
-		switch qosServiceConfig.GetServiceQoSType() {
-		case evm.QoSType:
-			evmServiceQoSConfig, ok := qosServiceConfig.(evm.EVMServiceQoSConfig)
-			if !ok {
-				return nil, fmt.Errorf("SHOULD NEVER HAPPEN: error building QoS instances: service ID %q is not an EVM service", serviceID)
-			}
+		svcLogger := hydratedLogger.With("service_id", serviceID).With("service_type", string(serviceType))
 
-			evmQoS := evm.NewQoSInstance(qosLogger, evmServiceQoSConfig)
+		switch serviceType {
+		case gateway.ServiceTypeEVM:
+			evmQoS := evm.NewSimpleQoSInstanceWithSyncAllowance(qosLogger, serviceID, syncAllowance)
 			qosServices[serviceID] = evmQoS
+			svcLogger.Debug().Uint64("sync_allowance", syncAllowance).Msg("Added EVM QoS instance")
 
-			hydratedLogger.With("service_id", serviceID).Debug().Msg("Added EVM QoS instance for the service ID.")
+		case gateway.ServiceTypeCosmos:
+			cosmosQoS := cosmos.NewSimpleQoSInstanceWithSyncAllowance(qosLogger, serviceID, syncAllowance)
+			qosServices[serviceID] = cosmosQoS
+			svcLogger.Debug().Uint64("sync_allowance", syncAllowance).Msg("Added Cosmos QoS instance")
 
-		case cosmos.QoSType:
-			cosmosSDKServiceQoSConfig, ok := qosServiceConfig.(cosmos.CosmosSDKServiceQoSConfig)
-			if !ok {
-				return nil, fmt.Errorf("SHOULD NEVER HAPPEN: error building QoS instances: service ID %q is not a CosmosSDK service", serviceID)
-			}
-
-			cosmosSDKQoS := cosmos.NewQoSInstance(qosLogger, cosmosSDKServiceQoSConfig)
-			qosServices[serviceID] = cosmosSDKQoS
-
-			hydratedLogger.With("service_id", serviceID).Debug().Msg("Added CosmosSDK QoS instance for the service ID.")
-
-		case solana.QoSType:
-			solanaServiceQoSConfig, ok := qosServiceConfig.(solana.SolanaServiceQoSConfig)
-			if !ok {
-				return nil, fmt.Errorf("SHOULD NEVER HAPPEN: error building QoS instances: service ID %q is not a Solana service", serviceID)
-			}
-
-			solanaQoS := solana.NewQoSInstance(qosLogger, solanaServiceQoSConfig)
+		case gateway.ServiceTypeSolana:
+			solanaQoS := solana.NewSimpleQoSInstance(qosLogger, serviceID)
 			qosServices[serviceID] = solanaQoS
+			svcLogger.Debug().Msg("Added Solana QoS instance")
 
-			hydratedLogger.With("service_id", serviceID).Debug().Msg("Added Solana QoS instance for the service ID.")
+		case gateway.ServiceTypeGeneric:
+			// Generic uses noop QoS (basic JSON-RPC handling without chain-specific validation)
+			genericQoS := noop.NewNoOpQoSService(qosLogger, serviceID)
+			qosServices[serviceID] = genericQoS
+			svcLogger.Debug().Msg("Added Generic QoS instance (noop)")
+
+		case gateway.ServiceTypePassthrough:
+			// Passthrough uses noop QoS
+			passthroughQoS := noop.NewNoOpQoSService(qosLogger, serviceID)
+			qosServices[serviceID] = passthroughQoS
+			svcLogger.Debug().Msg("Added Passthrough QoS instance (noop)")
+
 		default:
-			return nil, fmt.Errorf("SHOULD NEVER HAPPEN: error building QoS instances: service ID %q not supported by PATH", serviceID)
+			// Unknown type falls back to noop
+			svcLogger.Warn().Msg("Unknown service type, using noop QoS")
+			noopQoS := noop.NewNoOpQoSService(qosLogger, serviceID)
+			qosServices[serviceID] = noopQoS
 		}
 	}
 
+	hydratedLogger.Info().Msgf("Initialized %d QoS service instances", len(qosServices))
 	return qosServices, nil
 }
 
@@ -117,12 +111,3 @@ func logGatewayServiceIDs(logger polylog.Logger, serviceConfigs map[protocol.Ser
 	logger.Info().Msgf("Service IDs configured by the gateway: %s.", strings.Join(serviceIDs, ", "))
 }
 
-// logQoSServiceConfigs outputs the configured service IDs for the gateway.
-func logQoSServiceConfigs(logger polylog.Logger, serviceConfigs []config.ServiceQoSConfig) {
-	// Output service IDs with QoS configurations
-	serviceIDs := make([]string, 0, len(serviceConfigs))
-	for _, serviceConfig := range serviceConfigs {
-		serviceIDs = append(serviceIDs, string(serviceConfig.GetServiceID()))
-	}
-	logger.Info().Msgf("Service IDs with available QoS configurations: %s.", strings.Join(serviceIDs, ", "))
-}

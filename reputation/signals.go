@@ -1,6 +1,8 @@
 package reputation
 
 import (
+	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -240,4 +242,31 @@ func ClassifyLatency(latency time.Duration, config LatencyConfig) *SignalType {
 		return &t
 	}
 	return nil
+}
+
+// WithMultiplier returns a new Signal with a multiplier applied to its impact.
+// This is used by probation to boost recovery when endpoints successfully handle requests.
+// The multiplier only affects the metadata - the actual impact calculation happens
+// in the scoring service which can read the multiplier from metadata.
+func (s Signal) WithMultiplier(multiplier float64) Signal {
+	if s.Metadata == nil {
+		s.Metadata = make(map[string]string)
+	}
+	s.Metadata["recovery_multiplier"] = fmt.Sprintf("%.2f", multiplier)
+	return s
+}
+
+// GetRecoveryMultiplier returns the recovery multiplier from signal metadata.
+// Returns 1.0 if no multiplier is set (no modification to impact).
+// This is used by calculateImpact to boost recovery scoring for probation endpoints.
+func (s Signal) GetRecoveryMultiplier() float64 {
+	if s.Metadata == nil {
+		return 1.0
+	}
+	if multiplierStr, ok := s.Metadata["recovery_multiplier"]; ok {
+		if multiplier, err := strconv.ParseFloat(multiplierStr, 64); err == nil && multiplier > 0 {
+			return multiplier
+		}
+	}
+	return 1.0
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
+	retrymetrics "github.com/pokt-network/path/metrics/retry"
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -74,28 +75,139 @@ func (rc *requestContext) HandleRelayRequest() error {
 // handleSingleRelayRequest handles a single relay request (original behavior)
 // handleSingleRelayRequest handles a single relay request (original behavior)
 func (rc *requestContext) handleSingleRelayRequest() error {
-	// Send the service request payload, through the protocol context, to the selected endpoint.
-	// In this code path, we are always guaranteed to have exactly one protocol context.
-	endpointResponses, err := rc.protocolContexts[0].HandleServiceRequest(rc.qosCtx.GetServicePayloads())
-	if err != nil {
-		rc.logger.Warn().Err(err).Msg("Failed to send a single relay request.")
-		return err
+	logger := rc.logger.With("method", "handleSingleRelayRequest")
+
+	// Get retry configuration for the service
+	retryConfig := rc.getRetryConfigForService()
+
+	// Determine max attempts
+	maxAttempts := 1
+	if retryConfig != nil && retryConfig.Enabled != nil && *retryConfig.Enabled {
+		if retryConfig.MaxRetries != nil && *retryConfig.MaxRetries > 0 {
+			maxAttempts = *retryConfig.MaxRetries + 1 // +1 for the initial attempt
+		}
 	}
 
-	// TODO_TECHDEBT(@adshmh): Ensure the protocol returns exactly one response per service payload:
-	// - Define a struct to contain each service payload and its corresponding response.
-	// - protocol should return this new struct to clarify mapping of service payloads and the corresponding endpoint response.
-	// - QoS packages should use this new struct to prepare the user response.
-	// - Remove the individual endpoint response handling from the gateway package.
-	//
-	for _, endpointResponse := range endpointResponses {
-		rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+	var lastErr error
+	var lastStatusCode int
+	retryStartTime := time.Now()
 
-		// Queue observation for async parsing (sampled, non-blocking)
-		rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+	// Retry loop
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			logger.Debug().
+				Int("attempt", attempt).
+				Int("max_attempts", maxAttempts).
+				Err(lastErr).
+				Msg("Retrying relay request")
+		}
+
+		// Send the service request payload, through the protocol context, to the selected endpoint.
+		// In this code path, we are always guaranteed to have exactly one protocol context.
+		endpointResponses, err := rc.protocolContexts[0].HandleServiceRequest(rc.qosCtx.GetServicePayloads())
+
+		// Extract status code and endpoint address from responses (if any)
+		statusCode := 0
+		var endpointAddr protocol.EndpointAddr
+		if len(endpointResponses) > 0 {
+			statusCode = endpointResponses[0].HTTPStatusCode
+			endpointAddr = endpointResponses[0].EndpointAddr
+		}
+
+		// Check if the request was successful
+		if err == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
+			// Success! Process the response
+			// TODO_TECHDEBT(@adshmh): Ensure the protocol returns exactly one response per service payload:
+			// - Define a struct to contain each service payload and its corresponding response.
+			// - protocol should return this new struct to clarify mapping of service payloads and the corresponding endpoint response.
+			// - QoS packages should use this new struct to prepare the user response.
+			// - Remove the individual endpoint response handling from the gateway package.
+			//
+			for _, endpointResponse := range endpointResponses {
+				rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+
+				// Queue observation for async parsing (sampled, non-blocking)
+				rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+			}
+
+			if attempt > 1 {
+				// Record retry success metrics
+				endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(endpointAddr))
+				retrymetrics.RecordRetrySuccess(string(rc.serviceID), endpointDomain, attempt)
+
+				// Record total retry latency
+				retryLatency := time.Since(retryStartTime).Seconds()
+				retrymetrics.RecordRetryLatency(string(rc.serviceID), true, retryLatency)
+
+				logger.Info().
+					Int("attempt", attempt).
+					Msg("Relay request succeeded after retry")
+			}
+
+			return nil
+		}
+
+		// Store the last error and status code for potential retry decision
+		lastErr = err
+		lastStatusCode = statusCode
+
+		// Log the error/failure
+		if err != nil {
+			logger.Warn().Err(err).
+				Int("attempt", attempt).
+				Int("max_attempts", maxAttempts).
+				Msg("Relay request failed with error")
+		} else {
+			logger.Warn().
+				Int("status_code", statusCode).
+				Int("attempt", attempt).
+				Int("max_attempts", maxAttempts).
+				Msg("Relay request failed with non-success status code")
+		}
+
+		// Update QoS context with the failed response (if we have responses)
+		for _, endpointResponse := range endpointResponses {
+			rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+			rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+		}
+
+		// Check if we should retry
+		if attempt < maxAttempts {
+			if !rc.shouldRetry(err, statusCode, retryConfig) {
+				logger.Debug().
+					Int("attempt", attempt).
+					Int("status_code", statusCode).
+					Msg("Request failed but retry conditions not met, stopping retries")
+				break
+			}
+
+			// Record retry attempt metrics
+			endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(endpointAddr))
+			retryReason := rc.determineRetryReason(err, statusCode)
+			retrymetrics.RecordRetryAttempt(string(rc.serviceID), endpointDomain, retryReason, attempt+1)
+		}
 	}
 
-	return nil
+	// Record failed retry latency if we made retry attempts
+	if maxAttempts > 1 {
+		retryLatency := time.Since(retryStartTime).Seconds()
+		retrymetrics.RecordRetryLatency(string(rc.serviceID), false, retryLatency)
+	}
+
+	// All retries exhausted or conditions not met
+	if lastErr != nil {
+		logger.Error().Err(lastErr).
+			Int("max_attempts", maxAttempts).
+			Msg("Failed to send relay request after all retry attempts")
+		return lastErr
+	}
+
+	// Return error for non-success status code
+	logger.Error().
+		Int("status_code", lastStatusCode).
+		Int("max_attempts", maxAttempts).
+		Msg("Relay request failed with non-success status code after all retry attempts")
+	return fmt.Errorf("relay request failed with status code %d after %d attempts", lastStatusCode, maxAttempts)
 }
 
 // TODO_TECHDEBT(@adshmh): Remove this method:
@@ -160,23 +272,164 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	qosContextMutex *sync.Mutex,
 ) {
 	startTime := time.Now()
-	responses, err := protocolCtx.HandleServiceRequest(rc.qosCtx.GetServicePayloads())
-	duration := time.Since(startTime)
 
+	// Get retry configuration for the service
+	retryConfig := rc.getRetryConfigForService()
+
+	// Determine max attempts
+	maxAttempts := 1
+	if retryConfig != nil && retryConfig.Enabled != nil && *retryConfig.Enabled {
+		if retryConfig.MaxRetries != nil && *retryConfig.MaxRetries > 0 {
+			maxAttempts = *retryConfig.MaxRetries + 1 // +1 for the initial attempt
+		}
+	}
+
+	var lastErr error
+	var lastResponses []protocol.Response
+
+	// Retry loop
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Check if context was canceled before attempting
+		select {
+		case <-ctx.Done():
+			logger.Debug().Msgf("Request to endpoint %d canceled before attempt %d", index, attempt)
+			return
+		default:
+		}
+
+		if attempt > 1 {
+			logger.Debug().
+				Int("endpoint_index", index).
+				Int("attempt", attempt).
+				Int("max_attempts", maxAttempts).
+				Err(lastErr).
+				Msg("Retrying parallel relay request")
+		}
+
+		responses, err := protocolCtx.HandleServiceRequest(rc.qosCtx.GetServicePayloads())
+
+		// Extract status code and endpoint address from responses (if any)
+		statusCode := 0
+		var endpointAddr protocol.EndpointAddr
+		if len(responses) > 0 {
+			statusCode = responses[0].HTTPStatusCode
+			endpointAddr = responses[0].EndpointAddr
+		}
+
+		// Check if the request was successful
+		if err == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
+			// Success! Send the result
+			duration := time.Since(startTime)
+			result := parallelRelayResult{
+				responses: responses,
+				err:       nil,
+				index:     index,
+				duration:  duration,
+				startTime: startTime,
+			}
+
+			if attempt > 1 {
+				// Record retry success metrics
+				endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(endpointAddr))
+				retrymetrics.RecordRetrySuccess(string(rc.serviceID), endpointDomain, attempt)
+
+				// Record total retry latency
+				retryLatency := time.Since(startTime).Seconds()
+				retrymetrics.RecordRetryLatency(string(rc.serviceID), true, retryLatency)
+
+				logger.Info().
+					Int("endpoint_index", index).
+					Int("attempt", attempt).
+					Msg("Parallel relay request succeeded after retry")
+			}
+
+			select {
+			case resultChan <- result:
+				// Result sent successfully
+			case <-ctx.Done():
+				logger.Debug().Msgf("Request to endpoint %d canceled after success on attempt %d", index, attempt)
+			}
+			return
+		}
+
+		// Store the last error and responses for potential retry decision
+		lastErr = err
+		lastResponses = responses
+
+		// Log the error/failure
+		if err != nil {
+			logger.Warn().Err(err).
+				Int("endpoint_index", index).
+				Int("attempt", attempt).
+				Int("max_attempts", maxAttempts).
+				Msgf("Parallel relay request to endpoint %d failed with error (attempt %d/%d)", index, attempt, maxAttempts)
+		} else {
+			logger.Warn().
+				Int("endpoint_index", index).
+				Int("status_code", statusCode).
+				Int("attempt", attempt).
+				Int("max_attempts", maxAttempts).
+				Msgf("Parallel relay request to endpoint %d failed with status code %d (attempt %d/%d)", index, statusCode, attempt, maxAttempts)
+		}
+
+		// Update QoS context with the failed response (if we have responses)
+		qosContextMutex.Lock()
+		for _, response := range responses {
+			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+			rc.tryQueueObservation(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+		}
+		qosContextMutex.Unlock()
+
+		// Check if we should retry
+		if attempt < maxAttempts {
+			if !rc.shouldRetry(err, statusCode, retryConfig) {
+				logger.Debug().
+					Int("endpoint_index", index).
+					Int("attempt", attempt).
+					Int("status_code", statusCode).
+					Msg("Request failed but retry conditions not met, stopping retries")
+				break
+			}
+
+			// Record retry attempt metrics
+			endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(endpointAddr))
+			retryReason := rc.determineRetryReason(err, statusCode)
+			retrymetrics.RecordRetryAttempt(string(rc.serviceID), endpointDomain, retryReason, attempt+1)
+
+			// Small delay before retry to avoid hammering the endpoint immediately
+			// We don't use exponential backoff here because parallel requests have their own timeout
+			select {
+			case <-ctx.Done():
+				logger.Debug().Msgf("Request to endpoint %d canceled during retry delay", index)
+				return
+			case <-time.After(100 * time.Millisecond):
+				// Continue to next attempt
+			}
+		}
+	}
+
+	// Record failed retry latency if we made retry attempts
+	if maxAttempts > 1 {
+		retryLatency := time.Since(startTime).Seconds()
+		retrymetrics.RecordRetryLatency(string(rc.serviceID), false, retryLatency)
+	}
+
+	// All retries exhausted - send the failure result
+	duration := time.Since(startTime)
 	result := parallelRelayResult{
-		responses: responses,
-		err:       err,
+		responses: lastResponses,
+		err:       lastErr,
 		index:     index,
 		duration:  duration,
 		startTime: startTime,
 	}
 
-	if err != nil {
-		// TODO_TECHDEBT(@adshmh): refactor the parallel requests feature:
-		// 1. Ensure parallel requests are handled correctly by the QoS layer: e.g. cannot use the most recent response as best anymore.
-		// 2. Simplify the parallel requests feature: it may be best to fully encapsulate it in the protocol/shannon package.
+	// TODO_TECHDEBT(@adshmh): refactor the parallel requests feature:
+	// 1. Ensure parallel requests are handled correctly by the QoS layer: e.g. cannot use the most recent response as best anymore.
+	// 2. Simplify the parallel requests feature: it may be best to fully encapsulate it in the protocol/shannon package.
+	if lastErr != nil {
 		qosContextMutex.Lock()
-		for _, response := range responses {
+		for _, response := range lastResponses {
 			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
 
 			// Queue observation for async parsing (sampled, non-blocking)
@@ -189,7 +442,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	case resultChan <- result:
 		// Result sent successfully
 	case <-ctx.Done():
-		logger.Debug().Msgf("Request to endpoint %d canceled after %dms", index, duration.Milliseconds())
+		logger.Debug().Msgf("Request to endpoint %d canceled after %dms and %d retry attempts", index, duration.Milliseconds(), maxAttempts)
 	}
 }
 

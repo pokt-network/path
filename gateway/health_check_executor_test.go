@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -171,4 +172,231 @@ func TestConfigMerging(t *testing.T) {
 	require.Equal(t, "poly_blockNumber", polygonCfg.Checks[0].Name)
 
 	t.Log("Config merging test passed")
+}
+
+// TestMapSignalType tests the mapping of signal type strings to reputation signals.
+func TestMapSignalType(t *testing.T) {
+	executor := &HealthCheckExecutor{
+		logger: polyzero.NewLogger(),
+	}
+
+	tests := []struct {
+		name       string
+		signalType string
+		reason     string
+		latency    time.Duration
+		wantType   string
+	}{
+		{
+			name:       "minor_error signal",
+			signalType: "minor_error",
+			reason:     "test reason",
+			latency:    100 * time.Millisecond,
+			wantType:   "minor_error",
+		},
+		{
+			name:       "major_error signal",
+			signalType: "major_error",
+			reason:     "timeout error",
+			latency:    500 * time.Millisecond,
+			wantType:   "major_error",
+		},
+		{
+			name:       "critical_error signal",
+			signalType: "critical_error",
+			reason:     "archival check failed",
+			latency:    1 * time.Second,
+			wantType:   "critical_error",
+		},
+		{
+			name:       "fatal_error signal",
+			signalType: "fatal_error",
+			reason:     "endpoint unreachable",
+			latency:    0,
+			wantType:   "fatal_error",
+		},
+		{
+			name:       "recovery_success signal",
+			signalType: "recovery_success",
+			reason:     "",
+			latency:    50 * time.Millisecond,
+			wantType:   "recovery_success",
+		},
+		{
+			name:       "unknown signal type defaults to minor_error",
+			signalType: "unknown_type",
+			reason:     "some error",
+			latency:    200 * time.Millisecond,
+			wantType:   "minor_error",
+		},
+		{
+			name:       "empty signal type defaults to minor_error",
+			signalType: "",
+			reason:     "error",
+			latency:    0,
+			wantType:   "minor_error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signal := executor.mapSignalType(tt.signalType, tt.reason, tt.latency)
+			require.NotNil(t, signal, "Signal should not be nil")
+
+			// Check signal has the expected type (SignalType is a string type)
+			signalType := string(signal.Type)
+			require.Contains(t, signalType, tt.wantType,
+				"Expected signal type to contain %s, got %s", tt.wantType, signalType)
+		})
+	}
+}
+
+// TestCategorizeHealthCheckError tests error categorization for metrics.
+func TestCategorizeHealthCheckError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected string
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: "",
+		},
+		{
+			name:     "timeout error string",
+			err:      fmt.Errorf("request timeout occurred"),
+			expected: "timeout",
+		},
+		{
+			name:     "connection error",
+			err:      fmt.Errorf("connection refused"),
+			expected: "connection_error",
+		},
+		{
+			name:     "status code error",
+			err:      fmt.Errorf("unexpected status code 500"),
+			expected: "unexpected_status",
+		},
+		{
+			name:     "response validation error",
+			err:      fmt.Errorf("response does not contain expected value"),
+			expected: "response_validation",
+		},
+		{
+			name:     "protocol error",
+			err:      fmt.Errorf("protocol negotiation failed"),
+			expected: "protocol_error",
+		},
+		{
+			name:     "generic error",
+			err:      http.ErrServerClosed,
+			expected: "unknown",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := categorizeHealthCheckError(tt.err)
+			require.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestNewHealthCheckExecutor tests executor creation with valid config.
+func TestNewHealthCheckExecutor(t *testing.T) {
+	config := &ActiveHealthChecksConfig{
+		Enabled: true,
+		Local: []ServiceHealthCheckConfig{
+			{
+				ServiceID: "eth",
+				Checks: []HealthCheckConfig{
+					{
+						Name:   "eth_blockNumber",
+						Type:   HealthCheckTypeJSONRPC,
+						Method: "POST",
+						Path:   "/",
+					},
+				},
+			},
+		},
+	}
+
+	executor := NewHealthCheckExecutor(HealthCheckExecutorConfig{
+		Config: config,
+		Logger: polyzero.NewLogger(),
+	})
+
+	require.NotNil(t, executor)
+	require.True(t, executor.ShouldRunChecks())
+
+	// Verify local config is loaded
+	ethConfig := executor.GetConfigForService("eth")
+	require.NotNil(t, ethConfig)
+	require.Len(t, ethConfig.Checks, 1)
+	require.Equal(t, "eth_blockNumber", ethConfig.Checks[0].Name)
+}
+
+// TestShouldRunChecks tests the shouldRunChecks logic.
+func TestShouldRunChecks(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   *ActiveHealthChecksConfig
+		expected bool
+	}{
+		{
+			name: "enabled config returns true",
+			config: &ActiveHealthChecksConfig{
+				Enabled: true,
+			},
+			expected: true,
+		},
+		{
+			name: "disabled config returns false",
+			config: &ActiveHealthChecksConfig{
+				Enabled: false,
+			},
+			expected: false,
+		},
+		{
+			name:     "nil config returns false",
+			config:   nil,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &HealthCheckExecutor{
+				config: tt.config,
+				logger: polyzero.NewLogger(),
+			}
+			require.Equal(t, tt.expected, executor.ShouldRunChecks())
+		})
+	}
+}
+
+// TestGetServiceConfigs tests retrieving all service configurations.
+func TestGetServiceConfigs(t *testing.T) {
+	enabled := true
+	executor := &HealthCheckExecutor{
+		config: &ActiveHealthChecksConfig{
+			Local: []ServiceHealthCheckConfig{
+				{ServiceID: "eth", Enabled: &enabled},
+				{ServiceID: "solana", Enabled: &enabled},
+			},
+		},
+		logger: polyzero.NewLogger(),
+	}
+
+	configs := executor.GetServiceConfigs()
+	require.Len(t, configs, 2)
+
+	// Verify service IDs
+	serviceIDs := make(map[string]bool)
+	for _, cfg := range configs {
+		serviceIDs[string(cfg.ServiceID)] = true
+	}
+	require.True(t, serviceIDs["eth"])
+	require.True(t, serviceIDs["solana"])
 }

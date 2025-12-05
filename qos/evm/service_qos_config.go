@@ -69,6 +69,23 @@ func NewEVMServiceQoSConfig(
 	}
 }
 
+// NewEVMServiceQoSConfigWithSyncAllowance creates a new EVM service configuration with custom sync allowance.
+func NewEVMServiceQoSConfigWithSyncAllowance(
+	serviceID protocol.ServiceID,
+	evmChainID string,
+	archivalCheckConfig *evmArchivalCheckConfig,
+	supportedAPIs map[sharedtypes.RPCType]struct{},
+	syncAllowance uint64,
+) EVMServiceQoSConfig {
+	return evmServiceQoSConfig{
+		serviceID:           serviceID,
+		evmChainID:          evmChainID,
+		archivalCheckConfig: archivalCheckConfig,
+		supportedAPIs:       supportedAPIs,
+		syncAllowance:       syncAllowance,
+	}
+}
+
 func NewEVMArchivalCheckConfig(
 	contractAddress string,
 	contractStartBlock uint64,

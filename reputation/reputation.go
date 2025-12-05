@@ -185,6 +185,26 @@ type ReputationService interface {
 	// Uses service-specific config if available, otherwise falls back to global default.
 	KeyBuilderForService(serviceID protocol.ServiceID) KeyBuilder
 
+	// SetServiceConfig sets per-service reputation configuration overrides.
+	// This allows different services to have different initial scores and min thresholds.
+	SetServiceConfig(serviceID protocol.ServiceID, config ServiceConfig)
+
+	// GetInitialScoreForService returns the initial score for a service.
+	// Uses per-service config if set, otherwise falls back to global default.
+	GetInitialScoreForService(serviceID protocol.ServiceID) float64
+
+	// GetMinThresholdForService returns the min threshold for a service.
+	// Uses per-service config if set, otherwise falls back to global default.
+	GetMinThresholdForService(serviceID protocol.ServiceID) float64
+
+	// SetLatencyProfile sets per-service latency profile configuration.
+	// This allows different services to have different latency thresholds and bonuses/penalties.
+	SetLatencyProfile(serviceID protocol.ServiceID, latencyConfig LatencyConfig)
+
+	// GetLatencyConfigForService returns the latency config for a service.
+	// Uses per-service config if set, otherwise falls back to global default.
+	GetLatencyConfigForService(serviceID protocol.ServiceID) LatencyConfig
+
 	// Start begins background sync processes (e.g., Redis pub/sub, periodic refresh).
 	// Should be called once during initialization.
 	Start(ctx context.Context) error
@@ -411,6 +431,26 @@ type ServiceConfig struct {
 	// KeyGranularity overrides the global key granularity for this service.
 	// Options: "per-endpoint", "per-domain", "per-supplier"
 	KeyGranularity string `yaml:"key_granularity"`
+
+	// InitialScore overrides the initial score for new endpoints in this service.
+	// If 0, uses the global default.
+	InitialScore float64 `yaml:"initial_score,omitempty"`
+
+	// MinThreshold overrides the minimum score for endpoint selection in this service.
+	// If 0, uses the global default.
+	MinThreshold float64 `yaml:"min_threshold,omitempty"`
+
+	// RecoveryTimeout overrides the recovery timeout for this service.
+	// If 0, uses the global default.
+	RecoveryTimeout time.Duration `yaml:"recovery_timeout,omitempty"`
+
+	// HealthChecksEnabled indicates whether health checks are enabled for this service.
+	// If true, time-based recovery is skipped (health checks handle recovery).
+	HealthChecksEnabled bool
+
+	// ProbationEnabled indicates whether probation is enabled for this service.
+	// If true, time-based recovery is skipped (probation handles recovery).
+	ProbationEnabled bool
 }
 
 // RedisConfig holds Redis-specific configuration.

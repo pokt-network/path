@@ -27,6 +27,7 @@ package gateway
 import (
 	"context"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -62,7 +63,7 @@ func NewLeaderElector(cfg LeaderElectorConfig) *LeaderElector {
 
 	// Generate a unique instance ID (hostname + pid + timestamp)
 	hostname, _ := os.Hostname()
-	instanceID := hostname + "-" + string(rune(os.Getpid())) + "-" + time.Now().Format("150405")
+	instanceID := hostname + "-" + strconv.Itoa(os.Getpid()) + "-" + time.Now().Format("150405")
 
 	return &LeaderElector{
 		client:     cfg.Client,

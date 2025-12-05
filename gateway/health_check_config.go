@@ -21,6 +21,9 @@ const (
 	DefaultExternalConfigTimeout = 30 * time.Second
 	DefaultExpectedStatusCode    = 200
 	DefaultReputationSignal      = "minor_error"
+	// DefaultSyncAllowance is the default number of blocks behind the latest block
+	// that an endpoint can be before it's considered out of sync.
+	DefaultSyncAllowance = 5
 )
 
 // Observation pipeline configuration defaults
@@ -112,6 +115,9 @@ type (
 		CheckInterval time.Duration `yaml:"check_interval,omitempty"`
 		// Enabled allows disabling all checks for this service.
 		Enabled *bool `yaml:"enabled,omitempty"`
+		// SyncAllowance is the number of blocks behind the latest block that an endpoint
+		// can be before it's considered out of sync. Overrides the global default for this service.
+		SyncAllowance *int `yaml:"sync_allowance,omitempty"`
 		// Checks is the list of health checks to run for this service.
 		Checks []HealthCheckConfig `yaml:"checks"`
 	}
@@ -147,6 +153,10 @@ type (
 	ActiveHealthChecksConfig struct {
 		// Enabled enables/disables the active health check system.
 		Enabled bool `yaml:"enabled,omitempty"`
+		// SyncAllowance is the default number of blocks behind the latest block that an endpoint
+		// can be before it's considered out of sync. Per-service overrides can set different values.
+		// Default: 5 blocks
+		SyncAllowance int `yaml:"sync_allowance,omitempty"`
 		// Coordination configures leader election for distributed deployments.
 		Coordination LeaderElectionConfig `yaml:"coordination,omitempty"`
 		// External is an optional external URL for health check rules.
@@ -212,6 +222,11 @@ func (hc *ActiveHealthChecksConfig) HydrateDefaults(hasRedis bool) {
 		} else {
 			hc.Coordination.Type = "none"
 		}
+	}
+
+	// Set default sync allowance
+	if hc.SyncAllowance == 0 {
+		hc.SyncAllowance = DefaultSyncAllowance
 	}
 
 	// Hydrate coordination defaults

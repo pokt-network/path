@@ -45,6 +45,23 @@ func NewCosmosSDKServiceQoSConfig(
 	}
 }
 
+// NewCosmosSDKServiceQoSConfigWithSyncAllowance creates a new CosmosSDK service configuration with custom sync allowance.
+func NewCosmosSDKServiceQoSConfigWithSyncAllowance(
+	serviceID protocol.ServiceID,
+	cosmosSDKChainID string,
+	evmChainID string,
+	supportedAPIs map[sharedtypes.RPCType]struct{},
+	syncAllowance uint64,
+) CosmosSDKServiceQoSConfig {
+	return cosmosSDKServiceQoSConfig{
+		serviceID:        serviceID,
+		cosmosSDKChainID: cosmosSDKChainID,
+		evmChainID:       evmChainID,
+		supportedAPIs:    supportedAPIs,
+		syncAllowance:    syncAllowance,
+	}
+}
+
 // Ensure implementation satisfies interface
 var _ CosmosSDKServiceQoSConfig = (*cosmosSDKServiceQoSConfig)(nil)
 

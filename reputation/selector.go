@@ -3,6 +3,7 @@ package reputation
 import (
 	"errors"
 	"math/rand"
+	"sync"
 )
 
 // ErrNoEndpointsAvailable is returned when no endpoints are available for selection.
@@ -14,13 +15,20 @@ var ErrNoEndpointsAvailable = errors.New("no endpoints available for selection")
 type TieredSelector struct {
 	config       TieredSelectionConfig
 	minThreshold float64
+
+	// probationEndpoints tracks which endpoints are currently in probation.
+	// An endpoint enters probation when its score falls below the probation threshold.
+	// Map key is the endpoint key, value is true if endpoint is in probation.
+	probationEndpoints   map[EndpointKey]bool
+	probationEndpointsMu sync.RWMutex
 }
 
 // NewTieredSelector creates a new TieredSelector with the given configuration.
 func NewTieredSelector(config TieredSelectionConfig, minThreshold float64) *TieredSelector {
 	return &TieredSelector{
-		config:       config,
-		minThreshold: minThreshold,
+		config:             config,
+		minThreshold:       minThreshold,
+		probationEndpoints: make(map[EndpointKey]bool),
 	}
 }
 
@@ -107,4 +115,59 @@ func (s *TieredSelector) Config() TieredSelectionConfig {
 // MinThreshold returns the minimum threshold for Tier 3.
 func (s *TieredSelector) MinThreshold() float64 {
 	return s.minThreshold
+}
+
+// IsInProbation returns true if the endpoint is currently in probation.
+func (s *TieredSelector) IsInProbation(key EndpointKey) bool {
+	s.probationEndpointsMu.RLock()
+	defer s.probationEndpointsMu.RUnlock()
+	return s.probationEndpoints[key]
+}
+
+// UpdateProbationStatus updates probation tracking based on current scores.
+// Returns the list of endpoints currently in probation.
+// An endpoint enters probation when: score < probationThreshold AND score >= minThreshold
+// An endpoint exits probation when: score >= probationThreshold
+func (s *TieredSelector) UpdateProbationStatus(endpoints map[EndpointKey]float64) []EndpointKey {
+	if !s.config.Probation.Enabled {
+		return nil
+	}
+
+	probationThreshold := s.config.Probation.Threshold
+	inProbation := make([]EndpointKey, 0)
+
+	s.probationEndpointsMu.Lock()
+	defer s.probationEndpointsMu.Unlock()
+
+	// Update probation status for all endpoints
+	for key, score := range endpoints {
+		wasInProbation := s.probationEndpoints[key]
+		// Endpoint is in probation if: score is below probation threshold but above min threshold
+		isInProbation := score < probationThreshold && score >= s.minThreshold
+
+		if isInProbation {
+			s.probationEndpoints[key] = true
+			inProbation = append(inProbation, key)
+		} else if wasInProbation {
+			// Endpoint has recovered or fallen below min threshold
+			delete(s.probationEndpoints, key)
+		}
+	}
+
+	return inProbation
+}
+
+// ShouldRouteToProb ation determines if this request should be routed to a probation endpoint.
+// Returns true with probability = traffic_percent / 100.
+// For example, if traffic_percent = 10, returns true 10% of the time.
+func (s *TieredSelector) ShouldRouteToProbation() bool {
+	if !s.config.Probation.Enabled {
+		return false
+	}
+
+	// Random number between 0 and 99
+	r := rand.Intn(100)
+	// Return true if random number is less than traffic percent
+	// e.g., if traffic_percent = 10, true when r is 0-9 (10% of the time)
+	return float64(r) < s.config.Probation.TrafficPercent
 }

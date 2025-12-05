@@ -15,6 +15,7 @@ import (
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/health"
 	"github.com/pokt-network/path/metrics/devtools"
+	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
@@ -90,6 +91,15 @@ type Protocol struct {
 	// tieredSelector selects endpoints using cascade-down tier logic.
 	// Created when reputation service is enabled with tiered selection enabled.
 	tieredSelector *reputation.TieredSelector
+
+	// serviceTieredSelectors stores per-service TieredSelectors for services with custom thresholds.
+	// When a service has a per-service tiered selection config, its selector is stored here.
+	// Falls back to the global tieredSelector if not present.
+	serviceTieredSelectors map[protocol.ServiceID]*reputation.TieredSelector
+
+	// unifiedServicesConfig is the unified YAML-driven service configuration.
+	// This consolidates all per-service settings and enables per-service overrides.
+	unifiedServicesConfig *gateway.UnifiedServicesConfig
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -141,6 +151,9 @@ func NewProtocol(
 
 		// load testing config, if specified.
 		loadTestingConfig: config.LoadTestingConfig,
+
+		// unifiedServicesConfig for per-service configuration overrides
+		unifiedServicesConfig: &config.UnifiedServices,
 	}
 
 	// Initialize reputation service if enabled.
@@ -177,6 +190,59 @@ func NewProtocol(
 
 		protocolInstance.reputationService = reputationSvc
 
+		// Configure per-service reputation settings from unified config
+		if protocolInstance.unifiedServicesConfig != nil {
+			for _, svc := range protocolInstance.unifiedServicesConfig.Services {
+				merged := protocolInstance.unifiedServicesConfig.GetMergedServiceConfig(svc.ID)
+				if merged != nil && merged.ReputationConfig != nil {
+					svcConfig := reputation.ServiceConfig{}
+					if merged.ReputationConfig.KeyGranularity != "" {
+						svcConfig.KeyGranularity = merged.ReputationConfig.KeyGranularity
+					}
+					if merged.ReputationConfig.InitialScore != nil {
+						svcConfig.InitialScore = *merged.ReputationConfig.InitialScore
+					}
+					if merged.ReputationConfig.MinThreshold != nil {
+						svcConfig.MinThreshold = *merged.ReputationConfig.MinThreshold
+					}
+					if merged.ReputationConfig.RecoveryTimeout != nil {
+						svcConfig.RecoveryTimeout = *merged.ReputationConfig.RecoveryTimeout
+					}
+					// Set health checks and probation enabled flags.
+					// These are used by shouldRecover to determine if time-based recovery applies.
+					if merged.HealthChecks != nil && merged.HealthChecks.Enabled != nil {
+						svcConfig.HealthChecksEnabled = *merged.HealthChecks.Enabled
+					}
+					if merged.Probation != nil && merged.Probation.Enabled != nil {
+						svcConfig.ProbationEnabled = *merged.Probation.Enabled
+					}
+					reputationSvc.SetServiceConfig(svc.ID, svcConfig)
+					reputationLogger.Debug().
+						Str("service_id", string(svc.ID)).
+						Float64("initial_score", svcConfig.InitialScore).
+						Float64("min_threshold", svcConfig.MinThreshold).
+						Str("key_granularity", svcConfig.KeyGranularity).
+						Bool("health_checks_enabled", svcConfig.HealthChecksEnabled).
+						Bool("probation_enabled", svcConfig.ProbationEnabled).
+						Msg("Configured per-service reputation settings")
+				}
+
+				// Configure per-service latency: choose between simple config and profile-based config
+				if merged != nil {
+					latencyConfig := buildLatencyConfigForService(merged, config.ReputationConfig.Latency, protocolInstance.unifiedServicesConfig)
+					if latencyConfig != nil {
+						reputationSvc.SetLatencyProfile(svc.ID, *latencyConfig)
+						reputationLogger.Debug().
+							Str("service_id", string(svc.ID)).
+							Bool("latency_enabled", latencyConfig.Enabled).
+							Dur("fast_threshold", latencyConfig.FastThreshold).
+							Dur("penalty_threshold", latencyConfig.PenaltyThreshold).
+							Msg("Configured per-service latency")
+					}
+				}
+			}
+		}
+
 		// Create tiered selector if tiered selection is enabled
 		if config.ReputationConfig.TieredSelection.Enabled {
 			protocolInstance.tieredSelector = reputation.NewTieredSelector(
@@ -188,6 +254,97 @@ func NewProtocol(
 				Float64("tier2_threshold", config.ReputationConfig.TieredSelection.Tier2Threshold).
 				Float64("min_threshold", config.ReputationConfig.MinThreshold).
 				Msg("Tiered endpoint selection enabled")
+
+			// Initialize per-service tiered selectors from unified config
+			protocolInstance.serviceTieredSelectors = make(map[protocol.ServiceID]*reputation.TieredSelector)
+			if protocolInstance.unifiedServicesConfig != nil {
+				for _, svc := range protocolInstance.unifiedServicesConfig.Services {
+					merged := protocolInstance.unifiedServicesConfig.GetMergedServiceConfig(svc.ID)
+					if merged != nil && merged.TieredSelection != nil {
+						// Only create per-service selector if thresholds differ from global defaults
+						hasCustomConfig := false
+						tier1 := config.ReputationConfig.TieredSelection.Tier1Threshold
+						tier2 := config.ReputationConfig.TieredSelection.Tier2Threshold
+						minThreshold := config.ReputationConfig.MinThreshold
+
+						if merged.TieredSelection.Tier1Threshold != nil &&
+							*merged.TieredSelection.Tier1Threshold != tier1 {
+							tier1 = *merged.TieredSelection.Tier1Threshold
+							hasCustomConfig = true
+						}
+						if merged.TieredSelection.Tier2Threshold != nil &&
+							*merged.TieredSelection.Tier2Threshold != tier2 {
+							tier2 = *merged.TieredSelection.Tier2Threshold
+							hasCustomConfig = true
+						}
+						// Use per-service min threshold if available
+						if merged.ReputationConfig != nil && merged.ReputationConfig.MinThreshold != nil {
+							minThreshold = *merged.ReputationConfig.MinThreshold
+							hasCustomConfig = true
+						}
+
+						if hasCustomConfig {
+							// Build tiered selection config with probation
+							// Use global default for Enabled if nil (defensive nil check)
+							tieredEnabled := config.ReputationConfig.TieredSelection.Enabled
+							if merged.TieredSelection.Enabled != nil {
+								tieredEnabled = *merged.TieredSelection.Enabled
+							}
+							svcTierConfig := reputation.TieredSelectionConfig{
+								Enabled:        tieredEnabled,
+								Tier1Threshold: tier1,
+								Tier2Threshold: tier2,
+							}
+
+							// Include per-service probation config if present
+							// Add defensive nil checks for each pointer field
+							if merged.Probation != nil {
+								// Use global defaults as fallbacks for nil pointer fields
+								probEnabled := config.ReputationConfig.TieredSelection.Probation.Enabled
+								probThreshold := config.ReputationConfig.TieredSelection.Probation.Threshold
+								probTrafficPct := config.ReputationConfig.TieredSelection.Probation.TrafficPercent
+								probRecoveryMult := config.ReputationConfig.TieredSelection.Probation.RecoveryMultiplier
+
+								if merged.Probation.Enabled != nil {
+									probEnabled = *merged.Probation.Enabled
+								}
+								if merged.Probation.Threshold != nil {
+									probThreshold = *merged.Probation.Threshold
+								}
+								if merged.Probation.TrafficPercent != nil {
+									probTrafficPct = *merged.Probation.TrafficPercent
+								}
+								if merged.Probation.RecoveryMultiplier != nil {
+									probRecoveryMult = *merged.Probation.RecoveryMultiplier
+								}
+
+								svcTierConfig.Probation = reputation.ProbationConfig{
+									Enabled:            probEnabled,
+									Threshold:          probThreshold,
+									TrafficPercent:     probTrafficPct,
+									RecoveryMultiplier: probRecoveryMult,
+								}
+							} else {
+								// Use global defaults
+								svcTierConfig.Probation = config.ReputationConfig.TieredSelection.Probation
+							}
+
+							protocolInstance.serviceTieredSelectors[svc.ID] = reputation.NewTieredSelector(
+								svcTierConfig,
+								minThreshold,
+							)
+							reputationLogger.Debug().
+								Str("service_id", string(svc.ID)).
+								Float64("tier1_threshold", tier1).
+								Float64("tier2_threshold", tier2).
+								Float64("min_threshold", minThreshold).
+								Bool("probation_enabled", svcTierConfig.Probation.Enabled).
+								Float64("probation_threshold", svcTierConfig.Probation.Threshold).
+								Msg("Configured per-service tiered selection")
+						}
+					}
+				}
+			}
 		}
 
 		reputationLogger.Info().Msg("Reputation service enabled and started")
@@ -692,6 +849,7 @@ func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations [
 
 // recordSignalFromObservation records a reputation signal for a single endpoint observation.
 // It maps the observation's error type and sanction type to a reputation signal and records it.
+// Also records probation traffic metrics if the endpoint is in probation.
 func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonEndpointObservation) {
 	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
 
@@ -703,13 +861,29 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 	sanctionType := obs.GetRecommendedSanction()
 
 	var signal reputation.Signal
+	var isSuccess bool
 
 	// No error = success
 	if errorType == protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED {
 		signal = reputation.NewSuccessSignal(0)
+		isSuccess = true
 	} else {
 		// Map error type and sanction type to a reputation signal
 		signal = mapErrorToSignal(errorType, sanctionType, 0)
+		isSuccess = false
+	}
+
+	// Check if this endpoint is in probation and record probation traffic metric
+	selector := p.getTieredSelectorForService(serviceID)
+	if selector != nil && selector.Config().Probation.Enabled && selector.IsInProbation(key) {
+		domain := extractEndpointDomain(string(endpointAddr), p.logger)
+		reputationmetrics.RecordProbationTraffic(string(serviceID), domain, isSuccess)
+
+		// If probation traffic succeeds, apply recovery multiplier to the signal
+		if isSuccess && selector.Config().Probation.RecoveryMultiplier > 0 {
+			// Apply recovery multiplier to boost recovery
+			signal = signal.WithMultiplier(selector.Config().Probation.RecoveryMultiplier)
+		}
 	}
 
 	// Record signal (fire-and-forget, non-blocking)
@@ -805,4 +979,10 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 // This is used by the health check executor to record health check results.
 func (p *Protocol) GetReputationService() reputation.ReputationService {
 	return p.reputationService
+}
+
+// GetUnifiedServicesConfig returns the unified services configuration.
+// This is used by components that need access to per-service configuration overrides.
+func (p *Protocol) GetUnifiedServicesConfig() *gateway.UnifiedServicesConfig {
+	return p.unifiedServicesConfig
 }

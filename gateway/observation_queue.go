@@ -112,6 +112,10 @@ type QueuedObservation struct {
 	// Latency of the request-response cycle.
 	Latency time.Duration
 
+	// RequestID is a unique identifier for this request, used for log correlation.
+	// It is either extracted from the X-Request-ID header or generated as a new UUID.
+	RequestID string
+
 	// === Request Context (raw - parse in worker) ===
 
 	// RequestPath is the URL path (e.g., "/", "/v1/completions").

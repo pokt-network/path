@@ -42,14 +42,14 @@ func getOwnedApps(
 		// Retrieve the app's secp256k1 private key from the hex string.
 		ownedAppPrivateKey, err := crypto.GetSecp256k1PrivateKeyFromKeyHex(ownedAppPrivateKeyHex)
 		if err != nil {
-			logger.Error().Err(err).Msgf("error getting app private key from hex for app with private key %s", ownedAppPrivateKeyHex)
+			logger.Error().Err(err).Msg("error getting app private key from hex for owned app (private key redacted)")
 			return nil, err
 		}
 
 		// Retrieve the app's address from the private key.
 		appAddr, err := crypto.GetAddressFromPrivateKey(ownedAppPrivateKey)
 		if err != nil {
-			logger.Error().Err(err).Msgf("error getting app address from private key for app with private key %s", ownedAppPrivateKeyHex)
+			logger.Error().Err(err).Msg("error getting app address from private key for owned app (private key redacted)")
 			return nil, err
 		}
 

@@ -100,6 +100,12 @@ type (
 		// reducing latency. Deep parsing is done asynchronously via configurable sampling.
 		ObservationPipelineConfig gateway.ObservationPipelineConfig `yaml:"observation_pipeline,omitempty"`
 
+		// UnifiedServices is the unified YAML-driven service configuration.
+		// This consolidates all per-service settings (type, rpc_types, fallback, health_checks)
+		// into a single structure with defaults and per-service overrides.
+		// When configured, this replaces the hardcoded service definitions in service_qos_config.go.
+		UnifiedServices gateway.UnifiedServicesConfig `yaml:",inline"`
+
 		// RedisConfig is the global Redis configuration passed from the top-level config.
 		// Used by reputation storage (when storage_type is "redis") and leader election.
 		// This is set programmatically, not from YAML.
@@ -267,9 +273,12 @@ func (c FullNodeConfig) Validate() error {
 
 // getServiceFallbackMap returns the fallback endpoint information for each
 // service ID from the YAML config, including the SendAllTraffic setting.
+// It merges both global service_fallback config and per-service fallback from unified_services.
+// Per-service fallback from unified_services takes precedence over global fallback.
 func (gc GatewayConfig) getServiceFallbackMap() map[protocol.ServiceID]serviceFallback {
 	configs := make(map[protocol.ServiceID]serviceFallback, len(gc.ServiceFallback))
 
+	// First, process global service_fallback configuration
 	for _, serviceFallbackConfig := range gc.ServiceFallback {
 		endpoints := make(map[protocol.EndpointAddr]endpoint, len(serviceFallbackConfig.FallbackEndpoints))
 
@@ -299,6 +308,45 @@ func (gc GatewayConfig) getServiceFallbackMap() map[protocol.ServiceID]serviceFa
 		configs[serviceFallbackConfig.ServiceID] = serviceFallback{
 			SendAllTraffic: serviceFallbackConfig.SendAllTraffic,
 			Endpoints:      endpoints,
+		}
+	}
+
+	// Second, process per-service fallback from unified services config
+	// This overrides global fallback if both are defined for the same service
+	if gc.UnifiedServices.HasServices() {
+		for _, svc := range gc.UnifiedServices.Services {
+			if svc.Fallback != nil && svc.Fallback.Enabled {
+				endpoints := make(map[protocol.EndpointAddr]endpoint, len(svc.Fallback.Endpoints))
+
+				// Create fallback endpoints from the unified config
+				for _, endpointMap := range svc.Fallback.Endpoints {
+					rpcTypeURLs := make(map[sharedtypes.RPCType]string, len(endpointMap))
+
+					for rpcTypeStr, url := range endpointMap {
+						// Convert string keys to RPC types
+						rpcType, err := sharedtypes.GetRPCTypeFromConfig(rpcTypeStr)
+						if err != nil {
+							// This should not happen if validation passed, but skip invalid RPC types
+							continue
+						}
+						rpcTypeURLs[rpcType] = url
+					}
+
+					// Create fallback endpoint struct from the configuration and add
+					// it to the map of endpoints for the service by its EndpointAddr.
+					fallbackEndpoint := fallbackEndpoint{
+						defaultURL:  endpointMap[defaultURLKey],
+						rpcTypeURLs: rpcTypeURLs,
+					}
+					endpoints[fallbackEndpoint.Addr()] = fallbackEndpoint
+				}
+
+				// Per-service fallback overrides global fallback for this service
+				configs[svc.ID] = serviceFallback{
+					SendAllTraffic: svc.Fallback.SendAllTraffic,
+					Endpoints:      endpoints,
+				}
+			}
 		}
 	}
 

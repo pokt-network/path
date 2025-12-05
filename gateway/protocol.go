@@ -124,6 +124,10 @@ type Protocol interface {
 	// Note: This does NOT filter by reputation - health checks should run against all endpoints.
 	GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]EndpointInfo, error)
 
+	// GetUnifiedServicesConfig returns the unified services configuration.
+	// This is used by components that need access to per-service configuration overrides.
+	GetUnifiedServicesConfig() *UnifiedServicesConfig
+
 	// health.Check interface is used to verify protocol instance's health status.
 	health.Check
 }

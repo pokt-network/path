@@ -2,26 +2,26 @@ package solana
 
 import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
+
+	"github.com/pokt-network/path/protocol"
 )
 
-// NewQoSInstance builds and returns an instance of the Solana QoS service.
-func NewQoSInstance(logger polylog.Logger, serviceConfig SolanaServiceQoSConfig) *QoS {
-	chainID := serviceConfig.getChainID()
-	serviceID := serviceConfig.GetServiceID()
-
+// NewSimpleQoSInstance creates a minimal Solana QoS instance without chain-specific validation.
+// Validation is now handled by active health checks.
+// This constructor only requires the service ID and provides JSON-RPC request parsing.
+func NewSimpleQoSInstance(logger polylog.Logger, serviceID protocol.ServiceID) *QoS {
 	logger = logger.With(
 		"qos_instance", "solana",
-		"chain_id", chainID,
 		"service_id", serviceID,
 	)
 
 	serviceState := &ServiceState{
 		logger:    logger,
 		serviceID: serviceID,
-		chainID:   chainID,
+		chainID:   "", // No chain ID validation - handled by health checks
 	}
 
-	solanaEndpointStore := &EndpointStore{
+	endpointStore := &EndpointStore{
 		logger:       logger,
 		serviceState: serviceState,
 	}
@@ -29,14 +29,15 @@ func NewQoSInstance(logger polylog.Logger, serviceConfig SolanaServiceQoSConfig)
 	requestValidator := &requestValidator{
 		logger:        logger,
 		serviceID:     serviceID,
-		chainID:       chainID,
-		endpointStore: solanaEndpointStore,
+		chainID:       "",
+		endpointStore: endpointStore,
 	}
 
 	return &QoS{
 		logger:           logger,
 		ServiceState:     serviceState,
-		EndpointStore:    solanaEndpointStore,
+		EndpointStore:    endpointStore,
 		requestValidator: requestValidator,
 	}
 }
+

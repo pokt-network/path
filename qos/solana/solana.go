@@ -11,6 +11,7 @@ import (
 	"github.com/pokt-network/path/metrics/devtools"
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
+	qostypes "github.com/pokt-network/path/qos/types"
 )
 
 // QoS implements gateway.QoSService by providing:
@@ -78,4 +79,36 @@ func (q *QoS) ApplyObservations(observations *qosobservations.Observations) erro
 // HydrateDisqualifiedEndpointsResponse is a no-op for the Solana QoS.
 // TODO_TECHDEBT(@commoddity): implement this for Solana to enable debugging QoS results.
 func (QoS) HydrateDisqualifiedEndpointsResponse(_ protocol.ServiceID, _ *devtools.DisqualifiedEndpointResponse) {
+}
+
+// UpdateFromExtractedData updates QoS state from extracted observation data.
+// Called by the observation pipeline after async parsing completes.
+// This updates the perceived block height without blocking user requests.
+//
+// Implements gateway.QoSService interface.
+func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *qostypes.ExtractedData) error {
+	if data == nil {
+		return nil
+	}
+
+	// Only update if we extracted a valid block height
+	if data.BlockHeight <= 0 {
+		return nil
+	}
+
+	q.serviceStateLock.Lock()
+	defer q.serviceStateLock.Unlock()
+
+	// Update perceived block height to maximum across all endpoints
+	blockHeight := uint64(data.BlockHeight)
+	if blockHeight > q.perceivedBlockHeight {
+		q.logger.Debug().
+			Str("endpoint", string(endpointAddr)).
+			Uint64("old_block", q.perceivedBlockHeight).
+			Uint64("new_block", blockHeight).
+			Msg("Updating perceived block height from observation pipeline")
+		q.perceivedBlockHeight = blockHeight
+	}
+
+	return nil
 }

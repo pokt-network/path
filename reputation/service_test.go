@@ -697,3 +697,250 @@ func TestService_ConcurrentAccess(t *testing.T) {
 	totalSignals := int64(goroutines * signalsPerGoroutine)
 	require.Equal(t, totalSignals, score.SuccessCount+score.ErrorCount, "all signals should be counted")
 }
+
+func TestService_PerServiceConfig(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	defer store.Close()
+
+	// Create service with global defaults
+	config := Config{
+		Enabled:      true,
+		InitialScore: 80,
+		MinThreshold: 30,
+	}
+	config.HydrateDefaults()
+
+	svc := NewService(config, store).(*service)
+	err := svc.Start(ctx)
+	require.NoError(t, err)
+	defer func() { _ = svc.Stop() }()
+
+	// Test 1: Per-service InitialScore override
+	ethConfig := ServiceConfig{
+		InitialScore: 90,
+		MinThreshold: 0, // Not set, should use global
+	}
+	svc.SetServiceConfig("eth", ethConfig)
+
+	ethInitialScore := svc.GetInitialScoreForService("eth")
+	require.Equal(t, 90.0, ethInitialScore, "eth should use per-service initial score")
+
+	ethMinThreshold := svc.GetMinThresholdForService("eth")
+	require.Equal(t, 30.0, ethMinThreshold, "eth should fall back to global min threshold when not overridden")
+
+	// Test 2: Per-service MinThreshold override
+	solanaConfig := ServiceConfig{
+		InitialScore: 0,  // Not set, should use global
+		MinThreshold: 50,
+	}
+	svc.SetServiceConfig("solana", solanaConfig)
+
+	solanaInitialScore := svc.GetInitialScoreForService("solana")
+	require.Equal(t, 80.0, solanaInitialScore, "solana should fall back to global initial score when not overridden")
+
+	solanaMinThreshold := svc.GetMinThresholdForService("solana")
+	require.Equal(t, 50.0, solanaMinThreshold, "solana should use per-service min threshold")
+
+	// Test 3: Service with no override uses global defaults
+	polygonInitialScore := svc.GetInitialScoreForService("polygon")
+	require.Equal(t, 80.0, polygonInitialScore, "polygon should use global initial score")
+
+	polygonMinThreshold := svc.GetMinThresholdForService("polygon")
+	require.Equal(t, 30.0, polygonMinThreshold, "polygon should use global min threshold")
+
+	// Test 4: Per-service KeyGranularity
+	arbitrumConfig := ServiceConfig{
+		KeyGranularity: KeyGranularitySupplier,
+		InitialScore:   85,
+		MinThreshold:   40,
+	}
+	svc.SetServiceConfig("arbitrum", arbitrumConfig)
+
+	arbitrumKeyBuilder := svc.KeyBuilderForService("arbitrum")
+	require.NotNil(t, arbitrumKeyBuilder, "arbitrum should have a key builder")
+
+	// Verify the key builder uses the correct granularity
+	defaultKeyBuilder := svc.KeyBuilderForService("polygon")
+	require.NotNil(t, defaultKeyBuilder, "polygon should use default key builder")
+
+	// Test 5: Verify serviceConfigs map is properly initialized
+	require.NotNil(t, svc.serviceConfigs, "serviceConfigs map should be initialized")
+}
+
+func TestService_PerServiceLatencyProfile(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	defer store.Close()
+
+	// Create service with global latency config
+	config := Config{
+		Enabled:      true,
+		InitialScore: 80,
+		Latency: LatencyConfig{
+			Enabled:          true,
+			FastThreshold:    100 * time.Millisecond,
+			NormalThreshold:  500 * time.Millisecond,
+			SlowThreshold:    1000 * time.Millisecond,
+			PenaltyThreshold: 2000 * time.Millisecond,
+			SevereThreshold:  5000 * time.Millisecond,
+			FastBonus:        2.0,
+			SlowPenalty:      0.5,
+			VerySlowPenalty:  0.0,
+		},
+	}
+	config.HydrateDefaults()
+
+	svc := NewService(config, store).(*service)
+	err := svc.Start(ctx)
+	require.NoError(t, err)
+	defer func() { _ = svc.Stop() }()
+
+	// Test 1: SetLatencyProfile stores the config
+	evmLatency := LatencyConfig{
+		Enabled:          true,
+		FastThreshold:    50 * time.Millisecond,
+		NormalThreshold:  200 * time.Millisecond,
+		SlowThreshold:    500 * time.Millisecond,
+		PenaltyThreshold: 1000 * time.Millisecond,
+		SevereThreshold:  3000 * time.Millisecond,
+	}
+	svc.SetLatencyProfile("eth", evmLatency)
+
+	// Verify it was stored
+	storedLatency := svc.getLatencyConfigForService("eth")
+	require.Equal(t, 50*time.Millisecond, storedLatency.FastThreshold, "eth should use per-service fast threshold")
+	require.Equal(t, 200*time.Millisecond, storedLatency.NormalThreshold, "eth should use per-service normal threshold")
+	require.Equal(t, 500*time.Millisecond, storedLatency.SlowThreshold, "eth should use per-service slow threshold")
+	require.Equal(t, 1000*time.Millisecond, storedLatency.PenaltyThreshold, "eth should use per-service penalty threshold")
+	require.Equal(t, 3000*time.Millisecond, storedLatency.SevereThreshold, "eth should use per-service severe threshold")
+
+	// Test 2: getLatencyConfigForService returns per-service config
+	llmLatency := LatencyConfig{
+		Enabled:          true,
+		FastThreshold:    2 * time.Second,
+		NormalThreshold:  10 * time.Second,
+		SlowThreshold:    30 * time.Second,
+		PenaltyThreshold: 60 * time.Second,
+		SevereThreshold:  120 * time.Second,
+	}
+	svc.SetLatencyProfile("llm", llmLatency)
+
+	retrievedLLMLatency := svc.getLatencyConfigForService("llm")
+	require.Equal(t, 2*time.Second, retrievedLLMLatency.FastThreshold, "llm should use per-service fast threshold")
+	require.Equal(t, 10*time.Second, retrievedLLMLatency.NormalThreshold, "llm should use per-service normal threshold")
+
+	// Test 3: Fallback to global config when no per-service config exists
+	polygonLatency := svc.getLatencyConfigForService("polygon")
+	require.Equal(t, 100*time.Millisecond, polygonLatency.FastThreshold, "polygon should fall back to global fast threshold")
+	require.Equal(t, 500*time.Millisecond, polygonLatency.NormalThreshold, "polygon should fall back to global normal threshold")
+	require.Equal(t, 1000*time.Millisecond, polygonLatency.SlowThreshold, "polygon should fall back to global slow threshold")
+	require.Equal(t, 2000*time.Millisecond, polygonLatency.PenaltyThreshold, "polygon should fall back to global penalty threshold")
+	require.Equal(t, 5000*time.Millisecond, polygonLatency.SevereThreshold, "polygon should fall back to global severe threshold")
+
+	// Test 4: Verify serviceLatencyProfiles map is properly initialized
+	require.NotNil(t, svc.serviceLatencyProfiles, "serviceLatencyProfiles map should be initialized")
+
+	// Test 5: Overwrite existing latency profile
+	newEthLatency := LatencyConfig{
+		Enabled:          true,
+		FastThreshold:    75 * time.Millisecond,
+		NormalThreshold:  250 * time.Millisecond,
+		SlowThreshold:    600 * time.Millisecond,
+		PenaltyThreshold: 1500 * time.Millisecond,
+		SevereThreshold:  4000 * time.Millisecond,
+	}
+	svc.SetLatencyProfile("eth", newEthLatency)
+
+	updatedLatency := svc.getLatencyConfigForService("eth")
+	require.Equal(t, 75*time.Millisecond, updatedLatency.FastThreshold, "eth latency profile should be updated")
+	require.Equal(t, 250*time.Millisecond, updatedLatency.NormalThreshold, "eth latency profile should be updated")
+}
+
+func TestService_MultipleServicesWithDifferentConfigs(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	defer store.Close()
+
+	// Create service with global defaults
+	config := Config{
+		Enabled:        true,
+		InitialScore:   70,
+		MinThreshold:   25,
+		KeyGranularity: KeyGranularityEndpoint,
+	}
+	config.HydrateDefaults()
+
+	svc := NewService(config, store).(*service)
+	err := svc.Start(ctx)
+	require.NoError(t, err)
+	defer func() { _ = svc.Stop() }()
+
+	// Set different per-service configs for "eth" and "solana"
+	ethConfig := ServiceConfig{
+		InitialScore:   95,
+		MinThreshold:   60,
+		KeyGranularity: KeyGranularityDomain,
+	}
+	svc.SetServiceConfig("eth", ethConfig)
+
+	solanaConfig := ServiceConfig{
+		InitialScore:   85,
+		MinThreshold:   45,
+		KeyGranularity: KeyGranularitySupplier,
+	}
+	svc.SetServiceConfig("solana", solanaConfig)
+
+	// Verify each service uses its own config
+	// ETH service
+	ethInitialScore := svc.GetInitialScoreForService("eth")
+	require.Equal(t, 95.0, ethInitialScore, "eth should use its own initial score")
+
+	ethMinThreshold := svc.GetMinThresholdForService("eth")
+	require.Equal(t, 60.0, ethMinThreshold, "eth should use its own min threshold")
+
+	ethKeyBuilder := svc.KeyBuilderForService("eth")
+	require.NotNil(t, ethKeyBuilder, "eth should have its own key builder")
+
+	// SOLANA service
+	solanaInitialScore := svc.GetInitialScoreForService("solana")
+	require.Equal(t, 85.0, solanaInitialScore, "solana should use its own initial score")
+
+	solanaMinThreshold := svc.GetMinThresholdForService("solana")
+	require.Equal(t, 45.0, solanaMinThreshold, "solana should use its own min threshold")
+
+	solanaKeyBuilder := svc.KeyBuilderForService("solana")
+	require.NotNil(t, solanaKeyBuilder, "solana should have its own key builder")
+
+	// POLYGON service (no override, uses global defaults)
+	polygonInitialScore := svc.GetInitialScoreForService("polygon")
+	require.Equal(t, 70.0, polygonInitialScore, "polygon should use global initial score")
+
+	polygonMinThreshold := svc.GetMinThresholdForService("polygon")
+	require.Equal(t, 25.0, polygonMinThreshold, "polygon should use global min threshold")
+
+	polygonKeyBuilder := svc.KeyBuilderForService("polygon")
+	require.NotNil(t, polygonKeyBuilder, "polygon should use default key builder")
+
+	// Verify that the key builders are different instances for different services
+	// (They should be, as different granularities were specified)
+	require.NotEqual(t, ethKeyBuilder, solanaKeyBuilder, "eth and solana should have different key builders due to different granularities")
+
+	// Test edge case: nil config (using zero values)
+	zeroConfig := ServiceConfig{}
+	svc.SetServiceConfig("base", zeroConfig)
+
+	// Should fall back to global defaults since all values are zero
+	baseInitialScore := svc.GetInitialScoreForService("base")
+	require.Equal(t, 70.0, baseInitialScore, "base should use global initial score when config has zero values")
+
+	baseMinThreshold := svc.GetMinThresholdForService("base")
+	require.Equal(t, 25.0, baseMinThreshold, "base should use global min threshold when config has zero values")
+
+	// Test edge case: empty service ID
+	emptyInitialScore := svc.GetInitialScoreForService("")
+	require.Equal(t, 70.0, emptyInitialScore, "empty service ID should use global initial score")
+
+	emptyMinThreshold := svc.GetMinThresholdForService("")
+	require.Equal(t, 25.0, emptyMinThreshold, "empty service ID should use global min threshold")
+}

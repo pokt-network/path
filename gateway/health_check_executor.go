@@ -15,17 +15,14 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
@@ -72,24 +69,34 @@ type HealthCheckExecutor struct {
 	// maxWorkers is the maximum number of concurrent health check workers.
 	maxWorkers int
 
-	// External config caching
+	// External config caching (global)
 	externalConfigMu    sync.RWMutex
 	externalConfigs     []ServiceHealthCheckConfig
 	externalConfigError error
 	stopRefresh         chan struct{}
+
+	// Per-service external config caching
+	// Maps service ID to the list of health check configs fetched from that service's external URL
+	perServiceExternalMu      sync.RWMutex
+	perServiceExternalConfigs map[protocol.ServiceID][]HealthCheckConfig
+
+	// unifiedServicesConfig provides per-service health check overrides from unified config.
+	// Health checks defined here are merged with local/external configs.
+	unifiedServicesConfig *UnifiedServicesConfig
 }
 
 // HealthCheckExecutorConfig contains configuration for creating a HealthCheckExecutor.
 type HealthCheckExecutorConfig struct {
-	Config           *ActiveHealthChecksConfig
-	ReputationSvc    reputation.ReputationService
-	Logger           polylog.Logger
-	Protocol         Protocol
-	MetricsReporter  RequestResponseReporter
-	DataReporter     RequestResponseReporter
-	LeaderElector    *LeaderElector
-	ObservationQueue *ObservationQueue
-	MaxWorkers       int
+	Config                *ActiveHealthChecksConfig
+	ReputationSvc         reputation.ReputationService
+	Logger                polylog.Logger
+	Protocol              Protocol
+	MetricsReporter       RequestResponseReporter
+	DataReporter          RequestResponseReporter
+	LeaderElector         *LeaderElector
+	ObservationQueue      *ObservationQueue
+	MaxWorkers            int
+	UnifiedServicesConfig *UnifiedServicesConfig
 }
 
 // NewHealthCheckExecutor creates a new HealthCheckExecutor.
@@ -116,8 +123,10 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
-		leaderElector:    cfg.LeaderElector,
-		observationQueue: cfg.ObservationQueue,
+		leaderElector:             cfg.LeaderElector,
+		observationQueue:          cfg.ObservationQueue,
+		unifiedServicesConfig:     cfg.UnifiedServicesConfig,
+		perServiceExternalConfigs: make(map[protocol.ServiceID][]HealthCheckConfig),
 	}
 }
 
@@ -143,29 +152,128 @@ func (e *HealthCheckExecutor) ShouldRunChecks() bool {
 }
 
 // GetServiceConfigs returns the merged health check configurations for all services.
-// This merges external (if configured) and local configs, with local taking precedence.
+// This merges external (if configured), local configs, and unified services config,
+// with the following precedence: unified services > local > external.
 func (e *HealthCheckExecutor) GetServiceConfigs() []ServiceHealthCheckConfig {
 	if e.config == nil {
+		return e.getUnifiedServicesHealthChecks()
+	}
+
+	// Start with external configs if available
+	var baseConfigs []ServiceHealthCheckConfig
+	if e.config.External != nil && e.config.External.URL != "" {
+		e.externalConfigMu.RLock()
+		externalConfigs := e.externalConfigs
+		e.externalConfigMu.RUnlock()
+		if len(externalConfigs) > 0 {
+			baseConfigs = externalConfigs
+		}
+	}
+
+	// Merge with local configs (local takes precedence over external)
+	if len(e.config.Local) > 0 {
+		if len(baseConfigs) > 0 {
+			baseConfigs = e.mergeConfigs(baseConfigs, e.config.Local)
+		} else {
+			baseConfigs = e.config.Local
+		}
+	}
+
+	// Merge with unified services config (highest precedence)
+	unifiedConfigs := e.getUnifiedServicesHealthChecks()
+	if len(unifiedConfigs) > 0 {
+		if len(baseConfigs) > 0 {
+			return e.mergeConfigs(baseConfigs, unifiedConfigs)
+		}
+		return unifiedConfigs
+	}
+
+	return baseConfigs
+}
+
+// getUnifiedServicesHealthChecks extracts health check configs from unified services config.
+// Converts ServiceHealthCheckOverride to ServiceHealthCheckConfig for each service.
+func (e *HealthCheckExecutor) getUnifiedServicesHealthChecks() []ServiceHealthCheckConfig {
+	if e.unifiedServicesConfig == nil {
 		return nil
 	}
 
-	// If no external config, just return local
-	if e.config.External == nil || e.config.External.URL == "" {
-		return e.config.Local
+	var configs []ServiceHealthCheckConfig
+	for _, svc := range e.unifiedServicesConfig.Services {
+		// Get merged config (with defaults applied)
+		merged := e.unifiedServicesConfig.GetMergedServiceConfig(svc.ID)
+		if merged == nil || merged.HealthChecks == nil {
+			continue
+		}
+
+		// Only include if health checks are enabled for this service
+		if merged.HealthChecks.Enabled != nil && !*merged.HealthChecks.Enabled {
+			continue
+		}
+
+		// Get per-service external checks if any
+		e.perServiceExternalMu.RLock()
+		externalChecks := e.perServiceExternalConfigs[svc.ID]
+		e.perServiceExternalMu.RUnlock()
+
+		// Get local checks
+		localChecks := merged.HealthChecks.Local
+
+		// Merge external + local (local takes precedence)
+		var finalChecks []HealthCheckConfig
+		if len(externalChecks) > 0 && len(localChecks) > 0 {
+			// Merge: local overrides external with same name
+			finalChecks = e.mergeHealthCheckConfigs(externalChecks, localChecks)
+		} else if len(localChecks) > 0 {
+			finalChecks = localChecks
+		} else if len(externalChecks) > 0 {
+			finalChecks = externalChecks
+		}
+
+		// Only add if we have checks
+		if len(finalChecks) > 0 {
+			cfg := ServiceHealthCheckConfig{
+				ServiceID:     svc.ID,
+				CheckInterval: merged.HealthChecks.Interval,
+				Checks:        finalChecks,
+			}
+			configs = append(configs, cfg)
+		}
+	}
+	return configs
+}
+
+// mergeHealthCheckConfigs merges external and local health check configs.
+// Local checks override external checks with the same name.
+func (e *HealthCheckExecutor) mergeHealthCheckConfigs(external, local []HealthCheckConfig) []HealthCheckConfig {
+	// Build a map of local checks by name
+	localByName := make(map[string]*HealthCheckConfig, len(local))
+	for i := range local {
+		localByName[local[i].Name] = &local[i]
 	}
 
-	// Get cached external configs
-	e.externalConfigMu.RLock()
-	externalConfigs := e.externalConfigs
-	e.externalConfigMu.RUnlock()
+	// Merge: external checks unless overridden by local
+	merged := make([]HealthCheckConfig, 0, len(external)+len(local))
+	processedNames := make(map[string]struct{})
 
-	// If no external configs loaded yet or failed, return local only
-	if len(externalConfigs) == 0 {
-		return e.config.Local
+	for _, extCheck := range external {
+		if localCheck, exists := localByName[extCheck.Name]; exists {
+			// Local overrides external
+			merged = append(merged, *localCheck)
+			processedNames[extCheck.Name] = struct{}{}
+		} else {
+			merged = append(merged, extCheck)
+		}
 	}
 
-	// Merge external and local configs (local takes precedence)
-	return e.mergeConfigs(externalConfigs, e.config.Local)
+	// Add local-only checks (not in external)
+	for _, localCheck := range local {
+		if _, processed := processedNames[localCheck.Name]; !processed {
+			merged = append(merged, localCheck)
+		}
+	}
+
+	return merged
 }
 
 // GetConfigForService returns the health check configuration for a specific service.
@@ -184,18 +292,20 @@ func (e *HealthCheckExecutor) GetConfigForService(serviceID protocol.ServiceID) 
 // InitExternalConfig initializes external config fetching.
 // Should be called after NewHealthCheckExecutor to start loading external configs.
 func (e *HealthCheckExecutor) InitExternalConfig(ctx context.Context) {
-	if e.config == nil || e.config.External == nil || e.config.External.URL == "" {
-		return
+	// Fetch global external config if configured
+	if e.config != nil && e.config.External != nil && e.config.External.URL != "" {
+		// Fetch initial config
+		e.refreshExternalConfig(ctx)
+
+		// Start periodic refresh if configured
+		if e.config.External.RefreshInterval > 0 {
+			e.stopRefresh = make(chan struct{})
+			go e.startExternalConfigRefresh(ctx)
+		}
 	}
 
-	// Fetch initial config
-	e.refreshExternalConfig(ctx)
-
-	// Start periodic refresh if configured
-	if e.config.External.RefreshInterval > 0 {
-		e.stopRefresh = make(chan struct{})
-		go e.startExternalConfigRefresh(ctx)
-	}
+	// Fetch per-service external configs
+	e.refreshPerServiceExternalConfigs(ctx)
 }
 
 // Stop stops the external config refresh goroutine if running.
@@ -308,6 +418,97 @@ func (e *HealthCheckExecutor) setExternalConfigError(err error) {
 	e.externalConfigMu.Lock()
 	e.externalConfigError = err
 	e.externalConfigMu.Unlock()
+}
+
+// refreshPerServiceExternalConfigs fetches external configs for each service that has one configured.
+// Per-service external configs are merged with their local checks in getUnifiedServicesHealthChecks.
+func (e *HealthCheckExecutor) refreshPerServiceExternalConfigs(ctx context.Context) {
+	if e.unifiedServicesConfig == nil {
+		return
+	}
+
+	for _, svc := range e.unifiedServicesConfig.Services {
+		merged := e.unifiedServicesConfig.GetMergedServiceConfig(svc.ID)
+		if merged == nil || merged.HealthChecks == nil || merged.HealthChecks.External == nil {
+			continue
+		}
+
+		ext := merged.HealthChecks.External
+		if ext.URL == "" {
+			continue
+		}
+
+		// Fetch the external config for this service
+		checks, err := e.fetchExternalChecksForService(ctx, svc.ID, ext)
+		if err != nil {
+			e.logger.Warn().
+				Err(err).
+				Str("service_id", string(svc.ID)).
+				Str("url", ext.URL).
+				Msg("Failed to fetch per-service external health checks")
+			continue
+		}
+
+		// Store in the per-service map
+		e.perServiceExternalMu.Lock()
+		e.perServiceExternalConfigs[svc.ID] = checks
+		e.perServiceExternalMu.Unlock()
+
+		e.logger.Info().
+			Str("service_id", string(svc.ID)).
+			Str("url", ext.URL).
+			Int("check_count", len(checks)).
+			Msg("Loaded per-service external health checks")
+	}
+}
+
+// fetchExternalChecksForService fetches health check configs from a per-service external URL.
+// Returns a list of HealthCheckConfig for that specific service.
+func (e *HealthCheckExecutor) fetchExternalChecksForService(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	ext *ExternalConfigSource,
+) ([]HealthCheckConfig, error) {
+	timeout := ext.Timeout
+	if timeout == 0 {
+		timeout = DefaultExternalConfigTimeout
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, "GET", ext.URL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read body: %w", err)
+	}
+
+	// Parse YAML - expecting []HealthCheckConfig (list of checks for this service)
+	var checks []HealthCheckConfig
+	if err := yaml.Unmarshal(bodyBytes, &checks); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	}
+
+	// Hydrate defaults for each check
+	for i := range checks {
+		checks[i].HydrateDefaults()
+	}
+
+	return checks, nil
 }
 
 // startExternalConfigRefresh runs periodic refresh of external config.
@@ -429,376 +630,6 @@ func (e *HealthCheckExecutor) mergeServiceConfigs(
 	return merged
 }
 
-// ExecuteCheck runs a single health check against an endpoint and returns the result.
-// Returns nil error if the check passes, or an error describing the failure.
-//
-// The check type determines the execution method:
-//   - jsonrpc, rest: HTTP request with optional body and response validation
-//   - websocket: WebSocket connection test with optional message exchange
-//   - grpc: Not yet implemented (returns error)
-func (e *HealthCheckExecutor) ExecuteCheck(
-	ctx context.Context,
-	endpointURL string,
-	check HealthCheckConfig,
-) error {
-	// Skip disabled checks
-	if check.Enabled != nil && !*check.Enabled {
-		return nil
-	}
-
-	// Use check-specific timeout or context deadline
-	checkCtx := ctx
-	if check.Timeout > 0 {
-		var cancel context.CancelFunc
-		checkCtx, cancel = context.WithTimeout(ctx, check.Timeout)
-		defer cancel()
-	}
-
-	// Dispatch to appropriate handler based on check type
-	switch check.Type {
-	case HealthCheckTypeJSONRPC, HealthCheckTypeREST:
-		result := e.executeHTTPCheck(checkCtx, endpointURL, check)
-		return result.Error
-	case HealthCheckTypeWebSocket:
-		return e.executeWebSocketCheck(checkCtx, endpointURL, check)
-	case HealthCheckTypeGRPC:
-		return fmt.Errorf("grpc health checks are not yet implemented")
-	default:
-		return fmt.Errorf("unknown health check type: %s", check.Type)
-	}
-}
-
-// executeHTTPCheckWithObservation runs an HTTP health check and submits the result to the observation queue.
-// This is called by RunChecksForEndpoint to handle both validation and async observation processing.
-func (e *HealthCheckExecutor) executeHTTPCheckWithObservation(
-	ctx context.Context,
-	serviceID protocol.ServiceID,
-	endpointAddr protocol.EndpointAddr,
-	endpointURL string,
-	check HealthCheckConfig,
-) error {
-	// Skip disabled checks
-	if check.Enabled != nil && !*check.Enabled {
-		return nil
-	}
-
-	// Use check-specific timeout or context deadline
-	checkCtx := ctx
-	if check.Timeout > 0 {
-		var cancel context.CancelFunc
-		checkCtx, cancel = context.WithTimeout(ctx, check.Timeout)
-		defer cancel()
-	}
-
-	// Execute the HTTP check
-	result := e.executeHTTPCheck(checkCtx, endpointURL, check)
-
-	// Submit to observation queue (always, not sampled) for async parsing
-	e.submitHealthCheckObservation(serviceID, endpointAddr, check, result)
-
-	return result.Error
-}
-
-// submitHealthCheckObservation submits a health check response to the observation queue for async processing.
-// Health checks are always submitted (not sampled) since they are already rate-limited by the check interval.
-func (e *HealthCheckExecutor) submitHealthCheckObservation(
-	serviceID protocol.ServiceID,
-	endpointAddr protocol.EndpointAddr,
-	check HealthCheckConfig,
-	result httpCheckResult,
-) {
-	// Skip if observation queue is not configured or not enabled
-	if e.observationQueue == nil || !e.observationQueue.IsEnabled() {
-		return
-	}
-
-	// Skip if we didn't get a response (connection error, etc.)
-	if result.ResponseBody == nil && result.StatusCode == 0 {
-		return
-	}
-
-	// Create the observation with health check context
-	obs := &QueuedObservation{
-		ServiceID:          serviceID,
-		EndpointAddr:       endpointAddr,
-		Source:             SourceHealthCheck, // Indicates this is from a health check
-		Timestamp:          time.Now(),
-		Latency:            result.Latency,
-		RequestPath:        check.Path,
-		RequestHTTPMethod:  check.Method,
-		RequestBody:        []byte(check.Body),
-		ResponseStatusCode: result.StatusCode,
-		ResponseBody:       result.ResponseBody,
-	}
-
-	// Submit (not TryQueue) - health checks should always be processed
-	e.observationQueue.Submit(obs)
-}
-
-// httpCheckResult contains the result of an HTTP health check, including
-// the response data needed for async observation processing.
-type httpCheckResult struct {
-	StatusCode   int
-	ResponseBody []byte
-	Latency      time.Duration
-	Error        error
-}
-
-// executeHTTPCheck performs an HTTP-based health check (jsonrpc or rest).
-// It sends an HTTP request and validates the response status code and optionally the body.
-// Returns the full result including response data for observation queue processing.
-func (e *HealthCheckExecutor) executeHTTPCheck(
-	ctx context.Context,
-	endpointURL string,
-	check HealthCheckConfig,
-) httpCheckResult {
-	result := httpCheckResult{}
-
-	// Build the full URL
-	fullURL := strings.TrimSuffix(endpointURL, "/") + check.Path
-
-	// Create the request body
-	var body io.Reader
-	if check.Body != "" {
-		body = bytes.NewBufferString(check.Body)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, check.Method, fullURL, body)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to create request: %w", err)
-		return result
-	}
-
-	// Apply configured headers if provided
-	if len(check.Headers) > 0 {
-		for key, value := range check.Headers {
-			req.Header.Set(key, value)
-		}
-	}
-
-	// Set default Content-Type for POST requests with body if not explicitly configured
-	if check.Method == "POST" && check.Body != "" && req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	// Execute the request
-	startTime := time.Now()
-	resp, err := e.httpClient.Do(req)
-	result.Latency = time.Since(startTime)
-
-	if err != nil {
-		result.Error = fmt.Errorf("request failed (latency=%v): %w", result.Latency, err)
-		return result
-	}
-	defer resp.Body.Close()
-
-	result.StatusCode = resp.StatusCode
-
-	// Always read the response body (needed for observation queue)
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to read response body: %w", err)
-		return result
-	}
-	result.ResponseBody = bodyBytes
-
-	// Check status code
-	if resp.StatusCode != check.ExpectedStatusCode {
-		result.Error = fmt.Errorf("unexpected status code: got %d, expected %d (latency=%v)",
-			resp.StatusCode, check.ExpectedStatusCode, result.Latency)
-		return result
-	}
-
-	// If ExpectedResponseContains is specified, validate the response body
-	if check.ExpectedResponseContains != "" {
-		if !strings.Contains(string(bodyBytes), check.ExpectedResponseContains) {
-			result.Error = fmt.Errorf("response body does not contain expected string %q (latency=%v)",
-				check.ExpectedResponseContains, result.Latency)
-			return result
-		}
-	}
-
-	return result
-}
-
-// executeWebSocketCheck performs a WebSocket health check.
-//
-// Behavior:
-//   - If Body is empty: Connection-only test. Success if connection is established.
-//   - If Body is provided: Send message and wait for response containing ExpectedResponseContains.
-//     If ExpectedResponseContains is empty, any response is considered success.
-//
-// The check respects the configured Timeout for the entire operation (connect + send/receive).
-func (e *HealthCheckExecutor) executeWebSocketCheck(
-	ctx context.Context,
-	endpointURL string,
-	check HealthCheckConfig,
-) error {
-	// Build WebSocket URL
-	wsURL, err := e.buildWebSocketURL(endpointURL, check.Path)
-	if err != nil {
-		return fmt.Errorf("failed to build websocket URL: %w", err)
-	}
-
-	// Create dialer with context
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-	}
-
-	// Connect to WebSocket endpoint
-	startTime := time.Now()
-	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
-	connectLatency := time.Since(startTime)
-
-	if err != nil {
-		if resp != nil {
-			return fmt.Errorf("websocket connection failed with status %d (latency=%v): %w",
-				resp.StatusCode, connectLatency, err)
-		}
-		return fmt.Errorf("websocket connection failed (latency=%v): %w", connectLatency, err)
-	}
-	defer conn.Close()
-
-	e.logger.Debug().
-		Str("url", wsURL).
-		Dur("connect_latency", connectLatency).
-		Msg("WebSocket connection established")
-
-	// If no body provided, connection-only test succeeds here
-	if check.Body == "" {
-		return nil
-	}
-
-	// Send message
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(check.Body)); err != nil {
-		return fmt.Errorf("failed to send websocket message: %w", err)
-	}
-
-	// Wait for response
-	// If ExpectedResponseContains is specified, we keep reading messages until we find a match or timeout
-	// If not specified, any message is considered success
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("websocket response timeout: %w", ctx.Err())
-		default:
-			// Set read deadline based on remaining context time
-			if deadline, ok := ctx.Deadline(); ok {
-				if err := conn.SetReadDeadline(deadline); err != nil {
-					return fmt.Errorf("failed to set read deadline: %w", err)
-				}
-			}
-
-			_, msgBytes, err := conn.ReadMessage()
-			if err != nil {
-				// Check if it's a timeout
-				if ctx.Err() != nil {
-					return fmt.Errorf("websocket response timeout: %w", ctx.Err())
-				}
-				return fmt.Errorf("failed to read websocket message: %w", err)
-			}
-
-			// If no specific response expected, any message is success
-			if check.ExpectedResponseContains == "" {
-				return nil
-			}
-
-			// Check if this message contains the expected string
-			if strings.Contains(string(msgBytes), check.ExpectedResponseContains) {
-				return nil
-			}
-
-			// Message didn't match, continue reading for more messages
-			e.logger.Debug().
-				Str("url", wsURL).
-				Str("expected", check.ExpectedResponseContains).
-				Int("msg_len", len(msgBytes)).
-				Msg("WebSocket message received but didn't match expected, waiting for more")
-		}
-	}
-}
-
-// buildWebSocketURL converts an HTTP URL to a WebSocket URL (ws:// or wss://).
-func (e *HealthCheckExecutor) buildWebSocketURL(endpointURL, path string) (string, error) {
-	parsedURL, err := url.Parse(endpointURL)
-	if err != nil {
-		return "", err
-	}
-
-	// Convert http(s) to ws(s)
-	switch parsedURL.Scheme {
-	case "http":
-		parsedURL.Scheme = "ws"
-	case "https":
-		parsedURL.Scheme = "wss"
-	case "ws", "wss":
-		// Already a WebSocket URL, keep as-is
-	default:
-		return "", fmt.Errorf("unsupported URL scheme: %s", parsedURL.Scheme)
-	}
-
-	// Append path
-	parsedURL.Path = strings.TrimSuffix(parsedURL.Path, "/") + path
-
-	return parsedURL.String(), nil
-}
-
-// RunChecksForEndpoint runs all configured checks for a service against a single endpoint.
-// Returns a map of check name to error (nil if check passed).
-//
-// Each check uses the appropriate URL based on its type:
-//   - jsonrpc, rest: Uses EndpointInfo.HTTPURL
-//   - websocket: Uses EndpointInfo.WebSocketURL
-func (e *HealthCheckExecutor) RunChecksForEndpoint(
-	ctx context.Context,
-	serviceID protocol.ServiceID,
-	endpoint EndpointInfo,
-) map[string]error {
-	svcConfig := e.GetConfigForService(serviceID)
-	if svcConfig == nil {
-		return nil
-	}
-
-	// Skip disabled services
-	if svcConfig.Enabled != nil && !*svcConfig.Enabled {
-		return nil
-	}
-
-	results := make(map[string]error)
-	for _, check := range svcConfig.Checks {
-		// Get the appropriate URL for this check type
-		endpointURL, err := endpoint.GetURLForCheckType(check.Type)
-		if err != nil {
-			// URL not available for this check type (e.g., no WebSocket URL)
-			// Skip this check but don't record as failure
-			e.logger.Debug().
-				Str("service_id", string(serviceID)).
-				Str("endpoint", string(endpoint.Addr)).
-				Str("check", check.Name).
-				Str("check_type", string(check.Type)).
-				Err(err).
-				Msg("Skipping health check - URL not available for check type")
-			results[check.Name] = err
-			continue
-		}
-
-		// Use executeHTTPCheckWithObservation for HTTP checks to capture response for async processing
-		switch check.Type {
-		case HealthCheckTypeJSONRPC, HealthCheckTypeREST:
-			err = e.executeHTTPCheckWithObservation(ctx, serviceID, endpoint.Addr, endpointURL, check)
-		default:
-			// WebSocket, gRPC, etc. use standard ExecuteCheck
-			err = e.ExecuteCheck(ctx, endpointURL, check)
-		}
-		results[check.Name] = err
-
-		// Record the result to reputation
-		e.recordCheckResult(ctx, serviceID, endpoint.Addr, check, err)
-	}
-
-	return results
-}
-
 // recordCheckResult records the health check result to the reputation system and metrics.
 func (e *HealthCheckExecutor) recordCheckResult(
 	ctx context.Context,
@@ -806,6 +637,7 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	endpointAddr protocol.EndpointAddr,
 	check HealthCheckConfig,
 	checkErr error,
+	latency time.Duration,
 ) {
 	key := reputation.NewEndpointKey(serviceID, endpointAddr)
 
@@ -816,8 +648,8 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	}
 
 	if checkErr == nil {
-		// Check passed - record success
-		signal := reputation.NewSuccessSignal(0)
+		// Check passed - record success with latency
+		signal := reputation.NewSuccessSignal(latency)
 		if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
 			e.logger.Warn().
 				Err(err).
@@ -827,21 +659,21 @@ func (e *HealthCheckExecutor) recordCheckResult(
 				Msg("Failed to record success signal")
 		}
 
-		// Record successful health check metric (duration recorded separately via RecordHealthCheckWithDuration)
+		// Record successful health check metric with latency
 		healthcheckmetrics.RecordHealthCheckResult(
 			string(serviceID),
 			endpointDomain,
 			check.Name,
 			string(check.Type),
-			true, // success
-			"",   // no error
-			0,    // duration will be recorded separately
+			true,                    // success
+			"",                      // no error
+			latency.Seconds(),       // duration in seconds
 		)
 		return
 	}
 
 	// Check failed - record error signal based on configured severity
-	signal := e.mapSignalType(check.ReputationSignal, checkErr.Error())
+	signal := e.mapSignalType(check.ReputationSignal, checkErr.Error(), latency)
 	if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
 		e.logger.Warn().
 			Err(err).
@@ -854,15 +686,15 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	// Determine error type for metrics
 	errorType := categorizeHealthCheckError(checkErr)
 
-	// Record health check metric for failures
+	// Record health check metric for failures with latency
 	healthcheckmetrics.RecordHealthCheckResult(
 		string(serviceID),
 		endpointDomain,
 		check.Name,
 		string(check.Type),
-		false, // not success
+		false,                   // not success
 		errorType,
-		0, // duration will be recorded separately in ExecuteCheckViaProtocol
+		latency.Seconds(),       // duration in seconds
 	)
 
 	e.logger.Debug().
@@ -897,110 +729,23 @@ func categorizeHealthCheckError(err error) string {
 }
 
 // mapSignalType converts a configured signal type string to a reputation.Signal.
-func (e *HealthCheckExecutor) mapSignalType(signalType string, reason string) reputation.Signal {
+func (e *HealthCheckExecutor) mapSignalType(signalType string, reason string, latency time.Duration) reputation.Signal {
 	switch signalType {
 	case "minor_error":
 		return reputation.NewMinorErrorSignal(reason)
 	case "major_error":
-		return reputation.NewMajorErrorSignal(reason, 0)
+		return reputation.NewMajorErrorSignal(reason, latency)
 	case "critical_error":
-		return reputation.NewCriticalErrorSignal(reason, 0)
+		return reputation.NewCriticalErrorSignal(reason, latency)
 	case "fatal_error":
 		return reputation.NewFatalErrorSignal(reason)
 	case "recovery_success":
 		// This is only used internally for recovery, not configurable
-		return reputation.NewRecoverySuccessSignal(0)
+		return reputation.NewRecoverySuccessSignal(latency)
 	default:
 		// Default to minor_error for unknown types
 		return reputation.NewMinorErrorSignal(reason)
 	}
-}
-
-// RunAllChecks runs health checks for all configured services against provided endpoints.
-// This is the main entry point called by the health check loop.
-func (e *HealthCheckExecutor) RunAllChecks(
-	ctx context.Context,
-	getEndpoints func(protocol.ServiceID) ([]EndpointInfo, error),
-) error {
-	if !e.ShouldRunChecks() {
-		return nil
-	}
-
-	serviceConfigs := e.GetServiceConfigs()
-	if len(serviceConfigs) == 0 {
-		e.logger.Debug().Msg("No health check configurations found")
-		return nil
-	}
-
-	// Track statistics for summary logging
-	startTime := time.Now()
-	totalEndpoints := 0
-	totalChecks := 0
-	totalPassed := 0
-	totalFailed := 0
-
-	e.logger.Info().
-		Int("service_count", len(serviceConfigs)).
-		Msg("Starting health check cycle")
-
-	for _, svcConfig := range serviceConfigs {
-		if svcConfig.Enabled != nil && !*svcConfig.Enabled {
-			continue
-		}
-
-		endpoints, err := getEndpoints(svcConfig.ServiceID)
-		if err != nil {
-			e.logger.Warn().
-				Err(err).
-				Str("service_id", string(svcConfig.ServiceID)).
-				Msg("Failed to get endpoints for health checks")
-			continue
-		}
-
-		if len(endpoints) == 0 {
-			e.logger.Debug().
-				Str("service_id", string(svcConfig.ServiceID)).
-				Msg("No endpoints available for health checks")
-			continue
-		}
-
-		e.logger.Info().
-			Str("service_id", string(svcConfig.ServiceID)).
-			Int("endpoint_count", len(endpoints)).
-			Int("check_count", len(svcConfig.Checks)).
-			Msg("Running health checks for service")
-
-		for _, endpoint := range endpoints {
-			totalEndpoints++
-			results := e.RunChecksForEndpoint(ctx, svcConfig.ServiceID, endpoint)
-			for checkName, checkErr := range results {
-				totalChecks++
-				if checkErr == nil {
-					totalPassed++
-				} else {
-					totalFailed++
-					e.logger.Info().
-						Str("service_id", string(svcConfig.ServiceID)).
-						Str("endpoint", string(endpoint.Addr)).
-						Str("check", checkName).
-						Str("error", checkErr.Error()).
-						Msg("Health check failed")
-				}
-			}
-		}
-	}
-
-	// Log summary
-	duration := time.Since(startTime)
-	e.logger.Info().
-		Int("total_endpoints", totalEndpoints).
-		Int("total_checks", totalChecks).
-		Int("passed", totalPassed).
-		Int("failed", totalFailed).
-		Dur("duration", duration).
-		Msg("Health check cycle completed")
-
-	return nil
 }
 
 // EndpointInfo contains endpoint information needed for health checks.
@@ -1018,28 +763,6 @@ type EndpointInfo struct {
 	WebSocketURL string
 }
 
-// GetURLForCheckType returns the appropriate URL for the given health check type.
-// Returns the HTTP URL for jsonrpc/rest checks, WebSocket URL for websocket checks.
-// Returns an error if the required URL is not available.
-func (e EndpointInfo) GetURLForCheckType(checkType HealthCheckType) (string, error) {
-	switch checkType {
-	case HealthCheckTypeJSONRPC, HealthCheckTypeREST:
-		if e.HTTPURL == "" {
-			return "", fmt.Errorf("HTTP URL not available for endpoint %s", e.Addr)
-		}
-		return e.HTTPURL, nil
-	case HealthCheckTypeWebSocket:
-		if e.WebSocketURL == "" {
-			return "", fmt.Errorf("WebSocket URL not available for endpoint %s", e.Addr)
-		}
-		return e.WebSocketURL, nil
-	case HealthCheckTypeGRPC:
-		return "", fmt.Errorf("gRPC health checks are not yet implemented")
-	default:
-		return "", fmt.Errorf("unknown health check type: %s", checkType)
-	}
-}
-
 // ExecuteCheckViaProtocol executes a health check through the protocol layer.
 // This sends the health check as a synthetic relay request, testing the full path
 // including relay miners, just like regular user requests.
@@ -1050,25 +773,24 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	serviceID protocol.ServiceID,
 	endpointAddr protocol.EndpointAddr,
 	check HealthCheckConfig,
-	serviceQoS QoSService,
-) error {
+) (time.Duration, error) {
 	if e.protocol == nil {
-		return fmt.Errorf("protocol not configured for health check executor")
+		return 0, fmt.Errorf("protocol not configured for health check executor")
 	}
 
 	// Skip disabled checks
 	if check.Enabled != nil && !*check.Enabled {
-		return nil
+		return 0, nil
 	}
 
 	startTime := time.Now()
 
 	// Create timeout context for the health check
-	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	timeout := 30 * time.Second
 	if check.Timeout > 0 {
-		cancel()
-		checkCtx, cancel = context.WithTimeout(ctx, check.Timeout)
+		timeout = check.Timeout
 	}
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Build the service payload from the health check config
@@ -1100,7 +822,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Str("endpoint", string(endpointAddr)).
 			Str("check", check.Name).
 			Msg("Failed to build protocol context for health check")
-		return fmt.Errorf("failed to build protocol context: %w", err)
+		return time.Since(startTime), fmt.Errorf("failed to build protocol context: %w", err)
 	}
 
 	// Execute the relay request through the protocol - this sends the actual relay to the supplier
@@ -1119,7 +841,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 
 		// Still publish observations for failed requests
 		e.publishHealthCheckObservations(serviceID, endpointAddr, startTime, protocolCtx, &protocolObs)
-		return relayErr
+		return latency, relayErr
 	}
 
 	// Process responses through QoS context
@@ -1149,7 +871,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Str("error", hcQoSCtx.GetError()).
 			Dur("latency", latency).
 			Msg("⚠️ Health check response validation failed")
-		return checkErr
+		return latency, checkErr
 	}
 
 	e.logger.Info().
@@ -1159,7 +881,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 		Dur("latency", latency).
 		Msg("✅ Health check passed via protocol relay")
 
-	return nil
+	return latency, nil
 }
 
 // publishHealthCheckObservations publishes observations for a health check without
@@ -1242,14 +964,14 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 	serviceID protocol.ServiceID,
 	endpointAddr protocol.EndpointAddr,
 	check HealthCheckConfig,
-) error {
+) (time.Duration, error) {
 	if e.protocol == nil {
-		return fmt.Errorf("protocol not configured for health check executor")
+		return 0, fmt.Errorf("protocol not configured for health check executor")
 	}
 
 	// Skip disabled checks
 	if check.Enabled != nil && !*check.Enabled {
-		return nil
+		return 0, nil
 	}
 
 	startTime := time.Now()
@@ -1261,11 +983,11 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 		Msg("Executing WebSocket health check via protocol")
 
 	// Create timeout context for the health check
-	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	timeout := 30 * time.Second
 	if check.Timeout > 0 {
-		cancel()
-		checkCtx, cancel = context.WithTimeout(ctx, check.Timeout)
+		timeout = check.Timeout
 	}
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Use protocol's CheckWebsocketConnection method
@@ -1312,13 +1034,15 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 			Msg("WebSocket health check observations published")
 	}
 
+	latency := time.Since(startTime)
 	e.logger.Debug().
 		Str("service_id", string(serviceID)).
 		Str("endpoint", string(endpointAddr)).
 		Str("check", check.Name).
+		Dur("latency", latency).
 		Msg("WebSocket health check completed via protocol")
 
-	return nil
+	return latency, nil
 }
 
 // RunChecksForEndpointViaProtocol runs all configured checks for a service through the protocol.
@@ -1327,7 +1051,6 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	endpointAddr protocol.EndpointAddr,
-	serviceQoS QoSService,
 ) map[string]error {
 	svcConfig := e.GetConfigForService(serviceID)
 	if svcConfig == nil {
@@ -1342,11 +1065,12 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 	results := make(map[string]error)
 	for _, check := range svcConfig.Checks {
 		var err error
+		var latency time.Duration
 
 		switch check.Type {
 		case HealthCheckTypeWebSocket:
 			// WebSocket checks use the protocol's CheckWebsocketConnection
-			err = e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, endpointAddr, check)
+			latency, err = e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, endpointAddr, check)
 		case HealthCheckTypeGRPC:
 			// gRPC checks not yet implemented
 			e.logger.Debug().
@@ -1357,13 +1081,13 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 			continue
 		default:
 			// HTTP-based checks (jsonrpc, rest)
-			err = e.ExecuteCheckViaProtocol(ctx, serviceID, endpointAddr, check, serviceQoS)
+			latency, err = e.ExecuteCheckViaProtocol(ctx, serviceID, endpointAddr, check)
 		}
 
 		results[check.Name] = err
 
-		// Record the result to reputation
-		e.recordCheckResult(ctx, serviceID, endpointAddr, check, err)
+		// Record the result to reputation with latency
+		e.recordCheckResult(ctx, serviceID, endpointAddr, check, err, latency)
 	}
 
 	return results
@@ -1374,7 +1098,6 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 	ctx context.Context,
 	getEndpointAddrs func(protocol.ServiceID) ([]protocol.EndpointAddr, error),
-	getServiceQoS func(protocol.ServiceID) QoSService,
 ) error {
 	if !e.ShouldRunChecks() {
 		return nil
@@ -1416,13 +1139,8 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			continue
 		}
 
-		serviceQoS := getServiceQoS(svcConfig.ServiceID)
-		if serviceQoS == nil {
-			e.logger.Warn().
-				Str("service_id", string(svcConfig.ServiceID)).
-				Msg("No QoS service available for health checks")
-			continue
-		}
+		// Record the number of endpoints being checked
+		healthcheckmetrics.SetEndpointsChecked(string(svcConfig.ServiceID), len(endpoints))
 
 		e.logger.Info().
 			Str("service_id", string(svcConfig.ServiceID)).
@@ -1431,7 +1149,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			Msg("Running health checks for service via protocol")
 
 		for _, endpointAddr := range endpoints {
-			e.RunChecksForEndpointViaProtocol(ctx, svcConfig.ServiceID, endpointAddr, serviceQoS)
+			e.RunChecksForEndpointViaProtocol(ctx, svcConfig.ServiceID, endpointAddr)
 		}
 	}
 

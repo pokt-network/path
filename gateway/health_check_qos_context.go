@@ -119,39 +119,26 @@ func (hc *HealthCheckQoSContext) UpdateWithResponse(
 		Msg("Health check passed")
 }
 
+
 // GetHTTPResponse returns a minimal HTTP response for health checks.
-// For synthetic requests, this is not typically used but required by the interface.
-// Implements RequestQoSContext interface.
+// This method is required by the RequestQoSContext interface but is not used for health checks.
 func (hc *HealthCheckQoSContext) GetHTTPResponse() pathhttp.HTTPResponse {
-	hc.responseMu.Lock()
-	defer hc.responseMu.Unlock()
-
-	if !hc.responseReceived {
-		return &simpleHTTPResponse{
-			statusCode: 503,
-			body:       []byte(`{"error": "no response received"}`),
-		}
-	}
-
-	return &simpleHTTPResponse{
-		statusCode: hc.httpStatusCode,
-		body:       hc.responseBody,
-	}
+	// Health checks don't generate user-facing HTTP responses.
+	// Return a no-op implementation.
+	return nil
 }
 
 // GetObservations returns QoS-level observations for the health check.
-// Implements RequestQoSContext interface.
+// This method is required by the RequestQoSContext interface but is not used for health checks.
 func (hc *HealthCheckQoSContext) GetObservations() qosobservations.Observations {
-	// Return empty observations - health check results are handled separately
-	// via the reputation service integration in the executor.
+	// Health check results are handled separately via the reputation service.
 	return qosobservations.Observations{}
 }
 
-// GetEndpointSelector returns a no-op selector since health checks
-// use pre-selected endpoints (specified in the YAML config or by the protocol).
-// Implements RequestQoSContext interface.
+// GetEndpointSelector returns a no-op selector since health checks use pre-selected endpoints.
+// This method is required by the RequestQoSContext interface but is not used for health checks.
 func (hc *HealthCheckQoSContext) GetEndpointSelector() protocol.EndpointSelector {
-	// Return nil to use default selection - the hydrator flow pre-selects endpoints anyway
+	// Health checks use endpoints specified in YAML config or by the protocol.
 	return nil
 }
 
@@ -169,32 +156,3 @@ func (hc *HealthCheckQoSContext) GetError() string {
 	return hc.responseError
 }
 
-// GetEndpointAddr returns the endpoint address that was checked.
-func (hc *HealthCheckQoSContext) GetEndpointAddr() protocol.EndpointAddr {
-	hc.responseMu.Lock()
-	defer hc.responseMu.Unlock()
-	return hc.endpointAddr
-}
-
-// GetCheckConfig returns the health check configuration.
-func (hc *HealthCheckQoSContext) GetCheckConfig() HealthCheckConfig {
-	return hc.checkConfig
-}
-
-// simpleHTTPResponse is a minimal implementation of pathhttp.HTTPResponse.
-type simpleHTTPResponse struct {
-	statusCode int
-	body       []byte
-}
-
-func (r *simpleHTTPResponse) GetPayload() []byte {
-	return r.body
-}
-
-func (r *simpleHTTPResponse) GetHTTPStatusCode() int {
-	return r.statusCode
-}
-
-func (r *simpleHTTPResponse) GetHTTPHeaders() map[string]string {
-	return map[string]string{"Content-Type": "application/json"}
-}

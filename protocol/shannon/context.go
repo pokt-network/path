@@ -1026,6 +1026,11 @@ func (rc *requestContext) handleEndpointSuccess(
 			endpointType := rc.getEndpointTypeForMetrics()
 			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointType, endpointDomain)
 		}
+
+		// Record additional latency penalty signals if applicable
+		// This is done by checking the per-service latency config and determining
+		// if the response was slow enough to warrant an additional penalty signal
+		rc.recordLatencyPenaltySignalsIfNeeded(endpointKey, latency, endpointDomain)
 	}
 
 	// Return relay response received from endpoint.
@@ -1047,6 +1052,54 @@ func (rc *requestContext) getEndpointTypeForMetrics() string {
 	default:
 		return reputationmetrics.EndpointTypeUnknown
 	}
+}
+
+// recordLatencyPenaltySignalsIfNeeded checks if the response latency exceeds penalty thresholds
+// and records additional penalty signals (slow_response, very_slow_response) if needed.
+// This allows endpoints to be penalized for slow responses even when the request succeeds.
+func (rc *requestContext) recordLatencyPenaltySignalsIfNeeded(
+	endpointKey reputation.EndpointKey,
+	latency time.Duration,
+	endpointDomain string,
+) {
+	// Get the latency config for this service (respects per-service overrides)
+	latencyConfig := rc.getLatencyConfigForService()
+
+	// Check if an additional latency penalty signal is needed
+	penaltySignalType := reputation.ClassifyLatency(latency, latencyConfig)
+	if penaltySignalType == nil {
+		return // No penalty needed
+	}
+
+	// Create and record the appropriate penalty signal
+	var penaltySignal reputation.Signal
+	switch *penaltySignalType {
+	case reputation.SignalTypeSlowResponse:
+		penaltySignal = reputation.NewSlowResponseSignal(latency)
+	case reputation.SignalTypeVerySlowResponse:
+		penaltySignal = reputation.NewVerySlowResponseSignal(latency)
+	default:
+		return // Unknown signal type, skip
+	}
+
+	// Fire-and-forget: don't block request on reputation recording
+	if err := rc.reputationService.RecordSignal(rc.context, endpointKey, penaltySignal); err != nil {
+		rc.logger.Warn().Err(err).
+			Str("signal_type", string(*penaltySignalType)).
+			Dur("latency", latency).
+			Msg("Failed to record latency penalty signal")
+		reputationmetrics.RecordError("record_signal", "storage_error")
+	} else {
+		// Record penalty signal metric on success
+		endpointType := rc.getEndpointTypeForMetrics()
+		reputationmetrics.RecordSignal(string(rc.serviceID), string(penaltySignal.Type), endpointType, endpointDomain)
+	}
+}
+
+// getLatencyConfigForService returns the latency config for the current service.
+// This fetches the config from the reputation service, which handles per-service overrides.
+func (rc *requestContext) getLatencyConfigForService() reputation.LatencyConfig {
+	return rc.reputationService.GetLatencyConfigForService(rc.serviceID)
 }
 
 // sendHTTPRequest is a shared method for sending HTTP requests with common logic

@@ -10,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	retrymetrics "github.com/pokt-network/path/metrics/retry"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	pathhttp "github.com/pokt-network/path/network/http"
 	"github.com/pokt-network/path/observation"
@@ -116,6 +118,10 @@ type requestContext struct {
 	httpRequestHeaders map[string]string
 	httpRequestBody    []byte
 	httpRequestTime    time.Time
+
+	// requestID is a unique identifier for this request, used for log correlation.
+	// It is either extracted from the X-Request-ID header or generated as a new UUID.
+	requestID string
 }
 
 // InitFromHTTPRequest builds the required context for serving an HTTP request.
@@ -123,6 +129,19 @@ type requestContext struct {
 //   - The target service ID
 //   - The Service QoS instance
 func (rc *requestContext) InitFromHTTPRequest(httpReq *http.Request) error {
+	// Extract or generate request ID for log correlation.
+	// Check common headers: X-Request-ID, X-Correlation-ID, X-Trace-ID
+	rc.requestID = httpReq.Header.Get("X-Request-ID")
+	if rc.requestID == "" {
+		rc.requestID = httpReq.Header.Get("X-Correlation-ID")
+	}
+	if rc.requestID == "" {
+		rc.requestID = httpReq.Header.Get("X-Trace-ID")
+	}
+	if rc.requestID == "" {
+		rc.requestID = uuid.New().String()
+	}
+
 	rc.logger = rc.getHTTPRequestLogger(httpReq)
 
 	// TODO_MVP(@adshmh): The HTTPRequestParser should return a context, similar to QoS, which is then used to get a QoS instance and the observation set.
@@ -349,8 +368,17 @@ func (rc *requestContext) broadcastObservationsInternal() {
 	var qosObservations qosobservations.Observations
 	if rc.qosCtx != nil {
 		qosObservations = rc.qosCtx.GetObservations()
-		if err := rc.serviceQoS.ApplyObservations(&qosObservations); err != nil {
-			rc.logger.Warn().Err(err).Msg("error applying QoS observations.")
+
+		// Only apply observations synchronously if the observation pipeline is not enabled.
+		// When the pipeline is enabled, we rely on:
+		// 1. Health checks (100%) for primary block height updates
+		// 2. Observation pipeline (sampled async) for user request-based updates
+		// This avoids heavy parsing on every request.
+		observationPipelineEnabled := rc.observationQueue != nil && rc.observationQueue.IsEnabled()
+		if !observationPipelineEnabled {
+			if err := rc.serviceQoS.ApplyObservations(&qosObservations); err != nil {
+				rc.logger.Warn().Err(err).Msg("error applying QoS observations.")
+			}
 		}
 	}
 
@@ -373,6 +401,11 @@ func (rc *requestContext) broadcastObservationsInternal() {
 	}
 }
 
+// GetRequestID returns the request ID for this request context.
+func (rc *requestContext) GetRequestID() string {
+	return rc.requestID
+}
+
 // getHTTPRequestLogger returns a logger with attributes set using the supplied HTTP request.
 func (rc *requestContext) getHTTPRequestLogger(httpReq *http.Request) polylog.Logger {
 	var urlStr string
@@ -381,6 +414,7 @@ func (rc *requestContext) getHTTPRequestLogger(httpReq *http.Request) polylog.Lo
 	}
 
 	return rc.logger.With(
+		"request_id", rc.requestID,
 		"http_req_url", urlStr,
 		"http_req_host", httpReq.Host,
 		"http_req_remote_addr", httpReq.RemoteAddr,
@@ -556,6 +590,7 @@ func (rc *requestContext) tryQueueObservation(endpointAddr protocol.EndpointAddr
 		Source:             SourceUserRequest,
 		Timestamp:          time.Now(),
 		Latency:            latency,
+		RequestID:          rc.requestID,
 		RequestPath:        rc.httpRequestPath,
 		RequestHTTPMethod:  rc.httpRequestMethod,
 		RequestHeaders:     rc.httpRequestHeaders,
@@ -566,4 +601,90 @@ func (rc *requestContext) tryQueueObservation(endpointAddr protocol.EndpointAddr
 
 	// Try to queue (non-blocking, sampled)
 	rc.observationQueue.TryQueue(obs)
+}
+
+// getRetryConfigForService retrieves the retry configuration for the current service.
+// Returns nil if no retry configuration is available or if the service is not found.
+func (rc *requestContext) getRetryConfigForService() *ServiceRetryConfig {
+	if rc.protocol == nil {
+		return nil
+	}
+
+	unifiedConfig := rc.protocol.GetUnifiedServicesConfig()
+	if unifiedConfig == nil {
+		return nil
+	}
+
+	// Get merged service config (with defaults applied)
+	mergedConfig := unifiedConfig.GetMergedServiceConfig(rc.serviceID)
+	if mergedConfig == nil {
+		return nil
+	}
+
+	return mergedConfig.RetryConfig
+}
+
+// shouldRetry determines if a request should be retried based on the error, status code, and retry config.
+// Returns true if the request should be retried.
+func (rc *requestContext) shouldRetry(err error, statusCode int, retryConfig *ServiceRetryConfig) bool {
+	// No retry config or retry disabled
+	if retryConfig == nil || retryConfig.Enabled == nil || !*retryConfig.Enabled {
+		return false
+	}
+
+	// Check for 5xx errors if configured
+	if retryConfig.RetryOn5xx != nil && *retryConfig.RetryOn5xx && statusCode >= 500 && statusCode < 600 {
+		return true
+	}
+
+	// If no error, nothing more to check
+	if err == nil {
+		return false
+	}
+
+	// Check for timeout errors if configured
+	if retryConfig.RetryOnTimeout != nil && *retryConfig.RetryOnTimeout {
+		// Check if error is a timeout (context.DeadlineExceeded or contains "timeout")
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+			return true
+		}
+	}
+
+	// Check for connection errors if configured
+	if retryConfig.RetryOnConnection != nil && *retryConfig.RetryOnConnection {
+		// Check if error is a connection error (contains "connection" or "dial")
+		errMsg := strings.ToLower(err.Error())
+		if strings.Contains(errMsg, "connection") || strings.Contains(errMsg, "dial") || strings.Contains(errMsg, "network") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// determineRetryReason determines the retry reason for metrics based on error and status code.
+func (rc *requestContext) determineRetryReason(err error, statusCode int) string {
+	// Check for 5xx errors first
+	if statusCode >= 500 && statusCode < 600 {
+		return retrymetrics.RetryReason5xx
+	}
+
+	// If no error, return empty (should not happen in retry context)
+	if err == nil {
+		return ""
+	}
+
+	// Check for timeout errors
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+		return retrymetrics.RetryReasonTimeout
+	}
+
+	// Check for connection errors
+	errMsg := strings.ToLower(err.Error())
+	if strings.Contains(errMsg, "connection") || strings.Contains(errMsg, "dial") || strings.Contains(errMsg, "network") {
+		return retrymetrics.RetryReasonConnectionError
+	}
+
+	// Default to connection error for unknown cases
+	return retrymetrics.RetryReasonConnectionError
 }
