@@ -55,6 +55,14 @@ type endpointResponse struct {
 	httpStatusCode int
 }
 
+// rawEndpointResponse stores raw bytes for passthrough mode.
+// Used when parsing is skipped for low-latency client responses.
+type rawEndpointResponse struct {
+	EndpointAddr   protocol.EndpointAddr
+	ResponseBytes  []byte
+	HTTPStatusCode int
+}
+
 // requestContext implements the functionality for EVM-based blockchain services.
 type requestContext struct {
 	logger polylog.Logger
@@ -94,6 +102,21 @@ type requestContext struct {
 
 	// endpointSelectionMetadata contains metadata about the endpoint selection process
 	endpointSelectionMetadata EndpointSelectionMetadata
+
+	// --- Passthrough mode fields ---
+	// When passthroughMode is true:
+	//   - UpdateWithResponse stores raw bytes without parsing
+	//   - GetHTTPResponse returns raw bytes as-is
+	//   - Heavy parsing is done asynchronously via sampling (see ObservationQueue)
+	// This reduces latency on the hot path for client responses.
+
+	// passthroughMode enables raw byte passthrough for client responses.
+	// When true, responses are not parsed - they're returned as-is to reduce latency.
+	passthroughMode bool
+
+	// rawResponses stores raw endpoint responses in passthrough mode.
+	// Used by GetHTTPResponse to return raw bytes without parsing.
+	rawResponses []rawEndpointResponse
 }
 
 // GetServicePayloads returns the service payloads for the JSON-RPC requests in the request context.
@@ -111,12 +134,31 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 }
 
 // UpdateWithResponse is NOT safe for concurrent use
+//
+// In passthrough mode (rc.passthroughMode == true):
+//   - Raw bytes are stored without parsing for fast client response
+//   - Heavy parsing is done asynchronously via ObservationQueue sampling
+//
+// In legacy mode (rc.passthroughMode == false):
+//   - Full JSON parsing is done synchronously (existing behavior)
 func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
 	rc.logger = rc.logger.With(
 		"endpoint_addr", endpointAddr,
 		"endpoint_response_len", len(responseBz),
 	)
 
+	// PASSTHROUGH MODE: Store raw bytes without parsing for low-latency client response.
+	// Heavy parsing (if needed) is done async via ObservationQueue sampling.
+	if rc.passthroughMode {
+		rc.rawResponses = append(rc.rawResponses, rawEndpointResponse{
+			EndpointAddr:   endpointAddr,
+			ResponseBytes:  responseBz,
+			HTTPStatusCode: httpStatusCode,
+		})
+		return
+	}
+
+	// LEGACY MODE: Full synchronous parsing (existing behavior)
 	// TODO_IMPROVE: check whether the request was valid, and return an error if it was not.
 	// This would be an extra safety measure, as the caller should have checked the returned value
 	// indicating the validity of the request when calling on QoS instance's ParseHTTPRequest
@@ -140,8 +182,51 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 //
 // GetHTTPResponse builds the HTTP response that should be returned for
 // an EVM blockchain service request.
+//
+// In passthrough mode: Returns raw bytes as-is (no parsing/re-encoding).
+// In legacy mode: Returns parsed and potentially re-formatted JSON-RPC response.
+//
 // Implements the gateway.RequestQoSContext interface.
 func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
+	// PASSTHROUGH MODE: Return raw bytes as-is (like NoOp)
+	if rc.passthroughMode {
+		return rc.getPassthroughHTTPResponse()
+	}
+
+	// LEGACY MODE: Return parsed response (existing behavior)
+	return rc.getLegacyHTTPResponse()
+}
+
+// getPassthroughHTTPResponse returns raw bytes as-is without parsing.
+// Used in passthrough mode for low-latency client responses.
+func (rc requestContext) getPassthroughHTTPResponse() pathhttp.HTTPResponse {
+	// No raw responses received - return error response
+	if len(rc.rawResponses) == 0 {
+		rc.logger.Warn().Msg("No responses received from any endpoints in passthrough mode. Returning generic non-response.")
+		responseNoneObj := responseNone{
+			logger:          rc.logger,
+			servicePayloads: rc.servicePayloads,
+		}
+		return responseNoneObj.GetHTTPResponse()
+	}
+
+	// Return the most recent raw response as-is
+	latestResponse := rc.rawResponses[len(rc.rawResponses)-1]
+
+	// Use original HTTP status from backend if available, otherwise default to 200 OK
+	statusCode := http.StatusOK
+	if latestResponse.HTTPStatusCode != 0 {
+		statusCode = latestResponse.HTTPStatusCode
+	}
+
+	return &passthroughHTTPResponse{
+		httpStatusCode: statusCode,
+		payload:        latestResponse.ResponseBytes,
+	}
+}
+
+// getLegacyHTTPResponse returns parsed JSON-RPC response (existing behavior).
+func (rc requestContext) getLegacyHTTPResponse() pathhttp.HTTPResponse {
 	// Use a noResponses struct if no responses were reported by the protocol from any endpoints.
 	if len(rc.endpointResponses) == 0 {
 		rc.logger.Warn().Msg("No responses received from any endpoints. Returning generic non-response.")
@@ -183,6 +268,26 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 		resp.HTTPStatusCode = rc.endpointResponses[0].httpStatusCode
 	}
 	return resp
+}
+
+// passthroughHTTPResponse implements pathhttp.HTTPResponse for raw byte passthrough.
+type passthroughHTTPResponse struct {
+	httpStatusCode int
+	payload        []byte
+}
+
+func (r *passthroughHTTPResponse) GetPayload() []byte {
+	return r.payload
+}
+
+func (r *passthroughHTTPResponse) GetHTTPStatusCode() int {
+	return r.httpStatusCode
+}
+
+func (r *passthroughHTTPResponse) GetHTTPHeaders() map[string]string {
+	return map[string]string{
+		"Content-Type": "application/json",
+	}
 }
 
 // getBatchHTTPResponse handles batch requests by combining individual JSON-RPC responses

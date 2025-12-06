@@ -8,28 +8,6 @@ import (
 	"github.com/pokt-network/path/protocol"
 )
 
-// hydrateLoggerWithEndpoint enhances a logger with a Shannon endpoint details.
-// Creates contextually rich logs.
-//
-// Parameters:
-//   - logger: The base logger to enhance
-//   - endpoint: The Shannon endpoint
-//
-// Returns:
-//   - An enhanced logger with all relevant endpoint fields attached
-func hydrateLoggerWithEndpoint(
-	logger polylog.Logger,
-	endpoint endpoint,
-) polylog.Logger {
-	hydratedLogger := logger.With(
-		"endpoint_supplier", endpoint.Supplier(),
-		"endpoint_url", endpoint.PublicURL(),
-	)
-
-	// Use hydrateLoggerWithSession for consistency
-	return hydrateLoggerWithSession(hydratedLogger, endpoint.Session())
-}
-
 // hydrateLoggerWithSession enhances a logger with full session details.
 // Creates contextually rich logs with comprehensive session information.
 //

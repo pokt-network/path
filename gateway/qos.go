@@ -8,6 +8,7 @@ import (
 	pathhttp "github.com/pokt-network/path/network/http"
 	"github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
+	qostypes "github.com/pokt-network/path/qos/types"
 )
 
 // RequestQoSContext
@@ -125,6 +126,14 @@ type QoSService interface {
 	//   - "local": from requests sent to an endpoint by THIS PATH instance.
 	//   - "shared": from QoS observations shared by OTHER PATH instances.
 	ApplyObservations(*qos.Observations) error
+
+	// UpdateFromExtractedData:
+	// - Updates QoS state from extracted observation data.
+	// - Called by the observation pipeline after async parsing completes.
+	// - This method updates endpoint state (e.g., perceived block number) without
+	//   blocking the hot path of user requests.
+	// - Data is extracted via DataExtractor from sampled requests and health checks.
+	UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *qostypes.ExtractedData) error
 
 	// HydrateDisqualifiedEndpointsResponse:
 	// - Fills the disqualified endpoint response with QoS-specific data.

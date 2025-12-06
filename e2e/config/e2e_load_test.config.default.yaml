@@ -22,9 +22,9 @@ e2e_load_test_config:
       # [Optional] Log Docker container output
       #   - In CI, will log to stdout
       #   - In local, will log to a file
-      docker_log: false
+      docker_log: true
       # [Optional] Force Docker image rebuild (useful after code changes)
-      force_rebuild_image: false
+      force_rebuild_image: true
 
   # Load Test Mode
   # Tests run against a specified gateway URL (local or public)

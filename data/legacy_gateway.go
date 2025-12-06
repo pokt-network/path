@@ -15,6 +15,11 @@ func setLegacyFieldsFromGatewayAuthData(
 	legacyRecord *legacyRecord,
 	authObservations *observation.RequestAuth,
 ) *legacyRecord {
+	// Health check observations may not have RequestAuth set
+	if authObservations == nil {
+		return legacyRecord
+	}
+
 	legacyRecord.TraceID = authObservations.TraceId
 	legacyRecord.Region = authObservations.Region
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
+	"github.com/redis/go-redis/v9"
 
 	configpkg "github.com/pokt-network/path/config"
 	"github.com/pokt-network/path/gateway"
@@ -69,7 +70,7 @@ func main() {
 	// Log the config path
 	logger.Info().Msgf("Starting PATH using config file: %s", configPath)
 
-	// Create a context for background services (pprof, hydrator, reputation) that can be canceled during shutdown.
+	// Create a context for background services (pprof, health checks, reputation) that can be canceled during shutdown.
 	// This context is used to signal graceful shutdown to all background goroutines.
 	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
 
@@ -79,13 +80,15 @@ func main() {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to create protocol"}`, err)
 	}
 
-	// Prepare the QoS instances
-	qosInstances, err := getServiceQoSInstances(logger, config, protocol)
+	// Prepare the QoS instances using the unified services config
+	unifiedServicesConfig := &config.GetGatewayConfig().GatewayConfig.UnifiedServices
+	unifiedServicesConfig.HydrateDefaults()
+	qosInstances, err := getServiceQoSInstances(logger, config, unifiedServicesConfig, protocol)
 	if err != nil {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to setup QoS instances"}`, err)
 	}
 
-	// Setup metrics reporter, to be used by Gateway and Hydrator
+	// Setup metrics reporter, to be used by Gateway and Health Checks
 	metricsReporter, err := setupMetricsServer(logger, prometheusMetricsServerAddr)
 	if err != nil {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start metrics server"}`, err)
@@ -100,20 +103,98 @@ func main() {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start the configured HTTP data reporter"}`, err)
 	}
 
-	// TODO_IMPROVE: consider using a separate protocol instance for the hydrator,
-	// to enable configuring separate worker pools for the user requests
-	// and the endpoint hydrator requests.
-	hydrator, err := setupEndpointHydrator(
+	// Setup the observation queue for async QoS data extraction.
+	// This enables non-blocking response processing with sampled deep parsing.
+	// NOTE: This is created before health check executor so it can be passed to both.
+	var observationQueue *gateway.ObservationQueue
+	observationPipelineConfig := config.GetGatewayConfig().GatewayConfig.ObservationPipelineConfig
+	if observationPipelineConfig.Enabled {
+		// Convert ObservationPipelineConfig to ObservationQueueConfig (same underlying structure)
+		queueConfig := gateway.ObservationQueueConfig(observationPipelineConfig)
+
+		// Create the observation queue
+		observationQueue = gateway.NewObservationQueue(queueConfig, logger)
+
+		// Build the extractor registry from unified services config
+		extractorRegistry := buildExtractorRegistry(unifiedServicesConfig)
+		observationQueue.SetRegistry(extractorRegistry)
+
+		// Set the observation handler for processing extracted data.
+		// The handler receives QoS instances so it can update perceived block numbers
+		// from sampled requests without blocking the hot path.
+		observationHandler := gateway.NewDefaultObservationHandler(logger)
+		observationHandler.SetQoSInstances(qosInstances)
+		observationQueue.SetHandler(observationHandler)
+
+		// Configure per-service sample rates from unified services config
+		if unifiedServicesConfig != nil {
+			for _, svc := range unifiedServicesConfig.Services {
+				merged := unifiedServicesConfig.GetMergedServiceConfig(svc.ID)
+				if merged != nil && merged.ObservationPipeline != nil && merged.ObservationPipeline.SampleRate != nil {
+					// Only set per-service rate if it differs from global
+					if *merged.ObservationPipeline.SampleRate != queueConfig.SampleRate {
+						observationQueue.SetPerServiceRate(svc.ID, *merged.ObservationPipeline.SampleRate)
+						logger.Debug().
+							Str("service_id", string(svc.ID)).
+							Float64("sample_rate", *merged.ObservationPipeline.SampleRate).
+							Msg("Configured per-service observation sample rate")
+					}
+				}
+			}
+		}
+
+		logger.Info().
+			Float64("sample_rate", queueConfig.SampleRate).
+			Int("worker_count", queueConfig.WorkerCount).
+			Int("queue_size", queueConfig.QueueSize).
+			Int("extractor_count", extractorRegistry.Count()).
+			Msg("Observation queue initialized")
+	}
+
+	// Setup the health check executor for YAML-configurable health checks.
+	// This runs health checks against endpoints and records results to the reputation system.
+	healthCheckConfig := &config.GetGatewayConfig().GatewayConfig.ActiveHealthChecksConfig
+
+	// Create Redis client for leader election if Redis is configured
+	// Redis is used for distributed leader election to ensure only one instance runs health checks
+	var redisClient *redis.Client
+	if config.RedisConfig != nil {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         config.RedisConfig.Address,
+			Password:     config.RedisConfig.Password,
+			DB:           config.RedisConfig.DB,
+			PoolSize:     config.RedisConfig.PoolSize,
+			DialTimeout:  config.RedisConfig.DialTimeout,
+			ReadTimeout:  config.RedisConfig.ReadTimeout,
+			WriteTimeout: config.RedisConfig.WriteTimeout,
+		})
+
+		// Validate Redis connection
+		if err := redisClient.Ping(backgroundCtx).Err(); err != nil {
+			logger.Warn().Err(err).Msg("Failed to connect to Redis - leader election will be disabled")
+			redisClient.Close()
+			redisClient = nil
+		} else {
+			logger.Info().
+				Str("address", config.RedisConfig.Address).
+				Msg("Redis client initialized for leader election")
+		}
+	}
+
+	healthCheckExecutor, leaderElector := setupHealthCheckExecutor(
 		backgroundCtx,
 		logger,
 		protocol,
-		qosInstances,
+		healthCheckConfig,
 		metricsReporter,
 		dataReporter,
-		config.HydratorConfig,
+		observationQueue,
+		unifiedServicesConfig,
+		redisClient,
 	)
-	if err != nil {
-		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to setup endpoint hydrator"}`, err)
+	// Log health check executor status (used for debugging, future shutdown coordination)
+	if healthCheckExecutor != nil {
+		logger.Info().Msg("Health check executor initialized successfully")
 	}
 
 	// Setup the request parser which maps requests to the correct QoS instance.
@@ -130,6 +211,7 @@ func main() {
 		MetricsReporter:            metricsReporter,
 		DataReporter:               dataReporter,
 		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
+		ObservationQueue:           observationQueue,
 	}
 
 	// Until all components are ready, the `/healthz` endpoint will return a 503 Service
@@ -137,9 +219,6 @@ func main() {
 	// health check components must implement the health.Check interface
 	// to be able to signal they are ready to service requests.
 	components := []health.Check{protocol}
-	if hydrator != nil {
-		components = append(components, hydrator)
-	}
 	healthChecker := &health.Checker{
 		Logger:            logger,
 		Components:        components,
@@ -194,8 +273,32 @@ func main() {
 
 	logger.Info().Msg("Shutting down PATH...")
 
-	// Cancel background context to stop all background services (pprof, hydrator)
+	// Cancel background context to stop all background services (pprof, health checks)
 	backgroundCancel()
+
+	// Stop leader election first to release leadership gracefully
+	if leaderElector != nil {
+		if err := leaderElector.Stop(); err != nil {
+			logger.Warn().Err(err).Msg("Failed to stop leader election gracefully")
+		}
+	}
+
+	// Stop the health check executor
+	if healthCheckExecutor != nil {
+		healthCheckExecutor.Stop()
+	}
+
+	// Stop the observation queue to drain pending observations
+	if observationQueue != nil {
+		observationQueue.Stop()
+	}
+
+	// Close Redis client if it was created
+	if redisClient != nil {
+		if err := redisClient.Close(); err != nil {
+			logger.Warn().Err(err).Msg("Failed to close Redis client")
+		}
+	}
 
 	// TODO_IMPROVE: Make shutdown timeout configurable and add graceful shutdown of dependencies
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

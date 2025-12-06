@@ -367,14 +367,15 @@ if [ "$ENVIRONMENT" = "production" ]; then
     fi
 fi
 
-# Local: Check if PATH service is running via health endpoint
+# Local: Check if PATH service is running via readiness endpoint
 if [ "$ENVIRONMENT" = "local" ]; then
-    echo "🏥 Checking if PATH service is running..."
-    health_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3069/healthz 2>/dev/null)
+    echo "🏥 Checking if PATH service is ready..."
+    # Using /ready instead of deprecated /healthz - /ready checks for sessions and endpoints
+    ready_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3069/ready 2>/dev/null)
 
-    if [ "$health_response" != "200" ]; then
+    if [ "$ready_response" != "200" ]; then
         echo ""
-        echo "❌ ERROR: PATH service is not running or not healthy (HTTP $health_response)"
+        echo "❌ ERROR: PATH service is not running or not ready (HTTP $ready_response)"
         echo ""
         echo "⚠️ IMPORTANT: Ensure you are running PATH locally before proceeding."
         echo "    👀 See instructions here: https://www.notion.so/buildwithgrove/PATH-on-Shannon-Load-Tests-200a36edfff6805296c9ce10f2066de6?source=copy_link#205a36edfff68087b27dd086a28f21e9"
@@ -383,7 +384,7 @@ if [ "$ENVIRONMENT" = "local" ]; then
         exit 1
     fi
 
-    echo -e "\n✅ PATH service is healthy - proceeding with service tests\n"
+    echo -e "\n✅ PATH service is ready - proceeding with service tests\n"
 else
     echo -e "\n🌍 Using production environment - skipping local health check\n"
 fi

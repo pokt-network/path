@@ -293,13 +293,13 @@ func TestRedisStorage_ConfigValidation(t *testing.T) {
 			errContains: "failed to connect to Redis",
 		},
 		{
-			name: "empty address uses default localhost",
+			name: "empty address hydrates to test container",
 			config: reputation.RedisConfig{
-				Address:     "", // Will be hydrated to localhost:6379
+				Address:     address, // Use test container address
 				DialTimeout: 500 * time.Millisecond,
 			},
-			expectError: true, // localhost:6379 won't be our test container
-			errContains: "failed to connect to Redis",
+			expectError: false,
+			errContains: "",
 		},
 	}
 
@@ -317,6 +317,37 @@ func TestRedisStorage_ConfigValidation(t *testing.T) {
 				require.NotNil(t, storage)
 				storage.Close()
 			}
+		})
+	}
+}
+
+// TestRedisConfig_HydrateDefaults tests that config hydration works correctly
+// without requiring an actual Redis connection.
+func TestRedisConfig_HydrateDefaults(t *testing.T) {
+	tests := []struct {
+		name            string
+		input           reputation.RedisConfig
+		expectedAddress string
+	}{
+		{
+			name:            "empty address hydrates to default localhost:6379",
+			input:           reputation.RedisConfig{Address: ""},
+			expectedAddress: "localhost:6379",
+		},
+		{
+			name:            "custom address is preserved",
+			input:           reputation.RedisConfig{Address: "custom:1234"},
+			expectedAddress: "custom:1234",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := tt.input
+			config.HydrateDefaults()
+			require.Equal(t, tt.expectedAddress, config.Address)
+			require.NotZero(t, config.PoolSize, "PoolSize should be hydrated")
+			require.NotZero(t, config.DialTimeout, "DialTimeout should be hydrated")
 		})
 	}
 }

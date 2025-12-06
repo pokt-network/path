@@ -157,7 +157,7 @@ func TestConfig_HydrateDefaults(t *testing.T) {
 func TestDefaultConfig(t *testing.T) {
 	config := DefaultConfig()
 
-	require.False(t, config.Enabled, "should be disabled by default")
+	require.True(t, config.Enabled, "should be enabled by default")
 	require.Equal(t, InitialScore, config.InitialScore)
 	require.Equal(t, DefaultMinThreshold, config.MinThreshold)
 	require.Equal(t, DefaultRecoveryTimeout, config.RecoveryTimeout)
@@ -416,8 +416,8 @@ func TestService_KeyBuilderForService_WithOverrides(t *testing.T) {
 		Enabled:        true,
 		KeyGranularity: KeyGranularityEndpoint, // Default is per-endpoint
 		ServiceOverrides: map[string]ServiceConfig{
-			"eth": {KeyGranularity: KeyGranularityDomain},     // eth uses per-domain
-			"sol": {KeyGranularity: KeyGranularitySupplier},   // sol uses per-supplier
+			"eth": {KeyGranularity: KeyGranularityDomain},   // eth uses per-domain
+			"sol": {KeyGranularity: KeyGranularitySupplier}, // sol uses per-supplier
 		},
 	}
 	store := newMockStorage()

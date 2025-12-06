@@ -194,8 +194,8 @@ func (p *Protocol) filterByReputation(
 		// Record score observation for histogram
 		reputationmetrics.RecordScoreObservation(string(serviceID), score.Value)
 
-		// Check if score is above the configured minimum threshold
-		minThreshold := p.getReputationMinThreshold()
+		// Check if score is above the configured minimum threshold (use per-service threshold)
+		minThreshold := p.getMinThresholdForService(serviceID)
 		if score.Value >= minThreshold {
 			filtered[addr] = ep
 			reputationmetrics.RecordEndpointAllowed(string(serviceID), endpointDomain)
@@ -267,10 +267,41 @@ func (p *Protocol) getReputationMinThreshold() float64 {
 	return reputation.DefaultMinThreshold
 }
 
+// getTieredSelectorForService returns the tiered selector for a specific service.
+// If a per-service selector is configured, it is returned; otherwise the global selector is used.
+func (p *Protocol) getTieredSelectorForService(serviceID protocol.ServiceID) *reputation.TieredSelector {
+	// Check for per-service selector
+	if p.serviceTieredSelectors != nil {
+		if selector, ok := p.serviceTieredSelectors[serviceID]; ok {
+			return selector
+		}
+	}
+	// Fall back to global selector
+	return p.tieredSelector
+}
+
+// getMinThresholdForService returns the minimum reputation threshold for a service.
+// Uses per-service configuration if available, otherwise falls back to global.
+func (p *Protocol) getMinThresholdForService(serviceID protocol.ServiceID) float64 {
+	// Check for per-service selector (has its own min threshold)
+	if p.serviceTieredSelectors != nil {
+		if selector, ok := p.serviceTieredSelectors[serviceID]; ok {
+			return selector.MinThreshold()
+		}
+	}
+	// Fall back to global
+	return p.getReputationMinThreshold()
+}
+
 // filterToHighestTier filters endpoints to only return those from the highest available tier.
 // This implements the cascade-down selection: if Tier 1 has endpoints, only return Tier 1.
 // If Tier 1 is empty, return Tier 2. If both are empty, return Tier 3.
 // This allows the QoS layer to still do its validation and selection, but only within the best tier.
+//
+// If probation is enabled, this function also:
+// - Updates probation status for all endpoints
+// - Randomly routes a percentage of traffic to probation endpoints
+// - Records probation metrics
 func (p *Protocol) filterToHighestTier(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
@@ -281,6 +312,13 @@ func (p *Protocol) filterToHighestTier(
 		return endpoints
 	}
 
+	// Get the tiered selector for this service (may be per-service or global)
+	selector := p.getTieredSelectorForService(serviceID)
+	if selector == nil {
+		// No selector configured, return all endpoints
+		return endpoints
+	}
+
 	// Get scores for all endpoints
 	endpointScores, err := p.getEndpointScores(ctx, serviceID, endpoints, logger)
 	if err != nil {
@@ -288,8 +326,72 @@ func (p *Protocol) filterToHighestTier(
 		return endpoints
 	}
 
-	// Group endpoints by tier
-	tier1, tier2, tier3 := p.tieredSelector.GroupByTier(endpointScores)
+	// Track probation transitions before updating status
+	var transitionEvents []struct {
+		key        reputation.EndpointKey
+		transition string
+	}
+
+	if selector.Config().Probation.Enabled {
+		probationThreshold := selector.Config().Probation.Threshold
+		for key, score := range endpointScores {
+			wasInProbation := selector.IsInProbation(key)
+			isInProbation := score < probationThreshold && score >= selector.MinThreshold()
+
+			// Record transition events
+			if isInProbation && !wasInProbation {
+				transitionEvents = append(transitionEvents, struct {
+					key        reputation.EndpointKey
+					transition string
+				}{key, reputationmetrics.ProbationTransitionEntered})
+			} else if !isInProbation && wasInProbation {
+				transitionEvents = append(transitionEvents, struct {
+					key        reputation.EndpointKey
+					transition string
+				}{key, reputationmetrics.ProbationTransitionExited})
+			}
+		}
+	}
+
+	// Update probation status and get list of endpoints currently in probation
+	probationEndpoints := selector.UpdateProbationStatus(endpointScores)
+	probationCount := len(probationEndpoints)
+
+	// Record probation metrics if probation is enabled
+	if selector.Config().Probation.Enabled {
+		reputationmetrics.SetProbationEndpointsCount(string(serviceID), probationCount)
+
+		// Record transition events
+		for _, event := range transitionEvents {
+			domain := extractEndpointDomain(string(event.key.EndpointAddr), logger)
+			reputationmetrics.RecordProbationTransition(string(serviceID), domain, event.transition)
+		}
+	}
+
+	// Check if this request should be routed to probation endpoints
+	shouldRouteToProbation := selector.ShouldRouteToProbation()
+
+	// If probation routing is active and we have probation endpoints, route to them
+	if shouldRouteToProbation && probationCount > 0 {
+		logger.Info().
+			Int("probation_count", probationCount).
+			Float64("traffic_percent", selector.Config().Probation.TrafficPercent).
+			Msg("Routing request to probation endpoints for recovery")
+
+		// Build result map with only probation endpoints
+		result := make(map[protocol.EndpointAddr]endpoint, probationCount)
+		for _, key := range probationEndpoints {
+			if ep, exists := endpoints[key.EndpointAddr]; exists {
+				result[key.EndpointAddr] = ep
+			}
+		}
+
+		return result
+	}
+
+	// Normal tier-based routing (non-probation)
+	// Group endpoints by tier using the service-specific selector
+	tier1, tier2, tier3 := selector.GroupByTier(endpointScores)
 	tier1Count, tier2Count, tier3Count := len(tier1), len(tier2), len(tier3)
 
 	// Record tier distribution metrics (gauge showing current state)
@@ -300,10 +402,13 @@ func (p *Protocol) filterToHighestTier(
 		Int("tier1_count", tier1Count).
 		Int("tier2_count", tier2Count).
 		Int("tier3_count", tier3Count).
+		Int("probation_count", probationCount).
 		Int("total_endpoints", len(endpoints)).
-		Float64("tier1_threshold", p.tieredSelector.Config().Tier1Threshold).
-		Float64("tier2_threshold", p.tieredSelector.Config().Tier2Threshold).
-		Float64("min_threshold", p.tieredSelector.MinThreshold()).
+		Float64("tier1_threshold", selector.Config().Tier1Threshold).
+		Float64("tier2_threshold", selector.Config().Tier2Threshold).
+		Float64("min_threshold", selector.MinThreshold()).
+		Float64("probation_threshold", selector.Config().Probation.Threshold).
+		Bool("probation_enabled", selector.Config().Probation.Enabled).
 		Msg("Tiered selection: endpoint distribution across tiers")
 
 	// Determine which tier to use and record metric
@@ -344,6 +449,7 @@ func (p *Protocol) filterToHighestTier(
 		Int("tier1_available", tier1Count).
 		Int("tier2_available", tier2Count).
 		Int("tier3_available", tier3Count).
+		Int("probation_available", probationCount).
 		Msg("Tiered selection: returning endpoints from highest available tier")
 
 	return result

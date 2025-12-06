@@ -85,6 +85,7 @@ var (
 	// relaysTotal tracks the total Shannon relay requests processed.
 	// Labels:
 	//   - service_id: Target service identifier (i.e. chain id in Shannon)
+	//   - request_type: Type of request (http, websocket_connection, websocket_message)
 	//   - success: Whether the relay was successful (true if at least one endpoint had no error)
 	//   - error_type: type of error encountered processing the request
 	//   - used_fallback: Whether the request was served using a fallback endpoint.
@@ -95,8 +96,8 @@ var (
 	// preserving detailed information for troubleshooting.
 	//
 	// Use to analyze:
-	//   - Request volume by service
-	//   - Success rates by service
+	//   - Request volume by service and request type
+	//   - Success rates by service and request type
 	//   - Detailed endpoint and app data available via exemplars when needed
 	//   - Distribution of traffic between protocol and fallback endpoints.
 	relaysTotal = prometheus.NewCounterVec(
@@ -105,7 +106,7 @@ var (
 			Name:      relaysTotalMetric,
 			Help:      "Total number of relays processed by Shannon protocol instance(s)",
 		},
-		[]string{"service_id", "success", "error_type", "used_fallback", "endpoint_domain"},
+		[]string{"service_id", "request_type", "success", "error_type", "used_fallback", "endpoint_domain"},
 	)
 
 	// TODO_IMPROVE(@adshmh): This should be called endpointErrorsTotal
@@ -489,11 +490,15 @@ func recordRelayTotal(
 	// e.g. there were no available endpoints.
 	// Skip processing endpoint observations.
 	if requestHasErr, requestErrorType := extractRequestError(observations); requestHasErr {
+		// Determine request type from observation data
+		requestType := getRequestType(observations)
+
 		relaysTotal.With(
 			prometheus.Labels{
-				"service_id": serviceID,
-				"success":    "false",
-				"error_type": requestErrorType,
+				"service_id":   serviceID,
+				"request_type": requestType,
+				"success":      "false",
+				"error_type":   requestErrorType,
 				// Relay request failed before reaching out to any endpoints so no fallback was used.
 				// Must be set to avoid inconsistent label cardinality error
 				"used_fallback":   "false",
@@ -565,10 +570,14 @@ func recordRelayTotal(
 		endpointDomain = ErrDomain
 	}
 
+	// Determine request type from observation data
+	requestType := getRequestType(observations)
+
 	// Increment the relay total counter with exemplars
 	relaysTotal.With(
 		prometheus.Labels{
 			"service_id":      serviceID,
+			"request_type":    requestType,
 			"success":         fmt.Sprintf("%t", success),
 			"error_type":      "",
 			"used_fallback":   fmt.Sprintf("%t", usedFallbackEndpoint),
@@ -629,6 +638,21 @@ func isFallbackEndpointUsed(observations []*protocolobservations.ShannonEndpoint
 		}
 	}
 	return false
+}
+
+// getRequestType determines the request type based on the observation data.
+// Returns "http", "websocket_connection", or "websocket_message" based on the observation type.
+func getRequestType(observations *protocolobservations.ShannonRequestObservations) string {
+	switch observations.GetObservationData().(type) {
+	case *protocolobservations.ShannonRequestObservations_HttpObservations:
+		return "http"
+	case *protocolobservations.ShannonRequestObservations_WebsocketConnectionObservation:
+		return "websocket_connection"
+	case *protocolobservations.ShannonRequestObservations_WebsocketMessageObservation:
+		return "websocket_message"
+	default:
+		return "unknown"
+	}
 }
 
 // processEndpointErrors records error metrics with exemplars for high-cardinality data

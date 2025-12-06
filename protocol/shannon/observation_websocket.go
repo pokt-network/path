@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
-	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
@@ -295,32 +294,5 @@ func buildWebsocketConnectionErrorObservation(
 		// Connection lifecycle
 		ConnectionEstablishedTimestamp: timestamppb.New(time.Now()),
 		EventType:                      eventType,
-	}
-}
-
-// builds a Shannon endpoint from an endpoint observation.
-// Used to identify an endpoint for applying sanctions.
-func buildEndpointFromWebSocketConnectionObservation(
-	observation *protocolobservations.ShannonWebsocketConnectionObservation,
-) endpoint {
-	session := buildSessionFromWebSocketConnectionObservation(observation)
-	return &protocolEndpoint{
-		session:  session,
-		supplier: observation.GetSupplier(),
-		url:      observation.GetEndpointUrl(),
-	}
-}
-
-func buildSessionFromWebSocketConnectionObservation(
-	observation *protocolobservations.ShannonWebsocketConnectionObservation,
-) sessiontypes.Session {
-	return sessiontypes.Session{
-		Header: &sessiontypes.SessionHeader{
-			ApplicationAddress:      observation.GetEndpointAppAddress(),
-			ServiceId:               observation.GetSessionServiceId(),
-			SessionId:               observation.GetSessionId(),
-			SessionStartBlockHeight: observation.GetSessionStartHeight(),
-			SessionEndBlockHeight:   observation.GetSessionEndHeight(),
-		},
 	}
 }

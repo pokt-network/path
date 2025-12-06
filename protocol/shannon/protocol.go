@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"runtime"
+	"time"
 
 	"github.com/alitto/pond/v2"
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -15,6 +15,7 @@ import (
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/health"
 	"github.com/pokt-network/path/metrics/devtools"
+	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
@@ -57,13 +58,6 @@ type Protocol struct {
 	// ownedApps is the list of apps owned by the gateway operator
 	ownedApps map[protocol.ServiceID][]string
 
-	// TODO_TECHDEBT(@adshmh,@commoddity,@olshansk): JSON_RPC RPC type should more correctly be called HTTP
-	// when used in this context. Add an HTTP RPC-type to the enum in poktroll and update this map when it is done.
-	//
-	// sanctionedEndpointsStores tracks sanctioned endpoints per RPC type
-	// currently only JSON_RPC (stand-in for HTTP) and WEBSOCKET are supported
-	sanctionedEndpointsStores map[sharedtypes.RPCType]*sanctionedEndpointsStore
-
 	// HTTP client used for sending relay requests to endpoints while also capturing & publishing various debug metrics.
 	httpClient *pathhttp.HTTPClientWithDebugMetrics
 
@@ -89,6 +83,10 @@ type Protocol struct {
 	// Allows measuring performance of PATH and full node(s) in isolation.
 	loadTestingConfig *LoadTestingConfig
 
+	// concurrencyConfig controls concurrency limits for request processing.
+	// These limits protect against resource exhaustion from batch requests and parallel relays.
+	concurrencyConfig gateway.ConcurrencyConfig
+
 	// reputationService tracks endpoint reputation scores.
 	// If enabled, endpoints are filtered by score in addition to binary sanctions.
 	// When nil, only binary sanctions are used for endpoint filtering.
@@ -97,6 +95,15 @@ type Protocol struct {
 	// tieredSelector selects endpoints using cascade-down tier logic.
 	// Created when reputation service is enabled with tiered selection enabled.
 	tieredSelector *reputation.TieredSelector
+
+	// serviceTieredSelectors stores per-service TieredSelectors for services with custom thresholds.
+	// When a service has a per-service tiered selection config, its selector is stored here.
+	// Falls back to the global tieredSelector if not present.
+	serviceTieredSelectors map[protocol.ServiceID]*reputation.TieredSelector
+
+	// unifiedServicesConfig is the unified YAML-driven service configuration.
+	// This consolidates all per-service settings and enables per-service overrides.
+	unifiedServicesConfig *gateway.UnifiedServicesConfig
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -121,6 +128,57 @@ func NewProtocol(
 		return nil, fmt.Errorf("failed to get app addresses from config: %w", err)
 	}
 
+	// Wire up defaults from parent config to unified services config.
+	// This allows gateway_config top-level settings to serve as defaults for all services,
+	// eliminating the need for a separate "defaults" section in YAML.
+	config.UnifiedServices.SetDefaultsFromParent(gateway.ParentConfigDefaults{
+		TieredSelectionEnabled:      config.ReputationConfig.TieredSelection.Enabled,
+		Tier1Threshold:              config.ReputationConfig.TieredSelection.Tier1Threshold,
+		Tier2Threshold:              config.ReputationConfig.TieredSelection.Tier2Threshold,
+		ProbationEnabled:            config.ReputationConfig.TieredSelection.Probation.Enabled,
+		ProbationThreshold:          config.ReputationConfig.TieredSelection.Probation.Threshold,
+		ProbationTrafficPercent:     config.ReputationConfig.TieredSelection.Probation.TrafficPercent,
+		ProbationRecoveryMultiplier: config.ReputationConfig.TieredSelection.Probation.RecoveryMultiplier,
+		RetryEnabled:                config.RetryConfig.Enabled,
+		MaxRetries:                  config.RetryConfig.MaxRetries,
+		RetryOn5xx:                  config.RetryConfig.RetryOn5xx,
+		RetryOnTimeout:              config.RetryConfig.RetryOnTimeout,
+		RetryOnConnection:           config.RetryConfig.RetryOnConnection,
+		MaxRetryLatency: func() time.Duration {
+			if config.RetryConfig.MaxRetryLatency != nil {
+				return *config.RetryConfig.MaxRetryLatency
+			}
+			return 0
+		}(),
+		ObservationPipelineEnabled: config.ObservationPipelineConfig.Enabled,
+		SampleRate:                 config.ObservationPipelineConfig.SampleRate,
+		HealthChecksEnabled:        config.ActiveHealthChecksConfig.Enabled,
+		HealthCheckInterval:        config.ActiveHealthChecksConfig.Coordination.RenewInterval,
+		SyncAllowance:              config.ActiveHealthChecksConfig.SyncAllowance,
+	})
+
+	// Apply defaults to concurrency config if not set.
+	// These defaults match the previous hardcoded behavior for backward compatibility.
+	if config.ConcurrencyConfig.MaxParallelEndpoints == 0 {
+		config.ConcurrencyConfig.MaxParallelEndpoints = 1
+	}
+	if config.ConcurrencyConfig.MaxConcurrentRelays == 0 {
+		config.ConcurrencyConfig.MaxConcurrentRelays = 5500
+	}
+	if config.ConcurrencyConfig.MaxBatchPayloads == 0 {
+		config.ConcurrencyConfig.MaxBatchPayloads = 5500
+	}
+
+	// 🚨 BIG WARNING: Parallel endpoints multiply token burn
+	if config.ConcurrencyConfig.MaxParallelEndpoints > 1 {
+		shannonLogger.Warn().
+			Int("max_parallel_endpoints", config.ConcurrencyConfig.MaxParallelEndpoints).
+			Msg("🚨 WARNING: max_parallel_endpoints > 1 is EXPERIMENTAL and will multiply token burn by the number of parallel endpoints! " +
+				"Each request will be sent to multiple endpoints simultaneously. " +
+				"Monitor your token usage and endpoint metrics closely. " +
+				"Recommended: Start with max_parallel_endpoints=1 and test thoroughly before increasing.")
+	}
+
 	protocolInstance := &Protocol{
 		logger: shannonLogger,
 
@@ -132,12 +190,6 @@ func NewProtocol(
 		gatewayAddr:          config.GatewayAddress,
 		gatewayPrivateKeyHex: config.GatewayPrivateKeyHex,
 		gatewayMode:          config.GatewayMode,
-		// tracks sanctioned endpoints per RPC type
-		// currently only JSON_RPC and WEBSOCKET are supported
-		sanctionedEndpointsStores: map[sharedtypes.RPCType]*sanctionedEndpointsStore{
-			sharedtypes.RPCType_JSON_RPC:  newSanctionedEndpointsStore(logger, config.SanctionConfig),
-			sharedtypes.RPCType_WEBSOCKET: newSanctionedEndpointsStore(logger, config.SanctionConfig),
-		},
 
 		// ownedApps is the list of apps owned by the gateway operator
 		ownedApps: ownedApps,
@@ -146,19 +198,28 @@ func NewProtocol(
 		httpClient: pathhttp.NewDefaultHTTPClientWithDebugMetrics(),
 
 		// relayPool is a shared worker pool for parallel relay processing.
-		// Uses MaxConcurrentRelaysPerRequest as the max workers to bound global concurrency.
-		relayPool: pond.NewPool(runtime.NumCPU() * 2),
+		// Uses MaxConcurrentRelays to bound global concurrency and prevent resource exhaustion.
+		relayPool: pond.NewPool(config.ConcurrencyConfig.MaxConcurrentRelays),
 
 		// serviceFallbacks contains the fallback information for each service.
 		serviceFallbackMap: config.getServiceFallbackMap(),
 
 		// load testing config, if specified.
 		loadTestingConfig: config.LoadTestingConfig,
+
+		// concurrency config controls parallel endpoint queries and batch request limits
+		concurrencyConfig: config.ConcurrencyConfig,
+
+		// unifiedServicesConfig for per-service configuration overrides
+		unifiedServicesConfig: &config.UnifiedServices,
 	}
 
 	// Initialize reputation service if enabled.
-	// When enabled, endpoints are filtered by reputation score in addition to binary sanctions.
+	// Reputation is the primary endpoint quality system - it tracks endpoint scores
+	// based on both user requests and health check probes (hydrator).
+	// When disabled, requests are relayed to any endpoint in the session without quality filtering.
 	if config.ReputationConfig.Enabled {
+		config.ReputationConfig.HydrateDefaults()
 		reputationLogger := shannonLogger.With("component", "reputation")
 
 		// Create storage based on configuration.
@@ -168,10 +229,10 @@ func NewProtocol(
 			// Use recovery timeout as TTL for entries - expired entries get auto-cleaned
 			store = reputationstorage.NewMemoryStorage(config.ReputationConfig.RecoveryTimeout)
 		case "redis":
-			if config.ReputationConfig.Redis == nil {
-				return nil, fmt.Errorf("redis storage requires redis configuration")
+			if config.RedisConfig == nil {
+				return nil, fmt.Errorf("redis storage requires global redis_config to be set")
 			}
-			redisStore, err := reputationstorage.NewRedisStorage(ctx, *config.ReputationConfig.Redis, config.ReputationConfig.RecoveryTimeout)
+			redisStore, err := reputationstorage.NewRedisStorage(ctx, *config.RedisConfig, config.ReputationConfig.RecoveryTimeout)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create redis storage: %w", err)
 			}
@@ -181,15 +242,70 @@ func NewProtocol(
 		}
 
 		reputationSvc := reputation.NewService(config.ReputationConfig, store)
+		reputationSvc.SetLogger(reputationLogger)
 		if err := reputationSvc.Start(ctx); err != nil {
 			return nil, fmt.Errorf("failed to start reputation service: %w", err)
 		}
 
 		protocolInstance.reputationService = reputationSvc
 
+		// Configure per-service reputation settings from unified config
+		if protocolInstance.unifiedServicesConfig != nil {
+			for _, svc := range protocolInstance.unifiedServicesConfig.Services {
+				merged := protocolInstance.unifiedServicesConfig.GetMergedServiceConfig(svc.ID)
+				if merged != nil && merged.ReputationConfig != nil {
+					svcConfig := reputation.ServiceConfig{}
+					if merged.ReputationConfig.KeyGranularity != "" {
+						svcConfig.KeyGranularity = merged.ReputationConfig.KeyGranularity
+					}
+					if merged.ReputationConfig.InitialScore != nil {
+						svcConfig.InitialScore = *merged.ReputationConfig.InitialScore
+					}
+					if merged.ReputationConfig.MinThreshold != nil {
+						svcConfig.MinThreshold = *merged.ReputationConfig.MinThreshold
+					}
+					if merged.ReputationConfig.RecoveryTimeout != nil {
+						svcConfig.RecoveryTimeout = *merged.ReputationConfig.RecoveryTimeout
+					}
+					// Set health checks and probation enabled flags.
+					// These are used by shouldRecover to determine if time-based recovery applies.
+					if merged.HealthChecks != nil && merged.HealthChecks.Enabled != nil {
+						svcConfig.HealthChecksEnabled = *merged.HealthChecks.Enabled
+					}
+					if merged.Probation != nil && merged.Probation.Enabled != nil {
+						svcConfig.ProbationEnabled = *merged.Probation.Enabled
+					}
+					reputationSvc.SetServiceConfig(svc.ID, svcConfig)
+					reputationLogger.Debug().
+						Str("service_id", string(svc.ID)).
+						Float64("initial_score", svcConfig.InitialScore).
+						Float64("min_threshold", svcConfig.MinThreshold).
+						Str("key_granularity", svcConfig.KeyGranularity).
+						Bool("health_checks_enabled", svcConfig.HealthChecksEnabled).
+						Bool("probation_enabled", svcConfig.ProbationEnabled).
+						Msg("Configured per-service reputation settings")
+				}
+
+				// Configure per-service latency: choose between simple config and profile-based config
+				if merged != nil {
+					latencyConfig := buildLatencyConfigForService(merged, config.ReputationConfig.Latency, protocolInstance.unifiedServicesConfig)
+					if latencyConfig != nil {
+						reputationSvc.SetLatencyProfile(svc.ID, *latencyConfig)
+						reputationLogger.Debug().
+							Str("service_id", string(svc.ID)).
+							Bool("latency_enabled", latencyConfig.Enabled).
+							Dur("fast_threshold", latencyConfig.FastThreshold).
+							Dur("penalty_threshold", latencyConfig.PenaltyThreshold).
+							Msg("Configured per-service latency")
+					}
+				}
+			}
+		}
+
 		// Create tiered selector if tiered selection is enabled
 		if config.ReputationConfig.TieredSelection.Enabled {
-			protocolInstance.tieredSelector = reputation.NewTieredSelector(
+			protocolInstance.tieredSelector = reputation.NewTieredSelectorWithLogger(
+				reputationLogger,
 				config.ReputationConfig.TieredSelection,
 				config.ReputationConfig.MinThreshold,
 			)
@@ -198,6 +314,98 @@ func NewProtocol(
 				Float64("tier2_threshold", config.ReputationConfig.TieredSelection.Tier2Threshold).
 				Float64("min_threshold", config.ReputationConfig.MinThreshold).
 				Msg("Tiered endpoint selection enabled")
+
+			// Initialize per-service tiered selectors from unified config
+			protocolInstance.serviceTieredSelectors = make(map[protocol.ServiceID]*reputation.TieredSelector)
+			if protocolInstance.unifiedServicesConfig != nil {
+				for _, svc := range protocolInstance.unifiedServicesConfig.Services {
+					merged := protocolInstance.unifiedServicesConfig.GetMergedServiceConfig(svc.ID)
+					if merged != nil && merged.TieredSelection != nil {
+						// Only create per-service selector if thresholds differ from global defaults
+						hasCustomConfig := false
+						tier1 := config.ReputationConfig.TieredSelection.Tier1Threshold
+						tier2 := config.ReputationConfig.TieredSelection.Tier2Threshold
+						minThreshold := config.ReputationConfig.MinThreshold
+
+						if merged.TieredSelection.Tier1Threshold != nil &&
+							*merged.TieredSelection.Tier1Threshold != tier1 {
+							tier1 = *merged.TieredSelection.Tier1Threshold
+							hasCustomConfig = true
+						}
+						if merged.TieredSelection.Tier2Threshold != nil &&
+							*merged.TieredSelection.Tier2Threshold != tier2 {
+							tier2 = *merged.TieredSelection.Tier2Threshold
+							hasCustomConfig = true
+						}
+						// Use per-service min threshold if available
+						if merged.ReputationConfig != nil && merged.ReputationConfig.MinThreshold != nil {
+							minThreshold = *merged.ReputationConfig.MinThreshold
+							hasCustomConfig = true
+						}
+
+						if hasCustomConfig {
+							// Build tiered selection config with probation
+							// Use global default for Enabled if nil (defensive nil check)
+							tieredEnabled := config.ReputationConfig.TieredSelection.Enabled
+							if merged.TieredSelection.Enabled != nil {
+								tieredEnabled = *merged.TieredSelection.Enabled
+							}
+							svcTierConfig := reputation.TieredSelectionConfig{
+								Enabled:        tieredEnabled,
+								Tier1Threshold: tier1,
+								Tier2Threshold: tier2,
+							}
+
+							// Include per-service probation config if present
+							// Add defensive nil checks for each pointer field
+							if merged.Probation != nil {
+								// Use global defaults as fallbacks for nil pointer fields
+								probEnabled := config.ReputationConfig.TieredSelection.Probation.Enabled
+								probThreshold := config.ReputationConfig.TieredSelection.Probation.Threshold
+								probTrafficPct := config.ReputationConfig.TieredSelection.Probation.TrafficPercent
+								probRecoveryMult := config.ReputationConfig.TieredSelection.Probation.RecoveryMultiplier
+
+								if merged.Probation.Enabled != nil {
+									probEnabled = *merged.Probation.Enabled
+								}
+								if merged.Probation.Threshold != nil {
+									probThreshold = *merged.Probation.Threshold
+								}
+								if merged.Probation.TrafficPercent != nil {
+									probTrafficPct = *merged.Probation.TrafficPercent
+								}
+								if merged.Probation.RecoveryMultiplier != nil {
+									probRecoveryMult = *merged.Probation.RecoveryMultiplier
+								}
+
+								svcTierConfig.Probation = reputation.ProbationConfig{
+									Enabled:            probEnabled,
+									Threshold:          probThreshold,
+									TrafficPercent:     probTrafficPct,
+									RecoveryMultiplier: probRecoveryMult,
+								}
+							} else {
+								// Use global defaults
+								svcTierConfig.Probation = config.ReputationConfig.TieredSelection.Probation
+							}
+
+							protocolInstance.serviceTieredSelectors[svc.ID] = reputation.NewTieredSelectorWithLogger(
+								reputationLogger.With("service_id", string(svc.ID)),
+								svcTierConfig,
+								minThreshold,
+							)
+							reputationLogger.Debug().
+								Str("service_id", string(svc.ID)).
+								Float64("tier1_threshold", tier1).
+								Float64("tier2_threshold", tier2).
+								Float64("min_threshold", minThreshold).
+								Bool("probation_enabled", svcTierConfig.Probation.Enabled).
+								Float64("probation_threshold", svcTierConfig.Probation.Threshold).
+								Msg("Configured per-service tiered selection")
+						}
+					}
+				}
+			}
 		}
 
 		reputationLogger.Info().Msg("Reputation service enabled and started")
@@ -404,24 +612,26 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 
 	// Return new request context for the pre-selected endpoint
 	return &requestContext{
-		logger:             p.logger,
-		context:            ctx,
-		fullNode:           p.FullNode,
-		selectedEndpoint:   selectedEndpoint,
-		serviceID:          serviceID,
-		relayRequestSigner: permittedSigner,
-		httpClient:         p.httpClient,
-		fallbackEndpoints:  fallbackEndpoints,
-		loadTestingConfig:  p.loadTestingConfig,
-		relayPool:          p.relayPool,
-		reputationService:  p.reputationService,
+		logger:                p.logger,
+		context:               ctx,
+		fullNode:              p.FullNode,
+		selectedEndpoint:      selectedEndpoint,
+		serviceID:             serviceID,
+		relayRequestSigner:    permittedSigner,
+		httpClient:            p.httpClient,
+		fallbackEndpoints:     fallbackEndpoints,
+		loadTestingConfig:     p.loadTestingConfig,
+		relayPool:             p.relayPool,
+		concurrencyConfig:     p.concurrencyConfig,
+		unifiedServicesConfig: p.unifiedServicesConfig,
+		reputationService:     p.reputationService,
+		currentRPCType:        sharedtypes.RPCType_JSON_RPC, // Health checks use JSON-RPC by default
 	}, protocolobservations.Observations{}, nil
 }
 
 // ApplyHTTPObservations updates protocol instance state based on endpoint observations.
-// Examples:
-// - Mark endpoints as invalid based on response quality
-// - Disqualify endpoints for a time period
+// Records reputation signals from hydrator (synthetic) health check observations,
+// allowing endpoints to recover from failures via successful health checks.
 //
 // Implements gateway.Protocol interface.
 func (p *Protocol) ApplyHTTPObservations(observations *protocolobservations.Observations) error {
@@ -436,12 +646,12 @@ func (p *Protocol) ApplyHTTPObservations(observations *protocolobservations.Obse
 		p.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msg("SHOULD RARELY HAPPEN: ApplyHTTPObservations called with nil set of Shannon request observations.")
 		return nil
 	}
-	// hand over the observations to the sanctioned endpoints store for adding any applicable sanctions.
-	sanctionedEndpointsStore, ok := p.sanctionedEndpointsStores[sharedtypes.RPCType_JSON_RPC]
-	if !ok {
-		return fmt.Errorf("INVARIANT VIOLATION: sanctioned endpoints store not initialized for RPC type: %s", sharedtypes.RPCType_JSON_RPC)
+
+	// Record reputation signals from observations.
+	// This allows health check results (from hydrator) to update endpoint reputation scores.
+	if p.reputationService != nil {
+		p.recordReputationSignalsFromObservations(shannonObservations)
 	}
-	sanctionedEndpointsStore.ApplyObservations(shannonObservations)
 
 	return nil
 }
@@ -580,35 +790,12 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		}
 
 		// Initialize the qualified endpoints as the full set of session endpoints.
-		// Sanctioned endpoints will be filtered out below if a valid RPC type is provided.
+		// Low-reputation endpoints will be filtered out below if reputation service is enabled.
 		qualifiedEndpoints := sessionEndpoints
 
-		// Filter out sanctioned endpoints if a valid RPC type is provided.
-		// If no valid RPC type is provided, don't filter out sanctioned endpoints.
-		// As of PR #424 the only supported RPC types are JSON_RPC and WEBSOCKET.
-		if sanctionedEndpointsStore, ok := p.sanctionedEndpointsStores[filterByRPCType]; ok {
-			logger.Debug().Msgf(
-				"app %s has %d endpoints before filtering sanctioned endpoints.",
-				app.Address, len(sessionEndpoints),
-			)
-
-			// Filter out any sanctioned endpoints
-			filteredEndpoints := sanctionedEndpointsStore.FilterSanctionedEndpoints(qualifiedEndpoints)
-			// All endpoints are sanctioned: log a warning and skip this app.
-			if len(filteredEndpoints) == 0 {
-				logger.Error().Msgf(
-					"❌ All %d session endpoints are sanctioned for service %s, app %s. SKIPPING the app.",
-					len(sessionEndpoints), serviceID, app.Address,
-				)
-				continue
-			}
-			qualifiedEndpoints = filteredEndpoints
-
-			logger.Debug().Msgf("app %s has %d endpoints after filtering sanctioned endpoints.", app.Address, len(qualifiedEndpoints))
-		}
-
 		// Filter out low-reputation endpoints if reputation service is enabled.
-		// This provides gradual exclusion based on score in addition to binary sanctions.
+		// Reputation is the primary endpoint quality system - it provides gradual
+		// exclusion based on score and allows recovery via health checks.
 		if p.reputationService != nil {
 			beforeCount := len(qualifiedEndpoints)
 			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, logger)
@@ -697,9 +884,174 @@ func (p *Protocol) GetTotalServiceEndpointsCount(serviceID protocol.ServiceID, h
 func (p *Protocol) HydrateDisqualifiedEndpointsResponse(serviceID protocol.ServiceID, details *devtools.DisqualifiedEndpointResponse) {
 	p.logger.Info().Msgf("hydrating disqualified endpoints response for service ID: %s", serviceID)
 
+	// Protocol-level disqualified endpoints are now managed by the reputation system.
+	// Low-reputation endpoints are filtered out during selection, not permanently banned.
 	details.ProtocolLevelDisqualifiedEndpoints = make(map[string]devtools.ProtocolLevelDataResponse)
 
-	for rpcType, sanctionedEndpointsStore := range p.sanctionedEndpointsStores {
-		details.ProtocolLevelDisqualifiedEndpoints[rpcType.String()] = sanctionedEndpointsStore.getSanctionDetails(serviceID)
+	// TODO_FUTURE: Add reputation-based endpoint status reporting here
+	// This could show endpoints below threshold and their current scores
+}
+
+// recordReputationSignalsFromObservations maps protocol observations to reputation signals.
+// This is called by ApplyHTTPObservations to update endpoint reputation scores based on
+// health check results from the hydrator or any other observation source.
+func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations []*protocolobservations.ShannonRequestObservations) {
+	for _, observationSet := range shannonObservations {
+		httpObservations := observationSet.GetHttpObservations()
+		if httpObservations == nil {
+			continue
+		}
+
+		serviceID := protocol.ServiceID(observationSet.GetServiceId())
+
+		for _, endpointObs := range httpObservations.GetEndpointObservations() {
+			p.recordSignalFromObservation(serviceID, endpointObs)
+		}
 	}
+}
+
+// recordSignalFromObservation records a reputation signal for a single endpoint observation.
+// It maps the observation's error type and sanction type to a reputation signal and records it.
+// Also records probation traffic metrics if the endpoint is in probation.
+func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonEndpointObservation) {
+	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
+
+	// Build endpoint key for reputation service
+	key := reputation.NewEndpointKey(serviceID, endpointAddr)
+
+	// Map observation to signal using the existing mapping function
+	errorType := obs.GetErrorType()
+	sanctionType := obs.GetRecommendedSanction()
+
+	var signal reputation.Signal
+	var isSuccess bool
+
+	// No error = success
+	if errorType == protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED {
+		signal = reputation.NewSuccessSignal(0)
+		isSuccess = true
+	} else {
+		// Map error type and sanction type to a reputation signal
+		signal = mapErrorToSignal(errorType, sanctionType, 0)
+		isSuccess = false
+	}
+
+	// Check if this endpoint is in probation and record probation traffic metric
+	selector := p.getTieredSelectorForService(serviceID)
+	if selector != nil && selector.Config().Probation.Enabled && selector.IsInProbation(key) {
+		domain := extractEndpointDomain(string(endpointAddr), p.logger)
+		reputationmetrics.RecordProbationTraffic(string(serviceID), domain, isSuccess)
+
+		// If probation traffic succeeds, apply recovery multiplier to the signal
+		if isSuccess && selector.Config().Probation.RecoveryMultiplier > 0 {
+			// Apply recovery multiplier to boost recovery
+			signal = signal.WithMultiplier(selector.Config().Probation.RecoveryMultiplier)
+		}
+	}
+
+	// Record signal (fire-and-forget, non-blocking)
+	ctx := context.Background()
+	if err := p.reputationService.RecordSignal(ctx, key, signal); err != nil {
+		p.logger.Warn().Err(err).
+			Str("endpoint", string(endpointAddr)).
+			Str("service", string(serviceID)).
+			Str("error_type", errorType.String()).
+			Msg("Failed to record reputation signal from observation")
+	}
+}
+
+// ** Health Check Integration **
+
+// GetEndpointsForHealthCheck returns a function that provides endpoint information
+// for health checks. This is used by the HealthCheckExecutor.RunAllChecks method.
+//
+// The returned function:
+//   - Gets sessions for the service from all owned apps
+//   - Extracts endpoints from sessions with HTTP and WebSocket URLs
+//   - Returns []gateway.EndpointInfo suitable for health checks
+//
+// Note: This does NOT filter by reputation - health checks should run against
+// all endpoints to allow recovery of low-scoring endpoints.
+func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gateway.EndpointInfo, error) {
+	return func(serviceID protocol.ServiceID) ([]gateway.EndpointInfo, error) {
+		ctx := context.Background()
+
+		// Get active sessions for this service (without filtering by reputation)
+		activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get sessions for service %s: %w", serviceID, err)
+		}
+
+		if len(activeSessions) == 0 {
+			p.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Msg("No active sessions for service")
+			return nil, nil
+		}
+
+		// Collect all unique endpoints from all sessions
+		allEndpoints := make(map[protocol.EndpointAddr]endpoint)
+
+		for _, session := range activeSessions {
+			sessionEndpoints, err := endpointsFromSession(session, "")
+			if err != nil {
+				p.logger.Warn().
+					Err(err).
+					Str("service_id", string(serviceID)).
+					Str("session_id", session.SessionId).
+					Msg("Failed to get endpoints from session")
+				continue
+			}
+			maps.Copy(allEndpoints, sessionEndpoints)
+		}
+
+		// Also include fallback endpoints if configured
+		fallbackEndpoints, _ := p.getServiceFallbackEndpoints(serviceID)
+		maps.Copy(allEndpoints, fallbackEndpoints)
+
+		if len(allEndpoints) == 0 {
+			return nil, nil
+		}
+
+		// Convert to gateway.EndpointInfo
+		result := make([]gateway.EndpointInfo, 0, len(allEndpoints))
+		for _, ep := range allEndpoints {
+			info := gateway.EndpointInfo{
+				Addr:    ep.Addr(),
+				HTTPURL: ep.PublicURL(),
+			}
+
+			// Get WebSocket URL if available
+			if wsURL, err := ep.WebsocketURL(); err == nil {
+				info.WebSocketURL = wsURL
+			}
+
+			result = append(result, info)
+		}
+
+		p.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Int("endpoint_count", len(result)).
+			Msg("Retrieved endpoints for health checks")
+
+		return result, nil
+	}
+}
+
+// GetReputationService returns the reputation service instance used by the protocol.
+// This is used by the health check executor to record health check results.
+func (p *Protocol) GetReputationService() reputation.ReputationService {
+	return p.reputationService
+}
+
+// GetUnifiedServicesConfig returns the unified services configuration.
+// This is used by components that need access to per-service configuration overrides.
+func (p *Protocol) GetUnifiedServicesConfig() *gateway.UnifiedServicesConfig {
+	return p.unifiedServicesConfig
+}
+
+// GetConcurrencyConfig returns the concurrency configuration.
+// This is used by components that need to respect concurrency limits.
+func (p *Protocol) GetConcurrencyConfig() gateway.ConcurrencyConfig {
+	return p.concurrencyConfig
 }

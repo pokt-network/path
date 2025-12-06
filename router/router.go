@@ -73,8 +73,23 @@ func NewRouter(
 // E.g. Hyperliquid requires adding /evm endpoint, and this COULD (should?) exist directly on the protocol.
 // The router can act as an interim solution.
 func (r *router) handleRoutes() {
+	// Operational endpoints for Kubernetes probes and debugging
+
+	// GET /health - minimal liveness probe (200 OK, no body)
+	r.mux.HandleFunc("GET /health", methodCheckMiddleware(r.handleHealth))
+
 	// GET /healthz - returns a JSON health check response indicating the ready status of PATH
+	// Deprecated: Use /health for liveness, /ready for readiness, and /config for configuration.
+	//nolint:staticcheck // Intentionally keeping deprecated endpoint during transition period
 	r.mux.HandleFunc("GET /healthz", methodCheckMiddleware(r.healthChecker.HealthzHandler))
+
+	// GET /ready - readiness probe for all services (200 if ready, 503 if not)
+	// GET /ready/{serviceId} - readiness probe for specific service
+	r.mux.HandleFunc("GET /ready", methodCheckMiddleware(r.handleReady))
+	r.mux.HandleFunc("GET /ready/", methodCheckMiddleware(r.handleReady))
+
+	// GET /config - returns sanitized active configuration (no secrets)
+	r.mux.HandleFunc("GET /config", methodCheckMiddleware(r.handleConfig))
 
 	// GET /v1/disqualified_endpoints/{service_id} - returns a JSON list of disqualified endpoints for a given service ID
 	r.mux.HandleFunc("GET /disqualified_endpoints", methodCheckMiddleware(r.handleDisqualifiedEndpoints))

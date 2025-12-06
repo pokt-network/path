@@ -1,16 +1,22 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	concurrencymetrics "github.com/pokt-network/path/metrics/concurrency"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
+	retrymetrics "github.com/pokt-network/path/metrics/retry"
 	pathhttp "github.com/pokt-network/path/network/http"
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
@@ -30,9 +36,8 @@ const (
 	// - Experiment with this feature in a single gateway and evaluate the results.
 	// - Collect and analyze the metrics of this feature, ensuring it does not lead to excessive resource usage or token burn
 	// - If all endpoints are sanctioned, send parallel requests by default
-	// - Make this configurable at the gateway level yaml config
+	// - ✅ DONE: Made configurable via concurrency_config.max_parallel_endpoints in YAML
 	// - Enable parallel requests for gateways that maintain their own backend nodes as a special config
-	maxParallelRequests = 1
 
 	// RelayRequestTimeout is the timeout for relay requests
 	// TODO_TECHDEBT: Look into whether we can remove this variable altogether and consolidate
@@ -76,6 +81,10 @@ type requestContext struct {
 	// of explicitly defining PATH gateway's components and their interactions.
 	dataReporter RequestResponseReporter
 
+	// observationQueue handles async, sampled observation processing.
+	// If nil, no async observation processing occurs.
+	observationQueue *ObservationQueue
+
 	// QoS related request context
 	serviceID  protocol.ServiceID
 	serviceQoS QoSService
@@ -101,6 +110,22 @@ type requestContext struct {
 	// Tracks whether the request was rejected by the QoS.
 	// This is needed for handling the observations: there will be no protocol context/observations in this case.
 	requestRejectedByQoS bool
+
+	// HTTP request metadata for async observation processing.
+	// These are captured from the original HTTP request for use in QueuedObservation.
+	httpRequestPath    string
+	httpRequestMethod  string
+	httpRequestHeaders map[string]string
+	httpRequestBody    []byte
+	httpRequestTime    time.Time
+
+	// originalHTTPRequest stores the original HTTP request for endpoint selection during retries.
+	// Required for retry endpoint rotation to select different endpoints on each retry attempt.
+	originalHTTPRequest *http.Request
+
+	// requestID is a unique identifier for this request, used for log correlation.
+	// It is either extracted from the X-Request-ID header or generated as a new UUID.
+	requestID string
 }
 
 // InitFromHTTPRequest builds the required context for serving an HTTP request.
@@ -108,7 +133,23 @@ type requestContext struct {
 //   - The target service ID
 //   - The Service QoS instance
 func (rc *requestContext) InitFromHTTPRequest(httpReq *http.Request) error {
+	// Extract or generate request ID for log correlation.
+	// Check common headers: X-Request-ID, X-Correlation-ID, X-Trace-ID
+	rc.requestID = httpReq.Header.Get("X-Request-ID")
+	if rc.requestID == "" {
+		rc.requestID = httpReq.Header.Get("X-Correlation-ID")
+	}
+	if rc.requestID == "" {
+		rc.requestID = httpReq.Header.Get("X-Trace-ID")
+	}
+	if rc.requestID == "" {
+		rc.requestID = uuid.New().String()
+	}
+
 	rc.logger = rc.getHTTPRequestLogger(httpReq)
+
+	// Store original HTTP request for endpoint selection during retries
+	rc.originalHTTPRequest = httpReq
 
 	// TODO_MVP(@adshmh): The HTTPRequestParser should return a context, similar to QoS, which is then used to get a QoS instance and the observation set.
 	// Extract the service ID and find the target service's corresponding QoS instance.
@@ -183,7 +224,12 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	}
 
 	// Select multiple endpoints for parallel relay attempts
-	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultiple(availableEndpoints, maxParallelRequests)
+	// Use per-service max_parallel_endpoints with fallback to global config (default: 1)
+	maxParallelEndpoints := rc.protocol.GetConcurrencyConfig().MaxParallelEndpoints // Global default
+	if concurrencyConfig := rc.getConcurrencyConfigForService(); concurrencyConfig != nil && concurrencyConfig.MaxParallelEndpoints != nil {
+		maxParallelEndpoints = *concurrencyConfig.MaxParallelEndpoints // Per-service override
+	}
+	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultiple(availableEndpoints, uint(maxParallelEndpoints))
 	if err != nil || len(selectedEndpoints) == 0 {
 		// no protocol context will be built: use the endpointLookup observation.
 		rc.updateProtocolObservations(&endpointLookupObs)
@@ -197,6 +243,10 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 
 	// Prepare Protocol contexts for all selected endpoints
 	numSelectedEndpoints := len(selectedEndpoints)
+
+	// Record parallel endpoint metrics to track token burn multiplier
+	concurrencymetrics.RecordParallelEndpoints(string(rc.serviceID), numSelectedEndpoints)
+
 	rc.protocolContexts = make([]ProtocolRequestContext, 0, numSelectedEndpoints)
 	var lastProtocolCtxSetupErrObs *protocolobservations.Observations
 
@@ -334,8 +384,17 @@ func (rc *requestContext) broadcastObservationsInternal() {
 	var qosObservations qosobservations.Observations
 	if rc.qosCtx != nil {
 		qosObservations = rc.qosCtx.GetObservations()
-		if err := rc.serviceQoS.ApplyObservations(&qosObservations); err != nil {
-			rc.logger.Warn().Err(err).Msg("error applying QoS observations.")
+
+		// Only apply observations synchronously if the observation pipeline is not enabled.
+		// When the pipeline is enabled, we rely on:
+		// 1. Health checks (100%) for primary block height updates
+		// 2. Observation pipeline (sampled async) for user request-based updates
+		// This avoids heavy parsing on every request.
+		observationPipelineEnabled := rc.observationQueue != nil && rc.observationQueue.IsEnabled()
+		if !observationPipelineEnabled {
+			if err := rc.serviceQoS.ApplyObservations(&qosObservations); err != nil {
+				rc.logger.Warn().Err(err).Msg("error applying QoS observations.")
+			}
 		}
 	}
 
@@ -358,6 +417,11 @@ func (rc *requestContext) broadcastObservationsInternal() {
 	}
 }
 
+// GetRequestID returns the request ID for this request context.
+func (rc *requestContext) GetRequestID() string {
+	return rc.requestID
+}
+
 // getHTTPRequestLogger returns a logger with attributes set using the supplied HTTP request.
 func (rc *requestContext) getHTTPRequestLogger(httpReq *http.Request) polylog.Logger {
 	var urlStr string
@@ -366,6 +430,7 @@ func (rc *requestContext) getHTTPRequestLogger(httpReq *http.Request) polylog.Lo
 	}
 
 	return rc.logger.With(
+		"request_id", rc.requestID,
 		"http_req_url", urlStr,
 		"http_req_host", httpReq.Host,
 		"http_req_remote_addr", httpReq.RemoteAddr,
@@ -476,4 +541,256 @@ func (rc *requestContext) updateGatewayObservationsWithParallelRequests(numReque
 		NumFailed:     int32(numFailed),
 		NumCanceled:   int32(numCanceled),
 	}
+}
+
+// captureHTTPRequestMetadata captures the HTTP request metadata for async observation processing.
+// This method reads the request body and restores it so it can be read again by downstream processing.
+// It should be called early in the request lifecycle before the body is consumed.
+//
+// The captured metadata is stored in the requestContext for later use when queuing observations.
+func (rc *requestContext) captureHTTPRequestMetadata(httpReq *http.Request) {
+	rc.httpRequestTime = time.Now()
+	rc.httpRequestPath = httpReq.URL.Path
+	rc.httpRequestMethod = httpReq.Method
+
+	// Capture headers (excluding sensitive ones)
+	rc.httpRequestHeaders = make(map[string]string)
+	for key, values := range httpReq.Header {
+		if len(values) > 0 {
+			// Skip sensitive headers (case-insensitive check)
+			lowerKey := strings.ToLower(key)
+			if lowerKey == "authorization" || lowerKey == "cookie" || lowerKey == "x-api-key" {
+				continue
+			}
+			rc.httpRequestHeaders[key] = values[0]
+		}
+	}
+
+	// Read and restore the request body
+	if httpReq.Body != nil {
+		bodyBytes, err := io.ReadAll(httpReq.Body)
+		if err != nil {
+			rc.logger.Debug().Err(err).Msg("Failed to read request body for observation queue")
+			return
+		}
+		// Store the body bytes
+		rc.httpRequestBody = bodyBytes
+		// Restore the body so it can be read again
+		httpReq.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
+}
+
+// tryQueueObservation attempts to queue an observation for async processing.
+// This method is non-blocking - if the queue is full or disabled, it silently skips.
+// It creates a QueuedObservation with all the captured request/response context.
+//
+// This should be called after UpdateWithResponse() to include the response data.
+func (rc *requestContext) tryQueueObservation(endpointAddr protocol.EndpointAddr, responseBody []byte, httpStatusCode int) {
+	// Skip if observation queue is not configured
+	if rc.observationQueue == nil {
+		return
+	}
+
+	// Skip if the queue is not enabled
+	if !rc.observationQueue.IsEnabled() {
+		return
+	}
+
+	// Calculate latency from request start time
+	latency := time.Since(rc.httpRequestTime)
+
+	// Create the queued observation with all context
+	obs := &QueuedObservation{
+		ServiceID:          rc.serviceID,
+		EndpointAddr:       endpointAddr,
+		Source:             SourceUserRequest,
+		Timestamp:          time.Now(),
+		Latency:            latency,
+		RequestID:          rc.requestID,
+		RequestPath:        rc.httpRequestPath,
+		RequestHTTPMethod:  rc.httpRequestMethod,
+		RequestHeaders:     rc.httpRequestHeaders,
+		RequestBody:        rc.httpRequestBody,
+		ResponseStatusCode: httpStatusCode,
+		ResponseBody:       responseBody,
+	}
+
+	// Try to queue (non-blocking, sampled)
+	rc.observationQueue.TryQueue(obs)
+}
+
+// getRetryConfigForService retrieves the retry configuration for the current service.
+// Returns nil if no retry configuration is available or if the service is not found.
+func (rc *requestContext) getRetryConfigForService() *ServiceRetryConfig {
+	if rc.protocol == nil {
+		return nil
+	}
+
+	unifiedConfig := rc.protocol.GetUnifiedServicesConfig()
+	if unifiedConfig == nil {
+		return nil
+	}
+
+	// Get merged service config (with defaults applied)
+	mergedConfig := unifiedConfig.GetMergedServiceConfig(rc.serviceID)
+	if mergedConfig == nil {
+		return nil
+	}
+
+	return mergedConfig.RetryConfig
+}
+
+// getConcurrencyConfigForService returns the merged concurrency configuration for the current service.
+// This includes both global defaults and per-service overrides.
+func (rc *requestContext) getConcurrencyConfigForService() *ServiceConcurrencyConfig {
+	unifiedConfig := rc.protocol.GetUnifiedServicesConfig()
+	if unifiedConfig == nil {
+		return nil
+	}
+
+	// Get merged service config (with defaults applied)
+	mergedConfig := unifiedConfig.GetMergedServiceConfig(rc.serviceID)
+	if mergedConfig == nil {
+		return nil
+	}
+
+	return mergedConfig.ConcurrencyConfig
+}
+
+// shouldRetry determines if a request should be retried based on the error, status code, duration, and retry config.
+// Returns true if the request should be retried.
+// The requestDuration parameter is the time the failed request took - if it exceeds MaxRetryLatency, no retry is attempted.
+// The endpointDomain parameter is used for metrics recording when retries are skipped due to budget exceeded.
+func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration time.Duration, retryConfig *ServiceRetryConfig, endpointDomain string) bool {
+	// No retry config or retry disabled
+	if retryConfig == nil || retryConfig.Enabled == nil || !*retryConfig.Enabled {
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Bool("retry_enabled", false).
+				Msg("[RETRY] Retry disabled or no config")
+		}
+		return false
+	}
+
+	// Check time budget first - if the failed request took too long, don't retry
+	// This prevents making users wait even longer after a slow failure
+	if retryConfig.MaxRetryLatency != nil && *retryConfig.MaxRetryLatency > 0 {
+		if requestDuration > *retryConfig.MaxRetryLatency {
+			if rc.logger != nil {
+				rc.logger.Debug().
+					Str("service_id", string(rc.serviceID)).
+					Int("status_code", statusCode).
+					Dur("request_duration_ms", requestDuration).
+					Dur("max_retry_latency_ms", *retryConfig.MaxRetryLatency).
+					Msg("[RETRY] Request took too long, skipping retry (time budget exceeded)")
+			}
+			// Record metric for budget exceeded with retry reason
+			retryReason := rc.determineRetryReason(err, statusCode)
+			retrymetrics.RecordRetryBudgetSkipped(string(rc.serviceID), endpointDomain, retryReason)
+			return false
+		}
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Int("status_code", statusCode).
+				Dur("request_duration_ms", requestDuration).
+				Dur("max_retry_latency_ms", *retryConfig.MaxRetryLatency).
+				Msg("[RETRY] Request duration within time budget, checking retry conditions")
+		}
+	}
+
+	// Check for 5xx errors if configured
+	if retryConfig.RetryOn5xx != nil && *retryConfig.RetryOn5xx && statusCode >= 500 && statusCode < 600 {
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Int("status_code", statusCode).
+				Dur("request_duration_ms", requestDuration).
+				Str("retry_reason", "5xx_error").
+				Msg("[RETRY] Will retry due to 5xx status code")
+		}
+		return true
+	}
+
+	// If no error, nothing more to check
+	if err == nil {
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Int("status_code", statusCode).
+				Msg("[RETRY] No error and not 5xx, will not retry")
+		}
+		return false
+	}
+
+	// Check for timeout errors if configured
+	if retryConfig.RetryOnTimeout != nil && *retryConfig.RetryOnTimeout {
+		// Check if error is a timeout (context.DeadlineExceeded or contains "timeout")
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+			if rc.logger != nil {
+				rc.logger.Debug().
+					Str("service_id", string(rc.serviceID)).
+					Err(err).
+					Dur("request_duration_ms", requestDuration).
+					Str("retry_reason", "timeout").
+					Msg("[RETRY] Will retry due to timeout error")
+			}
+			return true
+		}
+	}
+
+	// Check for connection errors if configured
+	if retryConfig.RetryOnConnection != nil && *retryConfig.RetryOnConnection {
+		// Check if error is a connection error (contains "connection" or "dial")
+		errMsg := strings.ToLower(err.Error())
+		if strings.Contains(errMsg, "connection") || strings.Contains(errMsg, "dial") || strings.Contains(errMsg, "network") {
+			if rc.logger != nil {
+				rc.logger.Debug().
+					Str("service_id", string(rc.serviceID)).
+					Err(err).
+					Dur("request_duration_ms", requestDuration).
+					Str("retry_reason", "connection_error").
+					Msg("[RETRY] Will retry due to connection error")
+			}
+			return true
+		}
+	}
+
+	if rc.logger != nil {
+		rc.logger.Debug().
+			Str("service_id", string(rc.serviceID)).
+			Err(err).
+			Int("status_code", statusCode).
+			Dur("request_duration_ms", requestDuration).
+			Msg("[RETRY] No retry conditions met")
+	}
+	return false
+}
+
+// determineRetryReason determines the retry reason for metrics based on error and status code.
+func (rc *requestContext) determineRetryReason(err error, statusCode int) string {
+	// Check for 5xx errors first
+	if statusCode >= 500 && statusCode < 600 {
+		return retrymetrics.RetryReason5xx
+	}
+
+	// If no error, return empty (should not happen in retry context)
+	if err == nil {
+		return ""
+	}
+
+	// Check for timeout errors
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+		return retrymetrics.RetryReasonTimeout
+	}
+
+	// Check for connection errors
+	errMsg := strings.ToLower(err.Error())
+	if strings.Contains(errMsg, "connection") || strings.Contains(errMsg, "dial") || strings.Contains(errMsg, "network") {
+		return retrymetrics.RetryReasonConnectionError
+	}
+
+	// Default to connection error for unknown cases
+	return retrymetrics.RetryReasonConnectionError
 }

@@ -43,9 +43,9 @@ func Test_handleHealthz(t *testing.T) {
 		expectedBody   string
 	}{
 		{
-			name:           "should return 200 with status ok",
+			name:           "should return 200 with status ok and deprecation notice",
 			expectedStatus: http.StatusOK,
-			expectedBody:   `{"status":"ready","imageTag":"development"}`,
+			expectedBody:   `{"deprecated":"This endpoint is deprecated. Use /health for liveness, /ready for readiness, and /config for configuration.","status":"ready","imageTag":"development"}`,
 		},
 	}
 

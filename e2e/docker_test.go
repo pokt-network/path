@@ -38,6 +38,14 @@ const (
 	// maxPathHealthCheckWaitTimeMillisec is the maximum amount of time a started PATH container has to report its status as healthy.
 	// Once this time expires, the associated E2E test is marked as failed and the PATH container is removed.
 	maxPathHealthCheckWaitTimeMillisec = 180_000
+
+	// Redis container settings
+	redisContainerName = "path-e2e-redis"
+	redisImage         = "redis"
+	redisImageTag      = "7-alpine"
+	redisInternalPort  = "6379"
+	// networkName is the Docker network used for container communication
+	networkName = "path-e2e-network"
 )
 
 // getDockerfileName returns the Dockerfile to use, configurable via TEST_DOCKERFILE env var.
@@ -60,6 +68,108 @@ func getImageName() string {
 // eg. 3069/tcp
 var containerPortAndProtocol = internalPathPort + "/tcp"
 
+// redisResource holds the Redis container resource for cleanup
+var redisResource *dockertest.Resource
+
+// setupDockerNetwork creates a Docker network for container communication.
+// Returns the network ID or empty string if network already exists.
+func setupDockerNetwork(t *testing.T, pool *dockertest.Pool) string {
+	t.Helper()
+
+	// Check if network already exists
+	networks, err := pool.Client.ListNetworks()
+	if err != nil {
+		t.Fatalf("Could not list networks: %s", err)
+	}
+
+	for _, n := range networks {
+		if n.Name == networkName {
+			fmt.Printf("  📡 Using existing Docker network: %s\n", networkName)
+			return n.ID
+		}
+	}
+
+	// Create the network
+	network, err := pool.Client.CreateNetwork(docker.CreateNetworkOptions{
+		Name:   networkName,
+		Driver: "bridge",
+	})
+	if err != nil {
+		t.Fatalf("Could not create network: %s", err)
+	}
+
+	fmt.Printf("  📡 Created Docker network: %s\n", networkName)
+	return network.ID
+}
+
+// setupRedisContainer starts a Redis container for e2e tests.
+// Returns the Redis container resource.
+func setupRedisContainer(t *testing.T, pool *dockertest.Pool, networkID string) *dockertest.Resource {
+	t.Helper()
+
+	fmt.Println("🔴 Starting Redis container for e2e tests...")
+
+	// Run Redis container
+	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
+		Name:       redisContainerName,
+		Repository: redisImage,
+		Tag:        redisImageTag,
+		NetworkID:  networkID,
+	}, func(config *docker.HostConfig) {
+		config.AutoRemove = true
+		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
+	})
+	if err != nil {
+		t.Fatalf("Could not start Redis container: %s", err)
+	}
+
+	if err := resource.Expire(containerExpirySeconds); err != nil {
+		t.Fatalf("Could not set Redis container expiry: %s", err)
+	}
+
+	// Wait for Redis to be ready
+	redisPort := resource.GetPort(redisInternalPort + "/tcp")
+	fmt.Printf("  🔴 Redis container started on port %s\n", redisPort)
+
+	// Verify Redis is responding
+	if err := pool.Retry(func() error {
+		// Simple TCP connection check - Redis responds to PING
+		conn, err := pool.Client.InspectContainer(resource.Container.ID)
+		if err != nil {
+			return err
+		}
+		if !conn.State.Running {
+			return fmt.Errorf("redis container not running")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Could not connect to Redis: %s", err)
+	}
+
+	fmt.Println("  ✅ Redis container is ready!")
+	return resource
+}
+
+// cleanupRedisContainer removes the Redis container.
+func cleanupRedisContainer(t *testing.T, pool *dockertest.Pool, resource *dockertest.Resource) {
+	t.Helper()
+	if resource != nil {
+		if err := pool.Purge(resource); err != nil {
+			t.Logf("Warning: could not purge Redis container: %s", err)
+		}
+	}
+}
+
+// cleanupDockerNetwork removes the Docker network.
+func cleanupDockerNetwork(t *testing.T, pool *dockertest.Pool, networkID string) {
+	t.Helper()
+	if networkID != "" {
+		if err := pool.Client.RemoveNetwork(networkID); err != nil {
+			t.Logf("Warning: could not remove network: %s", err)
+		}
+	}
+}
+
 // setupPathInstance starts an instance of PATH in a Docker container.
 //
 // Returns:
@@ -73,12 +183,32 @@ func setupPathInstance(
 ) (containerPort string, cleanupFn func()) {
 	t.Helper()
 
-	// Initialize the ephemeral PATH Docker container
-	pool, resource, containerPort, logOutputFile := setupPathDocker(t, configFilePath, dockerOpts)
+	// Initialize dockertest pool first (needed for Redis and network setup)
+	pool, err := dockertest.NewPool("")
+	if err != nil {
+		t.Fatalf("Could not construct pool: %s", err)
+	}
+	pool.MaxWait = time.Duration(maxPathHealthCheckWaitTimeMillisec) * time.Millisecond
+
+	// Setup Docker network for container communication
+	networkID := setupDockerNetwork(t, pool)
+
+	// Start Redis container first (PATH depends on it)
+	redisRes := setupRedisContainer(t, pool, networkID)
+
+	// Initialize the ephemeral PATH Docker container (connected to same network)
+	pathResource, containerPort, logOutputFile := setupPathDocker(t, pool, networkID, configFilePath, dockerOpts)
 
 	cleanupFn = func() {
 		// Cleanup the ephemeral PATH Docker container
-		cleanupPathDocker(t, pool, resource)
+		cleanupPathDocker(t, pool, pathResource)
+
+		// Cleanup Redis container
+		cleanupRedisContainer(t, pool, redisRes)
+
+		// Cleanup the network (after all containers are removed)
+		cleanupDockerNetwork(t, pool, networkID)
+
 		if logOutputFile != "" {
 			fmt.Printf("\n%s===== 👀 LOGS 👀 =====%s\n", BOLD_CYAN, RESET)
 			fmt.Printf("\n ✍️ PATH container output logged to %s ✍️ \n\n", logOutputFile)
@@ -96,14 +226,17 @@ func setupPathInstance(
 // - Mounts necessary configuration files.
 // - Sets environment variables for the container.
 // - Exposes required ports and sets extra hosts.
+// - Connects to the provided Docker network (for Redis communication).
 // - Sets up a signal handler to clean up the container on termination signals.
-// - Performs a health check to ensure the container is ready for requests.
-// - Returns the dockertest pool, resource, and the container port.
+// - Performs a readiness check to ensure the container is ready for requests.
+// - Returns the resource, container port, and log output file path.
 func setupPathDocker(
 	t *testing.T,
+	pool *dockertest.Pool,
+	networkID string,
 	configFilePath string,
 	dockerOpts DockerConfig,
-) (*dockertest.Pool, *dockertest.Resource, string, string) {
+) (*dockertest.Resource, string, string) {
 	t.Helper()
 
 	// Get docker options from the global test options
@@ -120,13 +253,6 @@ func setupPathDocker(
 
 	// eg. {file_path}/path/e2e/config/.shannon.config.yaml:/app/config/.config.yaml
 	containerConfigMount := configFilePath + configMountPoint
-
-	// Initialize the dockertest pool
-	pool, err := dockertest.NewPool("")
-	if err != nil {
-		t.Fatalf("Could not construct pool: %s", err)
-	}
-	pool.MaxWait = time.Duration(maxPathHealthCheckWaitTimeMillisec) * time.Millisecond
 
 	// Get dockerfile and image name (configurable via TEST_DOCKERFILE env var)
 	dockerfileName := getDockerfileName()
@@ -165,7 +291,7 @@ func setupPathDocker(
 
 	fmt.Println("\n🌿 Starting PATH test container ...")
 
-	// Run the built image
+	// Run the built image - connect to network for Redis communication
 	runOpts := &dockertest.RunOptions{
 		Name:         containerName,
 		Repository:   imageName,
@@ -173,6 +299,7 @@ func setupPathDocker(
 		Env:          []string{containerEnvImageTag},
 		ExposedPorts: []string{containerPortAndProtocol},
 		ExtraHosts:   []string{containerExtraHost},
+		NetworkID:    networkID, // Connect to same network as Redis
 	}
 	resource, err := pool.RunWithOptions(runOpts, func(config *docker.HostConfig) {
 		config.AutoRemove = true
@@ -278,25 +405,27 @@ func setupPathDocker(
 
 	fmt.Println("  ✅ PATH test container started successfully!")
 
-	// performs a health check on the PATH container to ensure it is ready for requests
-	healthCheckURL := fmt.Sprintf("http://%s/healthz", resource.GetHostPort(containerPortAndProtocol))
+	// performs a readiness check on the PATH container to ensure it is ready for requests
+	// Using /ready instead of deprecated /healthz - /ready checks for sessions and endpoints
+	readinessURL := fmt.Sprintf("http://%s/ready", resource.GetHostPort(containerPortAndProtocol))
 
-	fmt.Printf("🏥  Performing health check on PATH test container at %s%s%s ...\n", CYAN, healthCheckURL, RESET)
+	fmt.Printf("🏥  Performing readiness check on PATH test container at %s%s%s ...\n", CYAN, readinessURL, RESET)
 
 	poolRetryChan := make(chan struct{}, 1)
 	retryConnectFn := func() error {
-		resp, err := http.Get(healthCheckURL)
+		resp, err := http.Get(readinessURL)
 		if err != nil {
-			return fmt.Errorf("unable to connect to health check endpoint: %w", err)
+			return fmt.Errorf("unable to connect to readiness endpoint: %w", err)
 		}
 		defer resp.Body.Close()
 
-		// the health check endpoint returns a 200 OK status if the service is ready
+		// the readiness endpoint returns a 200 OK status if the service is ready
+		// (has sessions and endpoints available)
 		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("health check endpoint returned non-200 status: %d", resp.StatusCode)
+			return fmt.Errorf("readiness endpoint returned non-200 status: %d", resp.StatusCode)
 		}
 
-		// notify the pool that the health check was successful
+		// notify the pool that the readiness check was successful
 		poolRetryChan <- struct{}{}
 		return nil
 	}
@@ -304,11 +433,11 @@ func setupPathDocker(
 		t.Fatalf("could not connect to docker: %s", err)
 	}
 
-	fmt.Println("  ✅ PATH test container is healthy and ready for tests!")
+	fmt.Println("  ✅ PATH test container is ready and has active sessions!")
 
 	<-poolRetryChan
 
-	return pool, resource, resource.GetPort(containerPortAndProtocol), logOutputFile
+	return resource, resource.GetPort(containerPortAndProtocol), logOutputFile
 }
 
 // cleanupPathDocker purges the Docker container and resource from the provided dockertest pool and resource.
