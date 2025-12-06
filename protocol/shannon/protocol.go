@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"runtime"
+	"time"
 
 	"github.com/alitto/pond/v2"
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -83,6 +83,10 @@ type Protocol struct {
 	// Allows measuring performance of PATH and full node(s) in isolation.
 	loadTestingConfig *LoadTestingConfig
 
+	// concurrencyConfig controls concurrency limits for request processing.
+	// These limits protect against resource exhaustion from batch requests and parallel relays.
+	concurrencyConfig gateway.ConcurrencyConfig
+
 	// reputationService tracks endpoint reputation scores.
 	// If enabled, endpoints are filtered by score in addition to binary sanctions.
 	// When nil, only binary sanctions are used for endpoint filtering.
@@ -124,6 +128,57 @@ func NewProtocol(
 		return nil, fmt.Errorf("failed to get app addresses from config: %w", err)
 	}
 
+	// Wire up defaults from parent config to unified services config.
+	// This allows gateway_config top-level settings to serve as defaults for all services,
+	// eliminating the need for a separate "defaults" section in YAML.
+	config.UnifiedServices.SetDefaultsFromParent(gateway.ParentConfigDefaults{
+		TieredSelectionEnabled:      config.ReputationConfig.TieredSelection.Enabled,
+		Tier1Threshold:              config.ReputationConfig.TieredSelection.Tier1Threshold,
+		Tier2Threshold:              config.ReputationConfig.TieredSelection.Tier2Threshold,
+		ProbationEnabled:            config.ReputationConfig.TieredSelection.Probation.Enabled,
+		ProbationThreshold:          config.ReputationConfig.TieredSelection.Probation.Threshold,
+		ProbationTrafficPercent:     config.ReputationConfig.TieredSelection.Probation.TrafficPercent,
+		ProbationRecoveryMultiplier: config.ReputationConfig.TieredSelection.Probation.RecoveryMultiplier,
+		RetryEnabled:                config.RetryConfig.Enabled,
+		MaxRetries:                  config.RetryConfig.MaxRetries,
+		RetryOn5xx:                  config.RetryConfig.RetryOn5xx,
+		RetryOnTimeout:              config.RetryConfig.RetryOnTimeout,
+		RetryOnConnection:           config.RetryConfig.RetryOnConnection,
+		MaxRetryLatency: func() time.Duration {
+			if config.RetryConfig.MaxRetryLatency != nil {
+				return *config.RetryConfig.MaxRetryLatency
+			}
+			return 0
+		}(),
+		ObservationPipelineEnabled: config.ObservationPipelineConfig.Enabled,
+		SampleRate:                 config.ObservationPipelineConfig.SampleRate,
+		HealthChecksEnabled:        config.ActiveHealthChecksConfig.Enabled,
+		HealthCheckInterval:        config.ActiveHealthChecksConfig.Coordination.RenewInterval,
+		SyncAllowance:              config.ActiveHealthChecksConfig.SyncAllowance,
+	})
+
+	// Apply defaults to concurrency config if not set.
+	// These defaults match the previous hardcoded behavior for backward compatibility.
+	if config.ConcurrencyConfig.MaxParallelEndpoints == 0 {
+		config.ConcurrencyConfig.MaxParallelEndpoints = 1
+	}
+	if config.ConcurrencyConfig.MaxConcurrentRelays == 0 {
+		config.ConcurrencyConfig.MaxConcurrentRelays = 5500
+	}
+	if config.ConcurrencyConfig.MaxBatchPayloads == 0 {
+		config.ConcurrencyConfig.MaxBatchPayloads = 5500
+	}
+
+	// 🚨 BIG WARNING: Parallel endpoints multiply token burn
+	if config.ConcurrencyConfig.MaxParallelEndpoints > 1 {
+		shannonLogger.Warn().
+			Int("max_parallel_endpoints", config.ConcurrencyConfig.MaxParallelEndpoints).
+			Msg("🚨 WARNING: max_parallel_endpoints > 1 is EXPERIMENTAL and will multiply token burn by the number of parallel endpoints! " +
+				"Each request will be sent to multiple endpoints simultaneously. " +
+				"Monitor your token usage and endpoint metrics closely. " +
+				"Recommended: Start with max_parallel_endpoints=1 and test thoroughly before increasing.")
+	}
+
 	protocolInstance := &Protocol{
 		logger: shannonLogger,
 
@@ -143,14 +198,17 @@ func NewProtocol(
 		httpClient: pathhttp.NewDefaultHTTPClientWithDebugMetrics(),
 
 		// relayPool is a shared worker pool for parallel relay processing.
-		// Uses MaxConcurrentRelaysPerRequest as the max workers to bound global concurrency.
-		relayPool: pond.NewPool(runtime.NumCPU() * 2),
+		// Uses MaxConcurrentRelays to bound global concurrency and prevent resource exhaustion.
+		relayPool: pond.NewPool(config.ConcurrencyConfig.MaxConcurrentRelays),
 
 		// serviceFallbacks contains the fallback information for each service.
 		serviceFallbackMap: config.getServiceFallbackMap(),
 
 		// load testing config, if specified.
 		loadTestingConfig: config.LoadTestingConfig,
+
+		// concurrency config controls parallel endpoint queries and batch request limits
+		concurrencyConfig: config.ConcurrencyConfig,
 
 		// unifiedServicesConfig for per-service configuration overrides
 		unifiedServicesConfig: &config.UnifiedServices,
@@ -184,6 +242,7 @@ func NewProtocol(
 		}
 
 		reputationSvc := reputation.NewService(config.ReputationConfig, store)
+		reputationSvc.SetLogger(reputationLogger)
 		if err := reputationSvc.Start(ctx); err != nil {
 			return nil, fmt.Errorf("failed to start reputation service: %w", err)
 		}
@@ -245,7 +304,8 @@ func NewProtocol(
 
 		// Create tiered selector if tiered selection is enabled
 		if config.ReputationConfig.TieredSelection.Enabled {
-			protocolInstance.tieredSelector = reputation.NewTieredSelector(
+			protocolInstance.tieredSelector = reputation.NewTieredSelectorWithLogger(
+				reputationLogger,
 				config.ReputationConfig.TieredSelection,
 				config.ReputationConfig.MinThreshold,
 			)
@@ -329,7 +389,8 @@ func NewProtocol(
 								svcTierConfig.Probation = config.ReputationConfig.TieredSelection.Probation
 							}
 
-							protocolInstance.serviceTieredSelectors[svc.ID] = reputation.NewTieredSelector(
+							protocolInstance.serviceTieredSelectors[svc.ID] = reputation.NewTieredSelectorWithLogger(
+								reputationLogger.With("service_id", string(svc.ID)),
 								svcTierConfig,
 								minThreshold,
 							)
@@ -551,18 +612,20 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 
 	// Return new request context for the pre-selected endpoint
 	return &requestContext{
-		logger:             p.logger,
-		context:            ctx,
-		fullNode:           p.FullNode,
-		selectedEndpoint:   selectedEndpoint,
-		serviceID:          serviceID,
-		relayRequestSigner: permittedSigner,
-		httpClient:         p.httpClient,
-		fallbackEndpoints:  fallbackEndpoints,
-		loadTestingConfig:  p.loadTestingConfig,
-		relayPool:          p.relayPool,
-		reputationService:  p.reputationService,
-		currentRPCType:     sharedtypes.RPCType_JSON_RPC, // Health checks use JSON-RPC by default
+		logger:                p.logger,
+		context:               ctx,
+		fullNode:              p.FullNode,
+		selectedEndpoint:      selectedEndpoint,
+		serviceID:             serviceID,
+		relayRequestSigner:    permittedSigner,
+		httpClient:            p.httpClient,
+		fallbackEndpoints:     fallbackEndpoints,
+		loadTestingConfig:     p.loadTestingConfig,
+		relayPool:             p.relayPool,
+		concurrencyConfig:     p.concurrencyConfig,
+		unifiedServicesConfig: p.unifiedServicesConfig,
+		reputationService:     p.reputationService,
+		currentRPCType:        sharedtypes.RPCType_JSON_RPC, // Health checks use JSON-RPC by default
 	}, protocolobservations.Observations{}, nil
 }
 
@@ -985,4 +1048,10 @@ func (p *Protocol) GetReputationService() reputation.ReputationService {
 // This is used by components that need access to per-service configuration overrides.
 func (p *Protocol) GetUnifiedServicesConfig() *gateway.UnifiedServicesConfig {
 	return p.unifiedServicesConfig
+}
+
+// GetConcurrencyConfig returns the concurrency configuration.
+// This is used by components that need to respect concurrency limits.
+func (p *Protocol) GetConcurrencyConfig() gateway.ConcurrencyConfig {
+	return p.concurrencyConfig
 }

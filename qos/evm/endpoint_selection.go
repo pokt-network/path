@@ -267,10 +267,17 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
 //   - The endpoint's block height is less than the perceived block height minus the sync allowance.
 func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error {
 	if ss.perceivedBlockNumber == 0 {
+		ss.logger.Debug().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Msg("🔍 Sync allowance check: no perceived block number yet")
 		return errNoBlockNumberObs
 	}
 
 	if check.parsedBlockNumberResponse == nil {
+		ss.logger.Debug().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Uint64("perceived_block", ss.perceivedBlockNumber).
+			Msg("🔍 Sync allowance check: endpoint has no block number observation")
 		return errNoBlockNumberObs
 	}
 
@@ -281,7 +288,25 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 	// then the endpoint is behind the chain and should be filtered out.
 	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
 	minAllowedBlockNumber := ss.perceivedBlockNumber - syncAllowance
+
+	// Log the sync allowance validation details
+	ss.logger.Debug().
+		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+		Uint64("endpoint_block", parsedBlockNumber).
+		Uint64("perceived_block", ss.perceivedBlockNumber).
+		Uint64("sync_allowance", syncAllowance).
+		Uint64("min_allowed_block", minAllowedBlockNumber).
+		Int64("blocks_behind", int64(ss.perceivedBlockNumber)-int64(parsedBlockNumber)).
+		Bool("within_allowance", parsedBlockNumber >= minAllowedBlockNumber).
+		Msg("🔍 Sync allowance validation")
+
 	if parsedBlockNumber < minAllowedBlockNumber {
+		ss.logger.Debug().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Uint64("endpoint_block", parsedBlockNumber).
+			Uint64("min_allowed_block", minAllowedBlockNumber).
+			Uint64("sync_allowance", syncAllowance).
+			Msg("❌ Endpoint failed sync allowance check - too far behind")
 		return fmt.Errorf("%w: block number %d is outside the sync allowance relative to min allowed block number %d and sync allowance %d",
 			errOutsideSyncAllowanceBlockNumberObs, parsedBlockNumber, minAllowedBlockNumber, syncAllowance)
 	}
@@ -293,15 +318,32 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 //   - The endpoint has not had an observation of its response to a `eth_chainId` request.
 //   - The endpoint's chain ID does not match the expected chain ID in the service state.
 func (ss *serviceState) isChainIDValid(check endpointCheckChainID) error {
+	expectedChainID := ss.serviceQoSConfig.getEVMChainID()
+
 	if check.chainID == nil {
+		ss.logger.Debug().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Str("expected_chain_id", string(expectedChainID)).
+			Msg("🔍 Chain ID check: endpoint has no chain ID observation")
 		return errNoChainIDObs
 	}
 
 	// Dereference pointer to show actual chain ID instead of memory address in error logs
 	chainID := *check.chainID
 
-	expectedChainID := ss.serviceQoSConfig.getEVMChainID()
+	ss.logger.Debug().
+		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+		Str("endpoint_chain_id", string(chainID)).
+		Str("expected_chain_id", string(expectedChainID)).
+		Bool("chain_id_matches", chainID == expectedChainID).
+		Msg("🔍 Chain ID validation")
+
 	if chainID != expectedChainID {
+		ss.logger.Debug().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Str("endpoint_chain_id", string(chainID)).
+			Str("expected_chain_id", string(expectedChainID)).
+			Msg("❌ Endpoint failed chain ID check - mismatch")
 		return fmt.Errorf("%w: chain ID %s does not match expected chain ID %s",
 			errInvalidChainIDObs, chainID, expectedChainID)
 	}

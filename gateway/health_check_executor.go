@@ -665,9 +665,9 @@ func (e *HealthCheckExecutor) recordCheckResult(
 			endpointDomain,
 			check.Name,
 			string(check.Type),
-			true,                    // success
-			"",                      // no error
-			latency.Seconds(),       // duration in seconds
+			true,              // success
+			"",                // no error
+			latency.Seconds(), // duration in seconds
 		)
 		return
 	}
@@ -692,9 +692,9 @@ func (e *HealthCheckExecutor) recordCheckResult(
 		endpointDomain,
 		check.Name,
 		string(check.Type),
-		false,                   // not success
+		false, // not success
 		errorType,
-		latency.Seconds(),       // duration in seconds
+		latency.Seconds(), // duration in seconds
 	)
 
 	e.logger.Debug().

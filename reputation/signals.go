@@ -186,6 +186,17 @@ func (s Signal) IsNegative() bool {
 	return s.GetDefaultImpact() < 0
 }
 
+// LatencyImpactResult contains the result of latency-aware impact calculation
+// along with metadata useful for logging/observability.
+type LatencyImpactResult struct {
+	FinalImpact     float64
+	BaseImpact      float64
+	Modifier        float64
+	LatencyCategory string // "fast", "normal", "slow", "very_slow", or "skipped"
+	Latency         time.Duration
+	Config          LatencyConfig
+}
+
 // CalculateLatencyAwareImpact calculates the score impact with latency modifiers.
 // For success signals, the impact is modified based on response latency:
 //   - Fast (< FastThreshold):      base_impact * FastBonus (default: +1 * 2.0 = +2)
@@ -198,31 +209,57 @@ func (s Signal) IsNegative() bool {
 // Additionally, if latency exceeds PenaltyThreshold or SevereThreshold,
 // an additional penalty signal should be recorded separately.
 func (s Signal) CalculateLatencyAwareImpact(config LatencyConfig) float64 {
+	result := s.CalculateLatencyAwareImpactWithDetails(config)
+	return result.FinalImpact
+}
+
+// CalculateLatencyAwareImpactWithDetails calculates the score impact with latency modifiers
+// and returns detailed information about the calculation for logging purposes.
+func (s Signal) CalculateLatencyAwareImpactWithDetails(config LatencyConfig) LatencyImpactResult {
 	baseImpact := s.GetDefaultImpact()
 
 	// Only apply latency modifiers to positive signals (success, recovery_success)
 	if baseImpact <= 0 || s.Latency == 0 || !config.Enabled {
-		return baseImpact
+		return LatencyImpactResult{
+			FinalImpact:     baseImpact,
+			BaseImpact:      baseImpact,
+			Modifier:        1.0,
+			LatencyCategory: "skipped",
+			Latency:         s.Latency,
+			Config:          config,
+		}
 	}
 
 	// Apply latency-based modifier for success signals
 	var modifier float64
+	var latencyCategory string
 	switch {
 	case s.Latency < config.FastThreshold:
 		// Fast response - bonus multiplier
 		modifier = config.FastBonus
+		latencyCategory = "fast"
 	case s.Latency < config.NormalThreshold:
 		// Normal response - standard impact
 		modifier = 1.0
+		latencyCategory = "normal"
 	case s.Latency < config.SlowThreshold:
 		// Slow response - reduced impact
 		modifier = config.SlowPenalty
+		latencyCategory = "slow"
 	default:
 		// Very slow response - minimal/no impact
 		modifier = config.VerySlowPenalty
+		latencyCategory = "very_slow"
 	}
 
-	return baseImpact * modifier
+	return LatencyImpactResult{
+		FinalImpact:     baseImpact * modifier,
+		BaseImpact:      baseImpact,
+		Modifier:        modifier,
+		LatencyCategory: latencyCategory,
+		Latency:         s.Latency,
+		Config:          config,
+	}
 }
 
 // ClassifyLatency returns the latency signal type based on thresholds.

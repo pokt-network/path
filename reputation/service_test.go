@@ -731,7 +731,7 @@ func TestService_PerServiceConfig(t *testing.T) {
 
 	// Test 2: Per-service MinThreshold override
 	solanaConfig := ServiceConfig{
-		InitialScore: 0,  // Not set, should use global
+		InitialScore: 0, // Not set, should use global
 		MinThreshold: 50,
 	}
 	svc.SetServiceConfig("solana", solanaConfig)

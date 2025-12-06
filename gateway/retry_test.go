@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -188,9 +189,9 @@ func TestShouldRetry(t *testing.T) {
 			expected:    false,
 		},
 		{
-			name:        "multiple retry conditions enabled - 5xx triggers",
-			err:         errors.New("server error"),
-			statusCode:  500,
+			name:       "multiple retry conditions enabled - 5xx triggers",
+			err:        errors.New("server error"),
+			statusCode: 500,
 			retryConfig: &ServiceRetryConfig{
 				Enabled:           boolPtr(true),
 				RetryOn5xx:        boolPtr(true),
@@ -200,9 +201,9 @@ func TestShouldRetry(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:        "multiple retry conditions enabled - timeout triggers",
-			err:         errors.New("timeout"),
-			statusCode:  0,
+			name:       "multiple retry conditions enabled - timeout triggers",
+			err:        errors.New("timeout"),
+			statusCode: 0,
 			retryConfig: &ServiceRetryConfig{
 				Enabled:           boolPtr(true),
 				RetryOn5xx:        boolPtr(true),
@@ -212,9 +213,9 @@ func TestShouldRetry(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:        "multiple retry conditions enabled - connection triggers",
-			err:         errors.New("connection refused"),
-			statusCode:  0,
+			name:       "multiple retry conditions enabled - connection triggers",
+			err:        errors.New("connection refused"),
+			statusCode: 0,
 			retryConfig: &ServiceRetryConfig{
 				Enabled:           boolPtr(true),
 				RetryOn5xx:        boolPtr(true),
@@ -224,9 +225,9 @@ func TestShouldRetry(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:        "unknown error with no matching conditions should not retry",
-			err:         errors.New("some random error"),
-			statusCode:  0,
+			name:       "unknown error with no matching conditions should not retry",
+			err:        errors.New("some random error"),
+			statusCode: 0,
 			retryConfig: &ServiceRetryConfig{
 				Enabled:           boolPtr(true),
 				RetryOn5xx:        boolPtr(false),
@@ -240,7 +241,7 @@ func TestShouldRetry(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rc := &requestContext{}
-			result := rc.shouldRetry(tt.err, tt.statusCode, tt.retryConfig)
+			result := rc.shouldRetry(tt.err, tt.statusCode, 100*time.Millisecond, tt.retryConfig, "")
 			require.Equal(t, tt.expected, result, "shouldRetry result mismatch for test case: %s", tt.name)
 		})
 	}
@@ -384,6 +385,14 @@ func (m *mockProtocolForRetry) GetTotalServiceEndpointsCount(serviceID protocol.
 func (m *mockProtocolForRetry) HydrateDisqualifiedEndpointsResponse(serviceID protocol.ServiceID, resp *devtools.DisqualifiedEndpointResponse) {
 }
 
+func (m *mockProtocolForRetry) GetConcurrencyConfig() ConcurrencyConfig {
+	return ConcurrencyConfig{
+		MaxParallelEndpoints: 1,
+		MaxConcurrentRelays:  5500,
+		MaxBatchPayloads:     5500,
+	}
+}
+
 func (m *mockProtocolForRetry) CheckWebsocketConnection(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr) *protocolobservations.Observations {
 	return nil
 }
@@ -500,7 +509,7 @@ func TestShouldRetryErrorMessageMatching(t *testing.T) {
 				}
 			}
 
-			result := rc.shouldRetry(err, 0, config)
+			result := rc.shouldRetry(err, 0, 100*time.Millisecond, config, "")
 			require.Equal(t, tt.expected, result)
 		})
 	}
@@ -537,7 +546,7 @@ func TestShouldRetryWithWrappedErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rc := &requestContext{}
-			result := rc.shouldRetry(tt.err, 0, tt.retryConfig)
+			result := rc.shouldRetry(tt.err, 0, 100*time.Millisecond, tt.retryConfig, "")
 			require.Equal(t, tt.expected, result)
 		})
 	}
@@ -585,7 +594,7 @@ func TestShouldRetryStatusCodeBoundaries(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rc := &requestContext{}
-			result := rc.shouldRetry(nil, tt.statusCode, config)
+			result := rc.shouldRetry(nil, tt.statusCode, 100*time.Millisecond, config, "")
 			require.Equal(t, tt.expected, result)
 		})
 	}
@@ -601,7 +610,7 @@ func TestShouldRetryPriorityOrder(t *testing.T) {
 		Enabled:    boolPtr(true),
 		RetryOn5xx: boolPtr(true),
 	}
-	result := rc.shouldRetry(nil, 503, config)
+	result := rc.shouldRetry(nil, 503, 100*time.Millisecond, config, "")
 	require.True(t, result, "5xx status should trigger retry even with nil error")
 
 	// Error conditions only checked if error is not nil
@@ -609,7 +618,7 @@ func TestShouldRetryPriorityOrder(t *testing.T) {
 		Enabled:        boolPtr(true),
 		RetryOnTimeout: boolPtr(true),
 	}
-	result2 := rc.shouldRetry(nil, 200, config2)
+	result2 := rc.shouldRetry(nil, 200, 100*time.Millisecond, config2, "")
 	require.False(t, result2, "timeout retry should not trigger with nil error")
 
 	// Both conditions can trigger independently
@@ -618,7 +627,7 @@ func TestShouldRetryPriorityOrder(t *testing.T) {
 		RetryOn5xx:     boolPtr(true),
 		RetryOnTimeout: boolPtr(true),
 	}
-	result3 := rc.shouldRetry(errors.New("timeout"), 503, config3)
+	result3 := rc.shouldRetry(errors.New("timeout"), 503, 100*time.Millisecond, config3, "")
 	require.True(t, result3, "both 5xx and timeout conditions should allow retry")
 }
 
@@ -662,7 +671,7 @@ func TestErrorStringMatching(t *testing.T) {
 				Enabled:        boolPtr(true),
 				RetryOnTimeout: boolPtr(true),
 			}
-			timeoutMatch := rc.shouldRetry(err, 0, timeoutConfig)
+			timeoutMatch := rc.shouldRetry(err, 0, 100*time.Millisecond, timeoutConfig, "")
 			if tt.expectType == "timeout" {
 				require.True(t, timeoutMatch, "Expected timeout pattern to match for: %s", tt.errorMsg)
 			} else {
@@ -674,7 +683,7 @@ func TestErrorStringMatching(t *testing.T) {
 				Enabled:           boolPtr(true),
 				RetryOnConnection: boolPtr(true),
 			}
-			connMatch := rc.shouldRetry(err, 0, connConfig)
+			connMatch := rc.shouldRetry(err, 0, 100*time.Millisecond, connConfig, "")
 			if tt.expectType == "connection" {
 				require.True(t, connMatch, "Expected connection pattern to match for: %s", tt.errorMsg)
 			} else {
@@ -711,13 +720,13 @@ func TestLowercaseConversion(t *testing.T) {
 
 	// First 4 errors should match timeout
 	for i := 0; i < 4; i++ {
-		result := rc.shouldRetry(errors[i], 0, timeoutConfig)
+		result := rc.shouldRetry(errors[i], 0, 100*time.Millisecond, timeoutConfig, "")
 		require.True(t, result, "Error '%s' should match timeout pattern", errors[i].Error())
 	}
 
 	// Last 3 errors should match connection
 	for i := 4; i < 7; i++ {
-		result := rc.shouldRetry(errors[i], 0, connConfig)
+		result := rc.shouldRetry(errors[i], 0, 100*time.Millisecond, connConfig, "")
 		require.True(t, result, "Error '%s' should match connection pattern", errors[i].Error())
 	}
 }
@@ -740,11 +749,11 @@ func TestMultipleKeywordsInError(t *testing.T) {
 	}
 
 	// Should match timeout condition
-	timeoutResult := rc.shouldRetry(mixedErr, 0, timeoutConfig)
+	timeoutResult := rc.shouldRetry(mixedErr, 0, 100*time.Millisecond, timeoutConfig, "")
 	require.True(t, timeoutResult, "Error with 'timeout' should match timeout condition")
 
 	// Should also match connection condition
-	connResult := rc.shouldRetry(mixedErr, 0, connConfig)
+	connResult := rc.shouldRetry(mixedErr, 0, 100*time.Millisecond, connConfig, "")
 	require.True(t, connResult, "Error with 'connection' should match connection condition")
 
 	// With both enabled, should still return true
@@ -753,7 +762,7 @@ func TestMultipleKeywordsInError(t *testing.T) {
 		RetryOnTimeout:    boolPtr(true),
 		RetryOnConnection: boolPtr(true),
 	}
-	bothResult := rc.shouldRetry(mixedErr, 0, bothConfig)
+	bothResult := rc.shouldRetry(mixedErr, 0, 100*time.Millisecond, bothConfig, "")
 	require.True(t, bothResult, "Error should match when both conditions are enabled")
 }
 
@@ -803,8 +812,8 @@ func TestActualErrorStringsFromLogs(t *testing.T) {
 
 	for _, tt := range realWorldErrors {
 		t.Run(tt.err.Error(), func(t *testing.T) {
-			timeoutMatch := rc.shouldRetry(tt.err, 0, timeoutConfig)
-			connMatch := rc.shouldRetry(tt.err, 0, connConfig)
+			timeoutMatch := rc.shouldRetry(tt.err, 0, 100*time.Millisecond, timeoutConfig, "")
+			connMatch := rc.shouldRetry(tt.err, 0, 100*time.Millisecond, connConfig, "")
 
 			switch tt.shouldMatch {
 			case "timeout":
@@ -830,12 +839,12 @@ func TestContextDeadlineExceededSpecifically(t *testing.T) {
 	}
 
 	// Test the actual context.DeadlineExceeded sentinel error
-	result := rc.shouldRetry(context.DeadlineExceeded, 0, config)
+	result := rc.shouldRetry(context.DeadlineExceeded, 0, 100*time.Millisecond, config, "")
 	require.True(t, result, "context.DeadlineExceeded should trigger retry")
 
 	// Test error message containing the word "timeout"
 	timeoutErr := errors.New("request timeout occurred")
-	timeoutResult := rc.shouldRetry(timeoutErr, 0, config)
+	timeoutResult := rc.shouldRetry(timeoutErr, 0, 100*time.Millisecond, config, "")
 	require.True(t, timeoutResult, "Error containing 'timeout' should trigger retry")
 }
 
@@ -913,7 +922,7 @@ func TestStatusCodeWithError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := rc.shouldRetry(tt.err, tt.statusCode, tt.retryConfig)
+			result := rc.shouldRetry(tt.err, tt.statusCode, 100*time.Millisecond, tt.retryConfig, "")
 			require.Equal(t, tt.expected, result, tt.description)
 		})
 	}
@@ -943,4 +952,205 @@ func TestStringContainsIsCaseInsensitive(t *testing.T) {
 			require.Equal(t, tc.expected, result)
 		})
 	}
+}
+
+// durationPtr returns a pointer to the given duration
+func durationPtr(d time.Duration) *time.Duration {
+	return &d
+}
+
+// TestMaxRetryLatency tests the time budget feature for retries
+func TestMaxRetryLatency(t *testing.T) {
+	rc := &requestContext{}
+
+	tests := []struct {
+		name            string
+		err             error
+		statusCode      int
+		requestDuration time.Duration
+		retryConfig     *ServiceRetryConfig
+		expected        bool
+		description     string
+	}{
+		{
+			name:            "request exceeds max retry latency - no retry",
+			err:             errors.New("server error"),
+			statusCode:      500,
+			requestDuration: 600 * time.Millisecond,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:         boolPtr(true),
+				RetryOn5xx:      boolPtr(true),
+				MaxRetryLatency: durationPtr(500 * time.Millisecond),
+			},
+			expected:    false,
+			description: "Should not retry when request took longer than max retry latency",
+		},
+		{
+			name:            "request within max retry latency - should retry",
+			err:             errors.New("server error"),
+			statusCode:      500,
+			requestDuration: 100 * time.Millisecond,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:         boolPtr(true),
+				RetryOn5xx:      boolPtr(true),
+				MaxRetryLatency: durationPtr(500 * time.Millisecond),
+			},
+			expected:    true,
+			description: "Should retry when request took less than max retry latency",
+		},
+		{
+			name:            "request at exact max retry latency boundary - should retry",
+			err:             errors.New("server error"),
+			statusCode:      500,
+			requestDuration: 500 * time.Millisecond,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:         boolPtr(true),
+				RetryOn5xx:      boolPtr(true),
+				MaxRetryLatency: durationPtr(500 * time.Millisecond),
+			},
+			expected:    true,
+			description: "Should retry when request took exactly max retry latency (boundary)",
+		},
+		{
+			name:            "nil max retry latency - should retry based on other conditions",
+			err:             errors.New("server error"),
+			statusCode:      500,
+			requestDuration: 10 * time.Second,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:         boolPtr(true),
+				RetryOn5xx:      boolPtr(true),
+				MaxRetryLatency: nil,
+			},
+			expected:    true,
+			description: "Should retry when max retry latency is nil (no time budget check)",
+		},
+		{
+			name:            "zero max retry latency - should retry based on other conditions",
+			err:             errors.New("server error"),
+			statusCode:      500,
+			requestDuration: 10 * time.Second,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:         boolPtr(true),
+				RetryOn5xx:      boolPtr(true),
+				MaxRetryLatency: durationPtr(0),
+			},
+			expected:    true,
+			description: "Should retry when max retry latency is 0 (disabled)",
+		},
+		{
+			name:            "slow timeout error exceeds budget - no retry",
+			err:             errors.New("timeout after waiting"),
+			statusCode:      0,
+			requestDuration: 2 * time.Second,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:         boolPtr(true),
+				RetryOnTimeout:  boolPtr(true),
+				MaxRetryLatency: durationPtr(500 * time.Millisecond),
+			},
+			expected:    false,
+			description: "Should not retry timeout errors when request took too long",
+		},
+		{
+			name:            "fast timeout error within budget - should retry",
+			err:             errors.New("timeout"),
+			statusCode:      0,
+			requestDuration: 200 * time.Millisecond,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:         boolPtr(true),
+				RetryOnTimeout:  boolPtr(true),
+				MaxRetryLatency: durationPtr(500 * time.Millisecond),
+			},
+			expected:    true,
+			description: "Should retry fast timeout errors within time budget",
+		},
+		{
+			name:            "connection error after long wait - no retry",
+			err:             errors.New("connection refused"),
+			statusCode:      0,
+			requestDuration: 5 * time.Second,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:           boolPtr(true),
+				RetryOnConnection: boolPtr(true),
+				MaxRetryLatency:   durationPtr(500 * time.Millisecond),
+			},
+			expected:    false,
+			description: "Should not retry connection errors when request took too long",
+		},
+		{
+			name:            "fast connection error - should retry",
+			err:             errors.New("connection refused"),
+			statusCode:      0,
+			requestDuration: 50 * time.Millisecond,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:           boolPtr(true),
+				RetryOnConnection: boolPtr(true),
+				MaxRetryLatency:   durationPtr(500 * time.Millisecond),
+			},
+			expected:    true,
+			description: "Should retry fast connection errors within time budget",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := rc.shouldRetry(tt.err, tt.statusCode, tt.requestDuration, tt.retryConfig, "")
+			require.Equal(t, tt.expected, result, tt.description)
+		})
+	}
+}
+
+// TestMaxRetryLatencyRealWorldScenarios tests realistic scenarios for time budget
+func TestMaxRetryLatencyRealWorldScenarios(t *testing.T) {
+	rc := &requestContext{}
+
+	// Scenario 1: Fast 5xx failure (network issue) - should retry
+	t.Run("fast_5xx_failure", func(t *testing.T) {
+		config := &ServiceRetryConfig{
+			Enabled:         boolPtr(true),
+			RetryOn5xx:      boolPtr(true),
+			MaxRetryLatency: durationPtr(500 * time.Millisecond),
+		}
+		// Server immediately returned 502 after 50ms
+		result := rc.shouldRetry(errors.New("bad gateway"), 502, 50*time.Millisecond, config, "")
+		require.True(t, result, "Fast 5xx errors should be retried")
+	})
+
+	// Scenario 2: Slow timeout (server overloaded) - should NOT retry
+	t.Run("slow_timeout", func(t *testing.T) {
+		config := &ServiceRetryConfig{
+			Enabled:         boolPtr(true),
+			RetryOn5xx:      boolPtr(true),
+			RetryOnTimeout:  boolPtr(true),
+			MaxRetryLatency: durationPtr(500 * time.Millisecond),
+		}
+		// Request timed out after 10 seconds
+		result := rc.shouldRetry(context.DeadlineExceeded, 0, 10*time.Second, config, "")
+		require.False(t, result, "Slow timeouts should not be retried to avoid cascading delays")
+	})
+
+	// Scenario 3: Archival query failure (expected to be slow) - custom higher budget
+	t.Run("archival_query_with_higher_budget", func(t *testing.T) {
+		config := &ServiceRetryConfig{
+			Enabled:         boolPtr(true),
+			RetryOn5xx:      boolPtr(true),
+			MaxRetryLatency: durationPtr(5 * time.Second), // Higher budget for archival
+		}
+		// Archival query failed after 3 seconds
+		result := rc.shouldRetry(errors.New("service unavailable"), 503, 3*time.Second, config, "")
+		require.True(t, result, "Slow archival queries with higher time budget should be retried")
+	})
+
+	// Scenario 4: Multiple fast failures in succession
+	t.Run("multiple_fast_failures", func(t *testing.T) {
+		config := &ServiceRetryConfig{
+			Enabled:         boolPtr(true),
+			RetryOn5xx:      boolPtr(true),
+			MaxRetryLatency: durationPtr(500 * time.Millisecond),
+		}
+		// Each attempt failed quickly - should allow retries
+		for i := 0; i < 3; i++ {
+			result := rc.shouldRetry(errors.New("internal server error"), 500, 100*time.Millisecond, config, "")
+			require.True(t, result, "Fast failures should always be retried (attempt %d)", i+1)
+		}
+	})
 }

@@ -27,8 +27,8 @@ const (
 	probationTrafficRoutedTotalMetric = "shannon_probation_traffic_routed_total"
 
 	// Tier selection metrics
-	tierDistributionGaugeMetric  = "shannon_reputation_tier_endpoints"
-	tierSelectionTotalMetric     = "shannon_reputation_tier_selection_total"
+	tierDistributionGaugeMetric = "shannon_reputation_tier_endpoints"
+	tierSelectionTotalMetric    = "shannon_reputation_tier_selection_total"
 )
 
 func init() {

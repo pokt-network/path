@@ -128,6 +128,10 @@ type Protocol interface {
 	// This is used by components that need access to per-service configuration overrides.
 	GetUnifiedServicesConfig() *UnifiedServicesConfig
 
+	// GetConcurrencyConfig returns the concurrency configuration.
+	// This is used by components that need to respect concurrency limits.
+	GetConcurrencyConfig() ConcurrencyConfig
+
 	// health.Check interface is used to verify protocol instance's health status.
 	health.Check
 }

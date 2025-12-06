@@ -287,15 +287,15 @@ func TestHealthCheckWithVariousCheckTypes(t *testing.T) {
 func TestHealthCheckDurationBuckets(t *testing.T) {
 	// Test various durations that fall into different histogram buckets
 	durations := []float64{
-		0.05,  // < 0.1
-		0.15,  // 0.1-0.25
-		0.3,   // 0.25-0.5
-		0.75,  // 0.5-1
-		1.5,   // 1-2
-		3.0,   // 2-5
-		7.5,   // 5-10
-		15.0,  // 10-30
-		35.0,  // > 30
+		0.05, // < 0.1
+		0.15, // 0.1-0.25
+		0.3,  // 0.25-0.5
+		0.75, // 0.5-1
+		1.5,  // 1-2
+		3.0,  // 2-5
+		7.5,  // 5-10
+		15.0, // 10-30
+		35.0, // > 30
 	}
 
 	for _, duration := range durations {

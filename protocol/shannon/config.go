@@ -100,6 +100,10 @@ type (
 		// reducing latency. Deep parsing is done asynchronously via configurable sampling.
 		ObservationPipelineConfig gateway.ObservationPipelineConfig `yaml:"observation_pipeline,omitempty"`
 
+		// Configures concurrency limits for request processing.
+		// Controls parallel endpoint queries and batch request limits to prevent resource exhaustion.
+		ConcurrencyConfig gateway.ConcurrencyConfig `yaml:"concurrency_config,omitempty"`
+
 		// UnifiedServices is the unified YAML-driven service configuration.
 		// This consolidates all per-service settings (type, rpc_types, fallback, health_checks)
 		// into a single structure with defaults and per-service overrides.
@@ -189,6 +193,18 @@ func (gc GatewayConfig) Validate() error {
 	if ltc := gc.LoadTestingConfig; ltc != nil {
 		if err := ltc.Validate(); err != nil {
 			return err
+		}
+	}
+
+	// Validate retry config
+	if err := gc.RetryConfig.Validate(nil); err != nil {
+		return fmt.Errorf("retry_config validation failed: %w", err)
+	}
+
+	// Validate concurrency config if set
+	if gc.ConcurrencyConfig.MaxParallelEndpoints > 0 || gc.ConcurrencyConfig.MaxConcurrentRelays > 0 || gc.ConcurrencyConfig.MaxBatchPayloads > 0 {
+		if err := gc.ConcurrencyConfig.Validate(nil); err != nil {
+			return fmt.Errorf("concurrency_config validation failed: %w", err)
 		}
 	}
 

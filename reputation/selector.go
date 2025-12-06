@@ -4,6 +4,8 @@ import (
 	"errors"
 	"math/rand"
 	"sync"
+
+	"github.com/pokt-network/poktroll/pkg/polylog"
 )
 
 // ErrNoEndpointsAvailable is returned when no endpoints are available for selection.
@@ -13,6 +15,7 @@ var ErrNoEndpointsAvailable = errors.New("no endpoints available for selection")
 // It groups endpoints into tiers based on their reputation scores and
 // selects from the highest available tier.
 type TieredSelector struct {
+	logger       polylog.Logger
 	config       TieredSelectionConfig
 	minThreshold float64
 
@@ -30,6 +33,22 @@ func NewTieredSelector(config TieredSelectionConfig, minThreshold float64) *Tier
 		minThreshold:       minThreshold,
 		probationEndpoints: make(map[EndpointKey]bool),
 	}
+}
+
+// NewTieredSelectorWithLogger creates a new TieredSelector with the given configuration and logger.
+func NewTieredSelectorWithLogger(logger polylog.Logger, config TieredSelectionConfig, minThreshold float64) *TieredSelector {
+	return &TieredSelector{
+		logger:             logger.With("component", "tiered_selector"),
+		config:             config,
+		minThreshold:       minThreshold,
+		probationEndpoints: make(map[EndpointKey]bool),
+	}
+}
+
+// SetLogger sets the logger for the TieredSelector.
+// This can be used to add logging after creation.
+func (s *TieredSelector) SetLogger(logger polylog.Logger) {
+	s.logger = logger.With("component", "tiered_selector")
 }
 
 // SelectEndpoint selects one endpoint using cascade-down tier logic.
@@ -148,16 +167,43 @@ func (s *TieredSelector) UpdateProbationStatus(endpoints map[EndpointKey]float64
 		if isInProbation {
 			s.probationEndpoints[key] = true
 			inProbation = append(inProbation, key)
+
+			// Log probation entry
+			if !wasInProbation && s.logger != nil {
+				s.logger.Debug().
+					Str("endpoint", string(key.EndpointAddr)).
+					Str("service_id", string(key.ServiceID)).
+					Float64("score", score).
+					Float64("probation_threshold", probationThreshold).
+					Float64("min_threshold", s.minThreshold).
+					Msg("[PROBATION] Endpoint ENTERED probation")
+			}
 		} else if wasInProbation {
 			// Endpoint has recovered or fallen below min threshold
 			delete(s.probationEndpoints, key)
+
+			// Log probation exit
+			if s.logger != nil {
+				exitReason := "recovered"
+				if score < s.minThreshold {
+					exitReason = "below_min_threshold"
+				}
+				s.logger.Debug().
+					Str("endpoint", string(key.EndpointAddr)).
+					Str("service_id", string(key.ServiceID)).
+					Float64("score", score).
+					Float64("probation_threshold", probationThreshold).
+					Float64("min_threshold", s.minThreshold).
+					Str("exit_reason", exitReason).
+					Msg("[PROBATION] Endpoint EXITED probation")
+			}
 		}
 	}
 
 	return inProbation
 }
 
-// ShouldRouteToProb ation determines if this request should be routed to a probation endpoint.
+// ShouldRouteToProbation determines if this request should be routed to a probation endpoint.
 // Returns true with probability = traffic_percent / 100.
 // For example, if traffic_percent = 10, returns true 10% of the time.
 func (s *TieredSelector) ShouldRouteToProbation() bool {
@@ -169,5 +215,16 @@ func (s *TieredSelector) ShouldRouteToProbation() bool {
 	r := rand.Intn(100)
 	// Return true if random number is less than traffic percent
 	// e.g., if traffic_percent = 10, true when r is 0-9 (10% of the time)
-	return float64(r) < s.config.Probation.TrafficPercent
+	shouldRoute := float64(r) < s.config.Probation.TrafficPercent
+
+	// Log probation routing decision
+	if s.logger != nil && shouldRoute {
+		s.logger.Debug().
+			Int("random_value", r).
+			Float64("traffic_percent", s.config.Probation.TrafficPercent).
+			Bool("routed_to_probation", shouldRoute).
+			Msg("[PROBATION] Routing request to probation endpoint")
+	}
+
+	return shouldRoute
 }

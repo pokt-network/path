@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pokt-network/poktroll/pkg/polylog"
+
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -173,6 +175,9 @@ type (
 		Enabled bool `yaml:"enabled,omitempty"`
 		// MaxRetries is the maximum number of retry attempts.
 		MaxRetries int `yaml:"max_retries,omitempty"`
+		// MaxRetryLatency is the maximum latency threshold for retries.
+		// Only retry if failed request took less than this duration.
+		MaxRetryLatency *time.Duration `yaml:"max_retry_latency,omitempty"`
 		// RetryOn5xx enables retrying on 5xx errors.
 		RetryOn5xx bool `yaml:"retry_on_5xx,omitempty"`
 		// RetryOnTimeout enables retrying on timeout errors.
@@ -447,6 +452,28 @@ func (pc *ObservationPipelineConfig) Validate() error {
 	if pc.QueueSize < 0 {
 		return fmt.Errorf("observation_pipeline.queue_size must be non-negative, got %d", pc.QueueSize)
 	}
+	return nil
+}
+
+// Validate validates the RetryConfig for reasonable values and logs warnings.
+func (rc *RetryConfig) Validate(logger polylog.Logger) error {
+	// Hard limit: max 10 retries (prevents DoS from misconfiguration)
+	if rc.MaxRetries > 10 {
+		return fmt.Errorf("retry_config.max_retries cannot exceed 10 (got %d) - excessive retries cause high latency and token burn", rc.MaxRetries)
+	}
+
+	// Warning: recommend ≤3 retries
+	if rc.MaxRetries > 3 && logger != nil {
+		logger.Warn().
+			Int("max_retries", rc.MaxRetries).
+			Msg("⚠️ retry_config.max_retries exceeds recommended threshold of 3 - may cause excessive latency and token burn")
+	}
+
+	// Validate max_retry_latency if set
+	if rc.MaxRetryLatency != nil && *rc.MaxRetryLatency < 0 {
+		return fmt.Errorf("retry_config.max_retry_latency cannot be negative (got %v)", *rc.MaxRetryLatency)
+	}
+
 	return nil
 }
 

@@ -416,8 +416,8 @@ func TestService_KeyBuilderForService_WithOverrides(t *testing.T) {
 		Enabled:        true,
 		KeyGranularity: KeyGranularityEndpoint, // Default is per-endpoint
 		ServiceOverrides: map[string]ServiceConfig{
-			"eth": {KeyGranularity: KeyGranularityDomain},     // eth uses per-domain
-			"sol": {KeyGranularity: KeyGranularitySupplier},   // sol uses per-supplier
+			"eth": {KeyGranularity: KeyGranularityDomain},   // eth uses per-domain
+			"sol": {KeyGranularity: KeyGranularitySupplier}, // sol uses per-supplier
 		},
 	}
 	store := newMockStorage()

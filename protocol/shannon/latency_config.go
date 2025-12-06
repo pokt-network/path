@@ -39,8 +39,13 @@ func buildLatencyConfigForService(
 	if merged.LatencyProfile != "" && unifiedConfig != nil {
 		latencyProfile := unifiedConfig.GetLatencyProfile(merged.LatencyProfile)
 		if latencyProfile != nil {
+			// Check if explicitly enabled/disabled at service level
+			enabled := globalLatency.Enabled
+			if merged.Latency != nil && merged.Latency.Enabled != nil {
+				enabled = *merged.Latency.Enabled
+			}
 			return &reputation.LatencyConfig{
-				Enabled:          globalLatency.Enabled,
+				Enabled:          enabled,
 				FastThreshold:    latencyProfile.FastThreshold,
 				NormalThreshold:  latencyProfile.NormalThreshold,
 				SlowThreshold:    latencyProfile.SlowThreshold,
@@ -92,13 +97,13 @@ func buildSimpleLatencyConfig(
 	// Build thresholds based on target
 	return &reputation.LatencyConfig{
 		Enabled:          enabled,
-		FastThreshold:    targetDuration,              // Fast: < target
-		NormalThreshold:  targetDuration * 2,          // Normal: target to 2x target
-		SlowThreshold:    targetDuration * 3,          // Slow: 2x to 3x target
-		PenaltyThreshold: targetDuration * 2,          // Penalty: > 2x target
-		SevereThreshold:  targetDuration * 3,          // Severe: > 3x target
-		FastBonus:        2.0 * weight,                // Fast gets bonus, scaled by weight
-		SlowPenalty:      0.5 * weight,                // Slow gets reduced impact, scaled by weight
-		VerySlowPenalty:  0.0,                         // Very slow gets no bonus (always 0)
+		FastThreshold:    targetDuration,     // Fast: < target
+		NormalThreshold:  targetDuration * 2, // Normal: target to 2x target
+		SlowThreshold:    targetDuration * 3, // Slow: 2x to 3x target
+		PenaltyThreshold: targetDuration * 2, // Penalty: > 2x target
+		SevereThreshold:  targetDuration * 3, // Severe: > 3x target
+		FastBonus:        2.0 * weight,       // Fast gets bonus, scaled by weight
+		SlowPenalty:      0.5 * weight,       // Slow gets reduced impact, scaled by weight
+		VerySlowPenalty:  0.0,                // Very slow gets no bonus (always 0)
 	}
 }

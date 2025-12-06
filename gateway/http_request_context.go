@@ -14,8 +14,9 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	retrymetrics "github.com/pokt-network/path/metrics/retry"
+	concurrencymetrics "github.com/pokt-network/path/metrics/concurrency"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
+	retrymetrics "github.com/pokt-network/path/metrics/retry"
 	pathhttp "github.com/pokt-network/path/network/http"
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
@@ -35,9 +36,8 @@ const (
 	// - Experiment with this feature in a single gateway and evaluate the results.
 	// - Collect and analyze the metrics of this feature, ensuring it does not lead to excessive resource usage or token burn
 	// - If all endpoints are sanctioned, send parallel requests by default
-	// - Make this configurable at the gateway level yaml config
+	// - ✅ DONE: Made configurable via concurrency_config.max_parallel_endpoints in YAML
 	// - Enable parallel requests for gateways that maintain their own backend nodes as a special config
-	maxParallelRequests = 1
 
 	// RelayRequestTimeout is the timeout for relay requests
 	// TODO_TECHDEBT: Look into whether we can remove this variable altogether and consolidate
@@ -119,6 +119,10 @@ type requestContext struct {
 	httpRequestBody    []byte
 	httpRequestTime    time.Time
 
+	// originalHTTPRequest stores the original HTTP request for endpoint selection during retries.
+	// Required for retry endpoint rotation to select different endpoints on each retry attempt.
+	originalHTTPRequest *http.Request
+
 	// requestID is a unique identifier for this request, used for log correlation.
 	// It is either extracted from the X-Request-ID header or generated as a new UUID.
 	requestID string
@@ -143,6 +147,9 @@ func (rc *requestContext) InitFromHTTPRequest(httpReq *http.Request) error {
 	}
 
 	rc.logger = rc.getHTTPRequestLogger(httpReq)
+
+	// Store original HTTP request for endpoint selection during retries
+	rc.originalHTTPRequest = httpReq
 
 	// TODO_MVP(@adshmh): The HTTPRequestParser should return a context, similar to QoS, which is then used to get a QoS instance and the observation set.
 	// Extract the service ID and find the target service's corresponding QoS instance.
@@ -217,7 +224,12 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	}
 
 	// Select multiple endpoints for parallel relay attempts
-	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultiple(availableEndpoints, maxParallelRequests)
+	// Use per-service max_parallel_endpoints with fallback to global config (default: 1)
+	maxParallelEndpoints := rc.protocol.GetConcurrencyConfig().MaxParallelEndpoints // Global default
+	if concurrencyConfig := rc.getConcurrencyConfigForService(); concurrencyConfig != nil && concurrencyConfig.MaxParallelEndpoints != nil {
+		maxParallelEndpoints = *concurrencyConfig.MaxParallelEndpoints // Per-service override
+	}
+	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultiple(availableEndpoints, uint(maxParallelEndpoints))
 	if err != nil || len(selectedEndpoints) == 0 {
 		// no protocol context will be built: use the endpointLookup observation.
 		rc.updateProtocolObservations(&endpointLookupObs)
@@ -231,6 +243,10 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 
 	// Prepare Protocol contexts for all selected endpoints
 	numSelectedEndpoints := len(selectedEndpoints)
+
+	// Record parallel endpoint metrics to track token burn multiplier
+	concurrencymetrics.RecordParallelEndpoints(string(rc.serviceID), numSelectedEndpoints)
+
 	rc.protocolContexts = make([]ProtocolRequestContext, 0, numSelectedEndpoints)
 	var lastProtocolCtxSetupErrObs *protocolobservations.Observations
 
@@ -624,21 +640,87 @@ func (rc *requestContext) getRetryConfigForService() *ServiceRetryConfig {
 	return mergedConfig.RetryConfig
 }
 
-// shouldRetry determines if a request should be retried based on the error, status code, and retry config.
+// getConcurrencyConfigForService returns the merged concurrency configuration for the current service.
+// This includes both global defaults and per-service overrides.
+func (rc *requestContext) getConcurrencyConfigForService() *ServiceConcurrencyConfig {
+	unifiedConfig := rc.protocol.GetUnifiedServicesConfig()
+	if unifiedConfig == nil {
+		return nil
+	}
+
+	// Get merged service config (with defaults applied)
+	mergedConfig := unifiedConfig.GetMergedServiceConfig(rc.serviceID)
+	if mergedConfig == nil {
+		return nil
+	}
+
+	return mergedConfig.ConcurrencyConfig
+}
+
+// shouldRetry determines if a request should be retried based on the error, status code, duration, and retry config.
 // Returns true if the request should be retried.
-func (rc *requestContext) shouldRetry(err error, statusCode int, retryConfig *ServiceRetryConfig) bool {
+// The requestDuration parameter is the time the failed request took - if it exceeds MaxRetryLatency, no retry is attempted.
+// The endpointDomain parameter is used for metrics recording when retries are skipped due to budget exceeded.
+func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration time.Duration, retryConfig *ServiceRetryConfig, endpointDomain string) bool {
 	// No retry config or retry disabled
 	if retryConfig == nil || retryConfig.Enabled == nil || !*retryConfig.Enabled {
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Bool("retry_enabled", false).
+				Msg("[RETRY] Retry disabled or no config")
+		}
 		return false
+	}
+
+	// Check time budget first - if the failed request took too long, don't retry
+	// This prevents making users wait even longer after a slow failure
+	if retryConfig.MaxRetryLatency != nil && *retryConfig.MaxRetryLatency > 0 {
+		if requestDuration > *retryConfig.MaxRetryLatency {
+			if rc.logger != nil {
+				rc.logger.Debug().
+					Str("service_id", string(rc.serviceID)).
+					Int("status_code", statusCode).
+					Dur("request_duration_ms", requestDuration).
+					Dur("max_retry_latency_ms", *retryConfig.MaxRetryLatency).
+					Msg("[RETRY] Request took too long, skipping retry (time budget exceeded)")
+			}
+			// Record metric for budget exceeded with retry reason
+			retryReason := rc.determineRetryReason(err, statusCode)
+			retrymetrics.RecordRetryBudgetSkipped(string(rc.serviceID), endpointDomain, retryReason)
+			return false
+		}
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Int("status_code", statusCode).
+				Dur("request_duration_ms", requestDuration).
+				Dur("max_retry_latency_ms", *retryConfig.MaxRetryLatency).
+				Msg("[RETRY] Request duration within time budget, checking retry conditions")
+		}
 	}
 
 	// Check for 5xx errors if configured
 	if retryConfig.RetryOn5xx != nil && *retryConfig.RetryOn5xx && statusCode >= 500 && statusCode < 600 {
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Int("status_code", statusCode).
+				Dur("request_duration_ms", requestDuration).
+				Str("retry_reason", "5xx_error").
+				Msg("[RETRY] Will retry due to 5xx status code")
+		}
 		return true
 	}
 
 	// If no error, nothing more to check
 	if err == nil {
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Int("status_code", statusCode).
+				Msg("[RETRY] No error and not 5xx, will not retry")
+		}
 		return false
 	}
 
@@ -646,6 +728,14 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, retryConfig *Se
 	if retryConfig.RetryOnTimeout != nil && *retryConfig.RetryOnTimeout {
 		// Check if error is a timeout (context.DeadlineExceeded or contains "timeout")
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+			if rc.logger != nil {
+				rc.logger.Debug().
+					Str("service_id", string(rc.serviceID)).
+					Err(err).
+					Dur("request_duration_ms", requestDuration).
+					Str("retry_reason", "timeout").
+					Msg("[RETRY] Will retry due to timeout error")
+			}
 			return true
 		}
 	}
@@ -655,10 +745,26 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, retryConfig *Se
 		// Check if error is a connection error (contains "connection" or "dial")
 		errMsg := strings.ToLower(err.Error())
 		if strings.Contains(errMsg, "connection") || strings.Contains(errMsg, "dial") || strings.Contains(errMsg, "network") {
+			if rc.logger != nil {
+				rc.logger.Debug().
+					Str("service_id", string(rc.serviceID)).
+					Err(err).
+					Dur("request_duration_ms", requestDuration).
+					Str("retry_reason", "connection_error").
+					Msg("[RETRY] Will retry due to connection error")
+			}
 			return true
 		}
 	}
 
+	if rc.logger != nil {
+		rc.logger.Debug().
+			Str("service_id", string(rc.serviceID)).
+			Err(err).
+			Int("status_code", statusCode).
+			Dur("request_duration_ms", requestDuration).
+			Msg("[RETRY] No retry conditions met")
+	}
 	return false
 }
 

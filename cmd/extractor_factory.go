@@ -39,7 +39,7 @@ func buildExtractorRegistry(unifiedConfig *gateway.UnifiedServicesConfig) *qosty
 			registry.Register(serviceID, cosmosExtractor)
 		case gateway.ServiceTypeSolana:
 			registry.Register(serviceID, solanaExtractor)
-		// Default: falls back to NoOpDataExtractor via registry.Get()
+			// Default: falls back to NoOpDataExtractor via registry.Get()
 		}
 	}
 

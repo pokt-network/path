@@ -110,4 +110,3 @@ func logGatewayServiceIDs(logger polylog.Logger, serviceConfigs map[protocol.Ser
 	}
 	logger.Info().Msgf("Service IDs configured by the gateway: %s.", strings.Join(serviceIDs, ", "))
 }
-

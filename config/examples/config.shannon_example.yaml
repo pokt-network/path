@@ -9,7 +9,7 @@
 # 2. Full node connection settings
 # 3. Gateway settings with unified service configuration
 #
-# Services inherit from `defaults` and can override any setting.
+# Services inherit from gateway_config settings and can override any setting.
 # Only specify what differs from defaults to keep configs clean.
 
 # =============================================================================
@@ -46,6 +46,13 @@ data_reporter_config:
 # Valid levels: debug, info, warn, error
 logger_config:
   level: "info"
+
+# Concurrency Configuration (optional)
+# Controls parallel request processing and batch limits
+concurrency_config:
+  max_parallel_endpoints: 1      # How many endpoints to query in parallel per request (1-10)
+  max_concurrent_relays: 5500    # Global limit on concurrent relay goroutines (100-10000)
+  max_batch_payloads: 5500       # Max payloads in batch request (1-10000, ≤ max_concurrent_relays)
 
 # =============================================================================
 # FULL NODE CONFIGURATION
@@ -96,7 +103,8 @@ gateway_config:
   # ===========================================================================
   # GLOBAL REPUTATION CONFIGURATION
   # ===========================================================================
-  # These settings apply globally and CANNOT be overridden per-service
+  # These settings apply globally and serve as defaults for all services.
+  # Per-service overrides can be specified in the services[] array.
 
   reputation_config:
     # Enable/disable the entire reputation system
@@ -109,7 +117,7 @@ gateway_config:
     # NOTE: This is GLOBAL ONLY - cannot be overridden per-service
     storage_type: "memory"
 
-    # Global initial score (can be overridden per-service in `defaults` or `services`)
+    # Global initial score (can be overridden per-service)
     initial_score: 80
 
     # Global minimum threshold (can be overridden per-service)
@@ -118,14 +126,30 @@ gateway_config:
     # Time before inactive low-scoring endpoints can recover
     recovery_timeout: 5m
 
+    # Tiered endpoint selection
+    # Cascade: tier1 first, then tier2, then tier3
+    tiered_selection:
+      enabled: true
+      tier1_threshold: 70    # Premium tier (highest priority)
+      tier2_threshold: 50    # Good tier
+
+      # Probation system for recovering endpoints
+      # Low-scoring endpoints get limited traffic to prove reliability
+      probation:
+        enabled: true
+        threshold: 10          # Score below which endpoint enters probation
+        traffic_percent: 10    # % of traffic routed to probation endpoints
+        recovery_multiplier: 2.0  # Boost for successful probation requests
+
   # ===========================================================================
   # GLOBAL RETRY CONFIGURATION (optional)
   # ===========================================================================
-  # Global retry settings - use `defaults` or `services` for per-service control
+  # Global retry settings - per-service overrides in services[] array
 
   retry_config:
     enabled: true
     max_retries: 1
+    max_retry_latency: 500ms  # Only retry if failed request took < 500ms
     retry_on_5xx: true
     retry_on_timeout: true
     retry_on_connection: true
@@ -145,7 +169,7 @@ gateway_config:
   # GLOBAL ACTIVE HEALTH CHECKS
   # ===========================================================================
   # Proactive endpoint monitoring - runs health checks on all endpoints
-  # Use `defaults` or `services` for per-service health check rules
+  # Per-service health check rules can be defined in services[].health_checks
 
   active_health_checks:
     enabled: true
@@ -255,86 +279,21 @@ gateway_config:
       very_slow_penalty: 0.3
 
   # ===========================================================================
-  # SERVICE DEFAULTS
-  # ===========================================================================
-  # Settings inherited by ALL services unless overridden per-service
-  # Only specify what you want as default behavior
-
-  defaults:
-    # QoS type determines how requests are validated and processed
-    # Options: evm, solana, cosmos, generic, passthrough
-    type: passthrough
-
-    # Supported RPC types for endpoints
-    # Options: json_rpc, rest, websocket, comet_bft, grpc
-    rpc_types:
-      - json_rpc
-
-    # Reference to a latency profile (from latency_profiles or built-in)
-    latency_profile: "standard"
-
-    # Per-service reputation overrides
-    # NOTE: storage_type is GLOBAL ONLY (set in gateway_config.reputation_config)
-    reputation_config:
-      enabled: true
-      initial_score: 70      # Default starting score
-      min_threshold: 40      # Default minimum for selection
-      recovery_timeout: 5m   # Time before recovery attempt
-      # key_granularity: "per-endpoint"  # per-endpoint, per-domain, per-supplier
-
-    # Inline latency config (alternative to latency_profile)
-    # If target_ms > 0, this OVERRIDES the latency_profile
-    latency:
-      enabled: true
-      target_ms: 0           # 0 means use latency_profile instead
-      penalty_weight: 0.3    # How much latency affects scoring (0.0-1.0)
-
-    # Tiered endpoint selection
-    # Cascade: tier1 first, then tier2, then tier3
-    tiered_selection:
-      enabled: true
-      tier1_threshold: 70    # Premium tier (highest priority)
-      tier2_threshold: 50    # Good tier
-
-    # Probation system for recovering endpoints
-    # Low-scoring endpoints get limited traffic to prove reliability
-    probation:
-      enabled: true
-      threshold: 10          # Score below which endpoint enters probation
-      traffic_percent: 10    # % of traffic routed to probation endpoints
-      recovery_multiplier: 2.0  # Boost for successful probation requests
-
-    # Retry configuration
-    retry_config:
-      enabled: true
-      max_retries: 1
-      retry_on_5xx: true
-      retry_on_timeout: true
-      retry_on_connection: true
-
-    # Observation pipeline per-service settings
-    # NOTE: worker_count and queue_size are GLOBAL ONLY
-    observation_pipeline:
-      enabled: true
-      sample_rate: 0.1       # Per-service sample rate (this WORKS)
-      # worker_count: 4      # GLOBAL ONLY - per-service value ignored
-      # queue_size: 1000     # GLOBAL ONLY - per-service value ignored
-
-    # Health check defaults
-    active_health_checks:
-      enabled: true
-      interval: 30s
-      sync_allowance: 5      # Blocks behind latest before considered out-of-sync
-      external:              # Per-service external URL (overrides global)
-        url: ""
-        refresh_interval: "1h"
-        timeout: "30s"
-      local: []              # Per-service local rules (override external by name)
-
-  # ===========================================================================
   # SERVICE CONFIGURATIONS
   # ===========================================================================
-  # Define services and their overrides. Only specify what differs from defaults.
+  # Define services with their per-service overrides.
+  # Each service inherits from gateway_config settings and can override:
+  # - type: QoS type (evm, solana, cosmos, generic, passthrough)
+  # - rpc_types: Supported RPC types
+  # - latency_profile: Reference to a named profile
+  # - reputation_config: Per-service reputation overrides
+  # - tiered_selection: Per-service tier thresholds
+  # - probation: Per-service probation settings
+  # - retry_config: Per-service retry settings
+  # - concurrency_config: Per-service concurrency overrides (max_parallel_endpoints, max_batch_payloads)
+  # - observation_pipeline: Per-service sample rate
+  # - fallback: Fallback endpoints (no defaults - must be explicitly configured)
+  # - health_checks: Per-service health check rules
 
   services:
     # -------------------------------------------------------------------------
@@ -505,3 +464,15 @@ gateway_config:
       latency_profile: "slow"
       retry_config:
         max_retries: 2
+
+      # Per-service concurrency overrides (optional)
+      # Use these to override global concurrency_config for specific services
+      # concurrency_config:
+      #   # max_parallel_endpoints: Race multiple endpoints in parallel (1-10)
+      #   # Use >1 for unreliable services to get faster responses
+      #   # ⚠️ WARNING: Values >1 multiply token burn (e.g., 3 endpoints = 3x cost)
+      #   max_parallel_endpoints: 3
+      #
+      #   # max_batch_payloads: Limit batch size for this service (1-10000)
+      #   # Useful for heavy services that process large batches
+      #   max_batch_payloads: 100

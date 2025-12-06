@@ -39,7 +39,7 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 			name:        "should load valid config from example file",
 			filePath:    "./examples/config.shannon_example.yaml",
 			skipCompare: true, // Example config is a reference doc, not a test fixture
-			want:        GatewayConfig{
+			want: GatewayConfig{
 				FullNodeConfig: shannonprotocol.FullNodeConfig{
 					RpcURL:                "https://shannon-grove-rpc.mainnet.poktroll.com",
 					SessionRolloverBlocks: 10,

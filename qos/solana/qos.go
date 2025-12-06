@@ -40,4 +40,3 @@ func NewSimpleQoSInstance(logger polylog.Logger, serviceID protocol.ServiceID) *
 		requestValidator: requestValidator,
 	}
 }
-

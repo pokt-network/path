@@ -45,8 +45,7 @@ const maxEndpointPayloadLenForLogging = 100
 
 // MaxConcurrentRelaysPerRequest limits the number of concurrent relay goroutines per request.
 // This prevents DoS attacks via large batch requests that could spawn unbounded goroutines.
-// TODO_IMPROVE: Make this configurable via gateway settings.
-const MaxConcurrentRelaysPerRequest = 5500
+// ✅ DONE: Now configurable via concurrency_config.max_batch_payloads in YAML (default: 5500)
 
 // requestContext provides all the functionality required by the gateway package
 // for handling a single service request.
@@ -126,6 +125,15 @@ type requestContext struct {
 	// Passed from Protocol, used to create task groups for batch requests.
 	relayPool pond.Pool
 
+	// concurrencyConfig controls concurrency limits for request processing.
+	// Used to enforce max batch payloads and other concurrency constraints.
+	// This is the GLOBAL config - per-service overrides are retrieved via unifiedServicesConfig.
+	concurrencyConfig gateway.ConcurrencyConfig
+
+	// unifiedServicesConfig provides access to per-service configuration overrides.
+	// Used to get per-service concurrency limits (max_batch_payloads, max_parallel_endpoints).
+	unifiedServicesConfig *gateway.UnifiedServicesConfig
+
 	// reputationService tracks endpoint reputation scores.
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
 	// When nil, only binary sanctions are used.
@@ -166,8 +174,18 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 		return []protocol.Response{response}, err
 	}
 
-	if len(payloads) > MaxConcurrentRelaysPerRequest {
-		response, err := rc.handleInternalError(fmt.Errorf("HandleServiceRequest: batch of payloads larger than allowed: %d, received: %d ", MaxConcurrentRelaysPerRequest, len(payloads)))
+	// Enforce configured max batch payload limit to prevent resource exhaustion
+	// Use per-service override if available, otherwise fall back to global config
+	maxBatchPayloads := rc.concurrencyConfig.MaxBatchPayloads
+	if rc.unifiedServicesConfig != nil {
+		if mergedConfig := rc.unifiedServicesConfig.GetMergedServiceConfig(rc.serviceID); mergedConfig != nil {
+			if mergedConfig.ConcurrencyConfig != nil && mergedConfig.ConcurrencyConfig.MaxBatchPayloads != nil {
+				maxBatchPayloads = *mergedConfig.ConcurrencyConfig.MaxBatchPayloads
+			}
+		}
+	}
+	if len(payloads) > maxBatchPayloads {
+		response, err := rc.handleInternalError(fmt.Errorf("HandleServiceRequest: batch of payloads larger than allowed: %d, received: %d ", maxBatchPayloads, len(payloads)))
 		return []protocol.Response{response}, err
 	}
 
@@ -210,11 +228,13 @@ func (rc *requestContext) sendSingleRelay(payload protocol.Payload) (protocol.Re
 // Uses pond worker pool for bounded concurrency and channels for thread-safe observation collection.
 // This prevents DoS attacks via large batch requests that could spawn unbounded goroutines.
 func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payload) ([]protocol.Response, error) {
+	maxBatchPayloads := rc.concurrencyConfig.MaxBatchPayloads
+
 	logger := rc.logger.With(
 		"method", "handleParallelRelayRequests",
 		"num_payloads", len(payloads),
 		"service_id", rc.serviceID,
-		"max_concurrent", MaxConcurrentRelaysPerRequest,
+		"max_concurrent", maxBatchPayloads,
 	)
 
 	logger.Debug().Msg("Starting parallel relay processing with worker pool")
@@ -223,12 +243,12 @@ func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payloa
 	rc.observationsChan = make(chan *protocolobservations.ShannonEndpointObservation, len(payloads))
 
 	// Start collector goroutine to gather observations from workers
-	// Cap at MaxConcurrentRelaysPerRequest since batch size is already limited to that
+	// Cap at max_batch_payloads since batch size is already limited to that
 	observationsCollected := make(chan struct{})
 	go func() {
 		defer close(observationsCollected)
 		for obs := range rc.observationsChan {
-			if len(rc.endpointObservations) < MaxConcurrentRelaysPerRequest {
+			if len(rc.endpointObservations) < maxBatchPayloads {
 				rc.endpointObservations = append(rc.endpointObservations, obs)
 			}
 			// Silently drop excess observations (shouldn't happen with batch size limit)

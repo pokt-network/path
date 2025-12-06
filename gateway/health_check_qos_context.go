@@ -83,6 +83,27 @@ func (hc *HealthCheckQoSContext) UpdateWithResponse(
 	hc.responseBody = endpointSerializedResponse
 	hc.httpStatusCode = httpStatusCode
 
+	// Log the validation criteria being applied
+	hc.logger.Debug().
+		Str("check_name", hc.checkConfig.Name).
+		Str("endpoint", string(endpointAddr)).
+		Int("expected_status_code", hc.checkConfig.ExpectedStatusCode).
+		Str("expected_response_contains", hc.checkConfig.ExpectedResponseContains).
+		Int("actual_status_code", httpStatusCode).
+		Int("response_size", len(endpointSerializedResponse)).
+		Msg("🔍 Health check validating response")
+
+	// Log truncated response body for debugging (max 200 chars)
+	responsePreview := string(endpointSerializedResponse)
+	if len(responsePreview) > 200 {
+		responsePreview = responsePreview[:200] + "..."
+	}
+	hc.logger.Debug().
+		Str("check_name", hc.checkConfig.Name).
+		Str("endpoint", string(endpointAddr)).
+		Str("response_preview", responsePreview).
+		Msg("🔍 Health check response body preview")
+
 	// Validate response
 	hc.responseSuccess = true
 	hc.responseError = ""
@@ -95,19 +116,27 @@ func (hc *HealthCheckQoSContext) UpdateWithResponse(
 			Int("expected", hc.checkConfig.ExpectedStatusCode).
 			Int("actual", httpStatusCode).
 			Str("endpoint", string(endpointAddr)).
-			Msg("Health check failed: unexpected status code")
+			Msg("❌ Health check failed: unexpected status code")
 		return
 	}
 
 	// Check response body contains expected string
 	if hc.checkConfig.ExpectedResponseContains != "" {
-		if !strings.Contains(string(endpointSerializedResponse), hc.checkConfig.ExpectedResponseContains) {
+		containsExpected := strings.Contains(string(endpointSerializedResponse), hc.checkConfig.ExpectedResponseContains)
+		hc.logger.Debug().
+			Str("check_name", hc.checkConfig.Name).
+			Str("endpoint", string(endpointAddr)).
+			Str("expected_contains", hc.checkConfig.ExpectedResponseContains).
+			Bool("contains_expected", containsExpected).
+			Msg("🔍 Health check validating response content")
+
+		if !containsExpected {
 			hc.responseSuccess = false
 			hc.responseError = "response does not contain expected content"
 			hc.logger.Debug().
 				Str("expected_contains", hc.checkConfig.ExpectedResponseContains).
 				Str("endpoint", string(endpointAddr)).
-				Msg("Health check failed: response content mismatch")
+				Msg("❌ Health check failed: response content mismatch")
 			return
 		}
 	}
@@ -116,9 +145,8 @@ func (hc *HealthCheckQoSContext) UpdateWithResponse(
 		Str("endpoint", string(endpointAddr)).
 		Str("check_name", hc.checkConfig.Name).
 		Int("status_code", httpStatusCode).
-		Msg("Health check passed")
+		Msg("✅ Health check validation passed")
 }
-
 
 // GetHTTPResponse returns a minimal HTTP response for health checks.
 // This method is required by the RequestQoSContext interface but is not used for health checks.
@@ -155,4 +183,3 @@ func (hc *HealthCheckQoSContext) GetError() string {
 	defer hc.responseMu.Unlock()
 	return hc.responseError
 }
-

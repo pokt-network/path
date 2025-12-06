@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pokt-network/poktroll/pkg/polylog"
+
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -211,6 +213,10 @@ type ReputationService interface {
 
 	// Stop gracefully shuts down background processes and flushes pending writes.
 	Stop() error
+
+	// SetLogger sets the logger for the reputation service.
+	// This enables debug logging for latency scoring and other operations.
+	SetLogger(logger polylog.Logger)
 }
 
 // Config holds configuration for the reputation system.

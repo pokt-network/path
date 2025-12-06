@@ -58,7 +58,6 @@ const (
 
 	// Auth Region HTTP header.
 	httpHeaderAuthRegion = "Auth-Region"
-
 )
 
 // ---------- User Requests ----------
@@ -116,4 +115,3 @@ func getTraceID(httpReq *http.Request) string {
 	// Envoy. For example, if PATH is running standalone (i.e. not behind Envoy).
 	return uuid.New().String()
 }
-

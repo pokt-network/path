@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pokt-network/poktroll/pkg/polylog"
+
 	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	"github.com/pokt-network/path/protocol"
 )
@@ -13,6 +15,7 @@ import (
 // All reads are served from local cache (<1μs), writes update cache immediately
 // and queue async writes to backend storage.
 type service struct {
+	logger            polylog.Logger
 	config            Config
 	storage           Storage
 	defaultKeyBuilder KeyBuilder
@@ -63,16 +66,16 @@ func NewService(config Config, store Storage) ReputationService {
 	}
 
 	return &service{
-		config:                   config,
-		storage:                  store,
-		defaultKeyBuilder:        NewKeyBuilder(config.KeyGranularity),
-		serviceKeyBuilders:       serviceKeyBuilders,
-		serviceConfigs:           make(map[string]ServiceConfig),
-		serviceLatencyProfiles:   make(map[string]LatencyConfig),
-		cache:                    make(map[string]Score),
-		writeCh:                  make(chan writeRequest, config.SyncConfig.WriteBufferSize),
-		stopCh:                   make(chan struct{}),
-		stoppedCh:                make(chan struct{}),
+		config:                 config,
+		storage:                store,
+		defaultKeyBuilder:      NewKeyBuilder(config.KeyGranularity),
+		serviceKeyBuilders:     serviceKeyBuilders,
+		serviceConfigs:         make(map[string]ServiceConfig),
+		serviceLatencyProfiles: make(map[string]LatencyConfig),
+		cache:                  make(map[string]Score),
+		writeCh:                make(chan writeRequest, config.SyncConfig.WriteBufferSize),
+		stopCh:                 make(chan struct{}),
+		stoppedCh:              make(chan struct{}),
 	}
 }
 
@@ -428,17 +431,49 @@ func (s *service) calculateImpact(serviceID protocol.ServiceID, signal Signal) f
 		impact = signal.GetDefaultImpact()
 	} else {
 		// Apply latency-aware impact calculation for success signals
-		impact = signal.CalculateLatencyAwareImpact(latencyConfig)
+		result := signal.CalculateLatencyAwareImpactWithDetails(latencyConfig)
+		impact = result.FinalImpact
+
+		// Log latency scoring details
+		if s.logger != nil && result.LatencyCategory != "skipped" {
+			s.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Str("signal_type", string(signal.Type)).
+				Str("latency_category", result.LatencyCategory).
+				Dur("latency", result.Latency).
+				Float64("base_impact", result.BaseImpact).
+				Float64("modifier", result.Modifier).
+				Float64("final_impact", result.FinalImpact).
+				Dur("fast_threshold", result.Config.FastThreshold).
+				Dur("normal_threshold", result.Config.NormalThreshold).
+				Dur("slow_threshold", result.Config.SlowThreshold).
+				Float64("fast_bonus", result.Config.FastBonus).
+				Float64("slow_penalty", result.Config.SlowPenalty).
+				Msg("[LATENCY_SCORE] Applied latency scoring")
+		}
 	}
 
 	// Apply recovery multiplier if set (used by probation system to boost recovery)
 	// Only applies to positive signals (success, recovery_success)
 	if impact > 0 {
 		multiplier := signal.GetRecoveryMultiplier()
+		if multiplier != 1.0 && s.logger != nil {
+			s.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Float64("original_impact", impact).
+				Float64("recovery_multiplier", multiplier).
+				Float64("boosted_impact", impact*multiplier).
+				Msg("[RECOVERY_MULTIPLIER] Applied recovery multiplier")
+		}
 		impact *= multiplier
 	}
 
 	return impact
+}
+
+// SetLogger sets the logger for the reputation service.
+func (s *service) SetLogger(logger polylog.Logger) {
+	s.logger = logger.With("component", "reputation_service")
 }
 
 // Start begins background sync processes.
