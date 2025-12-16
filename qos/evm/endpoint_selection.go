@@ -142,17 +142,18 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 
 		endpoint, found := ss.endpointStore.endpoints[availableEndpointAddr]
 		if !found {
-			logger.Warn().Msgf("❓ SKIPPING endpoint %s because it was not found in PATH's endpoint store.", availableEndpointAddr)
+			// It is valid for an endpoint to not be in the store yet (e.g., first request,
+			// no observations collected). Treat it as a fresh endpoint and allow it.
+			// It will be added to the store once observations are collected.
+			logger.Info().Msg("endpoint not yet in store, treating as fresh endpoint")
 
-			// Create validation result for endpoint not found
-			failureDetails := "endpoint not found in PATH's endpoint store"
+			// Create validation result for endpoint not in store (but still valid)
 			result := &qosobservations.EndpointValidationResult{
-				EndpointAddr:   string(availableEndpointAddr),
-				Success:        false,
-				FailureReason:  qosobservations.EndpointValidationFailureReason_ENDPOINT_VALIDATION_FAILURE_REASON_ENDPOINT_NOT_FOUND.Enum(),
-				FailureDetails: &failureDetails,
+				EndpointAddr: string(availableEndpointAddr),
+				Success:      true,
 			}
 			validationResults = append(validationResults, result)
+			filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
 			continue
 		}
 

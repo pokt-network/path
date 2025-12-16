@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	concurrencymetrics "github.com/pokt-network/path/metrics/concurrency"
@@ -72,6 +73,12 @@ type requestContext struct {
 	// 	1. service ID
 	// 	2. The service ID's corresponding QoS instance.
 	httpRequestParser HTTPRequestParser
+
+	// rpcTypeValidator validates detected RPC types against service configuration
+	rpcTypeValidator *RPCTypeValidator
+
+	// detectedRPCType stores the detected RPC type for this request
+	detectedRPCType sharedtypes.RPCType
 
 	// metricsReporter is used to export metrics based on observations made in handling service requests.
 	metricsReporter RequestResponseReporter
@@ -168,7 +175,109 @@ func (rc *requestContext) InitFromHTTPRequest(httpReq *http.Request) error {
 		return errHTTPRequestRejectedByParser
 	}
 
+	// FAIL FAST: Validate service ID is configured in unified config
+	// This provides a clear error message with available services if service is not configured
+	if serviceID != "" && rc.protocol != nil {
+		unifiedConfig := rc.protocol.GetUnifiedServicesConfig()
+		if unifiedConfig != nil && !unifiedConfig.HasService(serviceID) {
+			// Get list of configured services for error message
+			configuredServices := unifiedConfig.GetConfiguredServiceIDs()
+
+			err := fmt.Errorf(
+				"service '%s' not configured. Available services: %v",
+				serviceID, configuredServices,
+			)
+
+			// Update gateway observations
+			rc.updateGatewayObservations(err)
+
+			// Set error response
+			rc.presetFailureHTTPResponse = NewServiceNotConfiguredErrorResponse(
+				serviceID,
+				configuredServices,
+				fmt.Sprintf("Service '%s' is not configured", serviceID),
+			)
+
+			// Log the error
+			rc.logger.Error().Err(err).Msg("Service not configured")
+			return err
+		}
+	}
+
 	rc.serviceQoS = serviceQoS
+	return nil
+}
+
+// ValidateRPCType detects and validates the RPC type for this request.
+// It fails fast if the detected RPC type is not in the service's configured rpc_types.
+func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
+	logger := rc.logger.With("method", "ValidateRPCType").With("service_id", rc.serviceID)
+
+	// Skip if no validator configured
+	if rc.rpcTypeValidator == nil {
+		logger.Warn().Msg("No RPC type validator configured - skipping validation")
+		return nil
+	}
+
+	// Get service's configured RPC types for detection
+	unifiedConfig := rc.protocol.GetUnifiedServicesConfig()
+	if unifiedConfig == nil {
+		logger.Warn().Msg("No unified config available - skipping RPC type validation")
+		return nil
+	}
+
+	serviceRPCTypes := unifiedConfig.GetServiceRPCTypes(rc.serviceID)
+	if len(serviceRPCTypes) == 0 {
+		logger.Warn().Msg("No RPC types configured for service - skipping validation")
+		return nil
+	}
+
+	// Detect RPC type from HTTP request
+	detector := NewRPCTypeDetector()
+	rpcType, err := detector.DetectRPCType(httpReq, string(rc.serviceID), serviceRPCTypes)
+	if err != nil {
+		logger.Error().Err(err).Msg("RPC type detection failed")
+
+		// Update gateway observations
+		rc.updateGatewayObservations(err)
+
+		// Set error response
+		rc.presetFailureHTTPResponse = NewRPCTypeValidationErrorResponse(
+			rc.serviceID,
+			"unknown",
+			serviceRPCTypes,
+			fmt.Sprintf("Failed to detect RPC type: %s", err.Error()),
+		)
+
+		return fmt.Errorf("%w: %s", ErrRPCTypeDetectionFailed, err.Error())
+	}
+
+	// Store detected RPC type
+	rc.detectedRPCType = rpcType
+	logger = logger.With("detected_rpc_type", rpcType.String())
+	logger.Debug().Msg("RPC type detected successfully")
+
+	// Validate detected RPC type against service configuration
+	if err := rc.rpcTypeValidator.ValidateRPCType(rc.serviceID, rpcType); err != nil {
+		logger.Error().Err(err).Msg("RPC type validation failed")
+
+		// Update gateway observations
+		rc.updateGatewayObservations(err)
+
+		// Set error response
+		mapper := NewRPCTypeMapper()
+		detectedTypeStr := mapper.FormatRPCType(rpcType)
+		rc.presetFailureHTTPResponse = NewRPCTypeValidationErrorResponse(
+			rc.serviceID,
+			detectedTypeStr,
+			serviceRPCTypes,
+			fmt.Sprintf("RPC type '%s' is not supported by service '%s'", detectedTypeStr, rc.serviceID),
+		)
+
+		return err
+	}
+
+	logger.Info().Msg("RPC type validation successful")
 	return nil
 }
 
@@ -182,7 +291,8 @@ func (rc *requestContext) BuildQoSContextFromHTTP(httpReq *http.Request) error {
 
 	// Build the payload for the requested service using the incoming HTTP request.
 	// This payload will be sent to an endpoint matching the requested service.
-	qosCtx, isValid := rc.serviceQoS.ParseHTTPRequest(rc.context, httpReq)
+	// Pass the detected RPC type so QoS can use it (or apply fallback logic if UNKNOWN_RPC).
+	qosCtx, isValid := rc.serviceQoS.ParseHTTPRequest(rc.context, httpReq, rc.detectedRPCType)
 	rc.qosCtx = qosCtx
 
 	if !isValid {
@@ -213,8 +323,19 @@ func (rc *requestContext) BuildQoSContextFromHTTP(httpReq *http.Request) error {
 func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Request) error {
 	logger := rc.logger.With("method", "BuildProtocolContextsFromHTTPRequest").With("service_id", rc.serviceID)
 
+	// Get RPC type from QoS-detected payload
+	payloads := rc.qosCtx.GetServicePayloads()
+	if len(payloads) == 0 {
+		return fmt.Errorf("%w: no payloads available from QoS context", errBuildProtocolContextsFromHTTPRequest)
+	}
+	rpcType := payloads[0].RPCType
+
+	logger = logger.With("rpc_type", rpcType.String())
+	logger.Debug().Msg("Using detected RPC type for endpoint selection")
+
 	// Retrieve the list of available endpoints for the requested service.
-	availableEndpoints, endpointLookupObs, err := rc.protocol.AvailableHTTPEndpoints(rc.context, rc.serviceID, httpReq)
+	// Filter endpoints to only those supporting the detected RPC type.
+	availableEndpoints, endpointLookupObs, err := rc.protocol.AvailableHTTPEndpoints(rc.context, rc.serviceID, rpcType, httpReq)
 	if err != nil {
 		// error encountered: use the supplied observations as protocol observations.
 		rc.updateProtocolObservations(&endpointLookupObs)
@@ -252,7 +373,7 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 
 	for i, endpointAddr := range selectedEndpoints {
 		logger.Debug().Msgf("Building protocol context for endpoint %d/%d: %s", i+1, numSelectedEndpoints, endpointAddr)
-		protocolCtx, protocolCtxSetupErrObs, err := rc.protocol.BuildHTTPRequestContextForEndpoint(rc.context, rc.serviceID, endpointAddr, httpReq)
+		protocolCtx, protocolCtxSetupErrObs, err := rc.protocol.BuildHTTPRequestContextForEndpoint(rc.context, rc.serviceID, endpointAddr, rpcType, httpReq)
 		if err != nil {
 			lastProtocolCtxSetupErrObs = &protocolCtxSetupErrObs
 			logger.Warn().Err(err).Str("endpoint_addr", string(endpointAddr)).Msgf("Failed to build protocol context for endpoint %d/%d, skipping", i+1, numSelectedEndpoints)

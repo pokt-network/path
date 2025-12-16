@@ -89,13 +89,13 @@ func main() {
 	}
 
 	// Setup metrics reporter, to be used by Gateway and Health Checks
-	metricsReporter, err := setupMetricsServer(logger, prometheusMetricsServerAddr)
+	metricsReporter, err := setupMetricsServer(logger, config.Metrics.PrometheusAddr)
 	if err != nil {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start metrics server"}`, err)
 	}
 
 	// Setup the pprof server with the background context for graceful shutdown
-	setupPprofServer(backgroundCtx, logger, pprofAddr)
+	setupPprofServer(backgroundCtx, logger, config.Metrics.PprofAddr)
 
 	// Setup the data reporter
 	dataReporter, err := setupHTTPDataReporter(logger, config.DataReporterConfig)

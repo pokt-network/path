@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/gateway"
 	qosobservations "github.com/pokt-network/path/observation/qos"
@@ -37,10 +38,13 @@ type evmRequestValidator struct {
 // validateHTTPRequest validates an HTTP request, extracting and validating its EVM JSONRPC payload.
 // If validation fails, an errorContext is returned along with false.
 // If validation succeeds, a fully initialized requestContext is returned along with true.
-func (erv *evmRequestValidator) validateHTTPRequest(req *http.Request) (gateway.RequestQoSContext, bool) {
+//
+// EVM only supports JSON-RPC, so detectedRPCType is logged but not used for routing.
+func (erv *evmRequestValidator) validateHTTPRequest(req *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
 	logger := erv.logger.With(
 		"qos", "EVM",
 		"method", "validateHTTPRequest",
+		"detected_rpc_type", detectedRPCType.String(),
 	)
 
 	// Read the HTTP request body with size limit to prevent OOM attacks

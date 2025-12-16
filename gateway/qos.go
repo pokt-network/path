@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+
 	"github.com/pokt-network/path/metrics/devtools"
 	pathhttp "github.com/pokt-network/path/network/http"
 	"github.com/pokt-network/path/observation/qos"
@@ -66,7 +68,9 @@ type RequestQoSContext interface {
 type QoSContextBuilder interface {
 	// ParseHTTPRequest:
 	// - Ensures the HTTP request is valid for the target service.
-	ParseHTTPRequest(context.Context, *http.Request) (RequestQoSContext, bool)
+	// - detectedRPCType: The RPC type detected by the gateway (or UNKNOWN_RPC if detection failed)
+	// - Services should respect this if not UNKNOWN_RPC, or apply their own fallback logic
+	ParseHTTPRequest(ctx context.Context, httpReq *http.Request, detectedRPCType sharedtypes.RPCType) (RequestQoSContext, bool)
 
 	// ParseWebsocketRequest:
 	// - Ensures a Websocket request is valid for the target service.

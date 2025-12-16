@@ -41,18 +41,39 @@ const (
 	DefaultObservationPipelineQueueSize = 1000
 )
 
-// HealthCheckType defines the protocol type for a health check.
+// HealthCheckType defines the RPC protocol type for a health check.
+// These values are aligned with service rpc_types configuration to ensure consistency.
+//
+// BREAKING CHANGE: The enum values have been updated to match service rpc_types:
+//   - "jsonrpc" → "json_rpc" (aligned with service config)
+//   - "comet_bft" is newly added for Cosmos CometBFT health checks
+//
+// Delivery mechanisms by type:
+//   - json_rpc, rest, comet_bft: HTTP delivery
+//   - websocket: WebSocket delivery
+//   - grpc: gRPC delivery (future)
 type HealthCheckType string
 
 const (
 	// HealthCheckTypeJSONRPC is for JSON-RPC endpoints (HTTP POST with JSON body).
-	HealthCheckTypeJSONRPC HealthCheckType = "jsonrpc"
-	// HealthCheckTypeREST is for REST endpoints (HTTP GET/POST).
+	// Aligned with service rpc_types: "json_rpc"
+	HealthCheckTypeJSONRPC HealthCheckType = "json_rpc"
+
+	// HealthCheckTypeREST is for REST API endpoints (HTTP GET/POST).
+	// Aligned with service rpc_types: "rest"
 	HealthCheckTypeREST HealthCheckType = "rest"
+
+	// HealthCheckTypeCometBFT is for CometBFT RPC endpoints (Cosmos chains).
+	// Aligned with service rpc_types: "comet_bft"
+	HealthCheckTypeCometBFT HealthCheckType = "comet_bft"
+
 	// HealthCheckTypeWebSocket is for WebSocket endpoints (connect, optionally send/receive).
+	// Aligned with service rpc_types: "websocket"
 	HealthCheckTypeWebSocket HealthCheckType = "websocket"
+
 	// HealthCheckTypeGRPC is for gRPC endpoints (future implementation).
 	// Uses the standard grpc.health.v1.Health service.
+	// Aligned with service rpc_types: "grpc"
 	HealthCheckTypeGRPC HealthCheckType = "grpc"
 )
 
@@ -63,8 +84,11 @@ type (
 		// Name is a unique identifier for this check within a service.
 		Name string `yaml:"name"`
 
-		// Type specifies the protocol type for this check.
-		// REQUIRED - must be one of: "jsonrpc", "rest", "websocket", "grpc".
+		// Type specifies the RPC protocol type for this check.
+		// REQUIRED - must match one of the service's configured rpc_types.
+		// Valid values: "json_rpc", "rest", "comet_bft", "websocket", "grpc"
+		//
+		// BREAKING CHANGE: Old value "jsonrpc" is now "json_rpc" for consistency.
 		// No default - explicit specification required to avoid ambiguity.
 		Type HealthCheckType `yaml:"type"`
 
@@ -381,18 +405,19 @@ func (hcc *HealthCheckConfig) Validate() error {
 
 	// Type is REQUIRED - no default, must be explicit
 	if hcc.Type == "" {
-		return fmt.Errorf("type is required for check %s (must be jsonrpc, rest, websocket, or grpc)", hcc.Name)
+		return fmt.Errorf("type is required for check %s (must be json_rpc, rest, comet_bft, websocket, or grpc)", hcc.Name)
 	}
 
 	// Validate type is one of the allowed values
 	validTypes := map[HealthCheckType]bool{
 		HealthCheckTypeJSONRPC:   true,
 		HealthCheckTypeREST:      true,
+		HealthCheckTypeCometBFT:  true,
 		HealthCheckTypeWebSocket: true,
 		HealthCheckTypeGRPC:      true,
 	}
 	if !validTypes[hcc.Type] {
-		return fmt.Errorf("invalid type '%s' for check %s (must be jsonrpc, rest, websocket, or grpc)", hcc.Type, hcc.Name)
+		return fmt.Errorf("invalid type '%s' for check %s (must be json_rpc, rest, comet_bft, websocket, or grpc)", hcc.Type, hcc.Name)
 	}
 
 	// gRPC is not yet implemented
@@ -400,8 +425,8 @@ func (hcc *HealthCheckConfig) Validate() error {
 		return fmt.Errorf("grpc health checks are not yet implemented for check %s", hcc.Name)
 	}
 
-	// Method is required for HTTP-based types (jsonrpc, rest)
-	if hcc.Type == HealthCheckTypeJSONRPC || hcc.Type == HealthCheckTypeREST {
+	// Method is required for HTTP-based types (json_rpc, rest, comet_bft)
+	if hcc.Type == HealthCheckTypeJSONRPC || hcc.Type == HealthCheckTypeREST || hcc.Type == HealthCheckTypeCometBFT {
 		if hcc.Method == "" {
 			return fmt.Errorf("method is required for %s check %s", hcc.Type, hcc.Name)
 		}

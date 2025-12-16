@@ -219,18 +219,13 @@ func setLegacyErrFieldsFromWebsocketConnectionError(
 	// Update ErrorType using the observed endpoint error.
 	legacyRecord.ErrorType = endpointErr.String()
 
-	// Build the endpoint error details, including any sanctions.
+	// Build the endpoint error details
 	var errMsg string
 	if errDetails := wsConnectionObs.GetErrorDetails(); errDetails != "" {
 		errMsg = fmt.Sprintf("error details: %s", errDetails)
 	}
 
-	// Add the sanction details to the error message.
-	if endpointSanction := wsConnectionObs.RecommendedSanction; endpointSanction != nil {
-		errMsg = fmt.Sprintf("%s, sanction: %s", errMsg, endpointSanction.String())
-	}
-
-	// Set the error message field.
+	// Set the error message field
 	legacyRecord.ErrorMessage = errMsg
 
 	return legacyRecord
@@ -250,18 +245,13 @@ func setLegacyErrFieldsFromWebsocketMessageError(
 	// Update ErrorType using the observed endpoint error.
 	legacyRecord.ErrorType = endpointErr.String()
 
-	// Build the endpoint error details, including any sanctions.
+	// Build the endpoint error details
 	var errMsg string
 	if errDetails := wsMessageObs.GetErrorDetails(); errDetails != "" {
 		errMsg = fmt.Sprintf("error details: %s", errDetails)
 	}
 
-	// Add the sanction details to the error message.
-	if endpointSanction := wsMessageObs.RecommendedSanction; endpointSanction != nil {
-		errMsg = fmt.Sprintf("%s, sanction: %s", errMsg, endpointSanction.String())
-	}
-
-	// Set the error message field.
+	// Set the error message field
 	legacyRecord.ErrorMessage = errMsg
 
 	return legacyRecord
@@ -271,7 +261,6 @@ func setLegacyErrFieldsFromWebsocketMessageError(
 // It handles:
 // - Error type mapping
 // - Error message construction
-// - Sanction details when present
 //
 // Parameters:
 // - legacyRecord: the record to update
@@ -291,15 +280,10 @@ func setLegacyErrFieldsFromShannonEndpointError(
 	// Update ErrorType using the observed endpoint error.
 	legacyRecord.ErrorType = endpointErr.String()
 
-	// Build the endpoint error details, including any sanctions.
+	// Build the endpoint error details
 	var errMsg string
 	if errDetails := endpointObservation.GetErrorDetails(); errDetails != "" {
 		errMsg = fmt.Sprintf("error details: %s", errDetails)
-	}
-
-	// Add the sanction details to the error message.
-	if endpointSanction := endpointObservation.RecommendedSanction; endpointSanction != nil {
-		errMsg = fmt.Sprintf("%s, sanction: %s", errMsg, endpointSanction.String())
 	}
 
 	legacyRecord.ErrorMessage = errMsg

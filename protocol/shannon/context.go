@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"math/rand"
 	"net/http"
 	"strconv"
 	"sync"
@@ -35,11 +34,6 @@ import (
 // - Moving HTTP request code to a dedicated file
 
 // TODO_TECHDEBT(@adshmh): Make this threshold configurable.
-//
-// Maximum time to wait before using a fallback endpoint.
-// TODO_TECHDEBT(@adshmh): Make this threshold configurable.
-const maxWaitBeforeFallbackMillisecond = 1_000
-
 // Maximum endpoint payload length for error logging (100 chars)
 const maxEndpointPayloadLenForLogging = 100
 
@@ -136,7 +130,7 @@ type requestContext struct {
 
 	// reputationService tracks endpoint reputation scores.
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
-	// When nil, only binary sanctions are used.
+	// When nil, no reputation-based filtering is applied.
 	reputationService reputation.ReputationService
 }
 
@@ -380,13 +374,6 @@ func (rc *requestContext) getSelectedEndpoint() endpoint {
 	return rc.selectedEndpoint
 }
 
-// setSelectedEndpoint sets the selected endpoint in a thread-safe manner.
-func (rc *requestContext) setSelectedEndpoint(endpoint endpoint) {
-	rc.selectedEndpointMutex.Lock()
-	defer rc.selectedEndpointMutex.Unlock()
-	rc.selectedEndpoint = endpoint
-}
-
 // executeRelayRequestStrategy determines and executes the appropriate relay strategy.
 // In particular, it includes logic that accounts for:
 //  1. Endpoint type (fallback vs protocol endpoint)
@@ -411,21 +398,12 @@ func (rc *requestContext) executeRelayRequestStrategy(payload protocol.Payload) 
 		rc.logger.Debug().Msg("Executing fallback relay")
 		return rc.sendFallbackRelay(selectedEndpoint, payload)
 
-	// ** Priority 2: Check Network conditions **
-	// Session rollover periods
-	// - Protocol relay with fallback protection during session rollover periods
-	// - Sends requests in parallel to ensure reliability during network transitions
-	//
-	// TODO_DELETE(@adshmh): No session rollover fallback for hey service.
-	case rc.fullNode.IsInSessionRollover() && rc.serviceID != "hey":
-		rc.logger.Debug().Msg("Executing protocol relay with fallback protection during session rollover periods")
-		// TODO_TECHDEBT(@adshmh): Separate error handling for fallback and Shannon endpoints.
-		return rc.sendRelayWithFallback(payload)
-
 	// ** Default **
 	// Standard protocol relay
 	// - Standard protocol relay through Shannon network
-	// - Used during stable network periods with protocol endpoints
+	// - During session rollover: Uses merged endpoints from current + extended sessions
+	// - During normal operation: Uses endpoints from current session only
+	// - Fallback endpoints only used when no session endpoints are available
 	default:
 		rc.logger.Debug().Msg("Executing standard protocol relay")
 		return rc.sendProtocolRelay(payload)
@@ -446,103 +424,6 @@ func buildHeaders(payload protocol.Payload) map[string]string {
 	}
 
 	return headers
-}
-
-// sendRelayWithFallback:
-// - Attempts Shannon endpoint with timeout
-// - Falls back to random fallback endpoint on failure/timeout
-// - Shields user from endpoint errors
-// - Updates the request context's selectedEndpoint for use by logging, metrics, and data logic.
-// TODO_TECHDEBT(@adshmh): This is an interim solution to be replaced with intelligent fallback.
-func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (protocol.Response, error) {
-	rc.hydrateLogger("sendRelayWithFallback")
-
-	// Convert timeout to time.Duration
-	relayTimeout := time.Duration(maxWaitBeforeFallbackMillisecond) * time.Millisecond
-
-	// Setup Shannon endpoint request:
-	// - Create channel for async response
-	// - Initialize response variables
-	endpointResponseReceivedChan := make(chan error, 1)
-	var (
-		endpointResponse protocol.Response
-		endpointErr      error
-	)
-
-	// Send Shannon relay in parallel:
-	// - Execute request asynchronously
-	// - Signal completion via channel
-	go func() {
-		endpointResponse, endpointErr = rc.sendProtocolRelay(payload)
-		// Signal the completion of Shannon Network relay.
-		endpointResponseReceivedChan <- endpointErr
-	}()
-
-	// Wait for Shannon response or timeout:
-	// - If successful, return Pocket Network response from RelayMiner
-	// - If error or timeout, fallback to a random fallback endpoint
-	select {
-
-	// RelayMiner responded (success or failure)
-	case err := <-endpointResponseReceivedChan:
-		// Successfully received and validated a response from the shannon endpoint.
-		// No need to use the fallback endpoint's response.
-		if err == nil {
-			return endpointResponse, nil
-		}
-
-		// TODO_TECHDEBT(@adshmh): Verify correct observations/sanctions when using fallback due to endpoint error.
-		//
-		rc.logger.Info().Err(err).Msg("Got a response from Pocket Network, but it contained an error. Using a fallback endpoint instead")
-
-		// Shannon endpoint failed, use fallback
-		return rc.sendRelayToARandomFallbackEndpoint(payload)
-
-	// RelayMiner timed out. Use a random fallback endpoint.
-	case <-time.After(relayTimeout):
-		rc.logger.Info().Msg("Timed out waiting for Pocket Network to respond. Using a fallback endpoint.")
-
-		// Use a random fallback endpoint
-		return rc.sendRelayToARandomFallbackEndpoint(payload)
-	}
-}
-
-// sendRelayToARandomFallbackEndpoint:
-// - Selects random fallback endpoint
-// - Routes payload via selected endpoint
-// - Returns error if no endpoints available
-// - Updates the request context's selectedEndpoint for use by logging, metrics, and data logic.
-func (rc *requestContext) sendRelayToARandomFallbackEndpoint(payload protocol.Payload) (protocol.Response, error) {
-	if len(rc.fallbackEndpoints) == 0 {
-		rc.logger.Warn().Msg("SHOULD HAPPEN RARELY: no fallback endpoints available for the service")
-		return protocol.Response{}, fmt.Errorf("no fallback endpoints available")
-	}
-
-	rc.hydrateLogger("sendRelayToARandomFallbackEndpoint")
-
-	// Select random fallback endpoint:
-	// - Convert map to slice for random selection
-	// - Pick random index
-	allFallbackEndpoints := make([]endpoint, 0, len(rc.fallbackEndpoints))
-	for _, endpoint := range rc.fallbackEndpoints {
-		allFallbackEndpoints = append(allFallbackEndpoints, endpoint)
-	}
-	fallbackEndpoint := allFallbackEndpoints[rand.Intn(len(allFallbackEndpoints))]
-
-	// TODO_TECHDEBT(@adshmh): Support tracking both the selected and fallback endpoints.
-	// This is needed to support accurate visibility/sanctions against both Shannon and fallback endpoints.
-	//
-	// Update the selected endpoint to the randomly selected fallback endpoint
-	// This ensures observations reflect the actually used endpoint
-	rc.setSelectedEndpoint(fallbackEndpoint)
-
-	// Use the randomly selected fallback endpoint to send a relay.
-	relayResponse, err := rc.sendFallbackRelay(fallbackEndpoint, payload)
-	if err != nil {
-		rc.logger.Warn().Err(err).Msg("SHOULD NEVER HAPPEN: fallback endpoint returned an error.")
-	}
-
-	return relayResponse, err
 }
 
 // TODO_TECHDEBT(@adshmh): Refactor to split the selection of and interactions with the fallback endpoint.
@@ -601,9 +482,36 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		} else {
 			targetServerURL = rc.loadTestingConfig.RelayMinerConfig.URL
 		}
-	// Default: use the selected endoint's URL
+	// Default: use the RPC-type-specific URL from the selected endpoint
 	default:
-		targetServerURL = selectedEndpoint.PublicURL()
+		targetServerURL = selectedEndpoint.GetURL(rc.currentRPCType)
+
+		// FALLBACK HANDLING: If the URL is empty, it means the endpoint doesn't support
+		// the originally requested RPC type. This happens when RPC type fallback occurred
+		// during endpoint selection (e.g., COMET_BFT → JSON_RPC).
+		// Try to find which RPC type the endpoint actually supports.
+		if targetServerURL == "" {
+			// Try common RPC types in priority order
+			fallbackTypes := []sharedtypes.RPCType{
+				sharedtypes.RPCType_JSON_RPC,
+				sharedtypes.RPCType_REST,
+				sharedtypes.RPCType_COMET_BFT,
+				sharedtypes.RPCType_GRPC,
+			}
+
+			for _, rpcType := range fallbackTypes {
+				if url := selectedEndpoint.GetURL(rpcType); url != "" {
+					targetServerURL = url
+					rc.logger.Info().
+						Str("requested_rpc_type", rc.currentRPCType.String()).
+						Str("actual_rpc_type", rpcType.String()).
+						Str("endpoint", string(selectedEndpoint.Addr())).
+						Msg("Endpoint doesn't support requested RPC type, using supported type from endpoint")
+					rc.currentRPCType = rpcType // Update to the actual RPC type
+					break
+				}
+			}
+		}
 	}
 
 	// TODO_TECHDEBT(@adshmh): Add a new struct to track details about the HTTP call.
@@ -640,7 +548,7 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 			Bytes:          httpRelayResponseBz,
 			HTTPStatusCode: httpStatusCode,
 			// Intentionally leaving the endpoint address empty.
-			// Ensuring no sanctions/invalidation rules apply to LoadTesting backend server
+			// Ensuring no reputation penalties/filtering apply to LoadTesting backend server
 			EndpointAddr: "",
 		}, nil
 	}
@@ -820,7 +728,7 @@ func buildUnsignedRelayRequest(
 //   - This bypasses protocol-level request processing and validation.
 //   - This DOES NOT get sent to a RelayMiner.
 //   - Returns the response received from the fallback endpoint.
-//   - Used in cases, such as, when all endpoints are sanctioned for a service ID.
+//   - Used in cases, such as, when all endpoints are filtered out (low reputation) for a service ID.
 func (rc *requestContext) sendFallbackRelay(
 	fallbackEndpoint endpoint,
 	payload protocol.Payload,
@@ -925,15 +833,18 @@ func (rc *requestContext) handleEndpointError(
 	selectedEndpoint := rc.getSelectedEndpoint()
 	selectedEndpointAddr := selectedEndpoint.Addr()
 
-	// Error classification based on trusted error sources only
-	endpointErrorType, recommendedSanctionType := classifyRelayError(rc.logger, endpointErr)
+	// Classify error and get reputation signal directly
+	// See ERROR_CLASSIFICATION.md for detailed error category documentation
+	latency := time.Since(endpointQueryTime)
+	endpointErrorType, signal := classifyErrorAsSignal(rc.logger, endpointErr, latency)
 
-	// Enhanced logging with error type and error source classification
+	// Enhanced logging with error type and reputation signal
 	isMalformedPayloadErr := isMalformedEndpointPayloadError(endpointErrorType)
 	rc.logger.Error().
 		Err(endpointErr).
 		Str("error_type", endpointErrorType.String()).
-		Str("sanction_type", recommendedSanctionType.String()).
+		Str("signal_type", string(signal.Type)).
+		Float64("signal_impact", signal.GetDefaultImpact()).
 		Bool("is_malformed_payload_error", isMalformedPayloadErr).
 		Msg("relay error occurred. Service request will fail.")
 
@@ -945,12 +856,11 @@ func (rc *requestContext) handleEndpointError(
 		time.Now(), // Timestamp: endpoint query completed.
 		endpointErrorType,
 		fmt.Sprintf("relay error: %v", endpointErr),
-		recommendedSanctionType,
 		rc.currentRelayMinerError, // Use RelayMinerError data from request context
 		rc.currentRPCType,         // Use RPC type from request context
 	)
 
-	// Track endpoint error observation for metrics and sanctioning
+	// Track endpoint error observation for metrics
 	// Use channel if available (parallel processing), otherwise append directly (single relay)
 	if rc.observationsChan != nil {
 		rc.observationsChan <- endpointObs
@@ -959,11 +869,10 @@ func (rc *requestContext) handleEndpointError(
 	}
 
 	// Record reputation signal if reputation service is enabled.
-	// This provides gradual scoring in addition to binary sanctions.
+	// This provides gradual scoring based on error severity.
 	if rc.reputationService != nil {
-		latency := time.Since(endpointQueryTime)
-		signal := mapErrorToSignal(endpointErrorType, recommendedSanctionType, latency)
-		endpointKey := rc.reputationService.KeyBuilderForService(rc.serviceID).BuildKey(rc.serviceID, selectedEndpointAddr)
+		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
+		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
 
 		// Extract domain for metrics
 		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
@@ -1029,7 +938,8 @@ func (rc *requestContext) handleEndpointSuccess(
 	if rc.reputationService != nil {
 		latency := time.Since(endpointQueryTime)
 		signal := reputation.NewSuccessSignal(latency)
-		endpointKey := rc.reputationService.KeyBuilderForService(rc.serviceID).BuildKey(rc.serviceID, selectedEndpointAddr)
+		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
+		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
 
 		// Extract domain for metrics
 		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())

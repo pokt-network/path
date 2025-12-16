@@ -49,6 +49,10 @@ type Gateway struct {
 	// sending the service payload to an endpoint.
 	Protocol
 
+	// RPCTypeValidator validates detected RPC types against service configuration.
+	// Used to fail fast with clear errors for unsupported RPC types.
+	RPCTypeValidator *RPCTypeValidator
+
 	// MetricsReporter is used to export metrics based on observations made in handling service requests.
 	MetricsReporter RequestResponseReporter
 
@@ -116,6 +120,7 @@ func (g Gateway) handleHTTPServiceRequest(
 		gatewayObservations: getUserRequestGatewayObservations(httpReq),
 		protocol:            g.Protocol,
 		httpRequestParser:   g.HTTPRequestParser,
+		rpcTypeValidator:    g.RPCTypeValidator,
 		metricsReporter:     g.MetricsReporter,
 		dataReporter:        g.DataReporter,
 		observationQueue:    g.ObservationQueue,
@@ -137,6 +142,14 @@ func (g Gateway) handleHTTPServiceRequest(
 	// e.g. extract the target service ID from the HTTP request.
 	err := gatewayRequestCtx.InitFromHTTPRequest(httpReq)
 	if err != nil {
+		return
+	}
+
+	// Validate RPC type before QoS processing.
+	// This fails fast if the detected RPC type is not in the service's configured rpc_types.
+	err = gatewayRequestCtx.ValidateRPCType(httpReq)
+	if err != nil {
+		logger.Error().Err(err).Msg("❌ RPC type validation failed")
 		return
 	}
 

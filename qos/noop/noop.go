@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics/devtools"
@@ -35,7 +36,8 @@ func NewNoOpQoSService(_ polylog.Logger, _ protocol.ServiceID) *NoOpQoS {
 // ParseHTTPRequest reads the supplied HTTP request's body and passes it on to a new requestContext instance.
 // It intentionally avoids performing any validation on the request, as is the designed behavior of the noop QoS.
 // Implements the gateway.QoSService interface.
-func (NoOpQoS) ParseHTTPRequest(_ context.Context, httpRequest *http.Request) (gateway.RequestQoSContext, bool) {
+// Fallback logic for NoOp: header → jsonrpc (NoOp passes through requests without validation)
+func (NoOpQoS) ParseHTTPRequest(_ context.Context, httpRequest *http.Request, _ sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
 	// Apply size limit to prevent OOM attacks from unbounded io.ReadAll calls
 	limitedBody := http.MaxBytesReader(nil, httpRequest.Body, maxRequestBodySize)
 	bz, err := io.ReadAll(limitedBody)

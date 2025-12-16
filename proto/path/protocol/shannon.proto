@@ -13,7 +13,7 @@ enum ShannonRequestErrorType {
   // Due to one or more of the following:
   // - Any of the gateway mode errors above
   // - Error fetching a session for one or more apps.
-  // - One or more available endpoints are sanctioned.
+  // - One or more available endpoints are below reputation threshold.
   SHANNON_REQUEST_ERROR_INTERNAL_NO_ENDPOINTS_AVAILABLE = 2;
   // Centralized gateway mode: Error fetching the app.
   SHANNON_REQUEST_ERROR_INTERNAL_CENTRALIZED_MODE_APP_FETCH_ERR = 3;
@@ -132,15 +132,6 @@ enum ShannonEndpointErrorType {
   SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_5XX = 43;
 }
 
-// ShannonSanctionType specifies the duration type for endpoint sanctions
-enum ShannonSanctionType {
-  SHANNON_SANCTION_UNSPECIFIED = 0;
-  SHANNON_SANCTION_SESSION = 1;  // Valid only for current session
-  SHANNON_SANCTION_PERMANENT = 2; // Sanction persists indefinitely; can only be cleared by Gateway restart (e.g., redeploying the K8s pod or restarting the binary)
-  SHANNON_SANCTION_DO_NOT_SANCTION = 3; // Do not sanction the endpoint based on this error
-  // TODO_IMPROVE: Add a temporary sanction that lasts a few blocks.
-}
-
 // ShannonRelayMinerError captures relay miner error details from the RelayResponse
 message ShannonRelayMinerError {
   // Codespace from the RelayMinerError
@@ -180,15 +171,12 @@ message ShannonWebsocketConnectionObservation {
   // Additional error details when available
   optional string error_details = 9;
 
-  // Recommended sanction type based on the error
-  optional ShannonSanctionType recommended_sanction = 10;
-
   // Tracks whether the endpoint is a fallback endpoint
-  bool is_fallback_endpoint = 11;
+  bool is_fallback_endpoint = 10;
 
   // Connection lifecycle timestamps
-  google.protobuf.Timestamp connection_established_timestamp = 12;
-  optional google.protobuf.Timestamp connection_closed_timestamp = 13;
+  google.protobuf.Timestamp connection_established_timestamp = 11;
+  optional google.protobuf.Timestamp connection_closed_timestamp = 12;
 
   // Connection event type to distinguish between establishment and closure
   enum ConnectionEventType {
@@ -197,7 +185,7 @@ message ShannonWebsocketConnectionObservation {
     CONNECTION_CLOSED = 2;
     CONNECTION_ESTABLISHMENT_FAILED = 3;
   }
-  ConnectionEventType event_type = 14;
+  ConnectionEventType event_type = 13;
 }
 
 // ShannonWebsocketMessageObservation stores observations from individual Websocket messages
@@ -236,14 +224,11 @@ message ShannonWebsocketMessageObservation {
   // Additional error details when available
   optional string error_details = 11;
 
-  // Recommended sanction type based on the error
-  optional ShannonSanctionType recommended_sanction = 12;
-
   // RelayMiner error details if the endpoint returned a RelayMinerError for this message
-  optional ShannonRelayMinerError relay_miner_error = 13;
+  optional ShannonRelayMinerError relay_miner_error = 12;
 
   // Tracks whether the endpoint is a fallback endpoint
-  bool is_fallback_endpoint = 14;
+  bool is_fallback_endpoint = 13;
 }
 
 // ShannonRequestObservations represents observations collected during the processing
@@ -313,17 +298,14 @@ message ShannonEndpointObservation {
   // Additional error details when available
   optional string error_details = 11;
 
-  // Recommended sanction type based on the error
-  optional ShannonSanctionType recommended_sanction = 12;
-
   // RelayMiner error details if the endpoint returned a RelayMinerError
-  optional ShannonRelayMinerError relay_miner_error = 13;
+  optional ShannonRelayMinerError relay_miner_error = 12;
 
   // HTTP status code of the endpoint response
-  optional int32 endpoint_backend_service_http_response_status_code = 14;
+  optional int32 endpoint_backend_service_http_response_status_code = 13;
 
   // HTTP Response payload size
-  optional int64 endpoint_backend_service_http_response_payload_size = 15;
+  optional int64 endpoint_backend_service_http_response_payload_size = 14;
 
   // TODO_TECHDEBT(@adshmh): Separate fallback endpoints into a separate message:
   // Most of fields above (e.g. session_id) only apply to a Shannon endpoint.
@@ -331,7 +313,7 @@ message ShannonEndpointObservation {
   // TODO_CONSIDERATION(@adshmh): Consider renaming to is_gateway_owned OR is_off_protocol.
   //
   // Tracks whether the endpoint is a fallback endpoint.
-  bool is_fallback_endpoint = 16;
+  bool is_fallback_endpoint = 15;
 }
 
 // ShannonObservationsList provides a container for multiple ShannonRequestObservations,

@@ -19,6 +19,14 @@ import (
 )
 
 // getCentralizedGatewayModeActiveSessions returns the set of active sessions under the Centralized gateway mode.
+//
+// During session rollover periods:
+//   - Fetches BOTH current session AND extended (previous) session for each app
+//   - Merges endpoints from both sessions to ensure continuity during rollover
+//   - Extended session is only added if it differs from current session
+//
+// During normal operation:
+//   - Fetches only the current session for each app
 func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
@@ -30,7 +38,7 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 	logger.Debug().Msgf("fetching active sessions for the service %s.", serviceID)
 
 	// TODO_CRITICAL(@commoddity): if an owned app is changed (i.e. re-staked) for
-	// a different service, PATH must be restarted for changes to take effect.
+	// a different service, PATH must be restarned for changes to take effect.
 	ownedAppsForService, ok := p.ownedApps[serviceID]
 	if !ok || len(ownedAppsForService) == 0 {
 		err := fmt.Errorf("%s: %s", errProtocolContextSetupCentralizedNoAppsForService, serviceID)
@@ -38,14 +46,40 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 		return nil, err
 	}
 
+	// Check if we're in session rollover period
+	inRollover := p.IsInSessionRollover()
+
 	// Loop over the address of apps owned by the gateway in Centralized gateway mode.
 	var ownedAppSessions []sessiontypes.Session
 	for _, ownedAppAddr := range ownedAppsForService {
-		session, err := p.getSession(ctx, logger, ownedAppAddr, serviceID)
+		// Always fetch current session
+		currentSession, err := p.getSession(ctx, logger, ownedAppAddr, serviceID)
 		if err != nil {
 			return nil, err
 		}
-		ownedAppSessions = append(ownedAppSessions, session)
+		ownedAppSessions = append(ownedAppSessions, currentSession)
+
+		// During rollover: ALSO fetch extended (previous) session for continuity
+		if inRollover {
+			extendedSession, err := p.GetSessionWithExtendedValidity(ctx, serviceID, ownedAppAddr)
+			if err != nil {
+				logger.Warn().Err(err).
+					Str("app_address", ownedAppAddr).
+					Msg("Failed to get extended session during rollover - continuing with current session only")
+				continue
+			}
+
+			// Only add extended session if it's different from current session
+			// (i.e., it's actually the previous session)
+			if extendedSession.SessionId != currentSession.SessionId {
+				ownedAppSessions = append(ownedAppSessions, extendedSession)
+				logger.Info().
+					Str("app_address", ownedAppAddr).
+					Str("current_session_id", currentSession.SessionId).
+					Str("extended_session_id", extendedSession.SessionId).
+					Msg("✨ Added extended session endpoints during rollover period")
+			}
+		}
 	}
 
 	// If no sessions were found, return an error.
@@ -55,8 +89,13 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 		return nil, err
 	}
 
-	logger.Info().Msgf("Successfully fetched %d sessions for %d owned apps for service %s.",
-		len(ownedAppSessions), len(ownedAppsForService), serviceID)
+	if inRollover {
+		logger.Info().Msgf("🔄 Session rollover active: fetched %d sessions (%d current + %d extended) for %d owned apps for service %s.",
+			len(ownedAppSessions), len(ownedAppsForService), len(ownedAppSessions)-len(ownedAppsForService), len(ownedAppsForService), serviceID)
+	} else {
+		logger.Info().Msgf("Successfully fetched %d sessions for %d owned apps for service %s.",
+			len(ownedAppSessions), len(ownedAppsForService), serviceID)
+	}
 
 	return ownedAppSessions, nil
 }

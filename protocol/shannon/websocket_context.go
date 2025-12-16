@@ -147,7 +147,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	selectedEndpoint, err := p.getPreSelectedEndpoint(ctx, serviceID, selectedEndpointAddr, nil, sharedtypes.RPCType_WEBSOCKET)
 	if err != nil {
 		err = fmt.Errorf("⁉️ SHOULD NEVER HAPPEN: failed to get pre-selected endpoint: %s", err.Error())
-		// Will not lead to sanctions as this does not indicate a problem with the endpoint, nor should it ever happen.
+		// Will not lead to reputation penalty as this does not indicate a problem with the endpoint, nor should it ever happen.
 		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
 
@@ -199,14 +199,26 @@ func (p *Protocol) getPreSelectedEndpoint(
 		return nil, err
 	}
 
+	// Parse allowed suppliers from header (if present)
+	allowedSuppliers := parseAllowedSuppliersHeader(httpReq)
+
 	// Retrieve the list of endpoints (i.e. backend service URLs by external operators)
 	// that can service RPC requests for the given service ID for the given apps.
 	// This includes fallback logic if session endpoints are unavailable.
-	// The final boolean parameter sets whether to filter out sanctioned endpoints.
-	endpoints, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, rpcType)
+	// The final boolean parameter sets whether to filter by reputation.
+	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, rpcType, allowedSuppliers)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, err
+	}
+
+	// Log if RPC type fallback occurred
+	if actualRPCType != rpcType {
+		logger.Info().
+			Str("requested_rpc_type", rpcType.String()).
+			Str("actual_rpc_type", actualRPCType.String()).
+			Msg("RPC type fallback was applied for websocket endpoint selection")
 	}
 
 	// Select the endpoint that matches the pre-selected address.
@@ -269,12 +281,12 @@ func (p *Protocol) recordReputationSignalsFromWebsocketObservations(shannonObser
 func (p *Protocol) recordSignalFromWebsocketConnectionObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonWebsocketConnectionObservation) {
 	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
 
-	// Build endpoint key for reputation service
-	key := reputation.NewEndpointKey(serviceID, endpointAddr)
+	// Build endpoint key for reputation service with WEBSOCKET RPC type
+	key := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_WEBSOCKET)
 
-	// Map observation to signal using the existing mapping function
+	// Map observation error type to signal
+	// Note: We only have errorType in observations now (sanctions removed)
 	errorType := obs.GetErrorType()
-	sanctionType := obs.GetRecommendedSanction()
 
 	var signal reputation.Signal
 
@@ -282,8 +294,9 @@ func (p *Protocol) recordSignalFromWebsocketConnectionObservation(serviceID prot
 	if errorType == protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED {
 		signal = reputation.NewSuccessSignal(0)
 	} else {
-		// Map error type and sanction type to a reputation signal
-		signal = mapErrorToSignal(errorType, sanctionType, 0)
+		// Map error type directly to reputation signal
+		// See ERROR_CLASSIFICATION.md for error category documentation
+		signal = errorTypeToSignal(errorType, 0)
 	}
 
 	// Record signal (fire-and-forget, non-blocking)
@@ -593,7 +606,7 @@ func (wrc *websocketRequestContext) recordWebsocketSignal(signal reputation.Sign
 		return
 	}
 
-	endpointKey := reputation.NewEndpointKey(wrc.serviceID, wrc.selectedEndpoint.Addr())
+	endpointKey := reputation.NewEndpointKey(wrc.serviceID, wrc.selectedEndpoint.Addr(), sharedtypes.RPCType_WEBSOCKET)
 
 	// Extract domain for metrics
 	endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())

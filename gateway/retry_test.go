@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/path/metrics/devtools"
@@ -346,7 +347,7 @@ func (m *mockProtocolForRetry) GetUnifiedServicesConfig() *UnifiedServicesConfig
 }
 
 // Implement minimal Protocol interface methods (not used in retry tests)
-func (m *mockProtocolForRetry) AvailableHTTPEndpoints(ctx context.Context, serviceID protocol.ServiceID, httpReq *http.Request) (protocol.EndpointAddrList, protocolobservations.Observations, error) {
+func (m *mockProtocolForRetry) AvailableHTTPEndpoints(ctx context.Context, serviceID protocol.ServiceID, rpcType sharedtypes.RPCType, httpReq *http.Request) (protocol.EndpointAddrList, protocolobservations.Observations, error) {
 	return nil, protocolobservations.Observations{}, nil
 }
 
@@ -354,7 +355,7 @@ func (m *mockProtocolForRetry) AvailableWebsocketEndpoints(ctx context.Context, 
 	return nil, protocolobservations.Observations{}, nil
 }
 
-func (m *mockProtocolForRetry) BuildHTTPRequestContextForEndpoint(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, httpReq *http.Request) (ProtocolRequestContext, protocolobservations.Observations, error) {
+func (m *mockProtocolForRetry) BuildHTTPRequestContextForEndpoint(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, rpcType sharedtypes.RPCType, httpReq *http.Request) (ProtocolRequestContext, protocolobservations.Observations, error) {
 	return nil, protocolobservations.Observations{}, nil
 }
 

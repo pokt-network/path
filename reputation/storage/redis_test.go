@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -73,7 +75,7 @@ func TestRedisStorage_GetSet(t *testing.T) {
 	storage := newRedisStorage(t, address, 0) // No TTL
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "supplier1-https://endpoint.com")
+	key := reputation.NewEndpointKey("eth", "supplier1-https://endpoint.com", sharedtypes.RPCType_JSON_RPC)
 	score := reputation.Score{
 		Value:        85.5,
 		LastUpdated:  time.Now().Truncate(time.Second), // Redis stores as Unix timestamp
@@ -107,9 +109,9 @@ func TestRedisStorage_GetMultiple(t *testing.T) {
 
 	// Setup test data
 	keys := []reputation.EndpointKey{
-		reputation.NewEndpointKey("eth", "endpoint1"),
-		reputation.NewEndpointKey("eth", "endpoint2"),
-		reputation.NewEndpointKey("eth", "endpoint3"),
+		reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC),
+		reputation.NewEndpointKey("eth", "endpoint2", sharedtypes.RPCType_JSON_RPC),
+		reputation.NewEndpointKey("eth", "endpoint3", sharedtypes.RPCType_JSON_RPC),
 	}
 
 	scores := map[reputation.EndpointKey]reputation.Score{
@@ -139,7 +141,7 @@ func TestRedisStorage_Delete(t *testing.T) {
 	storage := newRedisStorage(t, address, 0)
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "endpoint1")
+	key := reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 	score := reputation.Score{Value: 85, LastUpdated: time.Now()}
 
 	// Set and verify
@@ -172,9 +174,9 @@ func TestRedisStorage_List(t *testing.T) {
 
 	// Setup test data for multiple services
 	scores := map[reputation.EndpointKey]reputation.Score{
-		reputation.NewEndpointKey("eth", "endpoint1"):  {Value: 80, LastUpdated: time.Now()},
-		reputation.NewEndpointKey("eth", "endpoint2"):  {Value: 85, LastUpdated: time.Now()},
-		reputation.NewEndpointKey("poly", "endpoint1"): {Value: 90, LastUpdated: time.Now()},
+		reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC):  {Value: 80, LastUpdated: time.Now()},
+		reputation.NewEndpointKey("eth", "endpoint2", sharedtypes.RPCType_JSON_RPC):  {Value: 85, LastUpdated: time.Now()},
+		reputation.NewEndpointKey("poly", "endpoint1", sharedtypes.RPCType_JSON_RPC): {Value: 90, LastUpdated: time.Now()},
 	}
 
 	err := storage.SetMultiple(ctx, scores)
@@ -208,7 +210,7 @@ func TestRedisStorage_TTL(t *testing.T) {
 	storage := newRedisStorage(t, address, ttl)
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "endpoint1")
+	key := reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 	score := reputation.Score{Value: 85, LastUpdated: time.Now()}
 
 	// Set with TTL
@@ -360,7 +362,7 @@ func TestRedisStorage_ConcurrentAccess(t *testing.T) {
 	storage := newRedisStorage(t, address, 0)
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "endpoint1")
+	key := reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Run concurrent reads and writes
 	done := make(chan bool)
@@ -416,7 +418,7 @@ func TestRedisStorage_ConcurrentMultiInstance(t *testing.T) {
 			defer wg.Done()
 
 			for op := 0; op < numOperationsPerInstance; op++ {
-				key := reputation.NewEndpointKey("eth", protocol.EndpointAddr(fmt.Sprintf("instance%d-endpoint%d", id, op)))
+				key := reputation.NewEndpointKey("eth", protocol.EndpointAddr(fmt.Sprintf("instance%d-endpoint%d", id, op)), sharedtypes.RPCType_JSON_RPC)
 				score := reputation.Score{
 					Value:        float64(50 + op),
 					LastUpdated:  time.Now(),
@@ -474,7 +476,7 @@ func TestRedisStorage_ConcurrentSameKey(t *testing.T) {
 	storage := newRedisStorage(t, address, 0)
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "contested-endpoint")
+	key := reputation.NewEndpointKey("eth", "contested-endpoint", sharedtypes.RPCType_JSON_RPC)
 	const numWriters = 50
 
 	var wg sync.WaitGroup
@@ -530,7 +532,7 @@ func TestRedisStorage_ConcurrentReadWrite(t *testing.T) {
 	storage := newRedisStorage(t, address, 0)
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "readwrite-endpoint")
+	key := reputation.NewEndpointKey("eth", "readwrite-endpoint", sharedtypes.RPCType_JSON_RPC)
 
 	// Initialize with a known value
 	initialScore := reputation.Score{
@@ -646,7 +648,7 @@ func TestRedisStorage_PersistenceAcrossConnections(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	key := reputation.NewEndpointKey("eth", "persistence-test-endpoint")
+	key := reputation.NewEndpointKey("eth", "persistence-test-endpoint", sharedtypes.RPCType_JSON_RPC)
 	score := reputation.Score{Value: 77.7, LastUpdated: time.Now()}
 
 	// First connection - write data
@@ -695,7 +697,7 @@ func TestRedisStorage_KeyPrefix(t *testing.T) {
 	require.NoError(t, err)
 	defer storage2.Close()
 
-	key := reputation.NewEndpointKey("eth", "endpoint1")
+	key := reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 	score1 := reputation.Score{Value: 80, LastUpdated: time.Now()}
 	score2 := reputation.Score{Value: 90, LastUpdated: time.Now()}
 

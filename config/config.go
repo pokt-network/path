@@ -24,6 +24,7 @@ type GatewayConfig struct {
 	// Other gateway configurations
 	Router             RouterConfig           `yaml:"router_config"`
 	Logger             LoggerConfig           `yaml:"logger_config"`
+	Metrics            MetricsConfig          `yaml:"metrics_config"`
 	HydratorConfig     EndpointHydratorConfig `yaml:"hydrator_config"`
 	MessagingConfig    MessagingConfig        `yaml:"messaging_config"`
 	DataReporterConfig HTTPDataReporterConfig `yaml:"data_reporter_config"`
@@ -110,6 +111,7 @@ func (c *GatewayConfig) hydrateDefaults() error {
 		return fmt.Errorf("invalid router config: %w", err)
 	}
 	c.Logger.hydrateLoggerDefaults()
+	c.Metrics.hydrateMetricsDefaults()
 	c.HydratorConfig.hydrateHydratorDefaults()
 	c.FullNodeConfig.HydrateDefaults()
 	return nil

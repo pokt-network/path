@@ -11,6 +11,7 @@ import (
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
 	"github.com/pokt-network/path/websockets"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
 
 // Protocol defines the core functionality of a protocol from the perspective of a gateway.
@@ -27,6 +28,7 @@ type Protocol interface {
 	AvailableHTTPEndpoints(
 		context.Context,
 		protocol.ServiceID,
+		sharedtypes.RPCType,
 		*http.Request,
 	) (protocol.EndpointAddrList, protocolobservations.Observations, error)
 
@@ -58,6 +60,7 @@ type Protocol interface {
 		context.Context,
 		protocol.ServiceID,
 		protocol.EndpointAddr,
+		sharedtypes.RPCType,
 		*http.Request,
 	) (ProtocolRequestContext, protocolobservations.Observations, error)
 

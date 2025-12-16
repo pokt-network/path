@@ -33,6 +33,7 @@ import (
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
 
 // HealthCheckExecutor executes configurable health checks against endpoints
@@ -639,7 +640,10 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	checkErr error,
 	latency time.Duration,
 ) {
-	key := reputation.NewEndpointKey(serviceID, endpointAddr)
+	// Convert health check type to RPC type for reputation tracking
+	// HealthCheckType string values match RPCType string values (e.g., "json_rpc", "rest")
+	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[string(check.Type)])
+	key := reputation.NewEndpointKey(serviceID, endpointAddr, rpcType)
 
 	// Extract domain from endpoint address for metrics
 	endpointDomain, err := shannonmetrics.ExtractDomainOrHost(string(endpointAddr))
@@ -814,7 +818,8 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 
 	// Get a protocol request context for this endpoint
 	// Passing nil for HTTP request since this is a synthetic request
-	protocolCtx, protocolObs, err := e.protocol.BuildHTTPRequestContextForEndpoint(checkCtx, serviceID, endpointAddr, nil)
+	// Use the RPC type from the health check payload for correct endpoint selection
+	protocolCtx, protocolObs, err := e.protocol.BuildHTTPRequestContextForEndpoint(checkCtx, serviceID, endpointAddr, servicePayload.RPCType, nil)
 	if err != nil {
 		e.logger.Warn().
 			Err(err).
@@ -946,11 +951,25 @@ func (e *HealthCheckExecutor) buildServicePayload(check HealthCheckConfig) proto
 		headers["Content-Type"] = "application/json"
 	}
 
+	// Convert health check Type (now aligned with rpc_types) to RPCType enum
+	mapper := NewRPCTypeMapper()
+	rpcType, err := mapper.ParseRPCType(string(check.Type))
+	if err != nil {
+		// Should never happen if config validation passed
+		e.logger.Error().
+			Str("check_name", check.Name).
+			Str("check_type", string(check.Type)).
+			Err(err).
+			Msg("Invalid health check type - using UNKNOWN_RPC")
+		rpcType = sharedtypes.RPCType_UNKNOWN_RPC
+	}
+
 	return protocol.Payload{
 		Method:  check.Method,
 		Path:    check.Path,
 		Data:    check.Body,
 		Headers: headers,
+		RPCType: rpcType, // Set from aligned health check type
 	}
 }
 

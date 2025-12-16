@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/pokt-network/path/protocol"
@@ -83,15 +84,19 @@ func (r *RedisStorage) parseKey(redisKey string) (reputation.EndpointKey, bool) 
 		return reputation.EndpointKey{}, false // Key didn't have the expected prefix
 	}
 
-	// Split into serviceID:endpointAddr
-	parts := strings.SplitN(withoutPrefix, ":", 2)
-	if len(parts) != 2 {
+	// Split into serviceID:endpointAddr:rpcType
+	parts := strings.SplitN(withoutPrefix, ":", 3)
+	if len(parts) != 3 {
 		return reputation.EndpointKey{}, false
 	}
+
+	// Parse RPC type from string
+	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[parts[2]])
 
 	return reputation.NewEndpointKey(
 		protocol.ServiceID(parts[0]),
 		protocol.EndpointAddr(parts[1]),
+		rpcType,
 	), true
 }
 

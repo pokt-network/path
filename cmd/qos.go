@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/config"
 	"github.com/pokt-network/path/gateway"
@@ -54,9 +55,11 @@ func getServiceQoSInstances(
 		// Get service type from unified config (falls back to defaults if not explicitly configured)
 		serviceType := gateway.ServiceTypePassthrough
 		var syncAllowance uint64
+		var rpcTypesStr []string
 		if unifiedConfig != nil {
 			serviceType = unifiedConfig.GetServiceType(serviceID)
 			syncAllowance = unifiedConfig.GetSyncAllowanceForService(serviceID)
+			rpcTypesStr = unifiedConfig.GetServiceRPCTypes(serviceID)
 		}
 
 		svcLogger := hydratedLogger.With("service_id", serviceID).With("service_type", string(serviceType))
@@ -68,9 +71,14 @@ func getServiceQoSInstances(
 			svcLogger.Debug().Uint64("sync_allowance", syncAllowance).Msg("Added EVM QoS instance")
 
 		case gateway.ServiceTypeCosmos:
-			cosmosQoS := cosmos.NewSimpleQoSInstanceWithSyncAllowance(qosLogger, serviceID, syncAllowance)
+			// Convert string RPC types to sharedtypes.RPCType
+			supportedAPIs := convertRPCTypesToMap(rpcTypesStr)
+
+			cosmosQoS := cosmos.NewSimpleQoSInstanceWithAPIs(qosLogger, serviceID, syncAllowance, supportedAPIs)
 			qosServices[serviceID] = cosmosQoS
-			svcLogger.Debug().Uint64("sync_allowance", syncAllowance).Msg("Added Cosmos QoS instance")
+			svcLogger.Debug().
+				Uint64("sync_allowance", syncAllowance).
+				Msgf("Added Cosmos QoS instance with supported RPC types: %v", rpcTypesStr)
 
 		case gateway.ServiceTypeSolana:
 			solanaQoS := solana.NewSimpleQoSInstance(qosLogger, serviceID)
@@ -109,4 +117,38 @@ func logGatewayServiceIDs(logger polylog.Logger, serviceConfigs map[protocol.Ser
 		serviceIDs = append(serviceIDs, string(serviceID))
 	}
 	logger.Info().Msgf("Service IDs configured by the gateway: %s.", strings.Join(serviceIDs, ", "))
+}
+
+// convertRPCTypesToMap converts string RPC types to a map of sharedtypes.RPCType.
+// This is used to configure supported APIs for QoS instances based on unified config.
+func convertRPCTypesToMap(rpcTypesStr []string) map[sharedtypes.RPCType]struct{} {
+	supportedAPIs := make(map[sharedtypes.RPCType]struct{})
+
+	for _, rpcTypeStr := range rpcTypesStr {
+		var rpcType sharedtypes.RPCType
+		switch strings.ToLower(rpcTypeStr) {
+		case "json_rpc", "jsonrpc":
+			rpcType = sharedtypes.RPCType_JSON_RPC
+		case "rest":
+			rpcType = sharedtypes.RPCType_REST
+		case "comet_bft", "cometbft":
+			rpcType = sharedtypes.RPCType_COMET_BFT
+		case "websocket", "ws":
+			rpcType = sharedtypes.RPCType_WEBSOCKET
+		case "grpc":
+			rpcType = sharedtypes.RPCType_GRPC
+		default:
+			// Skip unknown RPC types
+			continue
+		}
+		supportedAPIs[rpcType] = struct{}{}
+	}
+
+	// If no valid RPC types were found, default to REST and COMET_BFT for Cosmos chains
+	if len(supportedAPIs) == 0 {
+		supportedAPIs[sharedtypes.RPCType_REST] = struct{}{}
+		supportedAPIs[sharedtypes.RPCType_COMET_BFT] = struct{}{}
+	}
+
+	return supportedAPIs
 }

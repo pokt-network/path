@@ -31,6 +31,12 @@ const (
 	// HTTPHeaderAppAddress is the key of the entry in HTTP headers that holds the target app's address
 	// in delegated mode. The target app will be used for sending the relay request.
 	HTTPHeaderAppAddress = "App-Address"
+
+	// HTTPHeaderTargetSuppliers is the key of the entry in HTTP headers that holds a comma-separated list
+	// of supplier addresses. When present, only suppliers from this list will be used for relays,
+	// bypassing reputation and other filtering logic.
+	// Example: "Target-Suppliers: pokt1abc...,pokt1def...,pokt1ghi..."
+	HTTPHeaderTargetSuppliers = "Target-Suppliers"
 )
 
 // The Parser struct is responsible for parsing the authoritative service ID from the request's

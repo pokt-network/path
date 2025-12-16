@@ -55,8 +55,9 @@ func getWebsocketMessageErrorObservation(
 	msgData []byte,
 	messageError error,
 ) protocolobservations.Observations {
-	// Error classification based on trusted error sources only
-	endpointErrorType, recommendedSanctionType := classifyRelayError(logger, messageError)
+	// Classify error to get error type
+	// Reputation signals are handled separately in websocket_context.go
+	endpointErrorType, _ := classifyErrorAsSignal(logger, messageError, 0)
 
 	// Create a new Websocket message observation for error
 	wsMessageObs := buildWebsocketMessageErrorObservation(
@@ -64,7 +65,6 @@ func getWebsocketMessageErrorObservation(
 		int64(len(msgData)),
 		endpointErrorType,
 		fmt.Sprintf("websocket message error: %v", messageError),
-		recommendedSanctionType,
 	)
 
 	return protocolobservations.Observations{
@@ -138,7 +138,9 @@ func getWebsocketConnectionErrorObservation(
 	selectedEndpoint endpoint,
 	err error,
 ) *protocolobservations.Observations {
-	endpointErrorType, recommendedSanctionType := classifyRelayError(logger, err)
+	// Classify error to get error type
+	// Reputation signals are handled separately in websocket_context.go
+	endpointErrorType, _ := classifyErrorAsSignal(logger, err, 0)
 
 	return &protocolobservations.Observations{
 		Shannon: &protocolobservations.ShannonObservationsList{
@@ -155,7 +157,6 @@ func getWebsocketConnectionErrorObservation(
 							selectedEndpoint,
 							endpointErrorType,
 							err.Error(),
-							recommendedSanctionType,
 							protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_ESTABLISHMENT_FAILED,
 						),
 					},
@@ -203,7 +204,6 @@ func buildWebsocketMessageErrorObservation(
 	msgSize int64,
 	errorType protocolobservations.ShannonEndpointErrorType,
 	errorDetails string,
-	sanctionType protocolobservations.ShannonSanctionType,
 ) *protocolobservations.ShannonWebsocketMessageObservation {
 	session := *endpoint.Session()
 	sessionHeader := session.GetHeader()
@@ -226,9 +226,8 @@ func buildWebsocketMessageErrorObservation(
 		MessagePayloadSize: msgSize,
 
 		// Error information
-		ErrorType:           &errorType,
-		ErrorDetails:        &errorDetails,
-		RecommendedSanction: &sanctionType,
+		ErrorType:    &errorType,
+		ErrorDetails: &errorDetails,
 	}
 }
 
@@ -270,7 +269,6 @@ func buildWebsocketConnectionErrorObservation(
 	endpoint endpoint,
 	errorType protocolobservations.ShannonEndpointErrorType,
 	errorDetails string,
-	sanctionType protocolobservations.ShannonSanctionType,
 	eventType protocolobservations.ShannonWebsocketConnectionObservation_ConnectionEventType,
 ) *protocolobservations.ShannonWebsocketConnectionObservation {
 	return &protocolobservations.ShannonWebsocketConnectionObservation{
@@ -287,9 +285,8 @@ func buildWebsocketConnectionErrorObservation(
 		SessionEndHeight:   endpoint.Session().GetHeader().SessionEndBlockHeight,
 
 		// Error information
-		ErrorType:           &errorType,
-		ErrorDetails:        &errorDetails,
-		RecommendedSanction: &sanctionType,
+		ErrorType:    &errorType,
+		ErrorDetails: &errorDetails,
 
 		// Connection lifecycle
 		ConnectionEstablishedTimestamp: timestamppb.New(time.Now()),

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/alitto/pond/v2"
@@ -15,13 +16,44 @@ import (
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/health"
 	"github.com/pokt-network/path/metrics/devtools"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
 	reputationstorage "github.com/pokt-network/path/reputation/storage"
+	"github.com/pokt-network/path/request"
 )
+
+// parseAllowedSuppliersHeader extracts and parses the Target-Suppliers header from the HTTP request.
+// Returns a slice of supplier addresses, or nil if the header is not present or empty.
+func parseAllowedSuppliersHeader(httpReq *http.Request) []string {
+	if httpReq == nil {
+		return nil
+	}
+
+	headerValue := httpReq.Header.Get(request.HTTPHeaderTargetSuppliers)
+	if headerValue == "" {
+		return nil
+	}
+
+	// Split by comma and trim whitespace
+	suppliers := strings.Split(headerValue, ",")
+	result := make([]string, 0, len(suppliers))
+	for _, supplier := range suppliers {
+		trimmed := strings.TrimSpace(supplier)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+
+	return result
+}
 
 // gateway package's Protocol interface is fulfilled by the Protocol struct
 // below using methods that are specific to Shannon.
@@ -35,7 +67,7 @@ var (
 )
 
 // devtools.ProtocolDisqualifiedEndpointsReporter is fulfilled by the Protocol struct below.
-// This allows the protocol to report its sanctioned endpoints data to the devtools.DisqualifiedEndpointReporter.
+// This allows the protocol to report its disqualified endpoints data to the devtools.DisqualifiedEndpointReporter.
 var _ devtools.ProtocolDisqualifiedEndpointsReporter = &Protocol{}
 
 // Protocol provides the functionality needed by the gateway package for sending a relay to a specific endpoint.
@@ -70,7 +102,7 @@ type Protocol struct {
 	// The fallback endpoints are used when no endpoints are available for the
 	// requested service from the onchain protocol.
 	//
-	// For example, if all protocol endpoints are sanctioned, the fallback
+	// For example, if all protocol endpoints are filtered out (low reputation), the fallback
 	// endpoints will be used to populate the list of endpoints.
 	//
 	// Each service can have a SendAllTraffic flag to send all traffic to
@@ -88,8 +120,8 @@ type Protocol struct {
 	concurrencyConfig gateway.ConcurrencyConfig
 
 	// reputationService tracks endpoint reputation scores.
-	// If enabled, endpoints are filtered by score in addition to binary sanctions.
-	// When nil, only binary sanctions are used for endpoint filtering.
+	// If enabled, endpoints are filtered by their reputation score.
+	// When nil, no reputation-based filtering is applied.
 	reputationService reputation.ReputationService
 
 	// tieredSelector selects endpoints using cascade-down tier logic.
@@ -430,6 +462,7 @@ func NewProtocol(
 func (p *Protocol) AvailableHTTPEndpoints(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
+	rpcType sharedtypes.RPCType,
 	httpReq *http.Request,
 ) (protocol.EndpointAddrList, protocolobservations.Observations, error) {
 	// hydrate the logger.
@@ -437,6 +470,7 @@ func (p *Protocol) AvailableHTTPEndpoints(
 		"service", serviceID,
 		"method", "AvailableEndpoints",
 		"gateway_mode", p.gatewayMode,
+		"rpc_type", rpcType.String(),
 	)
 
 	// TODO_TECHDEBT(@adshmh): validate "serviceID" is a valid onchain Shannon service.
@@ -449,18 +483,31 @@ func (p *Protocol) AvailableHTTPEndpoints(
 	logger = logger.With("number_of_valid_sessions", len(activeSessions))
 	logger.Debug().Msg("fetched the set of active sessions.")
 
+	// Parse allowed suppliers from header (if present)
+	allowedSuppliers := parseAllowedSuppliersHeader(httpReq)
+
 	// Retrieve a list of all unique endpoints for the given service ID filtered by
 	// the list of apps this gateway/application owns and can send relays on behalf of.
 	//
-	// This includes fallback logic: if all session endpoints are sanctioned and the
+	// This includes fallback logic: if all session endpoints are filtered out (low reputation) and the
 	// requested service is configured with at least one fallback URL, the fallback
 	// endpoints will be used to populate the list of endpoints.
 	//
-	// The final boolean parameter sets whether to filter out sanctioned endpoints.
-	endpoints, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, sharedtypes.RPCType_JSON_RPC)
+	// The final boolean parameter sets whether to filter by reputation.
+	// The final RPC type parameter filters endpoints to only those supporting the requested RPC type.
+	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, rpcType, allowedSuppliers)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
+	}
+
+	// Log if RPC type fallback occurred
+	if actualRPCType != rpcType {
+		logger.Info().
+			Str("requested_rpc_type", rpcType.String()).
+			Str("actual_rpc_type", actualRPCType.String()).
+			Msg("RPC type fallback was applied during endpoint selection")
 	}
 
 	logger = logger.With("number_of_unique_endpoints", len(endpoints))
@@ -510,18 +557,30 @@ func (p *Protocol) AvailableWebsocketEndpoints(
 	logger = logger.With("number_of_valid_sessions", len(activeSessions))
 	logger.Debug().Msg("fetched the set of active sessions.")
 
+	// Parse allowed suppliers from header (if present)
+	allowedSuppliers := parseAllowedSuppliersHeader(httpReq)
+
 	// Retrieve a list of all unique endpoints for the given service ID filtered by
 	// the list of apps this gateway/application owns and can send relays on behalf of.
 	//
-	// This includes fallback logic: if all session endpoints are sanctioned and the
+	// This includes fallback logic: if all session endpoints are filtered out (low reputation) and the
 	// requested service is configured with at least one fallback URL, the fallback
 	// endpoints will be used to populate the list of endpoints.
 	//
-	// The final boolean parameter sets whether to filter out sanctioned endpoints.
-	endpoints, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, sharedtypes.RPCType_WEBSOCKET)
+	// The final boolean parameter sets whether to filter by reputation.
+	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
+	}
+
+	// Log if RPC type fallback occurred
+	if actualRPCType != sharedtypes.RPCType_WEBSOCKET {
+		logger.Info().
+			Str("requested_rpc_type", sharedtypes.RPCType_WEBSOCKET.String()).
+			Str("actual_rpc_type", actualRPCType.String()).
+			Msg("RPC type fallback was applied for websocket endpoint selection")
 	}
 
 	logger = logger.With("number_of_unique_endpoints", len(endpoints))
@@ -548,7 +607,7 @@ func (p *Protocol) AvailableWebsocketEndpoints(
 // Behavior:
 //   - Retrieves active sessions for the given service ID from the full node.
 //   - Retrieves unique endpoints available across all active sessions
-//   - Filtering out sanctioned endpoints from list of unique endpoints.
+//   - Filters endpoints by reputation (if enabled).
 //   - Obtains the relay request signer appropriate for the current gateway mode.
 //   - Returns a fully initialized request context for use in downstream protocol operations.
 //   - On failure, logs the error, returns a context setup observation, and a non-nil error.
@@ -558,12 +617,14 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	selectedEndpointAddr protocol.EndpointAddr,
+	rpcType sharedtypes.RPCType,
 	httpReq *http.Request,
 ) (gateway.ProtocolRequestContext, protocolobservations.Observations, error) {
 	logger := p.logger.With(
 		"method", "BuildHTTPRequestContextForEndpoint",
 		"service_id", serviceID,
 		"endpoint_addr", selectedEndpointAddr,
+		"rpc_type", rpcType.String(),
 	)
 
 	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
@@ -572,14 +633,27 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
 	}
 
+	// Parse allowed suppliers from header (if present)
+	allowedSuppliers := parseAllowedSuppliersHeader(httpReq)
+
 	// Retrieve the list of endpoints (i.e. backend service URLs by external operators)
 	// that can service RPC requests for the given service ID for the given apps.
 	// This includes fallback logic if session endpoints are unavailable.
-	// The final boolean parameter sets whether to filter out sanctioned endpoints.
-	endpoints, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, sharedtypes.RPCType_JSON_RPC)
+	// The final boolean parameter sets whether to filter by reputation.
+	// The final RPC type parameter filters endpoints to only those supporting the requested RPC type.
+	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, rpcType, allowedSuppliers)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
+	}
+
+	// Log if RPC type fallback occurred
+	if actualRPCType != rpcType {
+		logger.Info().
+			Str("requested_rpc_type", rpcType.String()).
+			Str("actual_rpc_type", actualRPCType.String()).
+			Msg("RPC type fallback was applied during endpoint selection")
 	}
 
 	// Select the endpoint that matches the pre-selected address.
@@ -625,7 +699,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		concurrencyConfig:     p.concurrencyConfig,
 		unifiedServicesConfig: p.unifiedServicesConfig,
 		reputationService:     p.reputationService,
-		currentRPCType:        sharedtypes.RPCType_JSON_RPC, // Health checks use JSON-RPC by default
+		currentRPCType:        rpcType, // Use detected RPC type from request
 	}, protocolobservations.Observations{}, nil
 }
 
@@ -688,13 +762,17 @@ func (p *Protocol) IsAlive() bool {
 // This function coordinates between session endpoints and fallback endpoints:
 //   - If configured to send all traffic to fallback, returns fallback endpoints only
 //   - Otherwise, attempts to get session endpoints and falls back to fallback endpoints if needed
+//
+// If allowedSuppliers is not empty, only endpoints from suppliers in the list will be returned,
+// bypassing reputation filtering and other selection logic.
 func (p *Protocol) getUniqueEndpoints(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	activeSessions []sessiontypes.Session,
-	filterSanctioned bool,
+	filterByReputation bool,
 	rpcType sharedtypes.RPCType,
-) (map[protocol.EndpointAddr]endpoint, error) {
+	allowedSuppliers []string,
+) (map[protocol.EndpointAddr]endpoint, sharedtypes.RPCType, error) {
 	logger := p.logger.With(
 		"method", "getUniqueEndpoints",
 		"service", serviceID,
@@ -708,33 +786,33 @@ func (p *Protocol) getUniqueEndpoints(
 	// return only the fallback endpoints and skip session endpoint logic.
 	if shouldSendAllTrafficToFallback && len(fallbackEndpoints) > 0 {
 		logger.Info().Msgf("🔀 Sending all traffic to fallback endpoints for service %s.", serviceID)
-		return fallbackEndpoints, nil
+		return fallbackEndpoints, rpcType, nil
 	}
 
 	// Try to get session endpoints first.
-	sessionEndpoints, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, rpcType)
+	sessionEndpoints, actualRPCType, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, rpcType, allowedSuppliers)
 	if err != nil {
 		logger.Error().Err(err).Msgf("Error getting session endpoints for service %s: %v", serviceID, err)
 	}
 
 	// Session endpoints are available, use them.
-	// This is the happy path where we have unsanctioned session endpoints available.
+	// This is the happy path where we have session endpoints available (after reputation filtering).
 	if len(sessionEndpoints) > 0 {
-		return sessionEndpoints, nil
+		return sessionEndpoints, actualRPCType, nil
 	}
 
 	// Handle the case where no session endpoints are available.
 	// If fallback endpoints are available for the service ID, use them.
 	if len(fallbackEndpoints) > 0 {
-		return fallbackEndpoints, nil
+		return fallbackEndpoints, rpcType, nil
 	}
 
-	// If no unsanctioned session endpoints are available and no fallback
+	// If no session endpoints are available (after reputation filtering) and no fallback
 	// endpoints are available for the service ID, return an error.
 	// Wrap the context setup error. Used for generating observations.
 	err = fmt.Errorf("%w: service %s", errProtocolContextSetupNoEndpoints, serviceID)
-	logger.Warn().Err(err).Msg("No endpoints or fallback available after filtering sanctioned endpoints: relay request will fail.")
-	return nil, err
+	logger.Warn().Err(err).Msg("No endpoints or fallback available after reputation filtering: relay request will fail.")
+	return nil, rpcType, err
 }
 
 // getSessionsUniqueEndpoints returns a map of all endpoints matching service ID from active sessions.
@@ -742,12 +820,16 @@ func (p *Protocol) getUniqueEndpoints(
 //
 // If an endpoint matches a serviceID across multiple apps/sessions, only a single
 // entry matching one of the apps/sessions is returned.
+//
+// If allowedSuppliers is not empty, only endpoints from suppliers in the list will be returned.
+// This bypasses reputation filtering and other selection logic.
 func (p *Protocol) getSessionsUniqueEndpoints(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	activeSessions []sessiontypes.Session,
 	filterByRPCType sharedtypes.RPCType,
-) (map[protocol.EndpointAddr]endpoint, error) {
+	allowedSuppliers []string,
+) (map[protocol.EndpointAddr]endpoint, sharedtypes.RPCType, error) {
 	logger := p.logger.With(
 		"method", "getSessionsUniqueEndpoints",
 		"service", serviceID,
@@ -760,15 +842,26 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 
 	endpoints := make(map[protocol.EndpointAddr]endpoint)
 
-	// TODO_TECHDEBT(@adshmh): Refactor load testing related code to make the filtering more visible.
-	//
-	// In Load Testing using RelayMiner mode: drop any endpoints ot matching the single supplier specified in the config.
-	//
-	var allowedSupplierAddr string
-	if ltc := p.loadTestingConfig; ltc != nil {
-		if ltc.RelayMinerConfig != nil {
-			allowedSupplierAddr = ltc.RelayMinerConfig.SupplierAddr
+	// Track the actual RPC type used (may differ from requested if fallback occurs)
+	actualRPCType := filterByRPCType
+
+	// Build the effective allowed suppliers list
+	// Priority: Target-Suppliers header > Load testing config
+	effectiveAllowedSuppliers := allowedSuppliers
+	if len(effectiveAllowedSuppliers) == 0 {
+		// TODO_TECHDEBT(@adshmh): Refactor load testing related code to make the filtering more visible.
+		//
+		// In Load Testing using RelayMiner mode: drop any endpoints not matching the single supplier specified in the config.
+		if ltc := p.loadTestingConfig; ltc != nil {
+			if ltc.RelayMinerConfig != nil && ltc.RelayMinerConfig.SupplierAddr != "" {
+				effectiveAllowedSuppliers = []string{ltc.RelayMinerConfig.SupplierAddr}
+			}
 		}
+	}
+
+	// Log if supplier filtering is active
+	if len(effectiveAllowedSuppliers) > 0 {
+		logger.Info().Msgf("Filtering endpoints to allowed suppliers only: %v", effectiveAllowedSuppliers)
 	}
 
 	// Iterate over all active sessions for the service ID.
@@ -783,22 +876,158 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msgf("Finding unique endpoints for session %s for app %s for service %s.", session.SessionId, app.Address, serviceID)
 
 		// Retrieve all endpoints for the session.
-		sessionEndpoints, err := endpointsFromSession(session, allowedSupplierAddr)
+		// Pass empty string to endpointsFromSession since we'll filter after RPC type filtering
+		sessionEndpoints, err := endpointsFromSession(session, "")
 		if err != nil {
 			logger.Error().Err(err).Msgf("Internal error: error getting all endpoints for service %s app %s and session: skipping the app.", serviceID, app.Address)
 			continue
 		}
 
-		// Initialize the qualified endpoints as the full set of session endpoints.
-		// Low-reputation endpoints will be filtered out below if reputation service is enabled.
+		// STRICT RPC TYPE FILTERING
+		// Filter endpoints to only those supporting the requested RPC type.
+		// If a supplier doesn't have the exact RPC type URL, it's excluded (no defaulting).
 		qualifiedEndpoints := sessionEndpoints
+		if filterByRPCType != sharedtypes.RPCType_UNKNOWN_RPC {
+			filteredEndpoints := make(map[protocol.EndpointAddr]endpoint)
+			skippedCount := 0
+
+			for addr, ep := range sessionEndpoints {
+				url := ep.GetURL(filterByRPCType)
+				if url != "" {
+					// Supplier supports this RPC type
+					filteredEndpoints[addr] = ep
+				} else {
+					// Supplier doesn't support requested RPC type - skip it
+					skippedCount++
+					logger.Debug().
+						Str("supplier", string(addr)).
+						Str("rpc_type", filterByRPCType.String()).
+						Msg("Skipping supplier - does not support requested RPC type")
+				}
+			}
+
+			// RPC TYPE FALLBACK
+			// If no endpoints found for the requested RPC type, check for a configured fallback.
+			// This is a temporary workaround for suppliers that stake with incorrect RPC types.
+			if len(filteredEndpoints) == 0 {
+				if fallbackRPCType, hasFallback := p.getRPCTypeFallback(serviceID, filterByRPCType); hasFallback {
+					logger.Warn().
+						Str("service", string(serviceID)).
+						Str("app", app.Address).
+						Str("requested_rpc_type", filterByRPCType.String()).
+						Str("fallback_rpc_type", fallbackRPCType.String()).
+						Int("skipped_suppliers", skippedCount).
+						Msg("No endpoints found for requested RPC type, falling back to alternate RPC type")
+
+					// Record fallback metric
+					shannonmetrics.RecordRPCTypeFallback(string(serviceID), filterByRPCType.String(), fallbackRPCType.String())
+
+					// Retry filtering with fallback RPC type
+					fallbackEndpoints := make(map[protocol.EndpointAddr]endpoint)
+					fallbackSkipped := 0
+					for addr, ep := range sessionEndpoints {
+						url := ep.GetURL(fallbackRPCType)
+						if url != "" {
+							fallbackEndpoints[addr] = ep
+						} else {
+							fallbackSkipped++
+						}
+					}
+
+					if len(fallbackEndpoints) > 0 {
+						logger.Info().
+							Str("fallback_rpc_type", fallbackRPCType.String()).
+							Int("endpoints_found", len(fallbackEndpoints)).
+							Int("endpoints_skipped", fallbackSkipped).
+							Msg("Successfully fell back to alternate RPC type")
+						filteredEndpoints = fallbackEndpoints
+						actualRPCType = fallbackRPCType // Update the RPC type we're using
+					} else {
+						logger.Warn().Msgf(
+							"⚠️ No endpoints support fallback RPC type %s either for service %s, app %s (skipped %d suppliers). SKIPPING the app.",
+							fallbackRPCType, serviceID, app.Address, fallbackSkipped,
+						)
+						continue
+					}
+				} else {
+					logger.Warn().Msgf(
+						"⚠️ No endpoints support RPC type %s for service %s, app %s (skipped %d suppliers). SKIPPING the app.",
+						filterByRPCType, serviceID, app.Address, skippedCount,
+					)
+					continue
+				}
+			}
+
+			if skippedCount > 0 && actualRPCType == filterByRPCType {
+				logger.Info().Msgf(
+					"Filtered endpoints by RPC type %s for app %s: %d remain, %d skipped",
+					filterByRPCType, app.Address, len(filteredEndpoints), skippedCount,
+				)
+			}
+
+			qualifiedEndpoints = filteredEndpoints
+		}
+
+		// SUPPLIER ALLOWLIST FILTERING
+		// If allowed suppliers are specified (via header or load testing config),
+		// filter to only those suppliers, bypassing reputation and other logic.
+		if len(effectiveAllowedSuppliers) > 0 {
+			supplierFilteredEndpoints := make(map[protocol.EndpointAddr]endpoint)
+			skippedCount := 0
+
+			for addr, ep := range qualifiedEndpoints {
+				// Extract supplier address from endpoint address (format: "supplierAddr-url")
+				supplierAddr := string(addr)
+				if dashIndex := strings.Index(supplierAddr, "-"); dashIndex > 0 {
+					supplierAddr = supplierAddr[:dashIndex]
+				}
+
+				// Check if supplier is in the allowed list
+				allowed := false
+				for _, allowedSupplier := range effectiveAllowedSuppliers {
+					if supplierAddr == allowedSupplier {
+						allowed = true
+						break
+					}
+				}
+
+				if allowed {
+					supplierFilteredEndpoints[addr] = ep
+				} else {
+					skippedCount++
+					logger.Debug().
+						Str("supplier", supplierAddr).
+						Str("endpoint", string(addr)).
+						Msg("Skipping endpoint - supplier not in allowed list")
+				}
+			}
+
+			if len(supplierFilteredEndpoints) == 0 {
+				logger.Warn().Msgf(
+					"⚠️ No endpoints match allowed suppliers %v for service %s, app %s (skipped %d endpoints). SKIPPING the app.",
+					effectiveAllowedSuppliers, serviceID, app.Address, skippedCount,
+				)
+				continue
+			}
+
+			logger.Info().Msgf(
+				"Filtered endpoints by allowed suppliers %v for app %s: %d remain, %d skipped",
+				effectiveAllowedSuppliers, app.Address, len(supplierFilteredEndpoints), skippedCount,
+			)
+
+			qualifiedEndpoints = supplierFilteredEndpoints
+
+			// IMPORTANT: When supplier filtering is active, skip reputation filtering
+			// to allow the user to explicitly target specific suppliers regardless of reputation.
+		}
 
 		// Filter out low-reputation endpoints if reputation service is enabled.
 		// Reputation is the primary endpoint quality system - it provides gradual
 		// exclusion based on score and allows recovery via health checks.
-		if p.reputationService != nil {
+		// SKIP this step if supplier filtering is active (user wants specific suppliers).
+		if p.reputationService != nil && len(effectiveAllowedSuppliers) == 0 {
 			beforeCount := len(qualifiedEndpoints)
-			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, logger)
+			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, filterByRPCType, logger)
 
 			if len(qualifiedEndpoints) == 0 {
 				logger.Warn().Msgf(
@@ -829,17 +1058,17 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 	if len(endpoints) > 0 {
 		// Apply tiered selection if enabled - only return endpoints from the highest available tier
 		if p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
-			endpoints = p.filterToHighestTier(ctx, serviceID, endpoints, logger)
+			endpoints = p.filterToHighestTier(ctx, serviceID, endpoints, filterByRPCType, logger)
 		}
 
 		logger.Info().Msgf("Successfully fetched %d session endpoints for active sessions.", len(endpoints))
-		return endpoints, nil
+		return endpoints, actualRPCType, nil
 	}
 
 	// No session endpoints are available.
 	err := fmt.Errorf("%w: service %s", errProtocolContextSetupNoEndpoints, serviceID)
 	logger.Warn().Err(err).Msg("No session endpoints available after filtering.")
-	return nil, err
+	return nil, filterByRPCType, err
 }
 
 // ** Fallback Endpoint Handling **
@@ -858,7 +1087,7 @@ func (p *Protocol) getServiceFallbackEndpoints(serviceID protocol.ServiceID) (ma
 // ** Disqualified Endpoint Reporting **
 
 // GetTotalServiceEndpointsCount returns the count of all unique endpoints for a service ID
-// without filtering sanctioned endpoints.
+// without filtering by reputation.
 func (p *Protocol) GetTotalServiceEndpointsCount(serviceID protocol.ServiceID, httpReq *http.Request) (int, error) {
 	ctx := context.Background()
 
@@ -868,9 +1097,10 @@ func (p *Protocol) GetTotalServiceEndpointsCount(serviceID protocol.ServiceID, h
 		return 0, err
 	}
 
-	// Get all endpoints for the service ID without filtering sanctioned endpoints.
-	// Since we don't want to filter sanctioned endpoints, we use an unsupported RPC type.
-	endpoints, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, sharedtypes.RPCType_UNKNOWN_RPC)
+	// Get all endpoints for the service ID without filtering by reputation.
+	// Since we don't want to filter by reputation, we use an unsupported RPC type.
+	// No supplier filtering since we don't have access to httpReq here.
+	endpoints, _, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, sharedtypes.RPCType_UNKNOWN_RPC, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -911,17 +1141,22 @@ func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations [
 }
 
 // recordSignalFromObservation records a reputation signal for a single endpoint observation.
-// It maps the observation's error type and sanction type to a reputation signal and records it.
+// It maps the observation's error type directly to a reputation signal and records it.
 // Also records probation traffic metrics if the endpoint is in probation.
 func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonEndpointObservation) {
 	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
 
-	// Build endpoint key for reputation service
-	key := reputation.NewEndpointKey(serviceID, endpointAddr)
+	// TODO_FUTURE: Add RPC type to ShannonEndpointObservation proto to support RPC-type-aware reputation.
+	// For now, default to JSON_RPC for HTTP observations since the proto doesn't include RPC type.
+	// This is acceptable for hydrator health checks which primarily test JSON-RPC endpoints.
+	rpcType := sharedtypes.RPCType_JSON_RPC
 
-	// Map observation to signal using the existing mapping function
+	// Build endpoint key for reputation service
+	key := reputation.NewEndpointKey(serviceID, endpointAddr, rpcType)
+
+	// Map observation error type to signal
+	// See ERROR_CLASSIFICATION.md for error category documentation
 	errorType := obs.GetErrorType()
-	sanctionType := obs.GetRecommendedSanction()
 
 	var signal reputation.Signal
 	var isSuccess bool
@@ -931,8 +1166,8 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 		signal = reputation.NewSuccessSignal(0)
 		isSuccess = true
 	} else {
-		// Map error type and sanction type to a reputation signal
-		signal = mapErrorToSignal(errorType, sanctionType, 0)
+		// Map error type directly to reputation signal
+		signal = errorTypeToSignal(errorType, 0)
 		isSuccess = false
 	}
 
@@ -967,14 +1202,15 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 //
 // The returned function:
 //   - Gets sessions for the service from all owned apps
+//   - Filters by RPC type: Only endpoints supporting health check RPC types
+//   - Filters by session validity: Only endpoints from sessions within grace period
+//   - Does NOT filter by reputation: Health checks help recover low-scoring endpoints
 //   - Extracts endpoints from sessions with HTTP and WebSocket URLs
 //   - Returns []gateway.EndpointInfo suitable for health checks
-//
-// Note: This does NOT filter by reputation - health checks should run against
-// all endpoints to allow recovery of low-scoring endpoints.
 func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gateway.EndpointInfo, error) {
 	return func(serviceID protocol.ServiceID) ([]gateway.EndpointInfo, error) {
 		ctx := context.Background()
+		logger := p.logger.With("method", "GetEndpointsForHealthCheck", "service_id", string(serviceID))
 
 		// Get active sessions for this service (without filtering by reputation)
 		activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
@@ -983,33 +1219,107 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 		}
 
 		if len(activeSessions) == 0 {
-			p.logger.Debug().
-				Str("service_id", string(serviceID)).
-				Msg("No active sessions for service")
+			logger.Debug().Msg("No active sessions for service")
 			return nil, nil
 		}
 
-		// Collect all unique endpoints from all sessions
+		// Get current block height for session validity filtering
+		currentHeight, err := p.GetCurrentBlockHeight(ctx)
+		if err != nil {
+			logger.Warn().Err(err).Msg("Failed to get current block height, skipping session validity filter")
+			currentHeight = 0 // If we can't get height, include all sessions
+		}
+
+		// Get grace period from shared params
+		var gracePeriod int64 = 0
+		if currentHeight > 0 {
+			sharedParams, err := p.GetSharedParams(ctx)
+			if err != nil {
+				logger.Warn().Err(err).Msg("Failed to get shared params for grace period, using 0")
+			} else {
+				gracePeriod = int64(sharedParams.GracePeriodEndOffsetBlocks)
+			}
+		}
+
+		// Determine which RPC types are used in health checks for this service
+		healthCheckRPCTypes := p.getHealthCheckRPCTypes(serviceID)
+		if len(healthCheckRPCTypes) == 0 {
+			logger.Debug().Msg("No health checks configured for service")
+			return nil, nil
+		}
+
+		logger.Debug().
+			Int64("current_height", currentHeight).
+			Int64("grace_period", gracePeriod).
+			Int("health_check_rpc_types", len(healthCheckRPCTypes)).
+			Msg("Filtering endpoints for health checks")
+
+		// Collect endpoints from valid sessions, filtered by RPC type
 		allEndpoints := make(map[protocol.EndpointAddr]endpoint)
 
 		for _, session := range activeSessions {
+			sessionEndHeight := session.Header.SessionEndBlockHeight
+			sessionEndWithGrace := sessionEndHeight + gracePeriod
+
+			// Skip sessions that have expired (beyond grace period)
+			if currentHeight > 0 && currentHeight > sessionEndWithGrace {
+				logger.Debug().
+					Str("session_id", session.SessionId).
+					Int64("session_end", sessionEndHeight).
+					Int64("session_end_with_grace", sessionEndWithGrace).
+					Msg("Skipping expired session (beyond grace period)")
+				continue
+			}
+
 			sessionEndpoints, err := endpointsFromSession(session, "")
 			if err != nil {
-				p.logger.Warn().
+				logger.Warn().
 					Err(err).
-					Str("service_id", string(serviceID)).
 					Str("session_id", session.SessionId).
 					Msg("Failed to get endpoints from session")
 				continue
 			}
-			maps.Copy(allEndpoints, sessionEndpoints)
+
+			// Filter endpoints by RPC type support
+			for addr, ep := range sessionEndpoints {
+				supportsAnyType := false
+				for rpcType := range healthCheckRPCTypes {
+					url := ep.GetURL(rpcType)
+					if url != "" {
+						supportsAnyType = true
+						break
+					}
+				}
+
+				if supportsAnyType {
+					allEndpoints[addr] = ep
+				} else {
+					logger.Debug().
+						Str("endpoint", string(addr)).
+						Msg("Skipping endpoint - does not support any health check RPC types")
+				}
+			}
 		}
 
-		// Also include fallback endpoints if configured
+		// Also include fallback endpoints if configured, filtered by RPC type
 		fallbackEndpoints, _ := p.getServiceFallbackEndpoints(serviceID)
-		maps.Copy(allEndpoints, fallbackEndpoints)
+		for addr, ep := range fallbackEndpoints {
+			supportsAnyType := false
+			for rpcType := range healthCheckRPCTypes {
+				url := ep.GetURL(rpcType)
+				if url != "" {
+					supportsAnyType = true
+					break
+				}
+			}
+
+			if supportsAnyType {
+				allEndpoints[addr] = ep
+			}
+		}
 
 		if len(allEndpoints) == 0 {
+			logger.Debug().Msg("No endpoints available after filtering")
 			return nil, nil
 		}
 
@@ -1029,13 +1339,64 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 			result = append(result, info)
 		}
 
-		p.logger.Debug().
-			Str("service_id", string(serviceID)).
+		logger.Info().
 			Int("endpoint_count", len(result)).
-			Msg("Retrieved endpoints for health checks")
+			Int("session_count", len(activeSessions)).
+			Msg("Retrieved filtered endpoints for health checks")
 
 		return result, nil
 	}
+}
+
+// getHealthCheckRPCTypes extracts the RPC types used in health checks for a service.
+// Returns a map of RPC types (as keys) that are configured in health checks.
+func (p *Protocol) getHealthCheckRPCTypes(serviceID protocol.ServiceID) map[sharedtypes.RPCType]struct{} {
+	rpcTypes := make(map[sharedtypes.RPCType]struct{})
+
+	// If no unified services config, return empty set
+	if p.unifiedServicesConfig == nil {
+		return rpcTypes
+	}
+
+	// Find the service configuration
+	var svcConfig *gateway.ServiceConfig
+	for i := range p.unifiedServicesConfig.Services {
+		if p.unifiedServicesConfig.Services[i].ID == serviceID {
+			svcConfig = &p.unifiedServicesConfig.Services[i]
+			break
+		}
+	}
+
+	if svcConfig == nil {
+		return rpcTypes
+	}
+
+	// Extract RPC types from health check configurations
+	if svcConfig.HealthChecks != nil && len(svcConfig.HealthChecks.Local) > 0 {
+		mapper := gateway.NewRPCTypeMapper()
+		for _, check := range svcConfig.HealthChecks.Local {
+			// Skip disabled checks
+			if check.Enabled != nil && !*check.Enabled {
+				continue
+			}
+
+			// Convert health check type to RPC type
+			rpcType, err := mapper.ParseRPCType(string(check.Type))
+			if err != nil {
+				p.logger.Warn().
+					Str("service_id", string(serviceID)).
+					Str("check_name", check.Name).
+					Str("check_type", string(check.Type)).
+					Err(err).
+					Msg("Failed to parse RPC type from health check config")
+				continue
+			}
+
+			rpcTypes[rpcType] = struct{}{}
+		}
+	}
+
+	return rpcTypes
 }
 
 // GetReputationService returns the reputation service instance used by the protocol.
@@ -1048,6 +1409,51 @@ func (p *Protocol) GetReputationService() reputation.ReputationService {
 // This is used by components that need access to per-service configuration overrides.
 func (p *Protocol) GetUnifiedServicesConfig() *gateway.UnifiedServicesConfig {
 	return p.unifiedServicesConfig
+}
+
+// getRPCTypeFallback checks if a fallback RPC type is configured for the given service and RPC type.
+// Returns the fallback RPC type and true if configured, or zero value and false otherwise.
+//
+// This is a temporary workaround for suppliers that stake with incorrect RPC types.
+// Example: If cosmoshub is configured with {comet_bft: json_rpc}, requests for comet_bft
+// will fall back to json_rpc endpoints if no comet_bft endpoints are found.
+func (p *Protocol) getRPCTypeFallback(serviceID protocol.ServiceID, requestedRPCType sharedtypes.RPCType) (sharedtypes.RPCType, bool) {
+	if p.unifiedServicesConfig == nil {
+		return sharedtypes.RPCType_UNKNOWN_RPC, false
+	}
+
+	// Find the service configuration
+	var svcConfig *gateway.ServiceConfig
+	for i := range p.unifiedServicesConfig.Services {
+		if p.unifiedServicesConfig.Services[i].ID == serviceID {
+			svcConfig = &p.unifiedServicesConfig.Services[i]
+			break
+		}
+	}
+
+	if svcConfig == nil || svcConfig.RPCTypeFallbacks == nil {
+		return sharedtypes.RPCType_UNKNOWN_RPC, false
+	}
+
+	// Look up fallback for the requested RPC type
+	// Try exact string match first, then lowercase version for flexibility
+	rpcTypeStr := requestedRPCType.String()
+	fallbackStr, exists := svcConfig.RPCTypeFallbacks[rpcTypeStr]
+	if !exists {
+		// Try lowercase version (config might use lowercase like "comet_bft")
+		fallbackStr, exists = svcConfig.RPCTypeFallbacks[strings.ToLower(rpcTypeStr)]
+		if !exists {
+			return sharedtypes.RPCType_UNKNOWN_RPC, false
+		}
+	}
+
+	// Parse the fallback RPC type string
+	fallbackRPCType := sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(fallbackStr)])
+	if fallbackRPCType == sharedtypes.RPCType_UNKNOWN_RPC {
+		return sharedtypes.RPCType_UNKNOWN_RPC, false
+	}
+
+	return fallbackRPCType, true
 }
 
 // GetConcurrencyConfig returns the concurrency configuration.

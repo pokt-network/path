@@ -192,6 +192,7 @@ type ServiceConfig struct {
 	ID                  protocol.ServiceID            `yaml:"id"`
 	Type                ServiceType                   `yaml:"type,omitempty"`
 	RPCTypes            []string                      `yaml:"rpc_types,omitempty"`
+	RPCTypeFallbacks    map[string]string             `yaml:"rpc_type_fallbacks,omitempty"`
 	LatencyProfile      string                        `yaml:"latency_profile,omitempty"`
 	ReputationConfig    *ServiceReputationConfig      `yaml:"reputation_config,omitempty"`
 	Latency             *ServiceLatencyConfig         `yaml:"latency,omitempty"`
@@ -472,6 +473,11 @@ func (c *UnifiedServicesConfig) GetConfiguredServiceIDs() []protocol.ServiceID {
 // HasServices returns true if any services are configured.
 func (c *UnifiedServicesConfig) HasServices() bool {
 	return len(c.Services) > 0
+}
+
+// HasService checks if a specific service is configured
+func (c *UnifiedServicesConfig) HasService(serviceID protocol.ServiceID) bool {
+	return c.GetServiceConfig(serviceID) != nil
 }
 
 // GetLatencyProfile returns the latency profile configuration for a profile name.

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/path/protocol"
@@ -94,12 +96,23 @@ func (m *mockStorage) List(_ context.Context, _ string) ([]EndpointKey, error) {
 	// Return all keys - parse the string keys back to EndpointKey
 	var keys []EndpointKey
 	for keyStr := range m.scores {
-		// Keys are stored as "serviceID:endpointAddr"
-		idx := strings.IndexByte(keyStr, ':')
-		if idx >= 0 {
+		// Keys are stored as "serviceID:endpointAddr:rpcType" (lowercase rpcType)
+		// EndpointAddr may contain colons (e.g., "https://example.com:8080")
+		// So we split and take: first part = serviceID, last part = rpcType, middle = endpointAddr
+		parts := strings.Split(keyStr, ":")
+		if len(parts) >= 3 {
+			serviceID := parts[0]
+			rpcTypeStr := parts[len(parts)-1]
+			// Everything between serviceID and rpcType is the endpointAddr
+			endpointAddr := strings.Join(parts[1:len(parts)-1], ":")
+
+			// RPC type is stored lowercase, but the enum map uses uppercase
+			rpcTypeUpper := strings.ToUpper(rpcTypeStr)
+			rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[rpcTypeUpper])
 			keys = append(keys, NewEndpointKey(
-				protocol.ServiceID(keyStr[:idx]),
-				protocol.EndpointAddr(keyStr[idx+1:]),
+				protocol.ServiceID(serviceID),
+				protocol.EndpointAddr(endpointAddr),
+				rpcType,
 			))
 		}
 	}
@@ -130,7 +143,7 @@ func TestService_RecordSignal(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = svc.Stop() }()
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Record success signal
 	err = svc.RecordSignal(ctx, key, NewSuccessSignal(100*time.Millisecond))
@@ -170,7 +183,7 @@ func TestService_ScoreClamping(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = svc.Stop() }()
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Record many successes - should clamp at MaxScore
 	for i := 0; i < 30; i++ {
@@ -210,9 +223,9 @@ func TestService_GetScores(t *testing.T) {
 	defer func() { _ = svc.Stop() }()
 
 	keys := []EndpointKey{
-		NewEndpointKey("eth", "endpoint1"),
-		NewEndpointKey("eth", "endpoint2"),
-		NewEndpointKey("eth", "endpoint3"),
+		NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC),
+		NewEndpointKey("eth", "endpoint2", sharedtypes.RPCType_JSON_RPC),
+		NewEndpointKey("eth", "endpoint3", sharedtypes.RPCType_JSON_RPC),
 	}
 
 	// Record signals for first two endpoints
@@ -250,9 +263,9 @@ func TestService_FilterByScore(t *testing.T) {
 	defer func() { _ = svc.Stop() }()
 
 	keys := []EndpointKey{
-		NewEndpointKey("eth", "good"),
-		NewEndpointKey("eth", "bad"),
-		NewEndpointKey("eth", "unknown"),
+		NewEndpointKey("eth", "good", sharedtypes.RPCType_JSON_RPC),
+		NewEndpointKey("eth", "bad", sharedtypes.RPCType_JSON_RPC),
+		NewEndpointKey("eth", "unknown", sharedtypes.RPCType_JSON_RPC),
 	}
 
 	// Set up scores: good=60, bad=20, unknown=not recorded (uses initial)
@@ -304,7 +317,7 @@ func TestService_ResetScore(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = svc.Stop() }()
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Lower the score
 	for i := 0; i < 5; i++ {
@@ -339,7 +352,7 @@ func TestService_WorksWithDefaultConfig(t *testing.T) {
 	}
 
 	svc := NewService(config, store)
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Service should record signals normally
 	err := svc.RecordSignal(ctx, key, NewFatalErrorSignal("critical"))
@@ -381,7 +394,7 @@ func TestService_AsyncWriteToStorage(t *testing.T) {
 	err := svc.Start(ctx)
 	require.NoError(t, err)
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Record signal - this updates local cache immediately but queues async write
 	err = svc.RecordSignal(ctx, key, NewSuccessSignal(100*time.Millisecond))
@@ -421,7 +434,7 @@ func TestService_StopFlushesWrites(t *testing.T) {
 	err := svc.Start(ctx)
 	require.NoError(t, err)
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Record signal
 	err = svc.RecordSignal(ctx, key, NewSuccessSignal(100*time.Millisecond))
@@ -447,7 +460,7 @@ func TestService_RefreshFromStorage(t *testing.T) {
 	defer store.Close()
 
 	// Pre-populate storage
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 	existingScore := Score{
 		Value:        95,
 		LastUpdated:  time.Now(),
@@ -511,7 +524,7 @@ func TestService_Recovery_GetScore(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = svc.Stop() }()
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Lower the score below threshold
 	for i := 0; i < 10; i++ {
@@ -554,7 +567,7 @@ func TestService_Recovery_FilterByScore(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = svc.Stop() }()
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Lower the score below threshold
 	for i := 0; i < 10; i++ {
@@ -596,7 +609,7 @@ func TestService_NoRecovery_AboveThreshold(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = svc.Stop() }()
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Record some errors but stay above threshold
 	for i := 0; i < 3; i++ {
@@ -636,7 +649,7 @@ func TestService_NoRecovery_BeforeTimeout(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = svc.Stop() }()
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Lower the score below threshold
 	for i := 0; i < 10; i++ {
@@ -666,7 +679,7 @@ func TestService_ConcurrentAccess(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = svc.Stop() }()
 
-	key := NewEndpointKey("eth", "endpoint1")
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 	const goroutines = 10
 	const signalsPerGoroutine = 100
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics/devtools"
@@ -40,8 +41,9 @@ type QoS struct {
 // It returns an error if the HTTP request cannot be parsed as a JSONRPC request.
 //
 // Implements the gateway.QoSService interface.
-func (qos *QoS) ParseHTTPRequest(_ context.Context, req *http.Request) (gateway.RequestQoSContext, bool) {
-	return qos.validateHTTPRequest(req)
+// Fallback logic for Solana: header → jsonrpc (Solana only supports JSON-RPC)
+func (qos *QoS) ParseHTTPRequest(_ context.Context, req *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
+	return qos.validateHTTPRequest(req, detectedRPCType)
 }
 
 // ParseWebsocketRequest builds a request context from the provided Websocket request.

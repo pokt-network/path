@@ -108,8 +108,9 @@ func (c *simpleServiceConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{
 // Returns (errorContext, false) if the request is not valid JSONRPC.
 //
 // Implements gateway.QoSService interface.
-func (qos *QoS) ParseHTTPRequest(_ context.Context, req *http.Request) (gateway.RequestQoSContext, bool) {
-	return qos.validateHTTPRequest(req)
+// Fallback logic for EVM: header → jsonrpc (EVM only supports JSON-RPC)
+func (qos *QoS) ParseHTTPRequest(_ context.Context, req *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
+	return qos.validateHTTPRequest(req, detectedRPCType)
 }
 
 // ParseWebsocketRequest builds a request context from the provided Websocket request.

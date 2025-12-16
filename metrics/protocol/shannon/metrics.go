@@ -43,6 +43,9 @@ const (
 	endpointLatencyMetric       = "shannon_endpoint_latency_seconds"
 	relayMinerErrorsTotalMetric = "shannon_relay_miner_errors_total"
 
+	// RPC type fallback metrics
+	rpcTypeFallbackTotalMetric = "shannon_rpc_type_fallback_total"
+
 	// The default value for a domain if it cannot be extracted from an endpoint URL
 	ErrDomain = "error_extracting_domain"
 )
@@ -79,6 +82,9 @@ func init() {
 	prometheus.MustRegister(endpointLatency)
 	prometheus.MustRegister(endpointResponseSize)
 	prometheus.MustRegister(relayMinerErrorsTotal)
+
+	// RPC type fallback metrics
+	prometheus.MustRegister(rpcTypeFallbackTotal)
 }
 
 var (
@@ -115,21 +121,21 @@ var (
 	// Labels:
 	//   - service_id: Target service identifier
 	//   - error_type: Type of error encountered (based on trusted classification)
-	//   - sanction_type: Type of sanction recommended (based on trusted classification)
 	//   - endpoint_domain: Effective TLD+1 domain extracted from endpoint URL
+	//
+	// Note: sanction_type label was removed - reputation system now handles all error scoring
 	//
 	// Use to analyze:
 	//   - Shannon protocol errors by service and type
-	//   - Sanctions recommended by the protocol
 	//
 	// TODO_TECHDEBT(@adshmh): Check whether merging SanctionsByDomain and relayErrorsTotal makes sense.
 	relaysErrorsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: pathProcess,
 			Name:      relaysErrorsTotalMetric,
-			Help:      "Total relay errors by service, endpoint domain, error type, and sanction type",
+			Help:      "Total relay errors by service, endpoint domain, and error type",
 		},
-		[]string{"service_id", "error_type", "sanction_type", "endpoint_domain"},
+		[]string{"service_id", "error_type", "endpoint_domain"},
 	)
 
 	// activeRelays tracks the current number of active Shannon HTTP requests.
@@ -361,6 +367,25 @@ var (
 		},
 		[]string{"service_id", "endpoint_domain", "endpoint_error_type", "relay_miner_codespace", "relay_miner_code"},
 	)
+
+	// rpcTypeFallbackTotal tracks RPC type fallback events.
+	// Labels:
+	//   - service_id: Target service identifier
+	//   - requested_rpc_type: The RPC type that was originally requested
+	//   - fallback_rpc_type: The RPC type that was used instead
+	//
+	// Use to analyze:
+	//   - How often fallbacks are occurring per service
+	//   - Which RPC types are misconfigured by suppliers
+	//   - Impact of fallback configuration
+	rpcTypeFallbackTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: pathProcess,
+			Name:      rpcTypeFallbackTotalMetric,
+			Help:      "Total number of RPC type fallbacks triggered when no endpoints support the requested RPC type",
+		},
+		[]string{"service_id", "requested_rpc_type", "fallback_rpc_type"},
+	)
 )
 
 // PublishMetrics exports all Shannon-related Prometheus metrics using observations
@@ -408,8 +433,7 @@ func PublishMetrics(
 			// Process endpoint errors
 			processEndpointErrors(logger, observationSet.GetServiceId(), httpObservations.GetEndpointObservations())
 
-			// Process sanctions by domain
-			processSanctionsByDomain(logger, observationSet.GetServiceId(), httpObservations.GetEndpointObservations())
+			// Note: processSanctionsByDomain removed - sanctions replaced by reputation system
 
 			// Process endpoint latency metrics
 			processEndpointLatency(logger, observationSet.GetServiceId(), httpObservations.GetEndpointObservations())
@@ -677,58 +701,12 @@ func processEndpointErrors(
 		// Extract low-cardinality labels (based on trusted error classification)
 		errorType := endpointObs.ErrorType.String()
 
-		// Extract sanction type (based on trusted error classification)
-		var sanctionType string
-		if endpointObs.RecommendedSanction != nil {
-			sanctionType = endpointObs.RecommendedSanction.String()
-		}
-
 		// Record relay error
+		// Note: sanction_type label removed - reputation system now handles all error scoring
 		relaysErrorsTotal.With(
 			prometheus.Labels{
 				"service_id":      serviceID,
 				"error_type":      errorType,
-				"sanction_type":   sanctionType,
-				"endpoint_domain": endpointDomain,
-			},
-		).Inc()
-	}
-}
-
-// processSanctionsByDomain records sanctions without RelayMinerError context
-func processSanctionsByDomain(
-	logger polylog.Logger,
-	serviceID string,
-	observations []*protocolobservations.ShannonEndpointObservation,
-) {
-	logger = logger.With("method", "processSanctionsByDomain")
-
-	for _, endpointObs := range observations {
-		// Skip nil observations and those without recommended sanction
-		if endpointObs == nil || endpointObs.RecommendedSanction == nil {
-			continue
-		}
-
-		// Extract effective TLD+1 from endpoint URL.
-		endpointUrl := endpointObs.GetEndpointUrl()
-		endpointDomain, err := ExtractDomainOrHost(endpointUrl)
-		if err != nil {
-			logger.Error().Err(err).Msgf("Could not extract domain from endpoint URL %s.", endpointUrl)
-			endpointDomain = ErrDomain
-		}
-
-		// Extract the sanction reason from the endpoint error type (trusted classification)
-		var sanctionReason string
-		if endpointObs.ErrorType != nil {
-			sanctionReason = endpointObs.GetErrorType().String()
-		}
-
-		// Increment the sanctions counter without RelayMinerError context
-		sanctionsByDomain.With(
-			prometheus.Labels{
-				"service_id":      serviceID,
-				"sanction_type":   endpointObs.GetRecommendedSanction().String(),
-				"sanction_reason": sanctionReason,
 				"endpoint_domain": endpointDomain,
 			},
 		).Inc()
@@ -1003,30 +981,15 @@ func processWebsocketConnectionErrors(
 
 	// Extract error information
 	errorType := wsConnectionObs.ErrorType.String()
-	var sanctionType string
-	if wsConnectionObs.RecommendedSanction != nil {
-		sanctionType = wsConnectionObs.RecommendedSanction.String()
-	}
 
 	// Record Websocket connection error
+	// Note: sanction_type label removed - reputation system now handles all error scoring
 	websocketConnectionErrors.With(
 		prometheus.Labels{
 			"service_id":      serviceID,
 			"error_type":      errorType,
-			"sanction_type":   sanctionType,
 			"endpoint_domain": endpointDomain,
 		}).Inc()
-
-	// Record sanction if recommended
-	if wsConnectionObs.RecommendedSanction != nil {
-		sanctionsByDomain.With(
-			prometheus.Labels{
-				"service_id":      serviceID,
-				"sanction_type":   sanctionType,
-				"sanction_reason": errorType,
-				"endpoint_domain": endpointDomain,
-			}).Inc()
-	}
 }
 
 // processWebsocketMessageErrors records Websocket message error metrics.
@@ -1052,30 +1015,15 @@ func processWebsocketMessageErrors(
 
 	// Extract error information
 	errorType := wsMessageObs.ErrorType.String()
-	var sanctionType string
-	if wsMessageObs.RecommendedSanction != nil {
-		sanctionType = wsMessageObs.RecommendedSanction.String()
-	}
 
 	// Record Websocket message error
+	// Note: sanction_type label removed - reputation system now handles all error scoring
 	websocketMessageErrors.With(
 		prometheus.Labels{
 			"service_id":      serviceID,
 			"error_type":      errorType,
-			"sanction_type":   sanctionType,
 			"endpoint_domain": endpointDomain,
 		}).Inc()
-
-	// Record sanction if recommended
-	if wsMessageObs.RecommendedSanction != nil {
-		sanctionsByDomain.With(
-			prometheus.Labels{
-				"service_id":      serviceID,
-				"sanction_type":   sanctionType,
-				"sanction_reason": errorType,
-				"endpoint_domain": endpointDomain,
-			}).Inc()
-	}
 
 	// Record RelayMinerError if present
 	if wsMessageObs.RelayMinerError != nil {
@@ -1138,4 +1086,19 @@ func recordWebsocketConnectionDuration(
 		"success":         fmt.Sprintf("%t", success),
 		"close_reason":    closeReason,
 	}).Observe(duration)
+}
+
+// RecordRPCTypeFallback records a metric when an RPC type fallback occurs.
+// This happens when no endpoints support the requested RPC type and a fallback is configured.
+//
+// Parameters:
+//   - serviceID: The service identifier (e.g., "cosmoshub")
+//   - requestedRPCType: The RPC type that was originally requested (e.g., "COMET_BFT")
+//   - fallbackRPCType: The RPC type that was used instead (e.g., "JSON_RPC")
+func RecordRPCTypeFallback(serviceID, requestedRPCType, fallbackRPCType string) {
+	rpcTypeFallbackTotal.With(prometheus.Labels{
+		"service_id":         serviceID,
+		"requested_rpc_type": requestedRPCType,
+		"fallback_rpc_type":  fallbackRPCType,
+	}).Inc()
 }

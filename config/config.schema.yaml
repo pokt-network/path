@@ -575,6 +575,14 @@ properties:
                         anyOf:
                           - pattern: "^(http|https)://.*$"
                           - pattern: "^(http|https|ws|wss)://.*$"
+            rpc_type_fallbacks:
+              description: "RPC type fallback mappings. When no endpoints are found for the requested RPC type, PATH will automatically retry with the fallback RPC type. This is a temporary workaround for suppliers that stake with incorrect RPC types. Example: {comet_bft: json_rpc, rest: json_rpc}"
+              type: object
+              additionalProperties: false
+              patternProperties:
+                "^(json_rpc|rest|comet_bft|websocket|grpc)$":
+                  type: string
+                  enum: ["json_rpc", "rest", "comet_bft", "websocket", "grpc"]
             health_checks:
               $ref: "#/definitions/service_health_check_override"
 
@@ -924,9 +932,9 @@ definitions:
               description: "Health check name."
               type: string
             type:
-              description: "Check type: jsonrpc, rest, websocket."
+              description: "RPC protocol type (must match service's rpc_types): json_rpc, rest, comet_bft, websocket, grpc."
               type: string
-              enum: ["jsonrpc", "rest", "websocket"]
+              enum: ["json_rpc", "rest", "comet_bft", "websocket", "grpc"]
             enabled:
               description: "Enable/disable this check."
               type: boolean

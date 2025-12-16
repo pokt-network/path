@@ -36,6 +36,7 @@ type sessionRolloverState struct {
 	ctx context.Context // Context for graceful shutdown of the monitor loop
 
 	blockClient *sdk.BlockClient // Block client for getting current block height
+	rpcURL      string           // RPC URL for WebSocket connection
 
 	sessionRolloverBlocks int64 // Grace period after session end where rollover issues may occur
 
@@ -48,13 +49,14 @@ type sessionRolloverState struct {
 	rolloverStateMu sync.RWMutex // Protects all fields above
 }
 
-// newSessionRolloverState creates a new sessionRolloverState with the provided logger, block client, and rollover blocks.
+// newSessionRolloverState creates a new sessionRolloverState with the provided logger, block client, RPC URL, and rollover blocks.
 // The provided context is used for graceful shutdown of the block height monitor loop.
-func newSessionRolloverState(ctx context.Context, logger polylog.Logger, blockClient *sdk.BlockClient, sessionRolloverBlocks int64) *sessionRolloverState {
+func newSessionRolloverState(ctx context.Context, logger polylog.Logger, blockClient *sdk.BlockClient, rpcURL string, sessionRolloverBlocks int64) *sessionRolloverState {
 	srs := &sessionRolloverState{
 		logger:                logger.With("component", "session_rollover_state"),
 		ctx:                   ctx,
 		blockClient:           blockClient,
+		rpcURL:                rpcURL,
 		sessionRolloverBlocks: sessionRolloverBlocks,
 	}
 
@@ -76,41 +78,34 @@ func (srs *sessionRolloverState) getSessionRolloverState() bool {
 	return srs.isInSessionRollover
 }
 
-// blockHeightMonitorLoop continuously checks block height to detect session rollovers.
+// blockHeightMonitorLoop continuously monitors block height to detect session rollovers.
+// It uses WebSocket subscription for instant updates, with automatic fallback to polling.
 // The loop exits when the context is canceled, enabling graceful shutdown.
 func (srs *sessionRolloverState) blockHeightMonitorLoop() {
 	srs.logger.Info().
 		Bool("block_client_available", srs.blockClient != nil).
-		Dur("check_interval", blockCheckInterval).
-		Msg("Block height monitor loop starting")
+		Str("rpc_url", srs.rpcURL).
+		Msg("Block height monitor loop starting with WebSocket support")
 
-	ticker := time.NewTicker(blockCheckInterval)
-	defer ticker.Stop()
+	// Create WebSocket monitor
+	monitor := newBlockHeightMonitor(srs.ctx, srs.logger, srs.rpcURL)
+	monitor.start()
 
 	for {
 		select {
 		case <-srs.ctx.Done():
 			srs.logger.Info().Msg("Block height monitor loop shutting down")
 			return
-		case <-ticker.C:
-			srs.updateBlockHeight()
+
+		case height := <-monitor.heightChan:
+			srs.updateWithBlockHeight(height)
 		}
 	}
 }
 
-// updateBlockHeight fetches current block height and recalculates rollover status
-// Runs on a regular interval to keep the rollover status up to date.
-func (srs *sessionRolloverState) updateBlockHeight() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Use the block client to get the current block height
-	newHeight, err := srs.blockClient.LatestBlockHeight(ctx)
-	if err != nil {
-		srs.logger.Error().Err(err).Msg("Failed to get current block height")
-		return
-	}
-
+// updateWithBlockHeight updates the session rollover state with a new block height.
+// Called when a new block height is received from WebSocket or polling.
+func (srs *sessionRolloverState) updateWithBlockHeight(newHeight int64) {
 	srs.rolloverStateMu.Lock()
 	defer srs.rolloverStateMu.Unlock()
 

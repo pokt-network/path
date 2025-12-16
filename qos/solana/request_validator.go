@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/gateway"
 	qosobservations "github.com/pokt-network/path/observation/qos"
@@ -45,10 +46,13 @@ type requestValidator struct {
 // - Extracts and validates the JSONRPC request from the HTTP body
 // - Returns (errorContext, false) if validation fails
 // - Returns (requestContext, true) if validation succeeds
-func (rv *requestValidator) validateHTTPRequest(req *http.Request) (gateway.RequestQoSContext, bool) {
+//
+// Solana only supports JSON-RPC, so detectedRPCType is logged but not used for routing.
+func (rv *requestValidator) validateHTTPRequest(req *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
 	logger := rv.logger.With(
 		"qos", "Solana",
 		"method", "validateHTTPRequest",
+		"detected_rpc_type", detectedRPCType.String(),
 	)
 
 	// Read the HTTP request body with a size limit to prevent OOM attacks

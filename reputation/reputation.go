@@ -13,31 +13,43 @@ package reputation
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/protocol"
 )
 
 // EndpointKey uniquely identifies an endpoint for reputation tracking.
-// It combines the service ID and endpoint address to create a unique key.
+// It combines the service ID, endpoint address, and RPC type to create a unique key.
+// The RPC type dimension allows tracking separate reputation scores for different
+// protocols (e.g., json_rpc vs websocket) at the same endpoint URL.
 type EndpointKey struct {
 	ServiceID    protocol.ServiceID
 	EndpointAddr protocol.EndpointAddr
+	RPCType      sharedtypes.RPCType // REQUIRED: RPC type dimension for reputation tracking
 }
 
-// NewEndpointKey creates a new EndpointKey from service ID and endpoint address.
-func NewEndpointKey(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr) EndpointKey {
+// NewEndpointKey creates a new EndpointKey from service ID, endpoint address, and RPC type.
+// The RPC type is required to track reputation separately for different protocols
+// (e.g., json_rpc, websocket, rest) at the same endpoint URL.
+func NewEndpointKey(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, rpcType sharedtypes.RPCType) EndpointKey {
 	return EndpointKey{
 		ServiceID:    serviceID,
 		EndpointAddr: endpointAddr,
+		RPCType:      rpcType,
 	}
 }
 
 // String returns a string representation of the endpoint key.
+// Format: "serviceID:endpointAddr:rpcType"
+// Example: "eth:pokt1abc-https://node.example.com:json_rpc"
 func (k EndpointKey) String() string {
-	return string(k.ServiceID) + ":" + string(k.EndpointAddr)
+	// Convert RPC type to lowercase to match wire format (json_rpc, rest, etc.)
+	rpcTypeStr := strings.ToLower(k.RPCType.String())
+	return string(k.ServiceID) + ":" + string(k.EndpointAddr) + ":" + rpcTypeStr
 }
 
 // Score represents an endpoint's reputation score at a point in time.
@@ -133,7 +145,7 @@ const (
 // Key granularity options determine how endpoints are grouped for scoring.
 // Ordered from finest to coarsest granularity.
 const (
-	// KeyGranularityEndpoint scores each endpoint URL separately (finest granularity).
+	// KeyGranularityEndpoint scores each endpoint URL separately (the finest granularity).
 	// Key format: serviceID:supplierAddr-endpointURL
 	// This is the default behavior.
 	KeyGranularityEndpoint = "per-endpoint"

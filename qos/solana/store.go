@@ -118,7 +118,11 @@ func (es *EndpointStore) filterValidEndpoints(allAvailableEndpoints protocol.End
 
 		endpoint, found := es.endpoints[availableEndpointAddr]
 		if !found {
-			logger.Warn().Msgf("❓ SKIPPING endpoint because it was not found in PATH's endpoint store: %s", availableEndpointAddr)
+			// It is valid for an endpoint to not be in the store yet (e.g., first request,
+			// no observations collected). Treat it as a fresh endpoint and allow it.
+			// It will be added to the store once observations are collected.
+			logger.Info().Msg("endpoint not yet in store, treating as fresh endpoint")
+			filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
 			continue
 		}
 

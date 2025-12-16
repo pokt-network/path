@@ -44,6 +44,19 @@ func NewSimpleQoSInstance(logger polylog.Logger, serviceID protocol.ServiceID) *
 // Validation (chain ID, etc.) is now handled by active health checks.
 // If syncAllowance is 0, the default value is used.
 func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID protocol.ServiceID, syncAllowance uint64) *QoS {
+	// Default supported APIs for CosmosSDK chains (REST and CometBFT)
+	defaultAPIs := map[sharedtypes.RPCType]struct{}{
+		sharedtypes.RPCType_REST:      {},
+		sharedtypes.RPCType_COMET_BFT: {},
+	}
+	return NewSimpleQoSInstanceWithAPIs(logger, serviceID, syncAllowance, defaultAPIs)
+}
+
+// NewSimpleQoSInstanceWithAPIs creates a minimal CosmosSDK QoS instance with custom supported APIs.
+// This is useful for hybrid chains (e.g., XRPLEVM) that support both CosmosSDK and EVM APIs.
+// Validation (chain ID, etc.) is now handled by active health checks.
+// If syncAllowance is 0, the default value is used.
+func NewSimpleQoSInstanceWithAPIs(logger polylog.Logger, serviceID protocol.ServiceID, syncAllowance uint64, supportedAPIs map[sharedtypes.RPCType]struct{}) *QoS {
 	logger = logger.With(
 		"qos_instance", "cosmossdk",
 		"service_id", serviceID,
@@ -58,6 +71,7 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 	minimalConfig := &simpleCosmosConfig{
 		serviceID:     serviceID,
 		syncAllowance: syncAllowance,
+		supportedAPIs: supportedAPIs,
 	}
 
 	serviceState := &serviceState{
@@ -72,10 +86,7 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 		cosmosChainID: "", // No chain ID validation - handled by health checks
 		evmChainID:    "",
 		serviceState:  serviceState,
-		supportedAPIs: map[sharedtypes.RPCType]struct{}{
-			sharedtypes.RPCType_REST:      {},
-			sharedtypes.RPCType_COMET_BFT: {},
-		},
+		supportedAPIs: supportedAPIs,
 	}
 
 	return &QoS{
@@ -88,7 +99,8 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 // simpleCosmosConfig is a minimal config for services without chain-specific params.
 type simpleCosmosConfig struct {
 	serviceID     protocol.ServiceID
-	syncAllowance uint64 // If 0, uses default
+	syncAllowance uint64                           // If 0, uses default
+	supportedAPIs map[sharedtypes.RPCType]struct{} // Supported RPC types
 }
 
 func (c *simpleCosmosConfig) GetServiceID() protocol.ServiceID { return c.serviceID }
@@ -102,6 +114,10 @@ func (c *simpleCosmosConfig) getSyncAllowance() uint64 {
 	return c.syncAllowance
 }
 func (c *simpleCosmosConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
+	if c.supportedAPIs != nil {
+		return c.supportedAPIs
+	}
+	// Default to REST and COMET_BFT if not configured
 	return map[sharedtypes.RPCType]struct{}{
 		sharedtypes.RPCType_REST:      {},
 		sharedtypes.RPCType_COMET_BFT: {},
@@ -115,8 +131,8 @@ func (c *simpleCosmosConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{}
 // Supports both REST endpoints (/health, /status) and JSON-RPC requests.
 //
 // Implements gateway.QoSService interface.
-func (qos *QoS) ParseHTTPRequest(_ context.Context, req *http.Request) (gateway.RequestQoSContext, bool) {
-	return qos.validateHTTPRequest(req)
+func (qos *QoS) ParseHTTPRequest(_ context.Context, req *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
+	return qos.validateHTTPRequest(req, detectedRPCType)
 }
 
 // ParseWebsocketRequest builds a request context from the provided Websocket request.

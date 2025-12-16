@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	retrymetrics "github.com/pokt-network/path/metrics/retry"
@@ -77,6 +78,13 @@ func (rc *requestContext) HandleRelayRequest() error {
 func (rc *requestContext) handleSingleRelayRequest() error {
 	logger := rc.logger.With("method", "handleSingleRelayRequest")
 
+	// Get RPC type from QoS-detected payload (needed for endpoint filtering and retries)
+	payloads := rc.qosCtx.GetServicePayloads()
+	if len(payloads) == 0 {
+		return fmt.Errorf("no payloads available from QoS context")
+	}
+	rpcType := payloads[0].RPCType
+
 	// Get retry configuration for the service
 	retryConfig := rc.getRetryConfigForService()
 
@@ -122,9 +130,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			// Mark the previous endpoint as tried
 			triedEndpoints[currentEndpointAddr] = true
 
-			// Get fresh endpoint list from protocol
+			// Get fresh endpoint list from protocol (filtered by detected RPC type)
 			availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
-				rc.context, rc.serviceID, rc.originalHTTPRequest)
+				rc.context, rc.serviceID, rpcType, rc.originalHTTPRequest)
 			if err != nil {
 				logger.Error().Err(err).Msg("Failed to get available endpoints for retry")
 				lastErr = err
@@ -179,7 +187,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 			// Build new protocol context for the selected endpoint
 			newProtocolCtx, _, err := rc.protocol.BuildHTTPRequestContextForEndpoint(
-				rc.context, rc.serviceID, newEndpointAddr, rc.originalHTTPRequest)
+				rc.context, rc.serviceID, newEndpointAddr, rpcType, rc.originalHTTPRequest)
 			if err != nil {
 				logger.Error().Err(err).
 					Str("endpoint", string(newEndpointAddr)).
@@ -389,13 +397,20 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 		With("service_id", rc.serviceID)
 	logger.Debug().Msg("Starting parallel relay race")
 
+	// Get RPC type from QoS-detected payload (needed for endpoint filtering and retries)
+	payloads := rc.qosCtx.GetServicePayloads()
+	if len(payloads) == 0 {
+		return fmt.Errorf("no payloads available from QoS context")
+	}
+	rpcType := payloads[0].RPCType
+
 	// TODO_TECHDEBT: Make sure timed out parallel requests are also sanctioned.
 	ctx, cancel := context.WithTimeout(rc.context, RelayRequestTimeout)
 	defer cancel()
 
-	resultChan, qosContextMutex := rc.launchParallelRequests(ctx, logger)
+	resultChan, qosContextMutex := rc.launchParallelRequests(ctx, logger, rpcType)
 
-	return rc.waitForFirstSuccessfulResponse(ctx, logger, resultChan, metrics, qosContextMutex)
+	return rc.waitForFirstSuccessfulResponse(ctx, logger, resultChan, metrics, qosContextMutex, rpcType)
 }
 
 // updateParallelRequestMetrics updates gateway observations with parallel request metrics
@@ -410,14 +425,14 @@ func (rc *requestContext) updateParallelRequestMetrics(metrics *parallelRequestM
 }
 
 // launchParallelRequests starts all parallel relay requests and returns a result channel and mutex for QoS context operations
-func (rc *requestContext) launchParallelRequests(ctx context.Context, logger polylog.Logger) (<-chan parallelRelayResult, *sync.Mutex) {
+func (rc *requestContext) launchParallelRequests(ctx context.Context, logger polylog.Logger, rpcType sharedtypes.RPCType) (<-chan parallelRelayResult, *sync.Mutex) {
 	resultChan := make(chan parallelRelayResult, len(rc.protocolContexts))
 
 	// Ensures thread-safety of QoS context operations.
 	qosContextMutex := &sync.Mutex{}
 
 	for protocolCtxIdx, protocolCtx := range rc.protocolContexts {
-		go rc.executeOneOfParallelRequests(ctx, logger, protocolCtx, protocolCtxIdx, resultChan, qosContextMutex)
+		go rc.executeOneOfParallelRequests(ctx, logger, protocolCtx, protocolCtxIdx, resultChan, qosContextMutex, rpcType)
 	}
 
 	return resultChan, qosContextMutex
@@ -431,6 +446,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	index int,
 	resultChan chan<- parallelRelayResult,
 	qosContextMutex *sync.Mutex,
+	rpcType sharedtypes.RPCType,
 ) {
 	startTime := time.Now()
 
@@ -477,9 +493,9 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			// Mark the previous endpoint as tried
 			triedEndpoints[currentEndpointAddr] = true
 
-			// Get fresh endpoint list from protocol
+			// Get fresh endpoint list from protocol (filtered by detected RPC type)
 			availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
-				rc.context, rc.serviceID, rc.originalHTTPRequest)
+				rc.context, rc.serviceID, rpcType, rc.originalHTTPRequest)
 			if err != nil {
 				logger.Error().Err(err).Int("endpoint_index", index).
 					Msg("Failed to get available endpoints for retry in parallel path")
@@ -536,7 +552,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 
 			// Build new protocol context for the selected endpoint
 			newProtocolCtx, _, err := rc.protocol.BuildHTTPRequestContextForEndpoint(
-				rc.context, rc.serviceID, newEndpointAddr, rc.originalHTTPRequest)
+				rc.context, rc.serviceID, newEndpointAddr, rpcType, rc.originalHTTPRequest)
 			if err != nil {
 				logger.Error().Err(err).
 					Int("endpoint_index", index).
@@ -758,6 +774,7 @@ func (rc *requestContext) waitForFirstSuccessfulResponse(
 	resultChan <-chan parallelRelayResult,
 	metrics *parallelRequestMetrics,
 	qosContextMutex *sync.Mutex,
+	rpcType sharedtypes.RPCType,
 ) error {
 	var lastErr error
 	var responseTimings []string

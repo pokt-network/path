@@ -195,7 +195,7 @@ gateway_config:
     #   rules:
     #     - service_id: "eth"           # Which service this check applies to
     #       name: "eth_blockNumber"     # Unique name for this check
-    #       type: "jsonrpc"             # Check type: jsonrpc, rest, websocket
+    #       type: "json_rpc"             # RPC type: json_rpc, rest, comet_bft, websocket, grpc
     #       method: "POST"              # HTTP method
     #       path: "/"                   # Request path
     #       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'
@@ -218,7 +218,7 @@ gateway_config:
     # local:
     #   - service_id: "eth"
     #     name: "eth_blockNumber"
-    #     type: "jsonrpc"
+    #     type: "json_rpc"
     #     method: "POST"
     #     path: "/"
     #     body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'
@@ -343,7 +343,7 @@ gateway_config:
         local:
           # Basic block number check
           - name: "eth_blockNumber"
-            type: "jsonrpc"
+            type: "json_rpc"
             method: "POST"
             path: "/"
             body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'
@@ -353,7 +353,7 @@ gateway_config:
 
           # Chain ID validation
           - name: "eth_chainId"
-            type: "jsonrpc"
+            type: "json_rpc"
             method: "POST"
             path: "/"
             body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}'
@@ -364,7 +364,7 @@ gateway_config:
 
           # Archival check (historical data)
           - name: "eth_archival"
-            type: "jsonrpc"
+            type: "json_rpc"
             method: "POST"
             path: "/"
             body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x28C6c06298d514Db089934071355E5743bf21d60","0xe4e1c0"]}'
@@ -409,15 +409,26 @@ gateway_config:
     # -------------------------------------------------------------------------
     - id: cosmoshub
       type: "cosmos"
-      rpc_types: ["rest", "comet_bft"]
+      rpc_types: ["json_rpc", "rest", "comet_bft"]
       latency_profile: "slow"
-      # Uses all other defaults
+
+      # RPC type fallback configuration
+      # Temporary workaround for suppliers that stake with incorrect RPC types.
+      # When no endpoints are found for the requested RPC type, PATH will
+      # automatically retry with the fallback type.
+      # Remove this once suppliers update their stakes to correct RPC types.
+      rpc_type_fallbacks:
+        comet_bft: json_rpc  # Fall back to json_rpc if no comet_bft endpoints
+        rest: json_rpc       # Fall back to json_rpc if no rest endpoints
 
     - id: osmosis
       type: "cosmos"
-      rpc_types: ["rest", "comet_bft"]
+      rpc_types: ["json_rpc", "rest", "comet_bft"]
       latency_profile: "slow"
-      # Uses all other defaults
+
+      # Example: only fallback comet_bft
+      rpc_type_fallbacks:
+        comet_bft: json_rpc
 
     # Cosmos chain with EVM support (like XRPL EVM)
     - id: xrplevm
