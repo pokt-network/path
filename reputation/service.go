@@ -7,7 +7,6 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
-	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -117,18 +116,6 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 
 	s.cache[key.String()] = score
 	s.mu.Unlock()
-
-	// Record signal metrics for observability
-	signalType := "success"
-	if signal.IsNegative() {
-		signalType = string(signal.Type)
-	}
-	reputationmetrics.RecordSignal(
-		string(key.ServiceID),
-		signalType,
-		reputationmetrics.EndpointTypeUnknown, // EndpointKey doesn't track type
-		string(key.EndpointAddr),              // Use full address as domain identifier
-	)
 
 	// Queue async write (non-blocking if buffer is full)
 	select {
@@ -420,18 +407,21 @@ func (s *service) getLatencyConfigForService(serviceID protocol.ServiceID) Laten
 
 // calculateImpact calculates the score impact for a signal, applying latency-aware
 // adjustments if the signal has latency data and latency scoring is enabled.
-// This respects per-service latency configuration.
+// This respects per-service latency configuration and configurable signal impacts.
 func (s *service) calculateImpact(serviceID protocol.ServiceID, signal Signal) float64 {
 	// Get latency config for the service (handles per-service overrides)
 	latencyConfig := s.getLatencyConfigForService(serviceID)
 
+	// Get base impact from configurable signal impacts (falls back to defaults)
+	baseImpact := s.config.SignalImpacts.GetImpact(signal.Type)
+
 	var impact float64
 	// If latency is disabled or signal has no latency, use base impact
 	if !latencyConfig.Enabled || signal.Latency == 0 {
-		impact = signal.GetDefaultImpact()
+		impact = baseImpact
 	} else {
 		// Apply latency-aware impact calculation for success signals
-		result := signal.CalculateLatencyAwareImpactWithDetails(latencyConfig)
+		result := signal.CalculateLatencyAwareImpactWithConfig(latencyConfig, baseImpact)
 		impact = result.FinalImpact
 
 		// Log latency scoring details

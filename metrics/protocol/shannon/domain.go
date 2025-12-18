@@ -9,6 +9,9 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
+// ErrDomain is a fallback domain value used when domain extraction fails
+const ErrDomain = "error"
+
 // ExtractDomainOrHost extracts the effective TLD+1 from a URL.
 // It falls back to a reasonable domain extraction for localhost, IP addresses, and other non-standard hosts.
 func ExtractDomainOrHost(rawURL string) (string, error) {

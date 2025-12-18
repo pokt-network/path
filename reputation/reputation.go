@@ -277,6 +277,10 @@ type Config struct {
 	// Latency configures how response latency affects reputation scoring.
 	// Fast endpoints get bonuses, slow endpoints get penalties.
 	Latency LatencyConfig `yaml:"latency,omitempty"`
+
+	// SignalImpacts configures how much each signal type affects the reputation score.
+	// This allows tuning how aggressively endpoints are penalized or rewarded.
+	SignalImpacts SignalImpactsConfig `yaml:"signal_impacts,omitempty"`
 }
 
 // TieredSelectionConfig configures tier-based endpoint selection.
@@ -427,6 +431,100 @@ func (p LatencyProfile) ToLatencyConfig(baseConfig LatencyConfig) LatencyConfig 
 		FastBonus:        baseConfig.FastBonus,
 		SlowPenalty:      baseConfig.SlowPenalty,
 		VerySlowPenalty:  baseConfig.VerySlowPenalty,
+	}
+}
+
+// SignalImpactsConfig configures the score impact for each signal type.
+// These values determine how much the reputation score changes when a signal is recorded.
+// All values should be provided - use defaults from DefaultSignalImpacts() if not specified.
+type SignalImpactsConfig struct {
+	// Success is the score change for successful responses. Default: +1
+	Success float64 `yaml:"success,omitempty"`
+
+	// MinorError is the score change for minor errors (validation issues). Default: -3
+	MinorError float64 `yaml:"minor_error,omitempty"`
+
+	// MajorError is the score change for major errors (timeout, connection). Default: -10
+	MajorError float64 `yaml:"major_error,omitempty"`
+
+	// CriticalError is the score change for critical errors (HTTP 5xx). Default: -25
+	CriticalError float64 `yaml:"critical_error,omitempty"`
+
+	// FatalError is the score change for fatal errors (config issues). Default: -50
+	FatalError float64 `yaml:"fatal_error,omitempty"`
+
+	// RecoverySuccess is the score change for successful probation recovery. Default: +15
+	RecoverySuccess float64 `yaml:"recovery_success,omitempty"`
+
+	// SlowResponse is the score change for slow responses. Default: -1
+	SlowResponse float64 `yaml:"slow_response,omitempty"`
+
+	// VerySlowResponse is the score change for very slow responses. Default: -3
+	VerySlowResponse float64 `yaml:"very_slow_response,omitempty"`
+}
+
+// DefaultSignalImpacts returns the default signal impact values.
+func DefaultSignalImpacts() SignalImpactsConfig {
+	return SignalImpactsConfig{
+		Success:          +1,
+		MinorError:       -3,
+		MajorError:       -10,
+		CriticalError:    -25,
+		FatalError:       -50,
+		RecoverySuccess:  +15,
+		SlowResponse:     -1,
+		VerySlowResponse: -3,
+	}
+}
+
+// GetImpact returns the configured impact for a signal type.
+// Falls back to default values if not configured (zero value).
+func (c *SignalImpactsConfig) GetImpact(signalType SignalType) float64 {
+	defaults := DefaultSignalImpacts()
+
+	switch signalType {
+	case SignalTypeSuccess:
+		if c.Success != 0 {
+			return c.Success
+		}
+		return defaults.Success
+	case SignalTypeMinorError:
+		if c.MinorError != 0 {
+			return c.MinorError
+		}
+		return defaults.MinorError
+	case SignalTypeMajorError:
+		if c.MajorError != 0 {
+			return c.MajorError
+		}
+		return defaults.MajorError
+	case SignalTypeCriticalError:
+		if c.CriticalError != 0 {
+			return c.CriticalError
+		}
+		return defaults.CriticalError
+	case SignalTypeFatalError:
+		if c.FatalError != 0 {
+			return c.FatalError
+		}
+		return defaults.FatalError
+	case SignalTypeRecoverySuccess:
+		if c.RecoverySuccess != 0 {
+			return c.RecoverySuccess
+		}
+		return defaults.RecoverySuccess
+	case SignalTypeSlowResponse:
+		if c.SlowResponse != 0 {
+			return c.SlowResponse
+		}
+		return defaults.SlowResponse
+	case SignalTypeVerySlowResponse:
+		if c.VerySlowResponse != 0 {
+			return c.VerySlowResponse
+		}
+		return defaults.VerySlowResponse
+	default:
+		return 0
 	}
 }
 

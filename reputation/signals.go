@@ -215,9 +215,14 @@ func (s Signal) CalculateLatencyAwareImpact(config LatencyConfig) float64 {
 
 // CalculateLatencyAwareImpactWithDetails calculates the score impact with latency modifiers
 // and returns detailed information about the calculation for logging purposes.
+// Uses the default (hardcoded) base impact from GetDefaultImpact().
 func (s Signal) CalculateLatencyAwareImpactWithDetails(config LatencyConfig) LatencyImpactResult {
-	baseImpact := s.GetDefaultImpact()
+	return s.CalculateLatencyAwareImpactWithConfig(config, s.GetDefaultImpact())
+}
 
+// CalculateLatencyAwareImpactWithConfig calculates the score impact with latency modifiers
+// using a provided base impact value. This allows using configurable signal impacts.
+func (s Signal) CalculateLatencyAwareImpactWithConfig(config LatencyConfig, baseImpact float64) LatencyImpactResult {
 	// Only apply latency modifiers to positive signals (success, recovery_success)
 	if baseImpact <= 0 || s.Latency == 0 || !config.Enabled {
 		return LatencyImpactResult{

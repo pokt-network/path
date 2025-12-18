@@ -85,7 +85,7 @@ func setupHealthCheckExecutor(
 		MetricsReporter:       metricsReporter,
 		DataReporter:          dataReporter,
 		ObservationQueue:      observationQueue,
-		MaxWorkers:            10,
+		MaxWorkers:            config.MaxWorkers, // Defaults to 10 in NewHealthCheckExecutor if 0
 		UnifiedServicesConfig: unifiedServicesConfig,
 	})
 

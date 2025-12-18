@@ -141,6 +141,19 @@ gateway_config:
         traffic_percent: 10    # % of traffic routed to probation endpoints
         recovery_multiplier: 2.0  # Boost for successful probation requests
 
+    # Signal impacts - how much each signal type affects reputation score
+    # Tune these to control how aggressively endpoints are penalized or rewarded
+    # Positive values = score increase, Negative values = score decrease
+    signal_impacts:
+      success: 1              # Successful response (default: +1)
+      minor_error: -3         # Validation issues, unknown errors (default: -3)
+      major_error: -10        # Timeout, connection errors (default: -10)
+      critical_error: -25     # HTTP 5xx errors (default: -25)
+      fatal_error: -50        # Config/setup errors (default: -50)
+      recovery_success: 15    # Successful probation recovery (default: +15)
+      slow_response: -1       # Response slower than penalty_threshold (default: -1)
+      very_slow_response: -3  # Response slower than severe_threshold (default: -3)
+
   # ===========================================================================
   # GLOBAL RETRY CONFIGURATION (optional)
   # ===========================================================================

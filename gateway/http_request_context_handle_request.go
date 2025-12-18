@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -10,8 +11,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
-	retrymetrics "github.com/pokt-network/path/metrics/retry"
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -84,6 +84,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		return fmt.Errorf("no payloads available from QoS context")
 	}
 	rpcType := payloads[0].RPCType
+	batchCount := len(payloads)
 
 	// Get retry configuration for the service
 	retryConfig := rc.getRetryConfigForService()
@@ -99,12 +100,14 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	var lastErr error
 	var lastStatusCode int
 	var lastEndpointAddr protocol.EndpointAddr
-	retryStartTime := time.Now()
 
 	// Track endpoints already tried to ensure retry endpoint rotation
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
 	currentProtocolCtx := rc.protocolContexts[0]
 	var currentEndpointAddr protocol.EndpointAddr
+
+	// Track overall retry attempt start time for metrics
+	retryLoopStartTime := time.Now()
 
 	// Retry loop
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -154,9 +157,6 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					Int("num_tried", len(triedEndpoints)).
 					Msg("All available endpoints tried, resetting for retry with backoff")
 
-				// Record endpoint exhaustion metric
-				retrymetrics.RecordEndpointExhaustion(string(rc.serviceID), len(availableEndpoints))
-
 				// Apply exponential backoff when cycling through endpoints
 				backoff := calculateRetryBackoff(attempt)
 				if backoff > 0 {
@@ -186,8 +186,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			currentEndpointAddr = newEndpointAddr
 
 			// Build new protocol context for the selected endpoint
+			// filterByReputation=true: Retries respect reputation filtering
 			newProtocolCtx, _, err := rc.protocol.BuildHTTPRequestContextForEndpoint(
-				rc.context, rc.serviceID, newEndpointAddr, rpcType, rc.originalHTTPRequest)
+				rc.context, rc.serviceID, newEndpointAddr, rpcType, rc.originalHTTPRequest, true)
 			if err != nil {
 				logger.Error().Err(err).
 					Str("endpoint", string(newEndpointAddr)).
@@ -203,9 +204,6 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				Int("attempt", attempt).
 				Int("num_tried", len(triedEndpoints)).
 				Msg("🔄 Switched to new endpoint for retry")
-
-			// Record endpoint switch metric
-			retrymetrics.RecordEndpointSwitch(string(rc.serviceID), attempt)
 		} else {
 			// First attempt: track the initial endpoint
 			if len(rc.protocolContexts) > 0 {
@@ -257,9 +255,6 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					Int("response_count", len(endpointResponses)).
 					Int("response_bytes", responseBytes).
 					Msg("STATUS_CODE_0: Successful request with status code 0 - protocol-level success?")
-
-				// Record metric for status code 0
-				retrymetrics.RecordStatusCodeZero(string(rc.serviceID), err != nil)
 			}
 
 			// Success! Process the response
@@ -276,19 +271,19 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
 			}
 
-			if attempt > 1 && endpointAddr != "" {
-				// Record retry success metrics (only if we have valid endpoint info)
-				endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(endpointAddr))
-				retrymetrics.RecordRetrySuccess(string(rc.serviceID), endpointDomain, attempt)
-
-				// Record total retry latency
-				retryLatency := time.Since(retryStartTime).Seconds()
-				retrymetrics.RecordRetryLatency(string(rc.serviceID), endpointDomain, true, retryLatency)
-
+			if attempt > 1 {
 				logger.Info().
 					Int("attempt", attempt).
 					Msg("Relay request succeeded after retry")
+
+				// Record retry result metric (success after retries)
+				totalLatency := time.Since(retryLoopStartTime).Seconds()
+				metrics.RecordRetryResult(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), strconv.Itoa(attempt-1), metrics.RetryResultSuccess, totalLatency)
 			}
+
+			// Record batch size metric
+			totalLatency := time.Since(retryLoopStartTime).Seconds()
+			metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), strconv.Itoa(batchCount), totalLatency)
 
 			return nil
 		}
@@ -320,7 +315,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 		// Check if we should retry
 		if attempt < maxAttempts {
-			// Only check shouldRetry and record metrics if we have endpoint info
+			// Only check shouldRetry if we have endpoint info
 			if endpointAddr == "" {
 				logger.Debug().
 					Int("attempt", attempt).
@@ -328,8 +323,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				break
 			}
 
-			endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(endpointAddr))
-			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, endpointDomain) {
+			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, string(endpointAddr)) {
 				logger.Debug().
 					Int("attempt", attempt).
 					Int("status_code", statusCode).
@@ -337,10 +331,6 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					Msg("Request failed but retry conditions not met, stopping retries")
 				break
 			}
-
-			// Record retry attempt metrics
-			retryReason := rc.determineRetryReason(err, statusCode)
-			retrymetrics.RecordRetryAttempt(string(rc.serviceID), endpointDomain, retryReason, attempt)
 
 			// Small delay before retry to avoid hammering the endpoint immediately
 			select {
@@ -353,17 +343,17 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		}
 	}
 
-	// Record failed retry latency if we made retry attempts
+	// All retries exhausted or conditions not met
+	totalLatency := time.Since(retryLoopStartTime).Seconds()
+
+	// Record batch size metric (even on failure)
+	metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), strconv.Itoa(batchCount), totalLatency)
+
+	// Record retry result metric (failure) if retries were actually attempted
 	if maxAttempts > 1 {
-		retryLatency := time.Since(retryStartTime).Seconds()
-		// Only record if we have a valid endpoint address
-		if lastEndpointAddr != "" {
-			endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(lastEndpointAddr))
-			retrymetrics.RecordRetryLatency(string(rc.serviceID), endpointDomain, false, retryLatency)
-		}
+		metrics.RecordRetryResult(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), strconv.Itoa(maxAttempts-1), metrics.RetryResultFailure, totalLatency)
 	}
 
-	// All retries exhausted or conditions not met
 	if lastErr != nil {
 		logger.Error().Err(lastErr).
 			Int("max_attempts", maxAttempts).
@@ -385,11 +375,11 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 //
 // handleParallelRelayRequests orchestrates parallel relay requests and returns the first successful response.
 func (rc *requestContext) handleParallelRelayRequests() error {
-	metrics := &parallelRequestMetrics{
+	parallelMetrics := &parallelRequestMetrics{
 		numRequestsToAttempt: len(rc.protocolContexts),
 		overallStartTime:     time.Now(),
 	}
-	defer rc.updateParallelRequestMetrics(metrics)
+	defer rc.updateParallelRequestMetrics(parallelMetrics)
 
 	logger := rc.logger.
 		With("method", "handleParallelRelayRequests").
@@ -403,6 +393,13 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 		return fmt.Errorf("no payloads available from QoS context")
 	}
 	rpcType := payloads[0].RPCType
+	batchCount := len(payloads)
+
+	// Record batch size metric on completion (deferred)
+	defer func() {
+		totalLatency := time.Since(parallelMetrics.overallStartTime).Seconds()
+		metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), strconv.Itoa(batchCount), totalLatency)
+	}()
 
 	// TODO_TECHDEBT: Make sure timed out parallel requests are also sanctioned.
 	ctx, cancel := context.WithTimeout(rc.context, RelayRequestTimeout)
@@ -410,7 +407,7 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 
 	resultChan, qosContextMutex := rc.launchParallelRequests(ctx, logger, rpcType)
 
-	return rc.waitForFirstSuccessfulResponse(ctx, logger, resultChan, metrics, qosContextMutex, rpcType)
+	return rc.waitForFirstSuccessfulResponse(ctx, logger, resultChan, parallelMetrics, qosContextMutex, rpcType)
 }
 
 // updateParallelRequestMetrics updates gateway observations with parallel request metrics
@@ -519,9 +516,6 @@ func (rc *requestContext) executeOneOfParallelRequests(
 					Int("num_tried", len(triedEndpoints)).
 					Msg("All available endpoints tried in parallel path, resetting with backoff")
 
-				// Record endpoint exhaustion metric
-				retrymetrics.RecordEndpointExhaustion(string(rc.serviceID), len(availableEndpoints))
-
 				// Apply exponential backoff when cycling through endpoints
 				backoff := calculateRetryBackoff(attempt)
 				if backoff > 0 {
@@ -551,8 +545,9 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			currentEndpointAddr = newEndpointAddr
 
 			// Build new protocol context for the selected endpoint
+			// filterByReputation=true: Retries respect reputation filtering
 			newProtocolCtx, _, err := rc.protocol.BuildHTTPRequestContextForEndpoint(
-				rc.context, rc.serviceID, newEndpointAddr, rpcType, rc.originalHTTPRequest)
+				rc.context, rc.serviceID, newEndpointAddr, rpcType, rc.originalHTTPRequest, true)
 			if err != nil {
 				logger.Error().Err(err).
 					Int("endpoint_index", index).
@@ -569,9 +564,6 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				Int("attempt", attempt).
 				Int("num_tried", len(triedEndpoints)).
 				Msg("🔄 Switched to new endpoint for retry in parallel path")
-
-			// Record endpoint switch metric
-			retrymetrics.RecordEndpointSwitch(string(rc.serviceID), attempt)
 		} else {
 			// First attempt: track the initial endpoint
 			currentEndpointAddr = lastEndpointAddr
@@ -619,9 +611,6 @@ func (rc *requestContext) executeOneOfParallelRequests(
 					Int("response_count", len(responses)).
 					Int("response_bytes", responseBytes).
 					Msg("STATUS_CODE_0: Successful request with status code 0 in parallel path - protocol-level success?")
-
-				// Record metric for status code 0
-				retrymetrics.RecordStatusCodeZero(string(rc.serviceID), err != nil)
 			}
 
 			// Success! Send the result
@@ -634,15 +623,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				startTime: startTime,
 			}
 
-			if attempt > 1 && endpointAddr != "" {
-				// Record retry success metrics (only if we have valid endpoint info)
-				endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(endpointAddr))
-				retrymetrics.RecordRetrySuccess(string(rc.serviceID), endpointDomain, attempt)
-
-				// Record total retry latency
-				retryLatency := time.Since(startTime).Seconds()
-				retrymetrics.RecordRetryLatency(string(rc.serviceID), endpointDomain, true, retryLatency)
-
+			if attempt > 1 {
 				logger.Info().
 					Int("endpoint_index", index).
 					Int("attempt", attempt).
@@ -689,7 +670,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 
 		// Check if we should retry
 		if attempt < maxAttempts {
-			// Only check shouldRetry and record metrics if we have endpoint info
+			// Only check shouldRetry if we have endpoint info
 			if endpointAddr == "" {
 				logger.Debug().
 					Int("endpoint_index", index).
@@ -698,8 +679,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				break
 			}
 
-			endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(endpointAddr))
-			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, endpointDomain) {
+			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, string(endpointAddr)) {
 				logger.Debug().
 					Int("endpoint_index", index).
 					Int("attempt", attempt).
@@ -708,10 +688,6 @@ func (rc *requestContext) executeOneOfParallelRequests(
 					Msg("Request failed but retry conditions not met, stopping retries")
 				break
 			}
-
-			// Record retry attempt metrics
-			retryReason := rc.determineRetryReason(err, statusCode)
-			retrymetrics.RecordRetryAttempt(string(rc.serviceID), endpointDomain, retryReason, attempt)
 
 			// Small delay before retry to avoid hammering the endpoint immediately
 			// We don't use exponential backoff here because parallel requests have their own timeout
@@ -722,16 +698,6 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			case <-time.After(100 * time.Millisecond):
 				// Continue to next attempt
 			}
-		}
-	}
-
-	// Record failed retry latency if we made retry attempts
-	if maxAttempts > 1 {
-		retryLatency := time.Since(startTime).Seconds()
-		// Only record if we have a valid endpoint address
-		if lastEndpointAddr != "" {
-			endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(lastEndpointAddr))
-			retrymetrics.RecordRetryLatency(string(rc.serviceID), endpointDomain, false, retryLatency)
 		}
 	}
 
@@ -812,10 +778,7 @@ func (rc *requestContext) handleSuccessfulResponse(
 	defer qosContextMutex.Unlock()
 
 	for _, response := range result.responses {
-		endpointDomain := shannonmetrics.ExtractTLDFromEndpointAddr(string(response.EndpointAddr))
-
 		logger.Info().
-			Str("endpoint_domain", endpointDomain).
 			Msgf("Parallel request success: endpoint %d/%d responded in %dms",
 				result.index+1, metrics.numRequestsToAttempt, overallDuration.Milliseconds())
 

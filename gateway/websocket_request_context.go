@@ -10,6 +10,8 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/pokt-network/path/metrics"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
@@ -324,15 +326,38 @@ func (wrc *websocketRequestContext) handleConnectionObservation(protocolObs *pro
 		if obsData, ok := shannonReqObs.GetObservationData().(*protocolobservations.ShannonRequestObservations_WebsocketConnectionObservation); ok {
 			// Handle connection lifecycle events
 			connObs := obsData.WebsocketConnectionObservation
+
+			// Extract domain for metrics
+			domain, domainErr := shannonmetrics.ExtractDomainOrHost(connObs.GetEndpointUrl())
+			if domainErr != nil {
+				domain = shannonmetrics.ErrDomain
+			}
+			serviceID := string(wrc.serviceID)
+
 			switch connObs.GetEventType() {
 			case protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_ESTABLISHED:
 				wrc.logger.Debug().Msg("Received connection establishment observation from protocol layer")
+				// Record successful connection establishment metric
+				metrics.RecordWebsocketConnectionEstablished(domain, serviceID)
 				wrc.broadcastWebsocketConnectionEstablished(protocolObs)
+
 			case protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_CLOSED:
 				wrc.logger.Debug().Msg("Received connection closure observation from protocol layer")
+				// Calculate connection duration from timestamps
+				var durationSeconds float64
+				if connObs.GetConnectionEstablishedTimestamp() != nil && connObs.GetConnectionClosedTimestamp() != nil {
+					establishedTime := connObs.GetConnectionEstablishedTimestamp().AsTime()
+					closedTime := connObs.GetConnectionClosedTimestamp().AsTime()
+					durationSeconds = closedTime.Sub(establishedTime).Seconds()
+				}
+				// Record connection closure metric with duration
+				metrics.RecordWebsocketConnectionClosed(domain, serviceID, durationSeconds)
 				wrc.broadcastWebsocketConnectionClosed(protocolObs)
+
 			case protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_ESTABLISHMENT_FAILED:
 				wrc.logger.Debug().Msg("Received connection establishment failure observation from protocol layer")
+				// Record connection failure metric
+				metrics.RecordWebsocketConnectionFailed(domain, serviceID)
 				wrc.broadcastWebsocketConnectionEstablished(protocolObs) // Treat as establishment event for metrics
 			}
 		} else {

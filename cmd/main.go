@@ -19,7 +19,6 @@ import (
 	configpkg "github.com/pokt-network/path/config"
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/health"
-	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/metrics/devtools"
 	protocolPkg "github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/request"
@@ -39,9 +38,6 @@ const defaultConfigPath = "config/.config.yaml"
 
 func main() {
 	log.Printf(`{"level":"info","message":"PATH 🌿 gateway starting..."}`)
-
-	// Initialize version metrics for Prometheus monitoring
-	metrics.SetVersionInfo(Version, Commit, BuildDate)
 
 	// Get the config path
 	configPath, err := getConfigPath(defaultConfigPath)
@@ -96,6 +92,10 @@ func main() {
 
 	// Setup the pprof server with the background context for graceful shutdown
 	setupPprofServer(backgroundCtx, logger, config.Metrics.PprofAddr)
+
+	// Setup the leaderboard publisher for endpoint distribution metrics.
+	// This publishes endpoint leaderboard data every 10 seconds.
+	leaderboardPublisher := setupLeaderboardPublisher(backgroundCtx, logger, protocol)
 
 	// Setup the data reporter
 	dataReporter, err := setupHTTPDataReporter(logger, config.DataReporterConfig)
@@ -286,6 +286,11 @@ func main() {
 	// Stop the health check executor
 	if healthCheckExecutor != nil {
 		healthCheckExecutor.Stop()
+	}
+
+	// Stop the leaderboard publisher
+	if leaderboardPublisher != nil {
+		leaderboardPublisher.Stop()
 	}
 
 	// Stop the observation queue to drain pending observations

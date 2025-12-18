@@ -355,7 +355,7 @@ func (m *mockProtocolForRetry) AvailableWebsocketEndpoints(ctx context.Context, 
 	return nil, protocolobservations.Observations{}, nil
 }
 
-func (m *mockProtocolForRetry) BuildHTTPRequestContextForEndpoint(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, rpcType sharedtypes.RPCType, httpReq *http.Request) (ProtocolRequestContext, protocolobservations.Observations, error) {
+func (m *mockProtocolForRetry) BuildHTTPRequestContextForEndpoint(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, rpcType sharedtypes.RPCType, httpReq *http.Request, filterByReputation bool) (ProtocolRequestContext, protocolobservations.Observations, error) {
 	return nil, protocolobservations.Observations{}, nil
 }
 

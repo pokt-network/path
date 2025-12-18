@@ -6,8 +6,6 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
-	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
-	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
 )
@@ -47,7 +45,6 @@ func (p *Protocol) filterByReputation(
 	scores, err := p.reputationService.GetScores(ctx, keys)
 	if err != nil {
 		logger.Warn().Err(err).Msg("Failed to get reputation scores, allowing all endpoints")
-		reputationmetrics.RecordError("get_scores", "storage_error")
 		return endpoints
 	}
 
@@ -57,45 +54,26 @@ func (p *Protocol) filterByReputation(
 		key := keyBuilder.BuildKey(serviceID, addr, rpcType)
 		score, exists := scores[key]
 
-		// Extract domain for metrics
-		endpointDomain := extractEndpointDomain(ep.PublicURL(), logger)
-
 		// If score doesn't exist, the endpoint is new and gets initial score (which is above threshold)
 		if !exists {
 			filtered[addr] = ep
-			reputationmetrics.RecordEndpointAllowed(string(serviceID), endpointDomain)
 			continue
 		}
-
-		// Record score observation for histogram
-		reputationmetrics.RecordScoreObservation(string(serviceID), score.Value)
 
 		// Check if score is above the configured minimum threshold (use per-service threshold)
 		minThreshold := p.getMinThresholdForService(serviceID)
 		if score.Value >= minThreshold {
 			filtered[addr] = ep
-			reputationmetrics.RecordEndpointAllowed(string(serviceID), endpointDomain)
 		} else {
 			logger.Debug().
 				Str("endpoint", string(addr)).
 				Float64("score", score.Value).
 				Float64("threshold", minThreshold).
 				Msg("Filtering out low-reputation endpoint")
-			reputationmetrics.RecordEndpointFiltered(string(serviceID), endpointDomain)
 		}
 	}
 
 	return filtered
-}
-
-// extractEndpointDomain extracts the domain from an endpoint URL for metrics labeling.
-func extractEndpointDomain(url string, logger polylog.Logger) string {
-	domain, err := shannonmetrics.ExtractDomainOrHost(url)
-	if err != nil {
-		logger.Debug().Err(err).Str("url", url).Msg("Could not extract domain from endpoint URL")
-		return shannonmetrics.ErrDomain
-	}
-	return domain
 }
 
 // getEndpointScores retrieves reputation scores for all endpoints and returns them
@@ -107,23 +85,25 @@ func (p *Protocol) getEndpointScores(
 	rpcType sharedtypes.RPCType,
 	_ polylog.Logger, // logger reserved for future debug logging
 ) (map[reputation.EndpointKey]float64, error) {
+	// Use the key builder to respect key_granularity setting
+	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+
 	// Build endpoint keys for batch lookup
 	keys := make([]reputation.EndpointKey, 0, len(endpoints))
 	for addr := range endpoints {
-		keys = append(keys, reputation.NewEndpointKey(serviceID, addr, rpcType))
+		keys = append(keys, keyBuilder.BuildKey(serviceID, addr, rpcType))
 	}
 
 	// Get scores from reputation service
 	scores, err := p.reputationService.GetScores(ctx, keys)
 	if err != nil {
-		reputationmetrics.RecordError("get_scores", "storage_error")
 		return nil, err
 	}
 
 	// Convert to score values map
 	result := make(map[reputation.EndpointKey]float64, len(endpoints))
 	for addr := range endpoints {
-		key := reputation.NewEndpointKey(serviceID, addr, rpcType)
+		key := keyBuilder.BuildKey(serviceID, addr, rpcType)
 		if score, exists := scores[key]; exists {
 			result[key] = score.Value
 		} else {
@@ -136,7 +116,7 @@ func (p *Protocol) getEndpointScores(
 }
 
 // getReputationMinThreshold returns the configured minimum reputation threshold.
-// Falls back to default if tiered selector is not configured.
+// Falls back to default if the tiered selector is not configured.
 func (p *Protocol) getReputationMinThreshold() float64 {
 	if p.tieredSelector != nil {
 		return p.tieredSelector.MinThreshold()
@@ -190,7 +170,7 @@ func (p *Protocol) filterToHighestTier(
 		return endpoints
 	}
 
-	// Get the tiered selector for this service (may be per-service or global)
+	// Get the tiered selector for this service (maybe per-service or global)
 	selector := p.getTieredSelectorForService(serviceID)
 	if selector == nil {
 		// No selector configured, return all endpoints
@@ -204,52 +184,25 @@ func (p *Protocol) filterToHighestTier(
 		return endpoints
 	}
 
-	// Track probation transitions before updating status
-	var transitionEvents []struct {
-		key        reputation.EndpointKey
-		transition string
+	// Build a mapping from aggregated keys (e.g., domain) to full endpoint addresses.
+	// This is needed because with per-domain granularity, the reputation keys contain
+	// domains (e.g., "dopokt.com") but we need to return endpoints keyed by their full
+	// addresses (e.g., "pokt1abc-https://relay.dopokt.com").
+	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+	keyToEndpoints := make(map[protocol.EndpointAddr][]protocol.EndpointAddr)
+	for addr := range endpoints {
+		key := keyBuilder.BuildKey(serviceID, addr, rpcType)
+		keyToEndpoints[key.EndpointAddr] = append(keyToEndpoints[key.EndpointAddr], addr)
 	}
 
-	if selector.Config().Probation.Enabled {
-		probationThreshold := selector.Config().Probation.Threshold
-		for key, score := range endpointScores {
-			wasInProbation := selector.IsInProbation(key)
-			isInProbation := score < probationThreshold && score >= selector.MinThreshold()
-
-			// Record transition events
-			if isInProbation && !wasInProbation {
-				transitionEvents = append(transitionEvents, struct {
-					key        reputation.EndpointKey
-					transition string
-				}{key, reputationmetrics.ProbationTransitionEntered})
-			} else if !isInProbation && wasInProbation {
-				transitionEvents = append(transitionEvents, struct {
-					key        reputation.EndpointKey
-					transition string
-				}{key, reputationmetrics.ProbationTransitionExited})
-			}
-		}
-	}
-
-	// Update probation status and get list of endpoints currently in probation
+	// Update probation status and get a list of endpoints currently in probation
 	probationEndpoints := selector.UpdateProbationStatus(endpointScores)
 	probationCount := len(probationEndpoints)
-
-	// Record probation metrics if probation is enabled
-	if selector.Config().Probation.Enabled {
-		reputationmetrics.SetProbationEndpointsCount(string(serviceID), probationCount)
-
-		// Record transition events
-		for _, event := range transitionEvents {
-			domain := extractEndpointDomain(string(event.key.EndpointAddr), logger)
-			reputationmetrics.RecordProbationTransition(string(serviceID), domain, event.transition)
-		}
-	}
 
 	// Check if this request should be routed to probation endpoints
 	shouldRouteToProbation := selector.ShouldRouteToProbation()
 
-	// If probation routing is active and we have probation endpoints, route to them
+	// If probation routing is active, and we have probation endpoints, route to them
 	if shouldRouteToProbation && probationCount > 0 {
 		logger.Info().
 			Int("probation_count", probationCount).
@@ -257,10 +210,13 @@ func (p *Protocol) filterToHighestTier(
 			Msg("Routing request to probation endpoints for recovery")
 
 		// Build result map with only probation endpoints
-		result := make(map[protocol.EndpointAddr]endpoint, probationCount)
+		// Use keyToEndpoints mapping to get full endpoint addresses from domain keys
+		result := make(map[protocol.EndpointAddr]endpoint)
 		for _, key := range probationEndpoints {
-			if ep, exists := endpoints[key.EndpointAddr]; exists {
-				result[key.EndpointAddr] = ep
+			for _, fullAddr := range keyToEndpoints[key.EndpointAddr] {
+				if ep, exists := endpoints[fullAddr]; exists {
+					result[fullAddr] = ep
+				}
 			}
 		}
 
@@ -271,9 +227,6 @@ func (p *Protocol) filterToHighestTier(
 	// Group endpoints by tier using the service-specific selector
 	tier1, tier2, tier3 := selector.GroupByTier(endpointScores)
 	tier1Count, tier2Count, tier3Count := len(tier1), len(tier2), len(tier3)
-
-	// Record tier distribution metrics (gauge showing current state)
-	reputationmetrics.RecordTierDistribution(string(serviceID), tier1Count, tier2Count, tier3Count)
 
 	// Log detailed tier distribution for observability
 	logger.Info().
@@ -306,18 +259,17 @@ func (p *Protocol) filterToHighestTier(
 	default:
 		// No endpoints in any tier (all below threshold) - return empty
 		logger.Warn().Msg("No endpoints available in any tier after tiered filtering")
-		reputationmetrics.RecordTierSelection(string(serviceID), 0)
 		return make(map[protocol.EndpointAddr]endpoint)
 	}
 
-	// Record the tier selection metric (counter for selections)
-	reputationmetrics.RecordTierSelection(string(serviceID), selectedTier)
-
 	// Build result map with only endpoints from the selected tier
-	result := make(map[protocol.EndpointAddr]endpoint, len(selectedKeys))
+	// Use keyToEndpoints mapping to get full endpoint addresses from domain/supplier keys
+	result := make(map[protocol.EndpointAddr]endpoint)
 	for _, key := range selectedKeys {
-		if ep, exists := endpoints[key.EndpointAddr]; exists {
-			result[key.EndpointAddr] = ep
+		for _, fullAddr := range keyToEndpoints[key.EndpointAddr] {
+			if ep, exists := endpoints[fullAddr]; exists {
+				result[fullAddr] = ep
+			}
 		}
 	}
 

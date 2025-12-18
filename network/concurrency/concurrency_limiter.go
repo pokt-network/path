@@ -27,8 +27,6 @@ import (
 	"context"
 	"sync"
 	"time"
-
-	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 )
 
 // TODO_IMPROVE: Make this configurable via settings
@@ -65,8 +63,6 @@ func (cl *ConcurrencyLimiter) Acquire(ctx context.Context) bool {
 		cl.mu.Lock()
 		defer cl.mu.Unlock()
 		cl.activeRequests++
-		// Track active relays for observability
-		shannonmetrics.SetActiveHTTPRelays(cl.activeRequests)
 		return true
 	case <-ctx.Done():
 		return false
@@ -87,8 +83,6 @@ func (cl *ConcurrencyLimiter) Release() {
 		cl.mu.Lock()
 		defer cl.mu.Unlock()
 		cl.activeRequests--
-		// Track active relays for observability
-		shannonmetrics.SetActiveHTTPRelays(cl.activeRequests)
 	default:
 		// TODO_TECHDEBT: Log acquire/release mismatch for debugging
 	}
@@ -98,9 +92,6 @@ func (cl *ConcurrencyLimiter) Release() {
 func (cl *ConcurrencyLimiter) getActiveRequests() int64 {
 	cl.mu.RLock()
 	defer cl.mu.RUnlock()
-
-	// Refresh metric with current count
-	shannonmetrics.SetActiveHTTPRelays(cl.activeRequests)
 
 	return cl.activeRequests
 }

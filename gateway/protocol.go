@@ -56,12 +56,15 @@ type Protocol interface {
 	//
 	// Return observation if the context setup fails.
 	// Used as protocol observation for the request when no protocol context exists.
+	// filterByReputation controls whether to filter endpoints by reputation score.
+	// Pass true for normal requests (respects reputation), false for health checks (reaches all endpoints).
 	BuildHTTPRequestContextForEndpoint(
-		context.Context,
-		protocol.ServiceID,
-		protocol.EndpointAddr,
-		sharedtypes.RPCType,
-		*http.Request,
+		ctx context.Context,
+		serviceID protocol.ServiceID,
+		endpointAddr protocol.EndpointAddr,
+		rpcType sharedtypes.RPCType,
+		httpReq *http.Request,
+		filterByReputation bool,
 	) (ProtocolRequestContext, protocolobservations.Observations, error)
 
 	// BuildWebsocketRequestContextForEndpoint builds and returns a ProtocolRequestContextWebsocket containing a single selected endpoint.

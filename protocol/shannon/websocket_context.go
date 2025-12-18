@@ -14,8 +14,8 @@ import (
 	sdk "github.com/pokt-network/shannon-sdk"
 
 	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/metrics"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
-	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
@@ -207,7 +207,11 @@ func (p *Protocol) getPreSelectedEndpoint(
 	// This includes fallback logic if session endpoints are unavailable.
 	// The final boolean parameter sets whether to filter by reputation.
 	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, rpcType, allowedSuppliers)
+	//
+	// NOTE: WebSocket endpoints currently don't have dedicated health checks, so they may have
+	// low initial scores. We use filterByReputation=false for WebSocket until health checks are implemented.
+	filterByReputation := rpcType != sharedtypes.RPCType_WEBSOCKET
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, err
@@ -281,8 +285,10 @@ func (p *Protocol) recordReputationSignalsFromWebsocketObservations(shannonObser
 func (p *Protocol) recordSignalFromWebsocketConnectionObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonWebsocketConnectionObservation) {
 	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
 
-	// Build endpoint key for reputation service with WEBSOCKET RPC type
-	key := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_WEBSOCKET)
+	// Build endpoint key using key builder to respect key_granularity setting
+	rpcType := sharedtypes.RPCType_WEBSOCKET
+	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+	key := keyBuilder.BuildKey(serviceID, endpointAddr, rpcType)
 
 	// Map observation error type to signal
 	// Note: We only have errorType in observations now (sanctions removed)
@@ -456,10 +462,19 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 
 	wrc.logger.Debug().Msgf("received message from client: %s", string(msgData))
 
+	// Extract domain for message metrics
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	serviceID := string(wrc.serviceID)
+
 	// If the selected endpoint is a fallback endpoint, skip signing the message.
 	// Fallback endpoints bypass the protocol so the raw message is sent to the endpoint.
 	// TODO_IMPROVE(@commoddity,@adshmh): Cleanly separate fallback endpoint handling from the protocol package.
 	if wrc.selectedEndpoint.IsFallback() {
+		// Record message metric for client→endpoint direction (fallback = always success)
+		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionClientToEndpoint, metrics.SignalOK)
 		return msgData, nil
 	}
 
@@ -467,9 +482,14 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 	signedRelayRequest, err := wrc.signClientWebsocketMessage(msgData)
 	if err != nil {
 		wrc.logger.Error().Err(err).Msg("❌ failed to sign request")
+		// Record message metric for client→endpoint direction with error
+		// Note: signing errors are PATH-side, not endpoint quality issues, but we track for observability
+		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionClientToEndpoint, metrics.SignalMinorError)
 		return nil, err
 	}
 
+	// Record message metric for client→endpoint direction
+	metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionClientToEndpoint, metrics.SignalOK)
 	return signedRelayRequest, nil
 }
 
@@ -515,12 +535,21 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 
 	wrc.logger.Debug().Msgf("received message from endpoint: %s", string(msgData))
 
+	// Extract domain for message metrics
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	serviceID := string(wrc.serviceID)
+
 	// If the selected endpoint is a fallback endpoint, skip validation.
 	// Fallback endpoints bypass the protocol so the raw message is sent to the endpoint.
 	// TODO_IMPROVE(@commoddity,@adshmh): Cleanly separate fallback endpoint handling from the protocol package.
 	if wrc.selectedEndpoint.IsFallback() {
 		// Record success signal for fallback endpoint messages
 		wrc.recordWebsocketSignal(reputation.NewSuccessSignal(time.Since(startTime)))
+		// Record message metric for endpoint→client direction
+		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalOK)
 		return msgData, getWebsocketMessageSuccessObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
 	}
 
@@ -530,11 +559,15 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 		wrc.logger.Error().Err(err).Msg("❌ failed to validate relay response")
 		// Record error signal for message validation failure
 		wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_message_validation_failed", time.Since(startTime)))
+		// Record message metric for endpoint→client direction with error
+		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMajorError)
 		return nil, getWebsocketMessageErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, msgData, err), err
 	}
 
 	// Record success signal for validated message
 	wrc.recordWebsocketSignal(reputation.NewSuccessSignal(time.Since(startTime)))
+	// Record message metric for endpoint→client direction
+	metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalOK)
 	return validatedRelayResponse, getWebsocketMessageSuccessObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
 }
 
@@ -606,7 +639,10 @@ func (wrc *websocketRequestContext) recordWebsocketSignal(signal reputation.Sign
 		return
 	}
 
-	endpointKey := reputation.NewEndpointKey(wrc.serviceID, wrc.selectedEndpoint.Addr(), sharedtypes.RPCType_WEBSOCKET)
+	// Build endpoint key using key builder to respect key_granularity setting
+	rpcType := sharedtypes.RPCType_WEBSOCKET
+	keyBuilder := wrc.reputationService.KeyBuilderForService(wrc.serviceID)
+	endpointKey := keyBuilder.BuildKey(wrc.serviceID, wrc.selectedEndpoint.Addr(), rpcType)
 
 	// Extract domain for metrics
 	endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
@@ -623,8 +659,5 @@ func (wrc *websocketRequestContext) recordWebsocketSignal(signal reputation.Sign
 	// Fire-and-forget: don't block request on reputation recording
 	if err := wrc.reputationService.RecordSignal(wrc.context, endpointKey, signal); err != nil {
 		wrc.logger.Warn().Err(err).Msg("Failed to record websocket reputation signal")
-		reputationmetrics.RecordError("record_signal", "storage_error")
-	} else {
-		reputationmetrics.RecordSignal(string(wrc.serviceID), string(signal.Type), reputationmetrics.EndpointTypeWebSocket, endpointDomain)
 	}
 }

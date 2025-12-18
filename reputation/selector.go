@@ -6,6 +6,9 @@ import (
 	"sync"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+
+	"github.com/pokt-network/path/metrics"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 )
 
 // ErrNoEndpointsAvailable is returned when no endpoints are available for selection.
@@ -21,7 +24,7 @@ type TieredSelector struct {
 
 	// probationEndpoints tracks which endpoints are currently in probation.
 	// An endpoint enters probation when its score falls below the probation threshold.
-	// Map key is the endpoint key, value is true if endpoint is in probation.
+	// Map key is the endpoint key, value is true if the endpoint is in probation.
 	probationEndpoints   map[EndpointKey]bool
 	probationEndpointsMu sync.RWMutex
 }
@@ -161,28 +164,46 @@ func (s *TieredSelector) UpdateProbationStatus(endpoints map[EndpointKey]float64
 	// Update probation status for all endpoints
 	for key, score := range endpoints {
 		wasInProbation := s.probationEndpoints[key]
-		// Endpoint is in probation if: score is below probation threshold but above min threshold
+		// Endpoint is in probation if: score is below the probation threshold but above min threshold
 		isInProbation := score < probationThreshold && score >= s.minThreshold
 
 		if isInProbation {
 			s.probationEndpoints[key] = true
 			inProbation = append(inProbation, key)
 
-			// Log probation entry
-			if !wasInProbation && s.logger != nil {
-				s.logger.Debug().
-					Str("endpoint", string(key.EndpointAddr)).
-					Str("service_id", string(key.ServiceID)).
-					Float64("score", score).
-					Float64("probation_threshold", probationThreshold).
-					Float64("min_threshold", s.minThreshold).
-					Msg("[PROBATION] Endpoint ENTERED probation")
+			// Log probation entry and record metric
+			if !wasInProbation {
+				// With per-domain key granularity, EndpointAddr is already the domain
+				// Try URL extraction first, fallback to raw EndpointAddr
+				domain, err := shannonmetrics.ExtractDomainOrHost(string(key.EndpointAddr))
+				if err != nil || domain == "" {
+					domain = string(key.EndpointAddr)
+				}
+				metrics.RecordProbationEvent(domain, metrics.NormalizeRPCType(key.RPCType.String()), string(key.ServiceID), metrics.ProbationEventEntered)
+
+				if s.logger != nil {
+					s.logger.Debug().
+						Str("endpoint", string(key.EndpointAddr)).
+						Str("service_id", string(key.ServiceID)).
+						Float64("score", score).
+						Float64("probation_threshold", probationThreshold).
+						Float64("min_threshold", s.minThreshold).
+						Msg("[PROBATION] Endpoint ENTERED probation")
+				}
 			}
 		} else if wasInProbation {
-			// Endpoint has recovered or fallen below min threshold
+			// Endpoint has recovered or fallen below a min threshold
 			delete(s.probationEndpoints, key)
 
-			// Log probation exit
+			// Log probation exit and record metric
+			// With per-domain key granularity, EndpointAddr is already the domain
+			// Try URL extraction first, fallback to raw EndpointAddr
+			domain, err := shannonmetrics.ExtractDomainOrHost(string(key.EndpointAddr))
+			if err != nil || domain == "" {
+				domain = string(key.EndpointAddr)
+			}
+			metrics.RecordProbationEvent(domain, metrics.NormalizeRPCType(key.RPCType.String()), string(key.ServiceID), metrics.ProbationEventExited)
+
 			if s.logger != nil {
 				exitReason := "recovered"
 				if score < s.minThreshold {
@@ -213,7 +234,7 @@ func (s *TieredSelector) ShouldRouteToProbation() bool {
 
 	// Random number between 0 and 99
 	r := rand.Intn(100)
-	// Return true if random number is less than traffic percent
+	// Return true if the random number is less than traffic percent
 	// e.g., if traffic_percent = 10, true when r is 0-9 (10% of the time)
 	shouldRoute := float64(r) < s.config.Probation.TrafficPercent
 

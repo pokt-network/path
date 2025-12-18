@@ -15,9 +15,8 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	concurrencymetrics "github.com/pokt-network/path/metrics/concurrency"
+	"github.com/pokt-network/path/metrics"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
-	retrymetrics "github.com/pokt-network/path/metrics/retry"
 	pathhttp "github.com/pokt-network/path/network/http"
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
@@ -365,15 +364,13 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	// Prepare Protocol contexts for all selected endpoints
 	numSelectedEndpoints := len(selectedEndpoints)
 
-	// Record parallel endpoint metrics to track token burn multiplier
-	concurrencymetrics.RecordParallelEndpoints(string(rc.serviceID), numSelectedEndpoints)
-
 	rc.protocolContexts = make([]ProtocolRequestContext, 0, numSelectedEndpoints)
 	var lastProtocolCtxSetupErrObs *protocolobservations.Observations
 
 	for i, endpointAddr := range selectedEndpoints {
 		logger.Debug().Msgf("Building protocol context for endpoint %d/%d: %s", i+1, numSelectedEndpoints, endpointAddr)
-		protocolCtx, protocolCtxSetupErrObs, err := rc.protocol.BuildHTTPRequestContextForEndpoint(rc.context, rc.serviceID, endpointAddr, rpcType, httpReq)
+		// filterByReputation=true: Normal requests respect reputation filtering
+		protocolCtx, protocolCtxSetupErrObs, err := rc.protocol.BuildHTTPRequestContextForEndpoint(rc.context, rc.serviceID, endpointAddr, rpcType, httpReq, true)
 		if err != nil {
 			lastProtocolCtxSetupErrObs = &protocolCtxSetupErrObs
 			logger.Warn().Err(err).Str("endpoint_addr", string(endpointAddr)).Msgf("Failed to build protocol context for endpoint %d/%d, skipping", i+1, numSelectedEndpoints)
@@ -521,6 +518,7 @@ func (rc *requestContext) broadcastObservationsInternal() {
 
 	// Prepare and publish observations to both the metrics and data reporters.
 	observations := &observation.RequestResponseObservations{
+		ServiceId:   string(rc.serviceID),
 		HttpRequest: &rc.httpObservations,
 		Gateway:     rc.gatewayObservations,
 		Protocol:    rc.protocolObservations,
@@ -806,9 +804,6 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration
 					Dur("max_retry_latency_ms", *retryConfig.MaxRetryLatency).
 					Msg("[RETRY] Request took too long, skipping retry (time budget exceeded)")
 			}
-			// Record metric for budget exceeded with retry reason
-			retryReason := rc.determineRetryReason(err, statusCode)
-			retrymetrics.RecordRetryBudgetSkipped(string(rc.serviceID), endpointDomain, retryReason)
 			return false
 		}
 		if rc.logger != nil {
@@ -823,6 +818,10 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration
 
 	// Check for 5xx errors if configured
 	if retryConfig.RetryOn5xx != nil && *retryConfig.RetryOn5xx && statusCode >= 500 && statusCode < 600 {
+		// Record retry metric
+		domain, _ := shannonmetrics.ExtractDomainOrHost(endpointDomain)
+		metrics.RecordRetryDistribution(domain, string(rc.detectedRPCType), string(rc.serviceID), metrics.RetryReason5xx)
+
 		if rc.logger != nil {
 			rc.logger.Debug().
 				Str("service_id", string(rc.serviceID)).
@@ -849,6 +848,10 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration
 	if retryConfig.RetryOnTimeout != nil && *retryConfig.RetryOnTimeout {
 		// Check if error is a timeout (context.DeadlineExceeded or contains "timeout")
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+			// Record retry metric
+			domain, _ := shannonmetrics.ExtractDomainOrHost(endpointDomain)
+			metrics.RecordRetryDistribution(domain, string(rc.detectedRPCType), string(rc.serviceID), metrics.RetryReasonTimeout)
+
 			if rc.logger != nil {
 				rc.logger.Debug().
 					Str("service_id", string(rc.serviceID)).
@@ -866,6 +869,10 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration
 		// Check if error is a connection error (contains "connection" or "dial")
 		errMsg := strings.ToLower(err.Error())
 		if strings.Contains(errMsg, "connection") || strings.Contains(errMsg, "dial") || strings.Contains(errMsg, "network") {
+			// Record retry metric
+			domain, _ := shannonmetrics.ExtractDomainOrHost(endpointDomain)
+			metrics.RecordRetryDistribution(domain, string(rc.detectedRPCType), string(rc.serviceID), metrics.RetryReasonConnection)
+
 			if rc.logger != nil {
 				rc.logger.Debug().
 					Str("service_id", string(rc.serviceID)).
@@ -887,31 +894,4 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration
 			Msg("[RETRY] No retry conditions met")
 	}
 	return false
-}
-
-// determineRetryReason determines the retry reason for metrics based on error and status code.
-func (rc *requestContext) determineRetryReason(err error, statusCode int) string {
-	// Check for 5xx errors first
-	if statusCode >= 500 && statusCode < 600 {
-		return retrymetrics.RetryReason5xx
-	}
-
-	// If no error, return empty (should not happen in retry context)
-	if err == nil {
-		return ""
-	}
-
-	// Check for timeout errors
-	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
-		return retrymetrics.RetryReasonTimeout
-	}
-
-	// Check for connection errors
-	errMsg := strings.ToLower(err.Error())
-	if strings.Contains(errMsg, "connection") || strings.Contains(errMsg, "dial") || strings.Contains(errMsg, "network") {
-		return retrymetrics.RetryReasonConnectionError
-	}
-
-	// Default to connection error for unknown cases
-	return retrymetrics.RetryReasonConnectionError
 }

@@ -284,6 +284,35 @@ properties:
                       description: "Latency that triggers severe penalty for this profile."
                       type: string
                       pattern: "^[0-9]+m?s$"
+          signal_impacts:
+            description: "Configuration for signal impact values. Controls how much each signal type affects the reputation score."
+            type: object
+            additionalProperties: false
+            properties:
+              success:
+                description: "Score change for successful responses. Default: +1"
+                type: number
+              minor_error:
+                description: "Score change for minor errors (validation issues). Default: -3"
+                type: number
+              major_error:
+                description: "Score change for major errors (timeout, connection). Default: -10"
+                type: number
+              critical_error:
+                description: "Score change for critical errors (HTTP 5xx). Default: -25"
+                type: number
+              fatal_error:
+                description: "Score change for fatal errors (config issues). Default: -50"
+                type: number
+              recovery_success:
+                description: "Score change for successful probation recovery. Default: +15"
+                type: number
+              slow_response:
+                description: "Score change for slow responses (above penalty_threshold). Default: -1"
+                type: number
+              very_slow_response:
+                description: "Score change for very slow responses (above severe_threshold). Default: -3"
+                type: number
 
       # Retry Configuration
       retry_config:

@@ -183,6 +183,10 @@ type (
 		// can be before it's considered out of sync. Per-service overrides can set different values.
 		// Default: 5 blocks
 		SyncAllowance int `yaml:"sync_allowance,omitempty"`
+		// MaxWorkers is the maximum number of concurrent health check workers.
+		// Higher values allow faster health check cycles but increase load on endpoints.
+		// Default: 10 workers
+		MaxWorkers int `yaml:"max_workers,omitempty"`
 		// Coordination configures leader election for distributed deployments.
 		Coordination LeaderElectionConfig `yaml:"coordination,omitempty"`
 		// External is an optional external URL for health check rules.

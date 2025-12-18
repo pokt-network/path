@@ -19,8 +19,8 @@ import (
 	sdk "github.com/pokt-network/shannon-sdk"
 
 	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/metrics"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
-	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
@@ -132,6 +132,11 @@ type requestContext struct {
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
 	// When nil, no reputation-based filtering is applied.
 	reputationService reputation.ReputationService
+
+	// tieredSelector provides access to tier-based selection and probation status.
+	// Used to check if endpoints are in probation when recording success signals.
+	// If non-nil and endpoint is in probation, RecoverySuccessSignal is used instead of SuccessSignal.
+	tieredSelector *reputation.TieredSelector
 }
 
 // HandleServiceRequest:
@@ -874,22 +879,29 @@ func (rc *requestContext) handleEndpointError(
 		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
 		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
 
-		// Extract domain for metrics
-		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
-		if domainErr != nil {
-			endpointDomain = shannonmetrics.ErrDomain
-		}
-
 		// Fire-and-forget: don't block request on reputation recording
 		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
 			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for error")
-			reputationmetrics.RecordError("record_signal", "storage_error")
-		} else {
-			// Record signal metric on success
-			endpointType := rc.getEndpointTypeForMetrics()
-			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointType, endpointDomain)
 		}
 	}
+
+	// Record relay metric for failed request
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	rpcTypeStr := metrics.NormalizeRPCType(rc.currentRPCType.String())
+	reputationSignal := mapSignalTypeToMetricSignal(signal.Type)
+
+	// Extract status code from error if possible, otherwise use "error"
+	statusCodeStr := "error"
+	if statusCode, ok := extractHTTPStatusCode(endpointErr); ok {
+		statusCodeStr = metrics.GetStatusCodeCategory(statusCode)
+	}
+
+	// Determine relay type - errors are recorded as normal type (probation detection requires success)
+	relayType := metrics.RelayTypeNormal
+	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
 	// Return error.
 	return protocol.Response{EndpointAddr: selectedEndpointAddr},
@@ -934,54 +946,67 @@ func (rc *requestContext) handleEndpointSuccess(
 	}
 
 	// Record reputation signal if reputation service is enabled.
-	// Success signals have a small positive impact (+1) on score.
+	latency := time.Since(endpointQueryTime)
+	var reputationSignal string
+	var relayType string
+
 	if rc.reputationService != nil {
-		latency := time.Since(endpointQueryTime)
-		signal := reputation.NewSuccessSignal(latency)
 		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
 		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
 
-		// Extract domain for metrics
-		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
-		if domainErr != nil {
-			endpointDomain = shannonmetrics.ErrDomain
+		// Check if endpoint is in probation - use RecoverySuccessSignal (+15) for probation,
+		// SuccessSignal (+1) for normal requests. This helps low-scoring endpoints recover faster.
+		var signal reputation.Signal
+		if rc.tieredSelector != nil && rc.tieredSelector.Config().Probation.Enabled && rc.tieredSelector.IsInProbation(endpointKey) {
+			// Probation endpoint succeeded - use recovery signal for stronger positive reinforcement
+			signal = reputation.NewRecoverySuccessSignal(latency)
+			reputationSignal = metrics.SignalOK
+			relayType = metrics.RelayTypeProbation
+
+			// Record that a request was routed to a probation endpoint
+			probationDomain, _ := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
+			if probationDomain == "" {
+				probationDomain = shannonmetrics.ErrDomain
+			}
+			metrics.RecordProbationEvent(probationDomain, metrics.NormalizeRPCType(rc.currentRPCType.String()), string(rc.serviceID), metrics.ProbationEventRouted)
+
+			rc.logger.Debug().
+				Str("endpoint", string(selectedEndpointAddr)).
+				Str("service_id", string(rc.serviceID)).
+				Dur("latency", latency).
+				Msg("Recording recovery success signal for probation endpoint")
+		} else {
+			// Normal request - use standard success signal
+			signal = reputation.NewSuccessSignal(latency)
+			reputationSignal = metrics.SignalOK
+			relayType = metrics.RelayTypeNormal
 		}
 
 		// Fire-and-forget: don't block request on reputation recording
 		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
 			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for success")
-			reputationmetrics.RecordError("record_signal", "storage_error")
-		} else {
-			// Record signal metric on success
-			endpointType := rc.getEndpointTypeForMetrics()
-			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointType, endpointDomain)
 		}
 
 		// Record additional latency penalty signals if applicable
 		// This is done by checking the per-service latency config and determining
 		// if the response was slow enough to warrant an additional penalty signal
-		rc.recordLatencyPenaltySignalsIfNeeded(endpointKey, latency, endpointDomain)
+		rc.recordLatencyPenaltySignalsIfNeeded(endpointKey, latency)
+	} else {
+		reputationSignal = metrics.SignalOK
+		relayType = metrics.RelayTypeNormal
 	}
+
+	// Record relay metric for successful request
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	statusCodeStr := metrics.GetStatusCodeCategory(endpointResponse.HTTPStatusCode)
+	rpcTypeStr := metrics.NormalizeRPCType(rc.currentRPCType.String())
+	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
 	// Return relay response received from endpoint.
 	return nil
-}
-
-// getEndpointTypeForMetrics returns the endpoint type string for metrics labeling.
-// Maps the current RPC type to a metrics-friendly string that matches the check_type values.
-func (rc *requestContext) getEndpointTypeForMetrics() string {
-	switch rc.currentRPCType {
-	case sharedtypes.RPCType_JSON_RPC:
-		return reputationmetrics.EndpointTypeJSONRPC
-	case sharedtypes.RPCType_REST:
-		return reputationmetrics.EndpointTypeREST
-	case sharedtypes.RPCType_GRPC:
-		return reputationmetrics.EndpointTypeGRPC
-	case sharedtypes.RPCType_WEBSOCKET:
-		return reputationmetrics.EndpointTypeWebSocket
-	default:
-		return reputationmetrics.EndpointTypeUnknown
-	}
 }
 
 // recordLatencyPenaltySignalsIfNeeded checks if the response latency exceeds penalty thresholds
@@ -990,7 +1015,6 @@ func (rc *requestContext) getEndpointTypeForMetrics() string {
 func (rc *requestContext) recordLatencyPenaltySignalsIfNeeded(
 	endpointKey reputation.EndpointKey,
 	latency time.Duration,
-	endpointDomain string,
 ) {
 	// Get the latency config for this service (respects per-service overrides)
 	latencyConfig := rc.getLatencyConfigForService()
@@ -1018,11 +1042,6 @@ func (rc *requestContext) recordLatencyPenaltySignalsIfNeeded(
 			Str("signal_type", string(*penaltySignalType)).
 			Dur("latency", latency).
 			Msg("Failed to record latency penalty signal")
-		reputationmetrics.RecordError("record_signal", "storage_error")
-	} else {
-		// Record penalty signal metric on success
-		endpointType := rc.getEndpointTypeForMetrics()
-		reputationmetrics.RecordSignal(string(rc.serviceID), string(penaltySignal.Type), endpointType, endpointDomain)
 	}
 }
 
@@ -1030,6 +1049,28 @@ func (rc *requestContext) recordLatencyPenaltySignalsIfNeeded(
 // This fetches the config from the reputation service, which handles per-service overrides.
 func (rc *requestContext) getLatencyConfigForService() reputation.LatencyConfig {
 	return rc.reputationService.GetLatencyConfigForService(rc.serviceID)
+}
+
+// mapSignalTypeToMetricSignal converts a reputation.SignalType to a metrics signal string
+func mapSignalTypeToMetricSignal(signalType reputation.SignalType) string {
+	switch signalType {
+	case reputation.SignalTypeSuccess, reputation.SignalTypeRecoverySuccess:
+		return metrics.SignalOK
+	case reputation.SignalTypeSlowResponse:
+		return metrics.SignalSlow
+	case reputation.SignalTypeVerySlowResponse:
+		return metrics.SignalSlowASF
+	case reputation.SignalTypeMinorError:
+		return metrics.SignalMinorError
+	case reputation.SignalTypeMajorError:
+		return metrics.SignalMajorError
+	case reputation.SignalTypeCriticalError:
+		return metrics.SignalCriticalError
+	case reputation.SignalTypeFatalError:
+		return metrics.SignalFatalError
+	default:
+		return metrics.SignalOK
+	}
 }
 
 // sendHTTPRequest is a shared method for sending HTTP requests with common logic

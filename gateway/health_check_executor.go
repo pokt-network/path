@@ -23,11 +23,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alitto/pond/v2"
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
 
-	healthcheckmetrics "github.com/pokt-network/path/metrics/healthcheck"
+	"github.com/pokt-network/path/metrics"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
@@ -67,8 +68,8 @@ type HealthCheckExecutor struct {
 	// This enables the same async processing pipeline for both user requests and health checks.
 	observationQueue *ObservationQueue
 
-	// maxWorkers is the maximum number of concurrent health check workers.
-	maxWorkers int
+	// pool is the worker pool for concurrent health check execution.
+	pool pond.Pool
 
 	// External config caching (global)
 	externalConfigMu    sync.RWMutex
@@ -107,6 +108,9 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 		maxWorkers = 10 // Default number of concurrent workers
 	}
 
+	// Create worker pool for concurrent health check execution
+	pool := pond.NewPool(maxWorkers)
+
 	return &HealthCheckExecutor{
 		config:          cfg.Config,
 		reputationSvc:   cfg.ReputationSvc,
@@ -114,7 +118,7 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 		protocol:        cfg.Protocol,
 		metricsReporter: cfg.MetricsReporter,
 		dataReporter:    cfg.DataReporter,
-		maxWorkers:      maxWorkers,
+		pool:            pool,
 		// HTTP client for external config fetching only
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -309,10 +313,13 @@ func (e *HealthCheckExecutor) InitExternalConfig(ctx context.Context) {
 	e.refreshPerServiceExternalConfigs(ctx)
 }
 
-// Stop stops the external config refresh goroutine if running.
+// Stop stops the external config refresh goroutine and worker pool.
 func (e *HealthCheckExecutor) Stop() {
 	if e.stopRefresh != nil {
 		close(e.stopRefresh)
+	}
+	if e.pool != nil {
+		e.pool.StopAndWait()
 	}
 }
 
@@ -641,38 +648,39 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	latency time.Duration,
 ) {
 	// Convert health check type to RPC type for reputation tracking
-	// HealthCheckType string values match RPCType string values (e.g., "json_rpc", "rest")
-	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[string(check.Type)])
-	key := reputation.NewEndpointKey(serviceID, endpointAddr, rpcType)
+	// HealthCheckType string values are lowercase (e.g., "json_rpc", "rest")
+	// RPCType_value map keys are uppercase (e.g., "JSON_RPC", "REST")
+	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(string(check.Type))])
+
+	// Use the key builder to respect key_granularity setting (per-endpoint, per-domain, per-supplier)
+	// This ensures health check signals are recorded to the same keys used by tiered selection
+	keyBuilder := e.reputationSvc.KeyBuilderForService(serviceID)
+	key := keyBuilder.BuildKey(serviceID, endpointAddr, rpcType)
 
 	// Extract domain from endpoint address for metrics
-	endpointDomain, err := shannonmetrics.ExtractDomainOrHost(string(endpointAddr))
+	domain, err := shannonmetrics.ExtractDomainOrHost(string(endpointAddr))
 	if err != nil {
-		endpointDomain = shannonmetrics.ErrDomain
+		domain = shannonmetrics.ErrDomain
 	}
+	rpcTypeStr := metrics.NormalizeRPCType(rpcType.String())
 
 	if checkErr == nil {
-		// Check passed - record success with latency
-		signal := reputation.NewSuccessSignal(latency)
+		// Check passed - record recovery success signal with latency
+		// Health checks use RecoverySuccessSignal (+15) because their purpose is to help
+		// low-scoring endpoints recover. This provides stronger positive reinforcement
+		// than regular SuccessSignal (+1) used by client requests.
+		signal := reputation.NewRecoverySuccessSignal(latency)
 		if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
 			e.logger.Warn().
 				Err(err).
 				Str("service_id", string(serviceID)).
 				Str("endpoint", string(endpointAddr)).
 				Str("check", check.Name).
-				Msg("Failed to record success signal")
+				Msg("Failed to record recovery success signal")
 		}
 
-		// Record successful health check metric with latency
-		healthcheckmetrics.RecordHealthCheckResult(
-			string(serviceID),
-			endpointDomain,
-			check.Name,
-			string(check.Type),
-			true,              // success
-			"",                // no error
-			latency.Seconds(), // duration in seconds
-		)
+		// Record health check metric for success
+		metrics.RecordHealthCheck(domain, rpcTypeStr, string(serviceID), check.Name, metrics.SignalOK)
 		return
 	}
 
@@ -687,19 +695,9 @@ func (e *HealthCheckExecutor) recordCheckResult(
 			Msg("Failed to record error signal")
 	}
 
-	// Determine error type for metrics
-	errorType := categorizeHealthCheckError(checkErr)
-
-	// Record health check metric for failures with latency
-	healthcheckmetrics.RecordHealthCheckResult(
-		string(serviceID),
-		endpointDomain,
-		check.Name,
-		string(check.Type),
-		false, // not success
-		errorType,
-		latency.Seconds(), // duration in seconds
-	)
+	// Record health check metric for failure
+	metricSignal := mapReputationSignalToMetricSignal(check.ReputationSignal)
+	metrics.RecordHealthCheck(domain, rpcTypeStr, string(serviceID), check.Name, metricSignal)
 
 	e.logger.Debug().
 		Str("service_id", string(serviceID)).
@@ -729,6 +727,26 @@ func categorizeHealthCheckError(err error) string {
 		return "protocol_error"
 	default:
 		return "unknown"
+	}
+}
+
+// mapReputationSignalToMetricSignal converts a configured signal string to a metrics signal constant.
+func mapReputationSignalToMetricSignal(signalType string) string {
+	switch signalType {
+	case "minor_error":
+		return metrics.SignalMinorError
+	case "major_error":
+		return metrics.SignalMajorError
+	case "critical_error":
+		return metrics.SignalCriticalError
+	case "fatal_error":
+		return metrics.SignalFatalError
+	case "slow":
+		return metrics.SignalSlow
+	case "slow_asf", "very_slow":
+		return metrics.SignalSlowASF
+	default:
+		return metrics.SignalOK
 	}
 }
 
@@ -819,7 +837,9 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	// Get a protocol request context for this endpoint
 	// Passing nil for HTTP request since this is a synthetic request
 	// Use the RPC type from the health check payload for correct endpoint selection
-	protocolCtx, protocolObs, err := e.protocol.BuildHTTPRequestContextForEndpoint(checkCtx, serviceID, endpointAddr, servicePayload.RPCType, nil)
+	// filterByReputation=false: Health checks must reach ALL endpoints including low-scoring ones
+	// This prevents death spiral where low-scoring endpoints can never recover
+	protocolCtx, protocolObs, err := e.protocol.BuildHTTPRequestContextForEndpoint(checkCtx, serviceID, endpointAddr, servicePayload.RPCType, nil, false)
 	if err != nil {
 		e.logger.Warn().
 			Err(err).
@@ -834,6 +854,13 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	responses, relayErr := protocolCtx.HandleServiceRequest(hcQoSCtx.GetServicePayloads())
 	latency := time.Since(startTime)
 
+	// Extract domain for metrics
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(endpointAddr))
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	rpcTypeStr := metrics.NormalizeRPCType(servicePayload.RPCType.String())
+
 	// Process the response
 	if relayErr != nil {
 		e.logger.Warn().
@@ -844,14 +871,19 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Dur("latency", latency).
 			Msg("❌ Health check relay request failed")
 
+		// Record relay metric for failed request
+		metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), "error", metrics.SignalMajorError, metrics.RelayTypeHealthCheck, latency.Seconds())
+
 		// Still publish observations for failed requests
 		e.publishHealthCheckObservations(serviceID, endpointAddr, startTime, protocolCtx, &protocolObs)
 		return latency, relayErr
 	}
 
 	// Process responses through QoS context
+	var httpStatusCode int
 	for _, response := range responses {
 		hcQoSCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+		httpStatusCode = response.HTTPStatusCode
 
 		e.logger.Info().
 			Str("service_id", string(serviceID)).
@@ -876,8 +908,17 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Str("error", hcQoSCtx.GetError()).
 			Dur("latency", latency).
 			Msg("⚠️ Health check response validation failed")
+
+		// Record relay metric for validation failure (relay succeeded but validation failed)
+		statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
+		metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, metrics.SignalMinorError, metrics.RelayTypeHealthCheck, latency.Seconds())
+
 		return latency, checkErr
 	}
+
+	// Record relay metric for successful health check
+	statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
+	metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, metrics.SignalOK, metrics.RelayTypeHealthCheck, latency.Seconds())
 
 	e.logger.Info().
 		Str("service_id", string(serviceID)).
@@ -1114,6 +1155,7 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 
 // RunAllChecksViaProtocol runs health checks through the protocol layer for all configured services.
 // This is the main entry point for protocol-based health checks.
+// Health checks are executed in parallel using a pond worker pool.
 func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 	ctx context.Context,
 	getEndpointAddrs func(protocol.ServiceID) ([]protocol.EndpointAddr, error),
@@ -1127,16 +1169,22 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 		return fmt.Errorf("protocol not configured")
 	}
 
+	if e.pool == nil {
+		e.logger.Warn().Msg("Worker pool not initialized, cannot run health checks")
+		return fmt.Errorf("worker pool not initialized")
+	}
+
 	serviceConfigs := e.GetServiceConfigs()
 	if len(serviceConfigs) == 0 {
 		e.logger.Debug().Msg("No health check configurations found")
 		return nil
 	}
 
-	e.logger.Info().
-		Int("service_count", len(serviceConfigs)).
-		Msg("Starting health checks via protocol")
+	// Create a task group to track all submitted jobs
+	group := e.pool.NewGroup()
+	totalJobs := 0
 
+	// Submit health check jobs to the worker pool
 	for _, svcConfig := range serviceConfigs {
 		if svcConfig.Enabled != nil && !*svcConfig.Enabled {
 			continue
@@ -1158,19 +1206,47 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			continue
 		}
 
-		// Record the number of endpoints being checked
-		healthcheckmetrics.SetEndpointsChecked(string(svcConfig.ServiceID), len(endpoints))
-
-		e.logger.Info().
-			Str("service_id", string(svcConfig.ServiceID)).
-			Int("endpoint_count", len(endpoints)).
-			Int("check_count", len(svcConfig.Checks)).
-			Msg("Running health checks for service via protocol")
-
+		// Submit a job for each endpoint
 		for _, endpointAddr := range endpoints {
-			e.RunChecksForEndpointViaProtocol(ctx, svcConfig.ServiceID, endpointAddr)
+			// Capture loop variables for closure
+			serviceID := svcConfig.ServiceID
+			endpoint := endpointAddr
+
+			group.Submit(func() {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					e.RunChecksForEndpointViaProtocol(ctx, serviceID, endpoint)
+				}
+			})
+			totalJobs++
 		}
 	}
+
+	if totalJobs == 0 {
+		e.logger.Debug().Msg("No health check jobs to execute")
+		return nil
+	}
+
+	e.logger.Info().
+		Int("service_count", len(serviceConfigs)).
+		Int("total_jobs", totalJobs).
+		Int("pool_running", int(e.pool.RunningWorkers())).
+		Msg("Starting health checks via protocol with pond pool")
+
+	// Wait for all jobs to complete
+	// group.Wait() returns an error only if context is canceled
+	if err := group.Wait(); err != nil {
+		e.logger.Warn().Err(err).
+			Int("total_jobs", totalJobs).
+			Msg("Health check cycle interrupted")
+		// Don't return error - allow health check loop to continue on next cycle
+	}
+
+	e.logger.Info().
+		Int("total_jobs", totalJobs).
+		Msg("Health check cycle completed")
 
 	return nil
 }

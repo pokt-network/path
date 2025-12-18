@@ -23,7 +23,7 @@ import (
 // During session rollover periods:
 //   - Fetches BOTH current session AND extended (previous) session for each app
 //   - Merges endpoints from both sessions to ensure continuity during rollover
-//   - Extended session is only added if it differs from current session
+//   - Extended session is only added if it differs from the current session
 //
 // During normal operation:
 //   - Fetches only the current session for each app
@@ -38,7 +38,7 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 	logger.Debug().Msgf("fetching active sessions for the service %s.", serviceID)
 
 	// TODO_CRITICAL(@commoddity): if an owned app is changed (i.e. re-staked) for
-	// a different service, PATH must be restarned for changes to take effect.
+	// a different service, PATH must be restarted for changes to take effect.
 	ownedAppsForService, ok := p.ownedApps[serviceID]
 	if !ok || len(ownedAppsForService) == 0 {
 		err := fmt.Errorf("%s: %s", errProtocolContextSetupCentralizedNoAppsForService, serviceID)
@@ -52,7 +52,7 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 	// Loop over the address of apps owned by the gateway in Centralized gateway mode.
 	var ownedAppSessions []sessiontypes.Session
 	for _, ownedAppAddr := range ownedAppsForService {
-		// Always fetch current session
+		// Always fetch the current session
 		currentSession, err := p.getSession(ctx, logger, ownedAppAddr, serviceID)
 		if err != nil {
 			return nil, err
@@ -61,15 +61,15 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 
 		// During rollover: ALSO fetch extended (previous) session for continuity
 		if inRollover {
-			extendedSession, err := p.GetSessionWithExtendedValidity(ctx, serviceID, ownedAppAddr)
-			if err != nil {
-				logger.Warn().Err(err).
+			extendedSession, extendedSessionErr := p.GetSessionWithExtendedValidity(ctx, serviceID, ownedAppAddr)
+			if extendedSessionErr != nil {
+				logger.Warn().Err(extendedSessionErr).
 					Str("app_address", ownedAppAddr).
 					Msg("Failed to get extended session during rollover - continuing with current session only")
 				continue
 			}
 
-			// Only add extended session if it's different from current session
+			// Only add an extended session if it's different from the current session
 			// (i.e., it's actually the previous session)
 			if extendedSession.SessionId != currentSession.SessionId {
 				ownedAppSessions = append(ownedAppSessions, extendedSession)

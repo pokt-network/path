@@ -14,7 +14,6 @@ import (
 	sdk "github.com/pokt-network/shannon-sdk"
 	"github.com/viccon/sturdyc"
 
-	sessionmetrics "github.com/pokt-network/path/metrics/session"
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -239,13 +238,10 @@ func (cfn *cachingFullNode) GetSession(
 		sessionKey,
 		func(fetchCtx context.Context) (sessiontypes.Session, error) {
 			logger.Debug().Str("session_key", sessionKey).Msgf("Fetching session from full node")
-			// Record session refresh metric when fetching from node (cache miss or early refresh)
 			session, fetchErr := cfn.lazyFullNode.GetSession(ctx, serviceID, appAddr)
 			if fetchErr != nil {
-				sessionmetrics.RecordSessionRefresh(string(serviceID), sessionmetrics.RefreshStatusError)
 				return session, fetchErr
 			}
-			sessionmetrics.RecordSessionRefresh(string(serviceID), sessionmetrics.RefreshStatusSuccess)
 			return session, nil
 		},
 	)
@@ -330,9 +326,6 @@ func (cfn *cachingFullNode) GetSessionWithExtendedValidity(
 	}
 
 	logger.Debug().Msg("IS WITHIN GRACE PERIOD: Going to fetch previous session")
-
-	// Record session rollover metric (we're using fallback to previous session)
-	sessionmetrics.RecordSessionRollover(string(serviceID), true)
 
 	// Use cache for previous session lookup with a specific key
 	prevSessionKey := getSessionCacheKey(serviceID, appAddr, prevSessionEndHeight)

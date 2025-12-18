@@ -16,8 +16,6 @@ import (
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/health"
 	"github.com/pokt-network/path/metrics/devtools"
-	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
-	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
@@ -112,7 +110,7 @@ type Protocol struct {
 	// Optional.
 	// Puts the Gateway in LoadTesting mode if specified.
 	// All relays will be sent to a fixed URL.
-	// Allows measuring performance of PATH and full node(s) in isolation.
+	// Allows measuring the performance of PATH and full node(s) in isolation.
 	loadTestingConfig *LoadTestingConfig
 
 	// concurrencyConfig controls concurrency limits for request processing.
@@ -125,7 +123,7 @@ type Protocol struct {
 	reputationService reputation.ReputationService
 
 	// tieredSelector selects endpoints using cascade-down tier logic.
-	// Created when reputation service is enabled with tiered selection enabled.
+	// Created when a reputation service is enabled with tiered selection enabled.
 	tieredSelector *reputation.TieredSelector
 
 	// serviceTieredSelectors stores per-service TieredSelectors for services with custom thresholds.
@@ -160,7 +158,7 @@ func NewProtocol(
 		return nil, fmt.Errorf("failed to get app addresses from config: %w", err)
 	}
 
-	// Wire up defaults from parent config to unified services config.
+	// Wire up defaults from parent config to unified services' config.
 	// This allows gateway_config top-level settings to serve as defaults for all services,
 	// eliminating the need for a separate "defaults" section in YAML.
 	config.UnifiedServices.SetDefaultsFromParent(gateway.ParentConfigDefaults{
@@ -569,7 +567,12 @@ func (p *Protocol) AvailableWebsocketEndpoints(
 	//
 	// The final boolean parameter sets whether to filter by reputation.
 	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers)
+	//
+	// NOTE: WebSocket endpoints currently don't have dedicated health checks, so they may have
+	// low initial scores. We use filterByReputation=false to allow connections to all WebSocket
+	// endpoints until WebSocket health checks are implemented.
+	// TODO_IMPROVE: Add WebSocket health checks and re-enable reputation filtering.
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -619,12 +622,14 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 	selectedEndpointAddr protocol.EndpointAddr,
 	rpcType sharedtypes.RPCType,
 	httpReq *http.Request,
+	filterByReputation bool,
 ) (gateway.ProtocolRequestContext, protocolobservations.Observations, error) {
 	logger := p.logger.With(
 		"method", "BuildHTTPRequestContextForEndpoint",
 		"service_id", serviceID,
 		"endpoint_addr", selectedEndpointAddr,
 		"rpc_type", rpcType.String(),
+		"filter_by_reputation", filterByReputation,
 	)
 
 	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
@@ -639,10 +644,10 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 	// Retrieve the list of endpoints (i.e. backend service URLs by external operators)
 	// that can service RPC requests for the given service ID for the given apps.
 	// This includes fallback logic if session endpoints are unavailable.
-	// The final boolean parameter sets whether to filter by reputation.
-	// The final RPC type parameter filters endpoints to only those supporting the requested RPC type.
+	// The filterByReputation parameter controls whether to filter by reputation score.
+	// The RPC type parameter filters endpoints to only those supporting the requested RPC type.
 	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, rpcType, allowedSuppliers)
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -684,6 +689,9 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 	// This would require the requestContext to be aware of _SendAllTraffic in this context.
 	fallbackEndpoints, _ := p.getServiceFallbackEndpoints(serviceID)
 
+	// Get tiered selector for probation status checking when recording success signals
+	tieredSelector := p.getTieredSelectorForService(serviceID)
+
 	// Return new request context for the pre-selected endpoint
 	return &requestContext{
 		logger:                p.logger,
@@ -699,6 +707,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		concurrencyConfig:     p.concurrencyConfig,
 		unifiedServicesConfig: p.unifiedServicesConfig,
 		reputationService:     p.reputationService,
+		tieredSelector:        tieredSelector,
 		currentRPCType:        rpcType, // Use detected RPC type from request
 	}, protocolobservations.Observations{}, nil
 }
@@ -790,7 +799,7 @@ func (p *Protocol) getUniqueEndpoints(
 	}
 
 	// Try to get session endpoints first.
-	sessionEndpoints, actualRPCType, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, rpcType, allowedSuppliers)
+	sessionEndpoints, actualRPCType, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers)
 	if err != nil {
 		logger.Error().Err(err).Msgf("Error getting session endpoints for service %s: %v", serviceID, err)
 	}
@@ -827,6 +836,7 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	activeSessions []sessiontypes.Session,
+	filterByReputation bool,
 	filterByRPCType sharedtypes.RPCType,
 	allowedSuppliers []string,
 ) (map[protocol.EndpointAddr]endpoint, sharedtypes.RPCType, error) {
@@ -918,9 +928,6 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 						Str("fallback_rpc_type", fallbackRPCType.String()).
 						Int("skipped_suppliers", skippedCount).
 						Msg("No endpoints found for requested RPC type, falling back to alternate RPC type")
-
-					// Record fallback metric
-					shannonmetrics.RecordRPCTypeFallback(string(serviceID), filterByRPCType.String(), fallbackRPCType.String())
 
 					// Retry filtering with fallback RPC type
 					fallbackEndpoints := make(map[protocol.EndpointAddr]endpoint)
@@ -1021,11 +1028,13 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 			// to allow the user to explicitly target specific suppliers regardless of reputation.
 		}
 
-		// Filter out low-reputation endpoints if reputation service is enabled.
+		// Filter out low-reputation endpoints if reputation service is enabled and filtering is requested.
 		// Reputation is the primary endpoint quality system - it provides gradual
 		// exclusion based on score and allows recovery via health checks.
-		// SKIP this step if supplier filtering is active (user wants specific suppliers).
-		if p.reputationService != nil && len(effectiveAllowedSuppliers) == 0 {
+		// SKIP this step if:
+		// - filterByReputation is false (e.g., for leaderboard metrics gathering)
+		// - supplier filtering is active (user wants specific suppliers)
+		if filterByReputation && p.reputationService != nil && len(effectiveAllowedSuppliers) == 0 {
 			beforeCount := len(qualifiedEndpoints)
 			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, filterByRPCType, logger)
 
@@ -1057,7 +1066,9 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 	// Return session endpoints if available.
 	if len(endpoints) > 0 {
 		// Apply tiered selection if enabled - only return endpoints from the highest available tier
-		if p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
+		// SKIP tiered filtering when filterByReputation is false (e.g., for leaderboard metrics gathering)
+		// because tiered selection is based on reputation scores.
+		if filterByReputation && p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
 			endpoints = p.filterToHighestTier(ctx, serviceID, endpoints, filterByRPCType, logger)
 		}
 
@@ -1098,9 +1109,8 @@ func (p *Protocol) GetTotalServiceEndpointsCount(serviceID protocol.ServiceID, h
 	}
 
 	// Get all endpoints for the service ID without filtering by reputation.
-	// Since we don't want to filter by reputation, we use an unsupported RPC type.
 	// No supplier filtering since we don't have access to httpReq here.
-	endpoints, _, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, sharedtypes.RPCType_UNKNOWN_RPC, nil)
+	endpoints, _, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, false, sharedtypes.RPCType_UNKNOWN_RPC, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -1151,8 +1161,9 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 	// This is acceptable for hydrator health checks which primarily test JSON-RPC endpoints.
 	rpcType := sharedtypes.RPCType_JSON_RPC
 
-	// Build endpoint key for reputation service
-	key := reputation.NewEndpointKey(serviceID, endpointAddr, rpcType)
+	// Build endpoint key using key builder to respect key_granularity setting
+	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+	key := keyBuilder.BuildKey(serviceID, endpointAddr, rpcType)
 
 	// Map observation error type to signal
 	// See ERROR_CLASSIFICATION.md for error category documentation
@@ -1171,12 +1182,9 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 		isSuccess = false
 	}
 
-	// Check if this endpoint is in probation and record probation traffic metric
+	// Check if this endpoint is in probation and apply recovery multiplier
 	selector := p.getTieredSelectorForService(serviceID)
 	if selector != nil && selector.Config().Probation.Enabled && selector.IsInProbation(key) {
-		domain := extractEndpointDomain(string(endpointAddr), p.logger)
-		reputationmetrics.RecordProbationTraffic(string(serviceID), domain, isSuccess)
-
 		// If probation traffic succeeds, apply recovery multiplier to the signal
 		if isSuccess && selector.Config().Probation.RecoveryMultiplier > 0 {
 			// Apply recovery multiplier to boost recovery
@@ -1350,11 +1358,14 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 
 // getHealthCheckRPCTypes extracts the RPC types used in health checks for a service.
 // Returns a map of RPC types (as keys) that are configured in health checks.
+// If no local health checks are configured, returns default RPC types (JSON_RPC)
+// to allow external health checks to run.
 func (p *Protocol) getHealthCheckRPCTypes(serviceID protocol.ServiceID) map[sharedtypes.RPCType]struct{} {
 	rpcTypes := make(map[sharedtypes.RPCType]struct{})
 
-	// If no unified services config, return empty set
+	// If no unified services config, return default JSON_RPC to allow external health checks
 	if p.unifiedServicesConfig == nil {
+		rpcTypes[sharedtypes.RPCType_JSON_RPC] = struct{}{}
 		return rpcTypes
 	}
 
@@ -1367,11 +1378,14 @@ func (p *Protocol) getHealthCheckRPCTypes(serviceID protocol.ServiceID) map[shar
 		}
 	}
 
+	// If service not found in unified config, return default JSON_RPC
+	// This allows external health checks to run for services defined only in external config
 	if svcConfig == nil {
+		rpcTypes[sharedtypes.RPCType_JSON_RPC] = struct{}{}
 		return rpcTypes
 	}
 
-	// Extract RPC types from health check configurations
+	// Extract RPC types from local health check configurations
 	if svcConfig.HealthChecks != nil && len(svcConfig.HealthChecks.Local) > 0 {
 		mapper := gateway.NewRPCTypeMapper()
 		for _, check := range svcConfig.HealthChecks.Local {
@@ -1394,6 +1408,11 @@ func (p *Protocol) getHealthCheckRPCTypes(serviceID protocol.ServiceID) map[shar
 
 			rpcTypes[rpcType] = struct{}{}
 		}
+	}
+
+	// If no local health checks configured, return default JSON_RPC to allow external health checks
+	if len(rpcTypes) == 0 {
+		rpcTypes[sharedtypes.RPCType_JSON_RPC] = struct{}{}
 	}
 
 	return rpcTypes
