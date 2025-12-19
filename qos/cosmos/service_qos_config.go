@@ -12,7 +12,8 @@ const QoSType = "cosmossdk"
 // defaultCosmosSDKBlockNumberSyncAllowance is the default sync allowance for CosmosSDK-based chains.
 // This number indicates how many blocks behind the perceived
 // block number the endpoint may be and still be considered valid.
-const defaultCosmosSDKBlockNumberSyncAllowance = 5
+// 0 means disabled (no sync allowance check).
+const defaultCosmosSDKBlockNumberSyncAllowance = 0
 
 // ServiceQoSConfig defines the base interface for service QoS configurations.
 // This avoids circular dependency with the config package.

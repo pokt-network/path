@@ -97,12 +97,6 @@ func main() {
 	// This publishes endpoint leaderboard data every 10 seconds.
 	leaderboardPublisher := setupLeaderboardPublisher(backgroundCtx, logger, protocol)
 
-	// Setup the data reporter
-	dataReporter, err := setupHTTPDataReporter(logger, config.DataReporterConfig)
-	if err != nil {
-		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to start the configured HTTP data reporter"}`, err)
-	}
-
 	// Setup the observation queue for async QoS data extraction.
 	// This enables non-blocking response processing with sampled deep parsing.
 	// NOTE: This is created before health check executor so it can be passed to both.
@@ -187,7 +181,6 @@ func main() {
 		protocol,
 		healthCheckConfig,
 		metricsReporter,
-		dataReporter,
 		observationQueue,
 		unifiedServicesConfig,
 		redisClient,
@@ -209,7 +202,6 @@ func main() {
 		HTTPRequestParser:          requestParser,
 		Protocol:                   protocol,
 		MetricsReporter:            metricsReporter,
-		DataReporter:               dataReporter,
 		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
 		ObservationQueue:           observationQueue,
 	}
@@ -248,16 +240,6 @@ func main() {
 		config.GetRouterConfig(),
 	)
 
-	// -------------------- Log PATH Startup Info --------------------
-
-	// Log out some basic info about the running PATH instance
-	configuredServiceIDs := make([]string, 0, len(protocol.ConfiguredServiceIDs()))
-	for serviceID := range protocol.ConfiguredServiceIDs() {
-		configuredServiceIDs = append(configuredServiceIDs, string(serviceID))
-	}
-	logger.Info().Msgf("🌿 PATH gateway starting on port %d for Protocol: %s with Configured Service IDs: %s",
-		config.GetRouterConfig().Port, protocol.Name(), strings.Join(configuredServiceIDs, ", "))
-
 	// -------------------- Start PATH API Router --------------------
 
 	// This will block until the router is stopped.
@@ -265,6 +247,64 @@ func main() {
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to start PATH API router")
 	}
+
+	// -------------------- Log PATH Startup Summary --------------------
+	// Log comprehensive startup info for operators
+
+	// Collect configured service IDs
+	configuredServiceIDs := make([]string, 0, len(protocol.ConfiguredServiceIDs()))
+	for serviceID := range protocol.ConfiguredServiceIDs() {
+		configuredServiceIDs = append(configuredServiceIDs, string(serviceID))
+	}
+
+	// Log version info if available
+	versionInfo := "dev"
+	if Version != "" {
+		versionInfo = Version
+		if Commit != "" {
+			versionInfo += " (" + Commit[:min(7, len(Commit))] + ")"
+		}
+	}
+
+	// Log startup summary
+	logger.Info().
+		Str("version", versionInfo).
+		Str("protocol", protocol.Name()).
+		Int("service_count", len(configuredServiceIDs)).
+		Str("services", strings.Join(configuredServiceIDs, ", ")).
+		Msg("PATH gateway initialized")
+
+	logger.Info().
+		Int("port", config.GetRouterConfig().Port).
+		Str("metrics_addr", config.Metrics.PrometheusAddr).
+		Str("pprof_addr", config.Metrics.PprofAddr).
+		Msg("Servers listening")
+
+	// Log endpoints info
+	logger.Info().
+		Str("requests", fmt.Sprintf("http://localhost:%d/v1", config.GetRouterConfig().Port)).
+		Str("health", fmt.Sprintf("http://localhost:%d/healthz", config.GetRouterConfig().Port)).
+		Str("metrics", fmt.Sprintf("http://%s/metrics", config.Metrics.PrometheusAddr)).
+		Str("pprof", fmt.Sprintf("http://%s/debug/pprof/", config.Metrics.PprofAddr)).
+		Msg("Available endpoints")
+
+	// Log health check status
+	if healthCheckExecutor != nil {
+		logger.Info().
+			Bool("enabled", healthCheckConfig.Enabled).
+			Bool("leader_election", redisClient != nil).
+			Msg("Health checks configured")
+	}
+
+	// Log observation pipeline status
+	if observationQueue != nil {
+		logger.Info().
+			Float64("sample_rate", observationPipelineConfig.SampleRate).
+			Int("workers", observationPipelineConfig.WorkerCount).
+			Msg("Observation pipeline active")
+	}
+
+	logger.Info().Msg("PATH gateway ready to accept requests")
 
 	// -------------------- PATH Shutdown --------------------
 	stop := make(chan os.Signal, 1)

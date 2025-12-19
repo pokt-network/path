@@ -199,7 +199,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 			currentProtocolCtx = newProtocolCtx
 
-			logger.Info().
+			logger.Debug().
 				Str("new_endpoint", string(newEndpointAddr)).
 				Int("attempt", attempt).
 				Int("num_tried", len(triedEndpoints)).
@@ -272,7 +272,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			}
 
 			if attempt > 1 {
-				logger.Info().
+				logger.Debug().
 					Int("attempt", attempt).
 					Msg("Relay request succeeded after retry")
 
@@ -558,7 +558,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 
 			currentProtocolCtx = newProtocolCtx
 
-			logger.Info().
+			logger.Debug().
 				Int("endpoint_index", index).
 				Str("new_endpoint", string(newEndpointAddr)).
 				Int("attempt", attempt).
@@ -624,7 +624,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			}
 
 			if attempt > 1 {
-				logger.Info().
+				logger.Debug().
 					Int("endpoint_index", index).
 					Int("attempt", attempt).
 					Msg("Parallel relay request succeeded after retry")
@@ -778,7 +778,7 @@ func (rc *requestContext) handleSuccessfulResponse(
 	defer qosContextMutex.Unlock()
 
 	for _, response := range result.responses {
-		logger.Info().
+		logger.Debug().
 			Msgf("Parallel request success: endpoint %d/%d responded in %dms",
 				result.index+1, metrics.numRequestsToAttempt, overallDuration.Milliseconds())
 

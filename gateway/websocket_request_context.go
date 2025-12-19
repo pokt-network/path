@@ -49,9 +49,6 @@ type websocketRequestContext struct {
 	// metricsReporter is used to export metrics based on observations made in handling service requests.
 	metricsReporter RequestResponseReporter
 
-	// dataReporter is used to export, to the data pipeline, observations made in handling service requests.
-	dataReporter RequestResponseReporter
-
 	// QoS related request context
 	serviceID  protocol.ServiceID
 	serviceQoS QoSService
@@ -106,7 +103,7 @@ func (wrc *websocketRequestContext) buildQoSContextFromHTTP(_ *http.Request) err
 	if !isValid {
 		// Update gateway observations for websocket rejection
 		wrc.updateGatewayObservations(errWebsocketRequestRejectedByQoS)
-		logger.Info().Msg("Websocket request rejected by QoS")
+		logger.Debug().Msg("Websocket request rejected by QoS")
 		return errWebsocketRequestRejectedByQoS
 	}
 
@@ -144,7 +141,7 @@ func (wrc *websocketRequestContext) handleWebsocketRequest(
 	// Set the received_time in gateway observations to mark connection establishment
 	wrc.gatewayObservations.ReceivedTime = timestamppb.New(time.Now())
 
-	logger.Info().Msg("🔌 Websocket connection established successfully")
+	logger.Info().Msg("Websocket connection established successfully")
 
 	return nil
 }
@@ -199,7 +196,7 @@ func (wrc *websocketRequestContext) buildProtocolContextAndStartBridge(
 	}
 
 	wrc.protocolCtx = protocolCtx
-	logger.Info().Msgf("Successfully built protocol context and started bridge for websocket endpoint: %s", selectedEndpoint)
+	logger.Debug().Msgf("Successfully built protocol context and started bridge for websocket endpoint: %s", selectedEndpoint)
 	return connectionObservationChan, nil
 }
 
@@ -404,9 +401,6 @@ func (wrc *websocketRequestContext) BroadcastMessageObservations(
 		if wrc.metricsReporter != nil {
 			wrc.metricsReporter.Publish(observations)
 		}
-		if wrc.dataReporter != nil {
-			wrc.dataReporter.Publish(observations)
-		}
 	}()
 }
 
@@ -460,9 +454,6 @@ func (wrc *websocketRequestContext) broadcastWebsocketConnectionClosed(protocolO
 	// Broadcast the combined observations to BOTH metrics and data pipeline
 	if wrc.metricsReporter != nil {
 		wrc.metricsReporter.Publish(observations)
-	}
-	if wrc.dataReporter != nil {
-		wrc.dataReporter.Publish(observations)
 	}
 }
 

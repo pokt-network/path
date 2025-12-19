@@ -9,7 +9,6 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/pokt-network/path/gateway"
-	"github.com/pokt-network/path/protocol"
 )
 
 // defaultProtocolHealthTimeout is the default timeout for waiting for the protocol to become healthy.
@@ -48,7 +47,6 @@ func waitForProtocolHealth(logger polylog.Logger, protocol gateway.Protocol, tim
 //   - protocol: The protocol instance for sending health check requests
 //   - config: Health check configuration from YAML
 //   - metricsReporter: Reporter for health check metrics
-//   - dataReporter: Reporter for health check data
 //   - observationQueue: Queue for async observation processing (optional)
 //   - unifiedServicesConfig: Unified services config for per-service health check overrides
 //   - redisClient: Redis client for leader election (optional, nil if Redis not configured)
@@ -60,7 +58,6 @@ func setupHealthCheckExecutor(
 	protocolInstance gateway.Protocol,
 	config *gateway.ActiveHealthChecksConfig,
 	metricsReporter gateway.RequestResponseReporter,
-	dataReporter gateway.RequestResponseReporter,
 	observationQueue *gateway.ObservationQueue,
 	unifiedServicesConfig *gateway.UnifiedServicesConfig,
 	redisClient *redis.Client,
@@ -83,7 +80,6 @@ func setupHealthCheckExecutor(
 		Logger:                logger.With("component", "health_check_executor"),
 		Protocol:              protocolInstance,
 		MetricsReporter:       metricsReporter,
-		DataReporter:          dataReporter,
 		ObservationQueue:      observationQueue,
 		MaxWorkers:            config.MaxWorkers, // Defaults to 10 in NewHealthCheckExecutor if 0
 		UnifiedServicesConfig: unifiedServicesConfig,
@@ -189,23 +185,12 @@ func runHealthChecks(
 
 	logger.Debug().Msg("Running health checks via protocol")
 
-	// Get endpoint addresses from the protocol's endpoint getter
-	getEndpointAddrs := func(serviceID protocol.ServiceID) ([]protocol.EndpointAddr, error) {
-		endpointInfoFn := protocolInstance.GetEndpointsForHealthCheck()
-		infos, err := endpointInfoFn(serviceID)
-		if err != nil {
-			return nil, err
-		}
-		addrs := make([]protocol.EndpointAddr, len(infos))
-		for i, info := range infos {
-			addrs[i] = info.Addr
-		}
-		return addrs, nil
-	}
+	// Get endpoint infos from the protocol (includes session ID for rollover detection)
+	getEndpointInfos := protocolInstance.GetEndpointsForHealthCheck()
 
 	// Run all checks through the protocol layer (synthetic relay requests)
 	// This tests the full path including relay miners, just like regular user requests.
-	err := executor.RunAllChecksViaProtocol(ctx, getEndpointAddrs)
+	err := executor.RunAllChecksViaProtocol(ctx, getEndpointInfos)
 	if err != nil {
 		logger.Warn().Err(err).Msg("Some health checks failed")
 	}

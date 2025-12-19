@@ -152,7 +152,10 @@ func NewCachingFullNode(
 		),
 	)
 
-	// Account cache: infinite for app lifetime; no early refresh needed.
+	// Account cache with 1 hour TTL.
+	// This provides a reasonable balance between reducing node load and allowing
+	// recovery from stale data (e.g., accounts that get their pubkey set after first tx).
+	// On signature verification failure, the cache is invalidated and refetched.
 	accountCache := sturdyc.New[*accounttypes.QueryAccountResponse](
 		accountCacheCapacity,
 		numShards,
@@ -198,6 +201,7 @@ func NewCachingFullNode(
 		sharedParamsCache: sharedParamsCache,
 		blockHeightCache:  blockHeightCache,
 		// Wrap the underlying account fetcher with a SturdyC caching layer.
+		// Uses 1 hour TTL with invalidation on signature verification failure.
 		cachingAccountClient: getCachingAccountClient(
 			logger,
 			accountCache,

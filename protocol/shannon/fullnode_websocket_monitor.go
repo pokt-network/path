@@ -191,7 +191,7 @@ func (m *blockHeightMonitor) attemptReconnect() {
 			return
 
 		case <-ticker.C:
-			m.logger.Info().Msg("Attempting to reconnect WebSocket")
+			m.logger.Debug().Msg("Attempting to reconnect WebSocket")
 
 			if err := m.connectWebSocket(); err != nil {
 				m.logger.Warn().Err(err).Msg("WebSocket reconnection failed, will retry")

@@ -25,7 +25,8 @@ const (
 	DefaultReputationSignal      = "minor_error"
 	// DefaultSyncAllowance is the default number of blocks behind the latest block
 	// that an endpoint can be before it's considered out of sync.
-	DefaultSyncAllowance = 5
+	// 0 means disabled (no sync allowance check).
+	DefaultSyncAllowance = 0
 )
 
 // Observation pipeline configuration defaults
@@ -143,6 +144,7 @@ type (
 		Enabled *bool `yaml:"enabled,omitempty"`
 		// SyncAllowance is the number of blocks behind the latest block that an endpoint
 		// can be before it's considered out of sync. Overrides the global default for this service.
+		// 0 means disabled (no sync allowance check). Default: 0 (disabled).
 		SyncAllowance *int `yaml:"sync_allowance,omitempty"`
 		// Checks is the list of health checks to run for this service.
 		Checks []HealthCheckConfig `yaml:"checks"`
@@ -181,7 +183,7 @@ type (
 		Enabled bool `yaml:"enabled,omitempty"`
 		// SyncAllowance is the default number of blocks behind the latest block that an endpoint
 		// can be before it's considered out of sync. Per-service overrides can set different values.
-		// Default: 5 blocks
+		// 0 means disabled (no sync allowance check). Default: 0 (disabled).
 		SyncAllowance int `yaml:"sync_allowance,omitempty"`
 		// MaxWorkers is the maximum number of concurrent health check workers.
 		// Higher values allow faster health check cycles but increase load on endpoints.

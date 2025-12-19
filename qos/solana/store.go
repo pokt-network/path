@@ -87,7 +87,7 @@ func (es *EndpointStore) SelectMultiple(
 	}
 
 	// Select up to numEndpoints endpoints from filtered list
-	logger.Info().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(allAvailableEndpoints))
+	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(allAvailableEndpoints))
 	return selector.SelectEndpointsWithDiversity(logger, filteredEndpointsAddr, numEndpoints), nil
 }
 
@@ -121,7 +121,7 @@ func (es *EndpointStore) filterValidEndpoints(allAvailableEndpoints protocol.End
 			// It is valid for an endpoint to not be in the store yet (e.g., first request,
 			// no observations collected). Treat it as a fresh endpoint and allow it.
 			// It will be added to the store once observations are collected.
-			logger.Info().Msg("endpoint not yet in store, treating as fresh endpoint")
+			logger.Debug().Msg("endpoint not yet in store, treating as fresh endpoint")
 			filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
 			continue
 		}

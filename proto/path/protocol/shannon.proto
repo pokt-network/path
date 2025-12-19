@@ -130,6 +130,10 @@ enum ShannonEndpointErrorType {
 
   // RelayMiner returned a 5XX HTTP status code
   SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_5XX = 43;
+
+  // Session mismatch - RelayMiner claims supplier is not in session
+  // This is likely a PATH-side caching/timing issue, not supplier's fault
+  SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_SESSION_MISMATCH = 44;
 }
 
 // ShannonRelayMinerError captures relay miner error details from the RelayResponse

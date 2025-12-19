@@ -5,11 +5,46 @@ import (
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
+	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
 )
+
+// getServiceRPCTypesForLeaderboard returns the RPC types configured for a service.
+// Falls back to JSON_RPC if no RPC types are configured.
+func (p *Protocol) getServiceRPCTypesForLeaderboard(serviceID protocol.ServiceID) []sharedtypes.RPCType {
+	mapper := gateway.NewRPCTypeMapper()
+
+	// Get configured RPC types for this service
+	configuredTypes := p.unifiedServicesConfig.GetServiceRPCTypes(serviceID)
+	if len(configuredTypes) == 0 {
+		// Default to JSON_RPC if no types configured
+		return []sharedtypes.RPCType{sharedtypes.RPCType_JSON_RPC}
+	}
+
+	var rpcTypes []sharedtypes.RPCType
+	for _, typeStr := range configuredTypes {
+		rpcType, err := mapper.ParseRPCType(typeStr)
+		if err != nil {
+			p.logger.Warn().
+				Str("service_id", string(serviceID)).
+				Str("rpc_type", typeStr).
+				Err(err).
+				Msg("Failed to parse RPC type for leaderboard, skipping")
+			continue
+		}
+		rpcTypes = append(rpcTypes, rpcType)
+	}
+
+	// If all configured types failed to parse, fall back to JSON_RPC
+	if len(rpcTypes) == 0 {
+		return []sharedtypes.RPCType{sharedtypes.RPCType_JSON_RPC}
+	}
+
+	return rpcTypes
+}
 
 // GetEndpointLeaderboardData implements the metrics.LeaderboardDataProvider interface.
 // It collects endpoint distribution data grouped by domain, rpc_type, service_id,
@@ -22,10 +57,10 @@ func (p *Protocol) GetEndpointLeaderboardData(ctx context.Context) ([]metrics.En
 
 	// Check if unified services config is available
 	if p.unifiedServicesConfig == nil {
-		logger.Info().Msg("📊 No unified services config available, returning empty leaderboard")
+		logger.Debug().Msg("No unified services config available, returning empty leaderboard")
 		return nil, nil
 	}
-	logger.Info().Int("service_count", len(p.unifiedServicesConfig.Services)).Msg("📊 Building leaderboard data")
+	logger.Debug().Int("service_count", len(p.unifiedServicesConfig.Services)).Msg("Building leaderboard data")
 
 	// Use a map to aggregate endpoints by their grouping key
 	type groupKey struct {
@@ -56,14 +91,8 @@ func (p *Protocol) GetEndpointLeaderboardData(ctx context.Context) ([]metrics.En
 			continue
 		}
 
-		// Query for each actual RPC type that suppliers can stake with.
-		// Suppliers stake with specific types (JSON_RPC, REST, WEBSOCKET, GRPC), not UNKNOWN.
-		rpcTypesToQuery := []sharedtypes.RPCType{
-			sharedtypes.RPCType_JSON_RPC,
-			sharedtypes.RPCType_REST,
-			sharedtypes.RPCType_GRPC,
-			sharedtypes.RPCType_WEBSOCKET,
-		}
+		// Query only for RPC types configured for this service
+		rpcTypesToQuery := p.getServiceRPCTypesForLeaderboard(serviceID)
 
 		for _, rpcType := range rpcTypesToQuery {
 			// Get endpoints for this RPC type, bypassing reputation filtering
@@ -216,13 +245,8 @@ func (p *Protocol) GetMeanScoreData(ctx context.Context) ([]metrics.MeanScoreEnt
 			continue
 		}
 
-		// Query for each actual RPC type
-		rpcTypesToQuery := []sharedtypes.RPCType{
-			sharedtypes.RPCType_JSON_RPC,
-			sharedtypes.RPCType_REST,
-			sharedtypes.RPCType_GRPC,
-			sharedtypes.RPCType_WEBSOCKET,
-		}
+		// Query only for RPC types configured for this service
+		rpcTypesToQuery := p.getServiceRPCTypesForLeaderboard(serviceID)
 
 		for _, rpcType := range rpcTypesToQuery {
 			// Get endpoints for this RPC type, bypassing reputation filtering

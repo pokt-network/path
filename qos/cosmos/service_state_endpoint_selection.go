@@ -32,7 +32,7 @@ var _ protocol.EndpointSelector = &serviceState{}
 func (ss *serviceState) Select(availableEndpoints protocol.EndpointAddrList) (protocol.EndpointAddr, error) {
 	logger := ss.logger.With("method", "Select")
 
-	logger.Info().Msgf("filtering %d available endpoints.", len(availableEndpoints))
+	logger.Debug().Msgf("filtering %d available endpoints.", len(availableEndpoints))
 
 	filteredEndpointsAddr, err := ss.filterValidEndpoints(availableEndpoints)
 	if err != nil {
@@ -46,7 +46,7 @@ func (ss *serviceState) Select(availableEndpoints protocol.EndpointAddrList) (pr
 		return randomAvailableEndpointAddr, nil
 	}
 
-	logger.Info().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(availableEndpoints))
+	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(availableEndpoints))
 
 	// TODO_FUTURE: consider ranking filtered endpoints, e.g. based on latency, rather than randomization.
 	selectedEndpointAddr := filteredEndpointsAddr[rand.Intn(len(filteredEndpointsAddr))]
@@ -58,7 +58,7 @@ func (ss *serviceState) Select(availableEndpoints protocol.EndpointAddrList) (pr
 // validity criteria. If numEndpoints is 0, it defaults to 1.
 func (ss *serviceState) SelectMultiple(allAvailableEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
 	logger := ss.logger.With("method", "SelectMultiple").With("num_endpoints", numEndpoints)
-	logger.Info().Msgf("filtering %d available endpoints to select up to %d.", len(allAvailableEndpoints), numEndpoints)
+	logger.Debug().Msgf("filtering %d available endpoints to select up to %d.", len(allAvailableEndpoints), numEndpoints)
 
 	filteredEndpointsAddr, err := ss.filterValidEndpoints(allAvailableEndpoints)
 	if err != nil {
@@ -73,7 +73,7 @@ func (ss *serviceState) SelectMultiple(allAvailableEndpoints protocol.EndpointAd
 	}
 
 	// Select up to numEndpoints endpoints from filtered list
-	logger.Info().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(allAvailableEndpoints))
+	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(allAvailableEndpoints))
 	return selector.SelectEndpointsWithDiversity(logger, filteredEndpointsAddr, numEndpoints), nil
 }
 
@@ -89,21 +89,24 @@ func (ss *serviceState) filterValidEndpoints(availableEndpoints protocol.Endpoin
 		return nil, errEmptyEndpointListObs
 	}
 
-	logger.Info().Msgf("About to filter through %d available endpoints", len(availableEndpoints))
+	logger.Debug().Msgf("About to filter through %d available endpoints", len(availableEndpoints))
 
 	// TODO_FUTURE: use service-specific metrics to add an endpoint ranking method
 	// which can be used to assign a rank/score to a valid endpoint to guide endpoint selection.
 	var filteredEndpointsAddr protocol.EndpointAddrList
 	for _, availableEndpointAddr := range availableEndpoints {
 		logger := logger.With("endpoint_addr", availableEndpointAddr)
-		logger.Info().Msg("processing endpoint")
+		logger.Debug().Msg("processing endpoint")
 
 		endpoint, found := ss.endpointStore.endpoints[availableEndpointAddr]
 		if !found {
 			// It is valid for an endpoint to not be in the store yet (e.g., first request,
 			// no observations collected). Treat it as a fresh endpoint and allow it.
 			// It will be added to the store once observations are collected.
-			logger.Info().Msg("endpoint not yet in store, treating as fresh endpoint")
+			logger.Warn().
+				Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+				Uint64("sync_allowance", ss.serviceQoSConfig.getSyncAllowance()).
+				Msg("🔍 Sync allowance check SKIPPED (endpoint not yet in store - fresh endpoint)")
 			filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
 			continue
 		}
@@ -114,7 +117,7 @@ func (ss *serviceState) filterValidEndpoints(availableEndpoints protocol.Endpoin
 		}
 
 		filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
-		logger.Info().Msgf("✅ endpoint %s passed validation", availableEndpointAddr)
+		logger.Debug().Msgf("endpoint %s passed validation", availableEndpointAddr)
 	}
 
 	return filteredEndpointsAddr, nil

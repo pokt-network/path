@@ -32,6 +32,7 @@ const (
 	LabelRetryCount         = "retry_count"
 	LabelResult             = "result"
 	LabelBatchCount         = "batch_count"
+	LabelSupplier           = "supplier"
 
 	// --- Latency signal values
 
@@ -272,6 +273,81 @@ var ProbationEventsTotal = promauto.NewCounterVec(
 )
 
 // =============================================================================
+// Supplier Blacklist Events (Counter)
+// Labels: domain, supplier, service_id, reason
+// Value: count
+// Purpose: Track suppliers blacklisted for validation/signature errors
+// =============================================================================
+
+var SupplierBlacklistTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "supplier_blacklist_total",
+		Help: "Suppliers blacklisted by domain, supplier address, service_id, and reason.",
+	},
+	[]string{LabelDomain, LabelSupplier, LabelServiceID, "reason"},
+)
+
+// Blacklist reason constants
+const (
+	BlacklistReasonSignatureError  = "signature_error"
+	BlacklistReasonValidationError = "validation_error"
+	BlacklistReasonUnmarshalError  = "unmarshal_error"
+	BlacklistReasonPubKeyError     = "pubkey_error"
+	BlacklistReasonNilPubKey       = "nil_pubkey"
+)
+
+// =============================================================================
+// Supplier Nil Pubkey Events (Counter)
+// Labels: supplier
+// Value: count
+// Purpose: Track suppliers with nil public keys (haven't signed first tx)
+// This helps identify suppliers that need to sign a transaction before they can be used
+// =============================================================================
+
+var SupplierNilPubkeyTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "supplier_nil_pubkey_total",
+		Help: "Count of times a supplier was found with nil public key (hasn't signed first tx).",
+	},
+	[]string{LabelSupplier},
+)
+
+// =============================================================================
+// Supplier Pubkey Cache Events (Counter)
+// Labels: supplier, event
+// Value: count
+// Purpose: Track cache invalidation and recovery events for supplier pubkeys
+// =============================================================================
+
+var SupplierPubkeyCacheEvents = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "supplier_pubkey_cache_events_total",
+		Help: "Supplier pubkey cache events: invalidated (on signature failure), recovered (nil -> valid).",
+	},
+	[]string{LabelSupplier, "event"},
+)
+
+// Pubkey cache event constants
+const (
+	PubkeyCacheEventInvalidated = "invalidated"
+	PubkeyCacheEventRecovered   = "recovered"
+)
+
+// =============================================================================
+// RPC Type Fallback (Counter)
+// Labels: domain, supplier, service_id, requested_rpc_type, fallback_rpc_type
+// Purpose: Track when suppliers don't support the requested RPC type and fallback is used
+// =============================================================================
+
+var RPCTypeFallbackTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "rpc_type_fallback_total",
+		Help: "Count of RPC type fallbacks when supplier doesn't support requested RPC type.",
+	},
+	[]string{LabelDomain, LabelSupplier, LabelServiceID, "requested_rpc_type", "fallback_rpc_type"},
+)
+
+// =============================================================================
 // Mean Reputation Score (Gauge)
 // Labels: domain, service_id, rpc_type
 // Value: mean score (0-100)
@@ -421,6 +497,36 @@ func RecordRequestSize(rpcType, serviceID string, bytesReceived, bytesSent int64
 // RecordProbationEvent records a probation event (entered, exited, or routed)
 func RecordProbationEvent(domain, rpcType, serviceID, event string) {
 	ProbationEventsTotal.WithLabelValues(domain, rpcType, serviceID, event).Inc()
+}
+
+// RecordSupplierBlacklist records a supplier being blacklisted with the specific reason
+// reason should be one of the BlacklistReason* constants
+func RecordSupplierBlacklist(domain, supplier, serviceID, reason string) {
+	SupplierBlacklistTotal.WithLabelValues(domain, supplier, serviceID, reason).Inc()
+}
+
+// RecordSupplierNilPubkey records when a supplier is found with a nil public key.
+// This indicates the supplier account exists but hasn't signed its first transaction yet.
+func RecordSupplierNilPubkey(supplier string) {
+	SupplierNilPubkeyTotal.WithLabelValues(supplier).Inc()
+}
+
+// RecordSupplierPubkeyCacheInvalidated records when a supplier's pubkey cache entry
+// is invalidated due to signature verification failure.
+func RecordSupplierPubkeyCacheInvalidated(supplier string) {
+	SupplierPubkeyCacheEvents.WithLabelValues(supplier, PubkeyCacheEventInvalidated).Inc()
+}
+
+// RecordSupplierPubkeyRecovered records when a supplier's pubkey transitions
+// from nil to valid (they signed their first transaction).
+func RecordSupplierPubkeyRecovered(supplier string) {
+	SupplierPubkeyCacheEvents.WithLabelValues(supplier, PubkeyCacheEventRecovered).Inc()
+}
+
+// RecordRPCTypeFallback records when a supplier doesn't support the requested RPC type
+// and a fallback RPC type is used instead
+func RecordRPCTypeFallback(domain, supplier, serviceID, requestedRPCType, fallbackRPCType string) {
+	RPCTypeFallbackTotal.WithLabelValues(domain, supplier, serviceID, requestedRPCType, fallbackRPCType).Inc()
 }
 
 // SetMeanScore sets the mean reputation score for a domain/service/rpc_type combination

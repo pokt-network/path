@@ -50,11 +50,13 @@ var (
 
 	// ** Request context setup errors **
 
-	// No endpoints available for the service.
-	// Can be due to one or more of the following:
-	// - Any of the gateway mode errors above.
-	// - Error fetching a session for an app.
-	errProtocolContextSetupNoEndpoints = errors.New("no endpoints found for service: relay request will fail")
+	// No valid endpoints available for the service.
+	// Endpoints exist in the session but none are usable. Can be due to:
+	// - RPC type mismatch (supplier doesn't support requested RPC type)
+	// - Low reputation score (filtered out)
+	// - Supplier blacklisted (validation/signature errors)
+	// - No fallback endpoints configured
+	errProtocolContextSetupNoEndpoints = errors.New("no valid endpoints available for service")
 	// Selected endpoint is no longer available.
 	// Can happen due to:
 	// - Bug in endpoint selection logic.

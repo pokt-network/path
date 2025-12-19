@@ -42,7 +42,11 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 	ownedAppsForService, ok := p.ownedApps[serviceID]
 	if !ok || len(ownedAppsForService) == 0 {
 		err := fmt.Errorf("%s: %s", errProtocolContextSetupCentralizedNoAppsForService, serviceID)
-		logger.Error().Err(err).Msg("🚨 MISCONFIGURATION: ❌ ZERO owned apps found for service.")
+		// Log only once per service to avoid spamming logs on every request
+		errorKey := "no_apps_" + string(serviceID)
+		if _, alreadyLogged := p.loggedMisconfigErrors.LoadOrStore(errorKey, true); !alreadyLogged {
+			logger.Error().Err(err).Msg("MISCONFIGURATION: No owned apps found for service - check config")
+		}
 		return nil, err
 	}
 
@@ -90,10 +94,10 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 	}
 
 	if inRollover {
-		logger.Info().Msgf("🔄 Session rollover active: fetched %d sessions (%d current + %d extended) for %d owned apps for service %s.",
+		logger.Debug().Msgf("Session rollover active: fetched %d sessions (%d current + %d extended) for %d owned apps for service %s.",
 			len(ownedAppSessions), len(ownedAppsForService), len(ownedAppSessions)-len(ownedAppsForService), len(ownedAppsForService), serviceID)
 	} else {
-		logger.Info().Msgf("Successfully fetched %d sessions for %d owned apps for service %s.",
+		logger.Debug().Msgf("Successfully fetched %d sessions for %d owned apps for service %s.",
 			len(ownedAppSessions), len(ownedAppsForService), serviceID)
 	}
 

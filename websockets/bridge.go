@@ -180,7 +180,7 @@ func (b *bridge) validateComponents() error {
 //
 // Full data flow: Client <---clientConn---> PATH Bridge <---endpointConn---> Relay Miner Bridge <------> Endpoint
 func (b *bridge) start() {
-	b.logger.Info().Msg("🏗️ Websocket bridge operation started successfully")
+	b.logger.Info().Msg("Websocket bridge operation started successfully")
 
 	// Listen for the context to be canceled and shut down the bridge
 	go func() {

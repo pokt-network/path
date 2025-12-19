@@ -17,7 +17,8 @@ const DefaultEVMArchivalThreshold = 128
 // defaultEVMBlockNumberSyncAllowance is the default sync allowance for EVM-based chains.
 // This number indicates how many blocks behind the perceived
 // block number the endpoint may be and still be considered valid.
-const defaultEVMBlockNumberSyncAllowance = 5
+// 0 means disabled (no sync allowance check).
+const defaultEVMBlockNumberSyncAllowance = 0
 
 // ServiceQoSConfig defines the base interface for service QoS configurations.
 // This avoids circular dependency with the config package.

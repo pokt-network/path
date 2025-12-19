@@ -147,7 +147,7 @@ func (qos *QoS) ParseWebsocketRequest(_ context.Context) (gateway.RequestQoSCont
 //   - takes a pointer to the DisqualifiedEndpointResponse
 //   - called by the devtools.DisqualifiedEndpointReporter to fill it with the QoS-specific data.
 func (qos *QoS) HydrateDisqualifiedEndpointsResponse(serviceID protocol.ServiceID, details *devtools.DisqualifiedEndpointResponse) {
-	qos.logger.Info().Msgf("hydrating disqualified endpoints response for service ID: %s", serviceID)
+	qos.logger.Debug().Msgf("hydrating disqualified endpoints response for service ID: %s", serviceID)
 	details.QoSLevelDisqualifiedEndpoints = qos.getDisqualifiedEndpointsResponse(serviceID)
 }
 

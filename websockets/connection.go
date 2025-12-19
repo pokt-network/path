@@ -104,7 +104,7 @@ func ConnectWebsocketEndpoint(
 	websocketURL string,
 	headers http.Header,
 ) (*websocket.Conn, error) {
-	wsLogger.Info().Msgf("🔗 Connecting to websocket endpoint: %s", websocketURL)
+	wsLogger.Info().Msgf("Connecting to websocket endpoint: %s", websocketURL)
 
 	// Ensure the websocket URL is valid.
 	url, err := url.Parse(websocketURL)
@@ -120,7 +120,7 @@ func ConnectWebsocketEndpoint(
 		return nil, err
 	}
 
-	wsLogger.Debug().Msgf("🔗 Connected to websocket endpoint: %s", websocketURL)
+	wsLogger.Debug().Msgf("Connected to websocket endpoint: %s", websocketURL)
 
 	return conn, nil
 }
@@ -219,7 +219,7 @@ func (c *websocketConnection) pingLoop() {
 			}
 
 		case <-c.ctx.Done():
-			c.logger.Info().Msg("pingLoop stopped due to context cancellation")
+			c.logger.Debug().Msg("pingLoop stopped due to context cancellation")
 			return
 		}
 	}

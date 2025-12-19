@@ -186,6 +186,9 @@ const (
 	ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_4XX ShannonEndpointErrorType = 42
 	// RelayMiner returned a 5XX HTTP status code
 	ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_5XX ShannonEndpointErrorType = 43
+	// Session mismatch - RelayMiner claims supplier is not in session
+	// This is likely a PATH-side caching/timing issue, not supplier's fault
+	ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_SESSION_MISMATCH ShannonEndpointErrorType = 44
 )
 
 // Enum value maps for ShannonEndpointErrorType.
@@ -234,6 +237,7 @@ var (
 		41: "SHANNON_ENDPOINT_ERROR_WEBSOCKET_RELAY_RESPONSE_VALIDATION_FAILED",
 		42: "SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_4XX",
 		43: "SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_5XX",
+		44: "SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_SESSION_MISMATCH",
 	}
 	ShannonEndpointErrorType_value = map[string]int32{
 		"SHANNON_ENDPOINT_ERROR_UNSPECIFIED":                                0,
@@ -279,6 +283,7 @@ var (
 		"SHANNON_ENDPOINT_ERROR_WEBSOCKET_RELAY_RESPONSE_VALIDATION_FAILED": 41,
 		"SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_4XX":                       42,
 		"SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_5XX":                       43,
+		"SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_SESSION_MISMATCH":               44,
 	}
 )
 
@@ -1295,7 +1300,7 @@ const file_path_protocol_shannon_proto_rawDesc = "" +
 	"2SHANNON_REQUEST_ERROR_INTERNAL_DELEGATED_FETCH_APP\x10\b\x12B\n" +
 	">SHANNON_REQUEST_ERROR_INTERNAL_DELEGATED_APP_DOES_NOT_DELEGATE\x10\t\x125\n" +
 	"1SHANNON_REQUEST_ERROR_INTERNAL_SIGNER_SETUP_ERROR\x10\n" +
-	"*\xd6\x11\n" +
+	"*\x8f\x12\n" +
 	"\x18ShannonEndpointErrorType\x12&\n" +
 	"\"SHANNON_ENDPOINT_ERROR_UNSPECIFIED\x10\x00\x12'\n" +
 	"\x1fSHANNON_ENDPOINT_ERROR_INTERNAL\x10\x01\x1a\x02\b\x01\x12!\n" +
@@ -1340,7 +1345,8 @@ const file_path_protocol_shannon_proto_rawDesc = "" +
 	"7SHANNON_ENDPOINT_ERROR_WEBSOCKET_REQUEST_SIGNING_FAILED\x10(\x12E\n" +
 	"ASHANNON_ENDPOINT_ERROR_WEBSOCKET_RELAY_RESPONSE_VALIDATION_FAILED\x10)\x12/\n" +
 	"+SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_4XX\x10*\x12/\n" +
-	"+SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_5XX\x10+B3Z1github.com/pokt-network/path/observation/protocolb\x06proto3"
+	"+SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_5XX\x10+\x127\n" +
+	"3SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_SESSION_MISMATCH\x10,B3Z1github.com/pokt-network/path/observation/protocolb\x06proto3"
 
 var (
 	file_path_protocol_shannon_proto_rawDescOnce sync.Once

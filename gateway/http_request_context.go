@@ -82,11 +82,6 @@ type requestContext struct {
 	// metricsReporter is used to export metrics based on observations made in handling service requests.
 	metricsReporter RequestResponseReporter
 
-	// dataReporter is used to export, to the data pipeline, observations made in handling service requests.
-	// It is declared separately from the `metricsReporter` to be consistent with the gateway package's role
-	// of explicitly defining PATH gateway's components and their interactions.
-	dataReporter RequestResponseReporter
-
 	// observationQueue handles async, sampled observation processing.
 	// If nil, no async observation processing occurs.
 	observationQueue *ObservationQueue
@@ -276,7 +271,7 @@ func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
 		return err
 	}
 
-	logger.Info().Msg("RPC type validation successful")
+	logger.Debug().Msg("RPC type validation successful")
 	return nil
 }
 
@@ -389,7 +384,7 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 		return errHTTPRequestRejectedByProtocol
 	}
 
-	logger.Info().Msgf("Successfully built %d protocol contexts for the request with %d selected endpoints", len(rc.protocolContexts), numSelectedEndpoints)
+	logger.Debug().Msgf("Successfully built %d protocol contexts for the request with %d selected endpoints", len(rc.protocolContexts), numSelectedEndpoints)
 
 	return nil
 }
@@ -449,7 +444,7 @@ func (rc *requestContext) writeHTTPResponse(response pathhttp.HTTPResponse, w ht
 		return
 	}
 
-	logger.Info().Msg("Completed processing the HTTP request and returned an HTTP response.")
+	logger.Debug().Msg("Completed processing the HTTP request and returned an HTTP response.")
 }
 
 // observationBroadcastTimeout is the maximum time allowed for broadcasting observations.
@@ -527,12 +522,6 @@ func (rc *requestContext) broadcastObservationsInternal() {
 
 	if rc.metricsReporter != nil {
 		rc.metricsReporter.Publish(observations)
-	}
-	// Need to account for an empty `data_reporter_config` field in the YAML config file.
-	// E.g. This can happen when running the Gateway in a local environment.
-	// TODO_DELETE: Skip data reporting for "hey" service
-	if rc.dataReporter != nil && rc.serviceID != "hey" {
-		rc.dataReporter.Publish(observations)
 	}
 }
 

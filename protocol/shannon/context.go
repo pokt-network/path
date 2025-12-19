@@ -32,11 +32,6 @@ import (
 // TODO_TECHDEBT(@olshansk): Cleanup the code in this file by:
 // - Renaming this to request_context.go
 // - Moving HTTP request code to a dedicated file
-
-// TODO_TECHDEBT(@adshmh): Make this threshold configurable.
-// Maximum endpoint payload length for error logging (100 chars)
-const maxEndpointPayloadLenForLogging = 100
-
 // MaxConcurrentRelaysPerRequest limits the number of concurrent relay goroutines per request.
 // This prevents DoS attacks via large batch requests that could spawn unbounded goroutines.
 // ✅ DONE: Now configurable via concurrency_config.max_batch_payloads in YAML (default: 5500)
@@ -137,6 +132,10 @@ type requestContext struct {
 	// Used to check if endpoints are in probation when recording success signals.
 	// If non-nil and endpoint is in probation, RecoverySuccessSignal is used instead of SuccessSignal.
 	tieredSelector *reputation.TieredSelector
+
+	// supplierBlacklist tracks suppliers with validation/signature errors.
+	// Used to blacklist suppliers on errors and skip domain reputation penalty.
+	supplierBlacklist *supplierBlacklist
 }
 
 // HandleServiceRequest:
@@ -471,6 +470,41 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		return defaultResponse, err
 	}
 
+	// Debug logging: capture session and supplier details for debugging "supplier does not belong to session" errors
+	session := selectedEndpoint.Session()
+	supplierAddr := selectedEndpoint.Supplier()
+
+	// Verify the supplier is actually in the session's Suppliers list
+	supplierInSession := false
+	for _, s := range session.Suppliers {
+		if s.OperatorAddress == supplierAddr {
+			supplierInSession = true
+			break
+		}
+	}
+
+	if !supplierInSession {
+		// This is a critical bug - the endpoint was created with a supplier not in the session
+		rc.logger.Error().
+			Str("session_id", session.SessionId).
+			Int64("session_start_height", session.Header.SessionStartBlockHeight).
+			Int64("session_end_height", session.Header.SessionEndBlockHeight).
+			Str("supplier_operator_address", supplierAddr).
+			Int("session_supplier_count", len(session.Suppliers)).
+			Str("app_address", session.Header.ApplicationAddress).
+			Msg("BUG: Supplier not found in session's Suppliers list - relay will fail")
+	}
+
+	rc.logger.Debug().
+		Str("session_id", session.SessionId).
+		Int64("session_start_height", session.Header.SessionStartBlockHeight).
+		Int64("session_end_height", session.Header.SessionEndBlockHeight).
+		Str("supplier_operator_address", supplierAddr).
+		Int("session_supplier_count", len(session.Suppliers)).
+		Str("app_address", session.Header.ApplicationAddress).
+		Bool("supplier_in_session", supplierInSession).
+		Msg("Sending relay with session details")
+
 	// Marshal relay request to bytes
 	relayRequestBz, err := signedRelayReq.Marshal()
 	if err != nil {
@@ -507,7 +541,7 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 			for _, rpcType := range fallbackTypes {
 				if url := selectedEndpoint.GetURL(rpcType); url != "" {
 					targetServerURL = url
-					rc.logger.Info().
+					rc.logger.Debug().
 						Str("requested_rpc_type", rc.currentRPCType.String()).
 						Str("actual_rpc_type", rpcType.String()).
 						Str("endpoint", string(selectedEndpoint.Addr())).
@@ -528,10 +562,12 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// Send the HTTP request to the protocol endpoint.
 	httpRelayResponseBz, httpStatusCode, err := rc.sendHTTPRequest(payload, targetServerURL, relayRequestBz)
 	if err != nil {
+		// Log at Debug level - individual relay failures are expected and handled by retry logic.
+		// Only final failures (all retries exhausted) should be logged at higher levels.
 		rc.logger.With(
 			"http_relay_response_preview", polylog.Preview(string(httpRelayResponseBz)),
 			"http_status_code", httpStatusCode,
-		).Error().Err(err).Msg("HTTP relay failed.")
+		).Debug().Err(err).Msg("HTTP relay failed, may retry")
 		return defaultResponse, err
 	}
 
@@ -638,16 +674,44 @@ func (rc *requestContext) validateAndProcessResponse(
 	rc.trackRelayMinerError(response)
 
 	if err != nil {
-		// Log raw payload for error tracking
-		responseStr := string(httpRelayResponseBz)
-		rc.logger.With(
-			"endpoint_payload", responseStr[:min(len(responseStr), maxEndpointPayloadLenForLogging)],
-			"endpoint_payload_length", len(httpRelayResponseBz),
-			"validation_error", err.Error(),
-		).Warn().Err(err).Msg("Failed to validate the payload from the selected endpoint. Relay request will fail.")
+		// Check if this is a supplier-specific validation error (signature, pubkey, etc.)
+		// These errors should blacklist the supplier, NOT penalize the domain's reputation.
+		if isSupplierValidationError(err) && rc.supplierBlacklist != nil {
+			supplierAddrStr := string(supplierAddr)
+			blacklistReason := getBlacklistReason(err)
+
+			// For signature/pubkey errors, invalidate the account cache and retry once.
+			// This handles cases where the cached pubkey is stale (e.g., account was queried
+			// before the supplier signed their first transaction).
+			if isPubkeyRelatedError(err) {
+				if retryResponse := rc.retryValidationWithCacheInvalidation(supplierAddrStr, httpRelayResponseBz); retryResponse != nil {
+					// Retry succeeded - return the valid response
+					rc.logger.Info().
+						Str("supplier", supplierAddrStr).
+						Msg("Signature verification succeeded after cache invalidation")
+					return retryResponse, nil
+				}
+			}
+
+			rc.supplierBlacklist.Blacklist(rc.serviceID, supplierAddrStr, err.Error())
+
+			// Extract domain for metrics
+			domain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
+			if domainErr != nil {
+				domain = shannonmetrics.ErrDomain
+			}
+			metrics.RecordSupplierBlacklist(domain, supplierAddrStr, string(rc.serviceID), blacklistReason)
+
+			rc.logger.Warn().
+				Str("supplier", supplierAddrStr).
+				Str("domain", domain).
+				Str("reason", blacklistReason).
+				Msg("Supplier blacklisted for validation error")
+		}
 
 		// Check if this is a validation error that requires raw payload analysis
 		if errors.Is(err, sdk.ErrRelayResponseValidationUnmarshal) || errors.Is(err, sdk.ErrRelayResponseValidationBasicValidation) {
+			responseStr := string(httpRelayResponseBz)
 			return nil, fmt.Errorf("raw_payload: %s: %w", responseStr, errMalformedEndpointPayload)
 		}
 
@@ -664,6 +728,50 @@ func (rc *requestContext) validateAndProcessResponse(
 	}
 
 	return response, nil
+}
+
+// retryValidationWithCacheInvalidation invalidates the account cache for the supplier
+// and retries signature verification. This handles cases where the cached pubkey is stale.
+//
+// Returns the valid response if retry succeeds, nil if it fails.
+func (rc *requestContext) retryValidationWithCacheInvalidation(
+	supplierAddr string,
+	httpRelayResponseBz []byte,
+) *servicetypes.RelayResponse {
+	// Get the caching account fetcher to invalidate the cache
+	accountClient := rc.fullNode.GetAccountClient()
+	cachingFetcher := GetCachingAccountFetcher(accountClient)
+
+	if cachingFetcher == nil {
+		// Not using caching - can't invalidate
+		rc.logger.Debug().
+			Str("supplier", supplierAddr).
+			Msg("Cannot retry validation - not using caching account fetcher")
+		return nil
+	}
+
+	// Invalidate the cache for this supplier
+	cachingFetcher.InvalidateCache(supplierAddr)
+
+	rc.logger.Info().
+		Str("supplier", supplierAddr).
+		Msg("Invalidated account cache, retrying signature verification")
+
+	// Retry validation
+	retryResponse, retryErr := rc.fullNode.ValidateRelayResponse(
+		sdk.SupplierAddress(supplierAddr),
+		httpRelayResponseBz,
+	)
+
+	if retryErr != nil {
+		rc.logger.Warn().
+			Err(retryErr).
+			Str("supplier", supplierAddr).
+			Msg("Signature verification failed after cache invalidation")
+		return nil
+	}
+
+	return retryResponse
 }
 
 // deserializeRelayResponse deserializes the relay response payload into a protocol.Response
@@ -796,7 +904,7 @@ func (rc *requestContext) trackRelayMinerError(relayResponse *servicetypes.Relay
 		"relay_miner_error_codespace", relayMinerErr.Codespace,
 		"relay_miner_error_code", relayMinerErr.Code,
 		"relay_miner_error_message", relayMinerErr.Message,
-	).Info().Msg("RelayMiner returned an error in RelayResponse (captured for reporting)")
+	).Debug().Msg("RelayMiner returned an error in RelayResponse (captured for reporting)")
 
 	// Store RelayMinerError data in request context for use in observations
 	rc.currentRelayMinerError = &protocolobservations.ShannonRelayMinerError{
@@ -843,15 +951,15 @@ func (rc *requestContext) handleEndpointError(
 	latency := time.Since(endpointQueryTime)
 	endpointErrorType, signal := classifyErrorAsSignal(rc.logger, endpointErr, latency)
 
-	// Enhanced logging with error type and reputation signal
+	// Debug level - individual endpoint errors are expected and handled by retry logic
 	isMalformedPayloadErr := isMalformedEndpointPayloadError(endpointErrorType)
-	rc.logger.Error().
+	rc.logger.Debug().
 		Err(endpointErr).
 		Str("error_type", endpointErrorType.String()).
 		Str("signal_type", string(signal.Type)).
 		Float64("signal_impact", signal.GetDefaultImpact()).
 		Bool("is_malformed_payload_error", isMalformedPayloadErr).
-		Msg("relay error occurred. Service request will fail.")
+		Msg("Relay error occurred, may retry")
 
 	// Build enhanced observation with RelayMinerError data from request context
 	endpointObs := buildEndpointErrorObservation(
@@ -875,7 +983,14 @@ func (rc *requestContext) handleEndpointError(
 
 	// Record reputation signal if reputation service is enabled.
 	// This provides gradual scoring based on error severity.
-	if rc.reputationService != nil {
+	//
+	// SKIP domain reputation penalty if supplier is blacklisted for validation errors.
+	// Validation errors (signature, pubkey) are supplier-specific issues and should
+	// not penalize other suppliers at the same domain.
+	supplierAddr := selectedEndpoint.Supplier()
+	isBlacklisted := rc.supplierBlacklist != nil && rc.supplierBlacklist.IsBlacklisted(rc.serviceID, supplierAddr)
+
+	if rc.reputationService != nil && !isBlacklisted {
 		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
 		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
 
@@ -883,6 +998,10 @@ func (rc *requestContext) handleEndpointError(
 		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
 			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for error")
 		}
+	} else if isBlacklisted {
+		rc.logger.Debug().
+			Str("supplier", supplierAddr).
+			Msg("Skipping domain reputation penalty for blacklisted supplier")
 	}
 
 	// Record relay metric for failed request

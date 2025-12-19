@@ -927,9 +927,10 @@ definitions:
         type: string
         pattern: "^[0-9]+[smh]$"
       sync_allowance:
-        description: "Number of blocks behind the latest that an endpoint can be before considered out of sync."
+        description: "Number of blocks behind the latest that an endpoint can be before considered out of sync. 0 means disabled (no sync check). Default: 0 (disabled)."
         type: integer
         minimum: 0
+        default: 0
       external:
         description: "External URL for fetching health check rules for this service."
         type: object

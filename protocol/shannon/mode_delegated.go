@@ -79,7 +79,7 @@ func (p *Protocol) getDelegatedGatewayModeActiveSession(
 		// (i.e., it's actually the previous session)
 		if extendedSession.SessionId != currentSession.SessionId {
 			sessions = append(sessions, extendedSession)
-			logger.Info().
+			logger.Debug().
 				Str("app_address", extractedAppAddr).
 				Str("current_session_id", currentSession.SessionId).
 				Str("extended_session_id", extendedSession.SessionId).

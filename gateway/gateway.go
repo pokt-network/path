@@ -56,11 +56,6 @@ type Gateway struct {
 	// MetricsReporter is used to export metrics based on observations made in handling service requests.
 	MetricsReporter RequestResponseReporter
 
-	// DataReporter is used to export, to the data pipeline, observations made in handling service requests.
-	// It is declared separately from the `MetricsReporter` to be consistent with the gateway package's role
-	// of explicitly defining PATH gateway's components and their interactions.
-	DataReporter RequestResponseReporter
-
 	// WebsocketMessageBufferSize is the buffer size for websocket message observation channels.
 	// Configurable to balance memory usage vs throughput for websocket connections.
 	// Default: DefaultWebsocketMessageBufferSize (100)
@@ -122,7 +117,6 @@ func (g Gateway) handleHTTPServiceRequest(
 		httpRequestParser:   g.HTTPRequestParser,
 		rpcTypeValidator:    g.RPCTypeValidator,
 		metricsReporter:     g.MetricsReporter,
-		dataReporter:        g.DataReporter,
 		observationQueue:    g.ObservationQueue,
 	}
 
@@ -218,7 +212,6 @@ func (g Gateway) handleWebSocketRequest(
 		protocol:            g.Protocol,
 		httpRequestParser:   g.HTTPRequestParser,
 		metricsReporter:     g.MetricsReporter,
-		dataReporter:        g.DataReporter,
 		// Note: We do NOT close messageObservationsChan here because Websocket connections
 		// outlive the HTTP handler. The channel will be closed when the Websocket actually disconnects.
 		messageObservationsChan: make(chan *observation.RequestResponseObservations, websocketBufferSize),
@@ -252,5 +245,5 @@ func (g Gateway) handleWebSocketRequest(
 	//   - Complete connection duration (from establishment to termination)
 	//   - Final connection status and termination reason
 	// This ensures we send only ONE connection observation per Websocket connection.
-	logger.Info().Msg("✅ Websocket connection and bridge shutdown complete, ready to broadcast final observations")
+	logger.Debug().Msg("Websocket connection and bridge shutdown complete, ready to broadcast final observations")
 }

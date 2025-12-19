@@ -219,7 +219,7 @@ func (p *Protocol) getPreSelectedEndpoint(
 
 	// Log if RPC type fallback occurred
 	if actualRPCType != rpcType {
-		logger.Info().
+		logger.Debug().
 			Str("requested_rpc_type", rpcType.String()).
 			Str("actual_rpc_type", actualRPCType.String()).
 			Msg("RPC type fallback was applied for websocket endpoint selection")
@@ -389,13 +389,13 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		defer close(connectionObservationChan)
 
 		// Send establishment observation immediately (buffered channel ensures it's captured)
-		wrc.logger.Info().Msg("✅ Websocket bridge started successfully, sending establishment observation")
+		wrc.logger.Debug().Msg("Websocket bridge started successfully, sending establishment observation")
 		connectionObservationChan <- getWebsocketConnectionEstablishedObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint)
 
 		// Wait for the bridge to complete (blocks until Websocket connection terminates)
 		<-bridgeCompletionChan
 		// Send closure observation
-		wrc.logger.Info().Msg("🔌 Websocket connection closed, sending closure observation")
+		wrc.logger.Debug().Msg("Websocket connection closed, sending closure observation")
 		connectionObservationChan <- getWebsocketConnectionClosedObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint)
 	}()
 

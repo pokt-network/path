@@ -135,7 +135,7 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 					fmt.Sprintf("%d", entry.SessionStartHeight),
 				).Set(float64(entry.EndpointCount))
 			}
-			lp.logger.Info().Int("entries", len(entries)).Msg("📊 Published endpoint leaderboard")
+			lp.logger.Debug().Int("entries", len(entries)).Msg("Published endpoint leaderboard")
 		}
 	}
 
@@ -153,7 +153,7 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 		for _, entry := range meanScores {
 			SetMeanScore(entry.Domain, entry.ServiceID, entry.RPCType, entry.MeanScore)
 		}
-		lp.logger.Info().Int("entries", len(meanScores)).Msg("📊 Published mean scores")
+		lp.logger.Debug().Int("entries", len(meanScores)).Msg("Published mean scores")
 	}
 }
 

@@ -22,12 +22,11 @@ type GatewayConfig struct {
 	GatewayModeConfig shannonprotocol.GatewayConfig  `yaml:"gateway_config"`
 
 	// Other gateway configurations
-	Router             RouterConfig           `yaml:"router_config"`
-	Logger             LoggerConfig           `yaml:"logger_config"`
-	Metrics            MetricsConfig          `yaml:"metrics_config"`
-	HydratorConfig     EndpointHydratorConfig `yaml:"hydrator_config"`
-	MessagingConfig    MessagingConfig        `yaml:"messaging_config"`
-	DataReporterConfig HTTPDataReporterConfig `yaml:"data_reporter_config"`
+	Router          RouterConfig           `yaml:"router_config"`
+	Logger          LoggerConfig           `yaml:"logger_config"`
+	Metrics         MetricsConfig          `yaml:"metrics_config"`
+	HydratorConfig  EndpointHydratorConfig `yaml:"hydrator_config"`
+	MessagingConfig MessagingConfig        `yaml:"messaging_config"`
 
 	// Global Redis configuration - used by reputation storage (when storage_type is "redis")
 	// and leader election for health checks.

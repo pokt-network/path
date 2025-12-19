@@ -138,6 +138,19 @@ type Protocol interface {
 	// This is used by components that need to respect concurrency limits.
 	GetConcurrencyConfig() ConcurrencyConfig
 
+	// UnblacklistSupplier removes a supplier from the blacklist.
+	// Called when a health check succeeds for a previously blacklisted supplier.
+	// Returns true if the supplier was blacklisted and has been removed.
+	UnblacklistSupplier(serviceID protocol.ServiceID, supplierAddr string) bool
+
+	// IsSupplierBlacklisted checks if a supplier is currently blacklisted.
+	IsSupplierBlacklisted(serviceID protocol.ServiceID, supplierAddr string) bool
+
+	// IsSessionActive checks if a session is currently active for a service.
+	// Used by health check executor to detect session rollover before attempting health checks.
+	// Returns true if the session is still in the current active sessions list.
+	IsSessionActive(ctx context.Context, serviceID protocol.ServiceID, sessionID string) bool
+
 	// health.Check interface is used to verify protocol instance's health status.
 	health.Check
 }

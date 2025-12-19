@@ -296,6 +296,19 @@ func (q *ObservationQueue) Submit(obs *QueuedObservation) bool {
 	return submitted
 }
 
+// ProcessSync processes an observation SYNCHRONOUSLY (blocking).
+// Use this for health checks which already run in background workers.
+// Unlike TryQueue/Submit, this does NOT use the worker pool - it processes immediately.
+// This avoids wasting queue space on health checks and ensures immediate block height updates.
+func (q *ObservationQueue) ProcessSync(obs *QueuedObservation) {
+	if !q.config.Enabled {
+		return
+	}
+
+	// Process directly without queuing
+	q.processObservation(obs)
+}
+
 // processObservation runs in a worker goroutine to parse the response.
 // This is where all the heavy parsing work happens - completely async.
 func (q *ObservationQueue) processObservation(obs *QueuedObservation) {

@@ -81,7 +81,7 @@ func (s *ServiceState) UpdateFromEndpoints(updatedEndpoints map[protocol.Endpoin
 			"endpoint", endpointAddr,
 			"block height", s.perceivedBlockHeight,
 			"epoch", s.perceivedEpoch,
-		).Info().Msg("Updating latest block height")
+		).Debug().Msg("Updating latest block height")
 	}
 
 	return nil

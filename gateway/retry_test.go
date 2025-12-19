@@ -398,6 +398,18 @@ func (m *mockProtocolForRetry) CheckWebsocketConnection(ctx context.Context, ser
 	return nil
 }
 
+func (m *mockProtocolForRetry) IsSessionActive(ctx context.Context, serviceID protocol.ServiceID, sessionID string) bool {
+	return true
+}
+
+func (m *mockProtocolForRetry) IsSupplierBlacklisted(serviceID protocol.ServiceID, supplierAddr string) bool {
+	return false
+}
+
+func (m *mockProtocolForRetry) UnblacklistSupplier(serviceID protocol.ServiceID, supplierAddr string) bool {
+	return false
+}
+
 func (m *mockProtocolForRetry) GetReputationService() reputation.ReputationService {
 	return nil
 }

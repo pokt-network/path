@@ -10,6 +10,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sdk "github.com/pokt-network/shannon-sdk"
 
+	"github.com/pokt-network/path/metrics"
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/reputation"
@@ -312,6 +313,19 @@ func classifyMalformedPayloadAsSignal(logger polylog.Logger, payloadContent stri
 			reputation.NewMinorErrorSignal("suppliers_unreachable")
 	}
 
+	// Supplier does not belong to session
+	// Category: Session Mismatch - Likely PATH Bug (NO PENALTY)
+	// This error indicates PATH is sending a relay with a session header that doesn't match
+	// what the RelayMiner expects. This is likely a session caching/timing issue on PATH side.
+	// We should NOT penalize the supplier for this - it's not their fault.
+	if strings.Contains(payloadContent, "supplier does not belong to session") {
+		logger.Warn().
+			Str("payload_preview", payloadContent[:min(len(payloadContent), 200)]).
+			Msg("Session mismatch detected - supplier claims not in session. This is likely a PATH-side caching issue.")
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_SESSION_MISMATCH,
+			reputation.NewSuccessSignal(0) // No penalty - not supplier's fault
+	}
+
 	// Response size exceeded
 	// Category: Not Supplier's Fault - Transient (MINOR -3)
 	// Could be legitimate large response
@@ -476,4 +490,66 @@ func extractHTTPStatusCode(err error) (int, bool) {
 	}
 
 	return statusCode, true
+}
+
+// isSupplierValidationError checks if an error is a supplier-specific validation error.
+// These errors (signature, pubkey, unmarshal) are supplier issues that should NOT
+// penalize the domain's reputation. Instead, the supplier should be blacklisted.
+//
+// Returns true for:
+// - Signature validation errors
+// - Public key errors (missing, nil)
+// - Response unmarshal errors
+// - Basic validation errors
+func isSupplierValidationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return errors.Is(err, sdk.ErrRelayResponseValidationUnmarshal) ||
+		errors.Is(err, sdk.ErrRelayResponseValidationBasicValidation) ||
+		errors.Is(err, sdk.ErrRelayResponseValidationGetPubKey) ||
+		errors.Is(err, sdk.ErrRelayResponseValidationNilSupplierPubKey) ||
+		errors.Is(err, sdk.ErrRelayResponseValidationSignatureError)
+}
+
+// getBlacklistReason returns the appropriate blacklist reason constant for an error.
+// Used for metrics tracking to understand why suppliers are being blacklisted.
+func getBlacklistReason(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+
+	switch {
+	case errors.Is(err, sdk.ErrRelayResponseValidationSignatureError):
+		return metrics.BlacklistReasonSignatureError
+	case errors.Is(err, sdk.ErrRelayResponseValidationUnmarshal):
+		return metrics.BlacklistReasonUnmarshalError
+	case errors.Is(err, sdk.ErrRelayResponseValidationGetPubKey):
+		return metrics.BlacklistReasonPubKeyError
+	case errors.Is(err, sdk.ErrRelayResponseValidationNilSupplierPubKey):
+		return metrics.BlacklistReasonNilPubKey
+	case errors.Is(err, sdk.ErrRelayResponseValidationBasicValidation):
+		return metrics.BlacklistReasonValidationError
+	default:
+		return "unknown"
+	}
+}
+
+// isPubkeyRelatedError checks if the error is related to public key issues.
+// These errors may be caused by stale cached pubkey data and can potentially
+// be resolved by invalidating the cache and retrying.
+//
+// Returns true for:
+// - ErrRelayResponseValidationGetPubKey: Failed to fetch public key
+// - ErrRelayResponseValidationNilSupplierPubKey: Supplier has nil public key
+// - ErrRelayResponseValidationSignatureError: Signature doesn't match (may be wrong key)
+func isPubkeyRelatedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return errors.Is(err, sdk.ErrRelayResponseValidationGetPubKey) ||
+		errors.Is(err, sdk.ErrRelayResponseValidationNilSupplierPubKey) ||
+		errors.Is(err, sdk.ErrRelayResponseValidationSignatureError)
 }

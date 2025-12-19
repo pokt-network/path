@@ -54,9 +54,6 @@ type HealthCheckExecutor struct {
 	// MetricsReporter is used to export metrics based on health check observations.
 	metricsReporter RequestResponseReporter
 
-	// DataReporter is used to export data pipeline observations from health checks.
-	dataReporter RequestResponseReporter
-
 	// httpClient is used for external config fetching only (not for health checks).
 	httpClient *http.Client
 
@@ -76,6 +73,7 @@ type HealthCheckExecutor struct {
 	externalConfigs     []ServiceHealthCheckConfig
 	externalConfigError error
 	stopRefresh         chan struct{}
+	stopOnce            sync.Once // Prevents double-close panic on stopRefresh channel
 
 	// Per-service external config caching
 	// Maps service ID to the list of health check configs fetched from that service's external URL
@@ -94,7 +92,6 @@ type HealthCheckExecutorConfig struct {
 	Logger                polylog.Logger
 	Protocol              Protocol
 	MetricsReporter       RequestResponseReporter
-	DataReporter          RequestResponseReporter
 	LeaderElector         *LeaderElector
 	ObservationQueue      *ObservationQueue
 	MaxWorkers            int
@@ -117,7 +114,6 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 		logger:          cfg.Logger,
 		protocol:        cfg.Protocol,
 		metricsReporter: cfg.MetricsReporter,
-		dataReporter:    cfg.DataReporter,
 		pool:            pool,
 		// HTTP client for external config fetching only
 		httpClient: &http.Client{
@@ -314,13 +310,16 @@ func (e *HealthCheckExecutor) InitExternalConfig(ctx context.Context) {
 }
 
 // Stop stops the external config refresh goroutine and worker pool.
+// Safe to call multiple times - uses sync.Once to prevent double-close panic.
 func (e *HealthCheckExecutor) Stop() {
-	if e.stopRefresh != nil {
-		close(e.stopRefresh)
-	}
-	if e.pool != nil {
-		e.pool.StopAndWait()
-	}
+	e.stopOnce.Do(func() {
+		if e.stopRefresh != nil {
+			close(e.stopRefresh)
+		}
+		if e.pool != nil {
+			e.pool.StopAndWait()
+		}
+	})
 }
 
 // refreshExternalConfig fetches and parses the external config from the configured URL.
@@ -783,6 +782,11 @@ type EndpointInfo struct {
 	// WebSocketURL is the URL for WebSocket health checks.
 	// May be empty if the endpoint doesn't support WebSocket.
 	WebSocketURL string
+
+	// SessionID is the session this endpoint belongs to.
+	// Used to detect session rollover - if session is no longer active,
+	// health checks for this endpoint should be skipped.
+	SessionID string
 }
 
 // ExecuteCheckViaProtocol executes a health check through the protocol layer.
@@ -818,13 +822,13 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	// Build the service payload from the health check config
 	servicePayload := e.buildServicePayload(check)
 
-	e.logger.Info().
+	e.logger.Debug().
 		Str("service_id", string(serviceID)).
 		Str("endpoint", string(endpointAddr)).
 		Str("check", check.Name).
 		Str("method", check.Method).
 		Str("path", check.Path).
-		Msg("🔍 Sending health check relay to supplier")
+		Msg("Sending health check relay to supplier")
 
 	// Create the health check QoS context
 	hcQoSCtx := NewHealthCheckQoSContext(HealthCheckQoSContextConfig{
@@ -841,12 +845,14 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	// This prevents death spiral where low-scoring endpoints can never recover
 	protocolCtx, protocolObs, err := e.protocol.BuildHTTPRequestContextForEndpoint(checkCtx, serviceID, endpointAddr, servicePayload.RPCType, nil, false)
 	if err != nil {
-		e.logger.Warn().
+		// Log at DEBUG - this is expected during session rollover when the endpoint
+		// was collected from an old session that has since expired
+		e.logger.Debug().
 			Err(err).
 			Str("service_id", string(serviceID)).
 			Str("endpoint", string(endpointAddr)).
 			Str("check", check.Name).
-			Msg("Failed to build protocol context for health check")
+			Msg("Failed to build protocol context for health check - endpoint may have left session")
 		return time.Since(startTime), fmt.Errorf("failed to build protocol context: %w", err)
 	}
 
@@ -863,13 +869,14 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 
 	// Process the response
 	if relayErr != nil {
-		e.logger.Warn().
+		// Debug level - health check failures are expected and handled by reputation system
+		e.logger.Debug().
 			Err(relayErr).
 			Str("service_id", string(serviceID)).
 			Str("endpoint", string(endpointAddr)).
 			Str("check", check.Name).
 			Dur("latency", latency).
-			Msg("❌ Health check relay request failed")
+			Msg("Health check relay request failed")
 
 		// Record relay metric for failed request
 		metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), "error", metrics.SignalMajorError, metrics.RelayTypeHealthCheck, latency.Seconds())
@@ -881,19 +888,25 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 
 	// Process responses through QoS context
 	var httpStatusCode int
+	var responseBody []byte
 	for _, response := range responses {
 		hcQoSCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
 		httpStatusCode = response.HTTPStatusCode
+		responseBody = response.Bytes
 
-		e.logger.Info().
+		e.logger.Debug().
 			Str("service_id", string(serviceID)).
 			Str("endpoint", string(endpointAddr)).
 			Str("check", check.Name).
 			Int("status_code", response.HTTPStatusCode).
 			Int("response_size", len(response.Bytes)).
 			Dur("latency", latency).
-			Msg("✅ Health check relay response received from supplier")
+			Msg("Health check relay response received from supplier")
 	}
+
+	// Process observation SYNCHRONOUSLY for block height extraction
+	// Health checks run in background, so no need for async queue - process immediately
+	e.processObservationSync(serviceID, endpointAddr, check, servicePayload, startTime, latency, httpStatusCode, responseBody)
 
 	// Publish observations for metrics (without calling ApplyObservations on QoS)
 	e.publishHealthCheckObservations(serviceID, endpointAddr, startTime, protocolCtx, &protocolObs)
@@ -901,13 +914,14 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	// Check if the health check QoS context reports success
 	if !hcQoSCtx.IsSuccess() {
 		checkErr := fmt.Errorf("health check validation failed: %s", hcQoSCtx.GetError())
-		e.logger.Warn().
+		// Debug level - health check failures are expected and handled by reputation system
+		e.logger.Debug().
 			Str("service_id", string(serviceID)).
 			Str("endpoint", string(endpointAddr)).
 			Str("check", check.Name).
 			Str("error", hcQoSCtx.GetError()).
 			Dur("latency", latency).
-			Msg("⚠️ Health check response validation failed")
+			Msg("Health check response validation failed")
 
 		// Record relay metric for validation failure (relay succeeded but validation failed)
 		statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
@@ -920,12 +934,26 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
 	metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, metrics.SignalOK, metrics.RelayTypeHealthCheck, latency.Seconds())
 
-	e.logger.Info().
+	// Try to unblacklist the supplier if it was previously blacklisted
+	// Extract supplier address from endpoint address (format: "supplierAddr-url")
+	supplierAddr := string(endpointAddr)
+	if dashIndex := strings.Index(supplierAddr, "-"); dashIndex > 0 {
+		supplierAddr = supplierAddr[:dashIndex]
+	}
+	if e.protocol.UnblacklistSupplier(serviceID, supplierAddr) {
+		e.logger.Info().
+			Str("service_id", string(serviceID)).
+			Str("supplier", supplierAddr).
+			Str("domain", domain).
+			Msg("Supplier unblacklisted after successful health check")
+	}
+
+	e.logger.Debug().
 		Str("service_id", string(serviceID)).
 		Str("endpoint", string(endpointAddr)).
 		Str("check", check.Name).
 		Dur("latency", latency).
-		Msg("✅ Health check passed via protocol relay")
+		Msg("Health check passed via protocol relay")
 
 	return latency, nil
 }
@@ -975,9 +1003,52 @@ func (e *HealthCheckExecutor) publishHealthCheckObservations(
 	if e.metricsReporter != nil {
 		e.metricsReporter.Publish(reqRespObs)
 	}
-	if e.dataReporter != nil {
-		e.dataReporter.Publish(reqRespObs)
+}
+
+// processObservationSync processes a health check response SYNCHRONOUSLY for block height extraction.
+// Unlike user requests that use the async observation queue, health checks already run in background
+// workers, so there's no need to add another async hop. Process immediately for faster updates.
+func (e *HealthCheckExecutor) processObservationSync(
+	serviceID protocol.ServiceID,
+	endpointAddr protocol.EndpointAddr,
+	check HealthCheckConfig,
+	payload protocol.Payload,
+	startTime time.Time,
+	latency time.Duration,
+	httpStatusCode int,
+	responseBody []byte,
+) {
+	// Skip if observation queue is not configured (we use it for access to registry + handler)
+	if e.observationQueue == nil {
+		return
 	}
+
+	// Skip if the queue is not enabled
+	if !e.observationQueue.IsEnabled() {
+		return
+	}
+
+	obs := &QueuedObservation{
+		ServiceID:          serviceID,
+		EndpointAddr:       endpointAddr,
+		Source:             SourceHealthCheck,
+		Timestamp:          startTime,
+		Latency:            latency,
+		RequestPath:        payload.Path,
+		RequestHTTPMethod:  payload.Method,
+		RequestBody:        []byte(payload.Data),
+		ResponseStatusCode: httpStatusCode,
+		ResponseBody:       responseBody,
+	}
+
+	// Process SYNCHRONOUSLY - health checks are already in background workers
+	e.observationQueue.ProcessSync(obs)
+
+	e.logger.Debug().
+		Str("service_id", string(serviceID)).
+		Str("endpoint", string(endpointAddr)).
+		Str("check", check.Name).
+		Msg("Health check observation processed synchronously for block height extraction")
 }
 
 // buildServicePayload creates a protocol.Payload from the health check configuration.
@@ -1082,9 +1153,6 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 		if e.metricsReporter != nil {
 			e.metricsReporter.Publish(reqRespObs)
 		}
-		if e.dataReporter != nil {
-			e.dataReporter.Publish(reqRespObs)
-		}
 
 		e.logger.Debug().
 			Str("service_id", string(serviceID)).
@@ -1158,7 +1226,7 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 // Health checks are executed in parallel using a pond worker pool.
 func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 	ctx context.Context,
-	getEndpointAddrs func(protocol.ServiceID) ([]protocol.EndpointAddr, error),
+	getEndpointInfos func(protocol.ServiceID) ([]EndpointInfo, error),
 ) error {
 	if !e.ShouldRunChecks() {
 		return nil
@@ -1190,7 +1258,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			continue
 		}
 
-		endpoints, err := getEndpointAddrs(svcConfig.ServiceID)
+		endpointInfos, err := getEndpointInfos(svcConfig.ServiceID)
 		if err != nil {
 			e.logger.Warn().
 				Err(err).
@@ -1199,7 +1267,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			continue
 		}
 
-		if len(endpoints) == 0 {
+		if len(endpointInfos) == 0 {
 			e.logger.Debug().
 				Str("service_id", string(svcConfig.ServiceID)).
 				Msg("No endpoints available for health checks")
@@ -1207,16 +1275,26 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 		}
 
 		// Submit a job for each endpoint
-		for _, endpointAddr := range endpoints {
+		for _, endpointInfo := range endpointInfos {
 			// Capture loop variables for closure
 			serviceID := svcConfig.ServiceID
-			endpoint := endpointAddr
+			endpoint := endpointInfo.Addr
+			sessionID := endpointInfo.SessionID
 
 			group.Submit(func() {
 				select {
 				case <-ctx.Done():
 					return
 				default:
+					// Check if session is still active before executing health check
+					// This prevents errors when session has rolled over between collection and execution
+					if sessionID != "" && e.protocol != nil {
+						if !e.protocol.IsSessionActive(ctx, serviceID, sessionID) {
+							// Session no longer active - skip silently
+							// This is expected during session rollover
+							return
+						}
+					}
 					e.RunChecksForEndpointViaProtocol(ctx, serviceID, endpoint)
 				}
 			})

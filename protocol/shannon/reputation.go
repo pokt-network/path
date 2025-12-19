@@ -204,7 +204,7 @@ func (p *Protocol) filterToHighestTier(
 
 	// If probation routing is active, and we have probation endpoints, route to them
 	if shouldRouteToProbation && probationCount > 0 {
-		logger.Info().
+		logger.Debug().
 			Int("probation_count", probationCount).
 			Float64("traffic_percent", selector.Config().Probation.TrafficPercent).
 			Msg("Routing request to probation endpoints for recovery")
@@ -229,7 +229,7 @@ func (p *Protocol) filterToHighestTier(
 	tier1Count, tier2Count, tier3Count := len(tier1), len(tier2), len(tier3)
 
 	// Log detailed tier distribution for observability
-	logger.Info().
+	logger.Debug().
 		Int("tier1_count", tier1Count).
 		Int("tier2_count", tier2Count).
 		Int("tier3_count", tier3Count).
@@ -273,7 +273,7 @@ func (p *Protocol) filterToHighestTier(
 		}
 	}
 
-	logger.Info().
+	logger.Debug().
 		Int("selected_tier", selectedTier).
 		Int("endpoints_in_selected_tier", len(result)).
 		Int("tier1_available", tier1Count).

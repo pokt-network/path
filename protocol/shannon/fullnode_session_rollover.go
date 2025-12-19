@@ -62,7 +62,7 @@ func newSessionRolloverState(ctx context.Context, logger polylog.Logger, blockCl
 
 	go srs.blockHeightMonitorLoop()
 
-	srs.logger.Info().
+	srs.logger.Debug().
 		Dur("check_interval", blockCheckInterval).
 		Int64("session_rollover_blocks", sessionRolloverBlocks).
 		Msg("Starting session rollover monitoring")
@@ -82,7 +82,7 @@ func (srs *sessionRolloverState) getSessionRolloverState() bool {
 // It uses WebSocket subscription for instant updates, with automatic fallback to polling.
 // The loop exits when the context is canceled, enabling graceful shutdown.
 func (srs *sessionRolloverState) blockHeightMonitorLoop() {
-	srs.logger.Info().
+	srs.logger.Debug().
 		Bool("block_client_available", srs.blockClient != nil).
 		Str("rpc_url", srs.rpcURL).
 		Msg("Block height monitor loop starting with WebSocket support")
@@ -94,7 +94,7 @@ func (srs *sessionRolloverState) blockHeightMonitorLoop() {
 	for {
 		select {
 		case <-srs.ctx.Done():
-			srs.logger.Info().Msg("Block height monitor loop shutting down")
+			srs.logger.Debug().Msg("Block height monitor loop shutting down")
 			return
 
 		case height := <-monitor.heightChan:
