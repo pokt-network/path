@@ -9,16 +9,19 @@ go 1.24.3
 // replace github.com/athanorlabs/go-dleq => /Users/olshansky/workspace/pocket/go-dleq
 
 require (
+	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/alitto/pond/v2 v2.6.0
 	github.com/cheggaaa/pb/v3 v3.1.7
+	github.com/cometbft/cometbft v0.38.17
 	github.com/cosmos/cosmos-sdk v0.53.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/ory/dockertest/v3 v3.11.0
 	github.com/pokt-network/poktroll v0.1.30-0.20250926212324-1588b0a53acb
-	github.com/pokt-network/shannon-sdk v0.0.0-20250926214315-b721a0025673
+	github.com/pokt-network/shannon-sdk v0.0.0-20251219193856-1fca8457fb61
 	github.com/prometheus/client_golang v1.22.0
 	github.com/redis/go-redis/v9 v9.17.2
+	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.40.0
 	github.com/tsenart/vegeta v12.7.0+incompatible
@@ -66,7 +69,6 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 // indirect
 	github.com/VividCortex/ewma v1.2.0 // indirect
-	github.com/alicebob/miniredis/v2 v2.35.0 // indirect
 	github.com/aws/aws-sdk-go v1.44.224 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bgentry/go-netrc v0.0.0-20140422174119-9fd32a8b3d3d // indirect
@@ -87,7 +89,6 @@ require (
 	github.com/cockroachdb/pebble v1.1.5 // indirect
 	github.com/cockroachdb/redact v1.1.6 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
-	github.com/cometbft/cometbft v0.38.17 // indirect
 	github.com/cometbft/cometbft-db v0.14.1 // indirect
 	github.com/containerd/continuity v0.4.3 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
@@ -218,7 +219,7 @@ require (
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/pokt-network/go-dleq v0.0.0-20250925202155-488f42ad642a // indirect
-	github.com/pokt-network/ring-go v0.1.1-0.20250925213458-782cc69bc1ec // indirect
+	github.com/pokt-network/ring-go v0.1.1-0.20251219190013-b576b71e4648 // indirect
 	github.com/pokt-network/smt v0.14.1 // indirect
 	github.com/pokt-network/smt/kvstore/pebble v0.0.0-20240822175047-21ea8639c188 // indirect
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
@@ -229,7 +230,6 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/rs/cors v1.11.1 // indirect
-	github.com/rs/zerolog v1.34.0 // indirect
 	github.com/sagikazarmark/locafero v0.7.0 // indirect
 	github.com/sasha-s/go-deadlock v0.3.5 // indirect
 	github.com/shirou/gopsutil/v4 v4.25.6 // indirect

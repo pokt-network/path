@@ -680,11 +680,11 @@ func (rc *requestContext) validateAndProcessResponse(
 			supplierAddrStr := string(supplierAddr)
 			blacklistReason := getBlacklistReason(err)
 
-			// For signature/pubkey errors, invalidate the account cache and retry once.
-			// This handles cases where the cached pubkey is stale (e.g., account was queried
-			// before the supplier signed their first transaction).
+			// For signature/pubkey errors, check if we should retry.
+			// Nil pubkey errors are rate-limited to avoid hammering the fullnode.
 			if isPubkeyRelatedError(err) {
-				if retryResponse := rc.retryValidationWithCacheInvalidation(supplierAddrStr, httpRelayResponseBz); retryResponse != nil {
+				isNilPubkey := errors.Is(err, sdk.ErrRelayResponseValidationNilSupplierPubKey)
+				if retryResponse := rc.retryValidationWithCacheInvalidation(supplierAddrStr, httpRelayResponseBz, isNilPubkey); retryResponse != nil {
 					// Retry succeeded - return the valid response
 					rc.logger.Info().
 						Str("supplier", supplierAddrStr).
@@ -733,10 +733,14 @@ func (rc *requestContext) validateAndProcessResponse(
 // retryValidationWithCacheInvalidation invalidates the account cache for the supplier
 // and retries signature verification. This handles cases where the cached pubkey is stale.
 //
-// Returns the valid response if retry succeeds, nil if it fails.
+// For nil pubkey errors, retries are rate-limited to avoid hammering the fullnode.
+// Public keys never change once set, so there's no need to re-query for valid pubkeys.
+//
+// Returns the valid response if retry succeeds, nil if it fails or retry is skipped.
 func (rc *requestContext) retryValidationWithCacheInvalidation(
 	supplierAddr string,
 	httpRelayResponseBz []byte,
+	isNilPubkey bool,
 ) *servicetypes.RelayResponse {
 	// Get the caching account fetcher to invalidate the cache
 	accountClient := rc.fullNode.GetAccountClient()
@@ -750,11 +754,23 @@ func (rc *requestContext) retryValidationWithCacheInvalidation(
 		return nil
 	}
 
+	// For nil pubkey errors, check if we should retry (rate limiting)
+	// Nil pubkey suppliers are only retried every 15 minutes to avoid burning fullnode queries
+	if isNilPubkey {
+		if !cachingFetcher.ShouldRetryNilPubkey(supplierAddr) {
+			rc.logger.Debug().
+				Str("supplier", supplierAddr).
+				Msg("Skipping nil pubkey retry - interval not yet passed")
+			return nil
+		}
+	}
+
 	// Invalidate the cache for this supplier
 	cachingFetcher.InvalidateCache(supplierAddr)
 
 	rc.logger.Info().
 		Str("supplier", supplierAddr).
+		Bool("is_nil_pubkey", isNilPubkey).
 		Msg("Invalidated account cache, retrying signature verification")
 
 	// Retry validation
@@ -764,11 +780,25 @@ func (rc *requestContext) retryValidationWithCacheInvalidation(
 	)
 
 	if retryErr != nil {
+		// If this was a nil pubkey error and retry still failed, track it for rate limiting
+		if isNilPubkey && errors.Is(retryErr, sdk.ErrRelayResponseValidationNilSupplierPubKey) {
+			cachingFetcher.TrackNilPubkey(supplierAddr)
+		}
+
 		rc.logger.Warn().
 			Err(retryErr).
 			Str("supplier", supplierAddr).
+			Bool("is_nil_pubkey", isNilPubkey).
 			Msg("Signature verification failed after cache invalidation")
 		return nil
+	}
+
+	// If retry succeeded for a nil pubkey supplier, log the recovery
+	if isNilPubkey {
+		rc.logger.Info().
+			Str("supplier", supplierAddr).
+			Msg("Nil pubkey supplier recovered - pubkey now available")
+		metrics.RecordSupplierPubkeyRecovered(supplierAddr)
 	}
 
 	return retryResponse

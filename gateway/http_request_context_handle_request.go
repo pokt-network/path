@@ -283,7 +283,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 			// Record batch size metric
 			totalLatency := time.Since(retryLoopStartTime).Seconds()
-			metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), strconv.Itoa(batchCount), totalLatency)
+			metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), batchCount, totalLatency)
 
 			return nil
 		}
@@ -347,7 +347,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	totalLatency := time.Since(retryLoopStartTime).Seconds()
 
 	// Record batch size metric (even on failure)
-	metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), strconv.Itoa(batchCount), totalLatency)
+	metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), batchCount, totalLatency)
 
 	// Record retry result metric (failure) if retries were actually attempted
 	if maxAttempts > 1 {
@@ -398,7 +398,7 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 	// Record batch size metric on completion (deferred)
 	defer func() {
 		totalLatency := time.Since(parallelMetrics.overallStartTime).Seconds()
-		metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), strconv.Itoa(batchCount), totalLatency)
+		metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), batchCount, totalLatency)
 	}()
 
 	// TODO_TECHDEBT: Make sure timed out parallel requests are also sanctioned.

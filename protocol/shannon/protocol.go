@@ -146,6 +146,17 @@ type Protocol struct {
 	// loggedMisconfigErrors tracks which misconfiguration errors have been logged
 	// to avoid spamming logs with the same error on every request.
 	loggedMisconfigErrors sync.Map
+
+	// relaySigner is the pre-initialized signer for signing relay requests.
+	// Created once during Protocol initialization and reused across all requests.
+	// Uses SignerContext caching internally for optimal ring signature performance.
+	relaySigner *signer
+
+	// sessionEndpointsCache caches endpoint maps by session ID.
+	// Session endpoints don't change within a session's lifetime, so caching avoids
+	// redundant AllEndpoints() calls and endpoint map construction on every request.
+	// Key: sessionId (string), Value: map[protocol.EndpointAddr]endpoint
+	sessionEndpointsCache sync.Map
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -258,6 +269,14 @@ func NewProtocol(
 		// supplierBlacklist tracks suppliers with validation/signature errors
 		supplierBlacklist: newSupplierBlacklist(),
 	}
+
+	// Initialize the relay signer with SignerContext caching for optimal ring signature performance.
+	// The signer is created once and reused across all requests.
+	relaySigner, err := newSigner(*fullNode.GetAccountClient(), config.GatewayPrivateKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create relay signer: %w", err)
+	}
+	protocolInstance.relaySigner = relaySigner
 
 	// Initialize reputation service if enabled.
 	// Reputation is the primary endpoint quality system - it tracks endpoint scores
@@ -763,7 +782,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		reputationService:     p.reputationService,
 		tieredSelector:        tieredSelector,
 		supplierBlacklist:     p.supplierBlacklist,
-		currentRPCType:        rpcType, // Use detected RPC type from request
+		currentRPCType:        actualRPCType, // Use actual RPC type after fallback (may differ from requested)
 	}, protocolobservations.Observations{}, nil
 }
 
@@ -937,9 +956,9 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		logger = hydrateLoggerWithSession(logger, &session)
 		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msgf("Finding unique endpoints for session %s for app %s for service %s.", session.SessionId, app.Address, serviceID)
 
-		// Retrieve all endpoints for the session.
-		// Pass empty string to endpointsFromSession since we'll filter after RPC type filtering
-		sessionEndpoints, err := endpointsFromSession(session, "")
+		// Retrieve all endpoints for the session (cached).
+		// Filtering happens after endpoint retrieval.
+		sessionEndpoints, err := p.getOrCreateSessionEndpoints(session)
 		if err != nil {
 			logger.Error().Err(err).Msgf("Internal error: error getting all endpoints for service %s app %s and session: skipping the app.", serviceID, app.Address)
 			continue
@@ -1378,7 +1397,7 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 				continue
 			}
 
-			sessionEndpoints, err := endpointsFromSession(session, "")
+			sessionEndpoints, err := p.getOrCreateSessionEndpoints(session)
 			if err != nil {
 				logger.Warn().
 					Err(err).

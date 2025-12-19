@@ -80,6 +80,16 @@ func (pmr *PrometheusMetricsReporter) processEndpointObservation(serviceID strin
 	domain, err := shannonmetrics.ExtractDomainOrHost(endpointURL)
 	if err != nil {
 		domain = shannonmetrics.ErrDomain
+		// Log context for debugging empty/invalid URLs
+		pmr.Logger.Warn().
+			Str("service_id", serviceID).
+			Str("supplier", endpointObs.GetSupplier()).
+			Str("endpoint_url", endpointURL).
+			Str("session_id", endpointObs.GetSessionId()).
+			Int64("session_start_height", endpointObs.GetSessionStartHeight()).
+			Str("error_type", endpointObs.GetErrorType().String()).
+			Err(err).
+			Msg("Failed to extract domain from endpoint URL")
 	}
 
 	// Calculate latency from timestamps
@@ -121,9 +131,10 @@ func (pmr *PrometheusMetricsReporter) processEndpointObservation(serviceID strin
 	RecordObservation(domain, rpcType, serviceID, networkType, method, reputationSignal)
 
 	// Metric 9: Request/Response sizes
+	requestSize := pmr.getRequestPayloadSize(qosObs)
 	responseSize := endpointObs.GetEndpointBackendServiceHttpResponsePayloadSize()
-	if responseSize > 0 {
-		RecordRequestSize(rpcType, serviceID, 0, responseSize)
+	if requestSize > 0 || responseSize > 0 {
+		RecordRequestSize(rpcType, serviceID, int64(requestSize), responseSize)
 	}
 
 	// Check if this was a retry (attemptIndex > 0 means retry)
@@ -339,16 +350,48 @@ func (pmr *PrometheusMetricsReporter) publishEVMMetrics(serviceID string, evmObs
 	// Check if there are multiple request observations (batch request)
 	requestCount := len(evmObs.GetRequestObservations())
 	if requestCount > 1 {
-		RecordBatchSize("jsonrpc", serviceID, strconv.Itoa(requestCount), 0)
+		RecordBatchSize("jsonrpc", serviceID, requestCount, 0)
 	}
 }
 
 // publishCosmosMetrics records Cosmos-specific metrics
 func (pmr *PrometheusMetricsReporter) publishCosmosMetrics(serviceID string, cosmosObs *qosobs.CosmosRequestObservations) {
-	// Cosmos observations processing - add batch tracking if applicable
+	// Metric 8: Batch size (if batch request)
+	// Check if there are multiple request profiles (batch request)
+	requestCount := len(cosmosObs.GetRequestProfiles())
+	if requestCount > 1 {
+		RecordBatchSize("cosmos", serviceID, requestCount, 0)
+	}
 }
 
 // publishSolanaMetrics records Solana-specific metrics
 func (pmr *PrometheusMetricsReporter) publishSolanaMetrics(serviceID string, solanaObs *qosobs.SolanaRequestObservations) {
-	// Solana observations processing - add batch tracking if applicable
+	// Note: Solana observations currently only track single requests (JsonrpcRequest is not a slice).
+	// Batch tracking would need to be added to the Solana QoS observation model first.
+	// TODO_TECHDEBT: Add batch request tracking for Solana if/when the observation model supports it.
+}
+
+// getRequestPayloadSize extracts the request payload size from QoS observations
+func (pmr *PrometheusMetricsReporter) getRequestPayloadSize(qosObs *qosobs.Observations) uint32 {
+	if qosObs == nil {
+		return 0
+	}
+
+	// Try EVM observations
+	if evmObs := qosObs.GetEvm(); evmObs != nil {
+		return evmObs.GetRequestPayloadLength()
+	}
+
+	// Try Cosmos observations
+	if cosmosObs := qosObs.GetCosmos(); cosmosObs != nil {
+		interpreter := &qosobs.CosmosSDKObservationInterpreter{Observations: cosmosObs}
+		return interpreter.GetTotalRequestPayloadLength()
+	}
+
+	// Try Solana observations
+	if solanaObs := qosObs.GetSolana(); solanaObs != nil {
+		return solanaObs.GetRequestPayloadLength()
+	}
+
+	return 0
 }

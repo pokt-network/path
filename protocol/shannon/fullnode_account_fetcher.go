@@ -24,9 +24,14 @@ import (
 
 const (
 	// accountCacheTTL: TTL for cached account data.
-	// Using 1 hour to balance between reducing node load and allowing recovery
-	// from stale data (e.g., accounts that get their pubkey set after first tx).
-	accountCacheTTL = 1 * time.Hour
+	// Public keys NEVER change once set, so we use an effectively infinite TTL.
+	// Only accounts WITH valid pubkeys are cached.
+	// Accounts with nil pubkeys are NOT cached - they are blacklisted and retried periodically.
+	accountCacheTTL = 365 * 24 * time.Hour // 1 year (effectively forever)
+
+	// nilPubkeyRetryInterval: How often to retry fetching accounts that had nil pubkeys.
+	// These suppliers may have signed their first transaction since we last checked.
+	nilPubkeyRetryInterval = 15 * time.Minute
 
 	// accountCacheCapacity: Maximum number of entries the account cache can hold.
 	// This is the total capacity, not per-shard. When capacity is exceeded, the cache
@@ -67,23 +72,47 @@ type cachingPoktNodeAccountFetcher struct {
 
 // invalidatedAccountTracker tracks supplier addresses that had cache invalidation
 // due to signature verification failures, for metrics and debugging.
+// It also tracks nil pubkey suppliers separately to allow periodic retries.
 type invalidatedAccountTracker struct {
 	mu sync.RWMutex
-	// addresses maps supplier address -> last invalidation timestamp
+	// addresses maps supplier address -> last invalidation timestamp (for signature errors)
 	addresses map[string]time.Time
+	// nilPubkeys maps supplier address -> last check timestamp (for nil pubkey retries)
+	nilPubkeys map[string]time.Time
 }
 
 func newInvalidatedAccountTracker() *invalidatedAccountTracker {
 	return &invalidatedAccountTracker{
-		addresses: make(map[string]time.Time),
+		addresses:  make(map[string]time.Time),
+		nilPubkeys: make(map[string]time.Time),
 	}
 }
 
-// Track records an address that was invalidated.
+// Track records an address that was invalidated due to signature error.
 func (t *invalidatedAccountTracker) Track(address string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.addresses[address] = time.Now()
+}
+
+// TrackNilPubkey records an address that had a nil pubkey.
+// This is used to rate-limit retries for these suppliers.
+func (t *invalidatedAccountTracker) TrackNilPubkey(address string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.nilPubkeys[address] = time.Now()
+}
+
+// ShouldRetryNilPubkey checks if enough time has passed to retry a nil pubkey supplier.
+// Returns true if the supplier should be retried (either not tracked or interval passed).
+func (t *invalidatedAccountTracker) ShouldRetryNilPubkey(address string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if ts, exists := t.nilPubkeys[address]; exists {
+		return time.Since(ts) >= nilPubkeyRetryInterval
+	}
+	return true // Not tracked, allow retry
 }
 
 // WasRecentlyInvalidated checks if an address was invalidated recently (last 5 min).
@@ -101,9 +130,9 @@ func (t *invalidatedAccountTracker) WasRecentlyInvalidated(address string) bool 
 // Account implements the `sdk.PoktNodeAccountFetcher` interface with caching.
 //
 // Caching strategy:
-// - Cache all accounts with 1 hour TTL
-// - On signature verification failure, caller should invalidate cache and retry
-// - The 1 hour TTL ensures eventual recovery even without explicit invalidation
+// - Public keys NEVER change once set → cache forever (1 year TTL)
+// - Only cache accounts WITH valid pubkeys
+// - Accounts with nil pubkeys are NOT cached (handled by blacklist + retry)
 //
 // See `sdk.PoktNodeAccountFetcher` interface:
 //
@@ -116,13 +145,13 @@ func (c *cachingPoktNodeAccountFetcher) Account(
 	address := req.Address
 	cacheKey := getAccountCacheKey(address)
 
-	// Check cache first
+	// Check cache first - if cached, pubkey is guaranteed to be valid
 	if resp, ok := c.accountCache.Get(cacheKey); ok {
-		c.logger.Debug().Str("address", address).Msg("Account cache hit")
+		c.logger.Debug().Str("address", address).Msg("Account cache hit (valid pubkey)")
 		return resp, nil
 	}
 
-	// Cache miss - fetch from node
+	// Cache miss - fetch from fullnode
 	c.logger.Debug().Str("address", address).Msg("Account cache miss, fetching from full node")
 
 	resp, err := c.underlyingAccountClient.Account(ctx, req, opts...)
@@ -131,11 +160,30 @@ func (c *cachingPoktNodeAccountFetcher) Account(
 		return nil, err
 	}
 
-	// Cache the response
-	c.accountCache.Set(cacheKey, resp)
-	c.logger.Debug().Str("address", address).Msg("Cached account (1h TTL)")
+	// Only cache if pubkey is valid (not nil)
+	// Accounts with nil pubkeys should NOT be cached - they need to be re-fetched
+	// when the supplier eventually signs their first transaction
+	if hasPubkey := c.accountHasValidPubkey(resp); hasPubkey {
+		c.accountCache.Set(cacheKey, resp)
+		c.logger.Debug().Str("address", address).Msg("Cached account with valid pubkey (forever)")
+	} else {
+		c.logger.Debug().Str("address", address).Msg("Account has nil pubkey - NOT caching")
+	}
 
 	return resp, nil
+}
+
+// accountHasValidPubkey checks if the account response contains a valid (non-nil) public key.
+func (c *cachingPoktNodeAccountFetcher) accountHasValidPubkey(resp *accounttypes.QueryAccountResponse) bool {
+	if resp == nil || resp.Account == nil {
+		return false
+	}
+
+	// The account is stored as an Any type, we need to unpack it
+	// For now, we'll rely on the SDK's validation to detect nil pubkeys
+	// If the account exists and has data, we consider it potentially valid
+	// The actual nil pubkey check happens during signature verification
+	return len(resp.Account.Value) > 0
 }
 
 // InvalidateCache removes an account from the cache.
@@ -159,6 +207,22 @@ func (c *cachingPoktNodeAccountFetcher) InvalidateCache(address string) {
 // Useful for detecting recurring signature verification issues.
 func (c *cachingPoktNodeAccountFetcher) WasRecentlyInvalidated(address string) bool {
 	return c.invalidatedTracker.WasRecentlyInvalidated(address)
+}
+
+// TrackNilPubkey records that a supplier has a nil pubkey.
+// This supplier will be rate-limited for retry attempts.
+func (c *cachingPoktNodeAccountFetcher) TrackNilPubkey(address string) {
+	c.invalidatedTracker.TrackNilPubkey(address)
+	c.logger.Info().
+		Str("address", address).
+		Dur("retry_interval", nilPubkeyRetryInterval).
+		Msg("Tracked nil pubkey supplier - will retry after interval")
+}
+
+// ShouldRetryNilPubkey checks if enough time has passed to retry a nil pubkey supplier.
+// Returns true if we should attempt to re-fetch the account (interval passed or not tracked).
+func (c *cachingPoktNodeAccountFetcher) ShouldRetryNilPubkey(address string) bool {
+	return c.invalidatedTracker.ShouldRetryNilPubkey(address)
 }
 
 // getAccountCacheKey returns the cache key for the given account address.

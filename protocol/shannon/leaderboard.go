@@ -96,7 +96,8 @@ func (p *Protocol) GetEndpointLeaderboardData(ctx context.Context) ([]metrics.En
 
 		for _, rpcType := range rpcTypesToQuery {
 			// Get endpoints for this RPC type, bypassing reputation filtering
-			endpoints, _, uniqueEndpointsErr := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil)
+			// actualRPCType may differ from rpcType if fallback occurred
+			endpoints, actualRPCType, uniqueEndpointsErr := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil)
 			if uniqueEndpointsErr != nil {
 				// No endpoints for this RPC type is normal - suppliers may not support all types
 				continue
@@ -104,7 +105,8 @@ func (p *Protocol) GetEndpointLeaderboardData(ctx context.Context) ([]metrics.En
 
 			// Process each endpoint
 			for endpointAddr, ep := range endpoints {
-				endpointURL := ep.GetURL(rpcType)
+				// Use actualRPCType (after fallback) to get the correct URL
+				endpointURL := ep.GetURL(actualRPCType)
 				domain, domainErr := shannonmetrics.ExtractDomainOrHost(endpointURL)
 				if domainErr != nil {
 					domain = shannonmetrics.ErrDomain
@@ -116,13 +118,13 @@ func (p *Protocol) GetEndpointLeaderboardData(ctx context.Context) ([]metrics.En
 					sessionStartHeight = session.Header.SessionStartBlockHeight
 				}
 
-				// Get tier threshold for this endpoint
-				tierThreshold := p.getTierThresholdForEndpoint(ctx, serviceID, endpointAddr, rpcType)
+				// Get tier threshold for this endpoint (use actualRPCType for correct key)
+				tierThreshold := p.getTierThresholdForEndpoint(ctx, serviceID, endpointAddr, actualRPCType)
 
-				// Create a grouping key
+				// Create a grouping key (use actualRPCType to reflect what's actually being used)
 				key := groupKey{
 					Domain:             domain,
-					RPCType:            metrics.NormalizeRPCType(rpcType.String()),
+					RPCType:            metrics.NormalizeRPCType(actualRPCType.String()),
 					ServiceID:          string(serviceID),
 					TierThreshold:      tierThreshold,
 					SessionStartHeight: sessionStartHeight,
@@ -250,33 +252,35 @@ func (p *Protocol) GetMeanScoreData(ctx context.Context) ([]metrics.MeanScoreEnt
 
 		for _, rpcType := range rpcTypesToQuery {
 			// Get endpoints for this RPC type, bypassing reputation filtering
-			endpoints, _, uniqueEndpointsErr := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil)
+			// actualRPCType may differ from rpcType if fallback occurred
+			endpoints, actualRPCType, uniqueEndpointsErr := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil)
 			if uniqueEndpointsErr != nil {
 				continue
 			}
 
 			// Process each endpoint
 			for endpointAddr, ep := range endpoints {
-				endpointURL := ep.GetURL(rpcType)
+				// Use actualRPCType (after fallback) to get the correct URL
+				endpointURL := ep.GetURL(actualRPCType)
 				domain, domainErr := shannonmetrics.ExtractDomainOrHost(endpointURL)
 				if domainErr != nil {
 					domain = shannonmetrics.ErrDomain
 				}
 
-				// Get the endpoint's score
+				// Get the endpoint's score (use actualRPCType for correct key)
 				keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
-				key := keyBuilder.BuildKey(serviceID, endpointAddr, rpcType)
+				key := keyBuilder.BuildKey(serviceID, endpointAddr, actualRPCType)
 				score, scoreErr := p.reputationService.GetScore(ctx, key)
 				if scoreErr != nil {
 					// Use initial score for endpoints without scores
 					score = reputation.Score{Value: p.reputationService.GetInitialScoreForService(serviceID)}
 				}
 
-				// Create aggregation key
+				// Create aggregation key (use actualRPCType to reflect what's actually being used)
 				aggKey := scoreKey{
 					Domain:    domain,
 					ServiceID: string(serviceID),
-					RPCType:   metrics.NormalizeRPCType(rpcType.String()),
+					RPCType:   metrics.NormalizeRPCType(actualRPCType.String()),
 				}
 
 				// Initialize aggregator if not exists

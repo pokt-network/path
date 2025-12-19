@@ -109,6 +109,12 @@ func setupRedisContainer(t *testing.T, pool *dockertest.Pool, networkID string) 
 
 	fmt.Println("🔴 Starting Redis container for e2e tests...")
 
+	// Clean up any existing container with the same name from previous interrupted runs
+	if err := pool.RemoveContainerByName(redisContainerName); err != nil {
+		// Log but don't fail - container may not exist
+		fmt.Printf("  ⚠️  Could not remove existing Redis container (may not exist): %v\n", err)
+	}
+
 	// Run Redis container
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Name:       redisContainerName,
@@ -290,6 +296,12 @@ func setupPathDocker(
 	}
 
 	fmt.Println("\n🌿 Starting PATH test container ...")
+
+	// Clean up any existing container with the same name from previous interrupted runs
+	if err := pool.RemoveContainerByName(containerName); err != nil {
+		// Log but don't fail - container may not exist
+		fmt.Printf("  ⚠️  Could not remove existing PATH container (may not exist): %v\n", err)
+	}
 
 	// Run the built image - connect to network for Redis communication
 	runOpts := &dockertest.RunOptions{

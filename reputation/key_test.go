@@ -193,7 +193,7 @@ func TestKeyBuilder_MalformedEndpointAddr_PerDomain(t *testing.T) {
 		{
 			name:         "malformed URL",
 			endpointAddr: "pokt1abc-not-a-url",
-			expectedKey:  "eth:pokt1abc-not-a-url:json_rpc", // Falls back to full addr
+			expectedKey:  "eth:not-a-url:json_rpc", // Extracts "not-a-url" as single-label domain
 		},
 	}
 

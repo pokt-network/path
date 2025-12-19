@@ -5,6 +5,7 @@ package metrics
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -232,6 +233,26 @@ var BatchSizeLatency = promauto.NewHistogramVec(
 		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
 	},
 	[]string{LabelRPCType, LabelServiceID, LabelBatchCount},
+)
+
+// BatchRequestsTotal counts the number of batch requests per service.
+// Used with BatchItemsTotal to calculate average batch size: items/requests
+var BatchRequestsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "batch_requests_total",
+		Help: "Total number of batch requests by service.",
+	},
+	[]string{LabelServiceID},
+)
+
+// BatchItemsTotal counts the total items across all batch requests per service.
+// Used with BatchRequestsTotal to calculate average batch size: items/requests
+var BatchItemsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "batch_items_total",
+		Help: "Total items across all batch requests by service.",
+	},
+	[]string{LabelServiceID},
 )
 
 // =============================================================================
@@ -483,9 +504,13 @@ func RecordRetryResult(rpcType, serviceID, retryCount, result string, latencySec
 }
 
 // RecordBatchSize records a batch request with latency
-func RecordBatchSize(rpcType, serviceID, batchCount string, latencySeconds float64) {
-	BatchSizeTotal.WithLabelValues(rpcType, serviceID, batchCount).Inc()
-	BatchSizeLatency.WithLabelValues(rpcType, serviceID, batchCount).Observe(latencySeconds)
+func RecordBatchSize(rpcType, serviceID string, batchCount int, latencySeconds float64) {
+	batchCountStr := strconv.Itoa(batchCount)
+	BatchSizeTotal.WithLabelValues(rpcType, serviceID, batchCountStr).Inc()
+	BatchSizeLatency.WithLabelValues(rpcType, serviceID, batchCountStr).Observe(latencySeconds)
+	// Record for average calculation: avg = items_total / requests_total
+	BatchRequestsTotal.WithLabelValues(serviceID).Inc()
+	BatchItemsTotal.WithLabelValues(serviceID).Add(float64(batchCount))
 }
 
 // RecordRequestSize records request and response sizes

@@ -152,10 +152,10 @@ func NewCachingFullNode(
 		),
 	)
 
-	// Account cache with 1 hour TTL.
-	// This provides a reasonable balance between reducing node load and allowing
-	// recovery from stale data (e.g., accounts that get their pubkey set after first tx).
-	// On signature verification failure, the cache is invalidated and refetched.
+	// Account cache with effectively infinite TTL (1 year).
+	// Public keys NEVER change once set, so we cache them forever.
+	// Only accounts with valid pubkeys are cached.
+	// Accounts with nil pubkeys are NOT cached - they are blacklisted and retried periodically.
 	accountCache := sturdyc.New[*accounttypes.QueryAccountResponse](
 		accountCacheCapacity,
 		numShards,

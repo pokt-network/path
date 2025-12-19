@@ -193,14 +193,10 @@ func (e protocolEndpoint) Supplier() string {
 // endpointsFromSession returns the list of all endpoints from a Shannon session.
 // It returns a map for efficient lookup, as the main/only consumer of this function uses
 // the return value for selecting an endpoint for sending a relay.
-func endpointsFromSession(
-	session sessiontypes.Session,
-	// TODO_TECHDEBT(@adshmh): Refactor load testing logic to make it more visible.
-	//
-	// The only supplier allowed from the session.
-	// Used in Load Testing against a single RelayMiner.
-	allowedSupplierAddr string,
-) (map[protocol.EndpointAddr]endpoint, error) {
+//
+// Note: This function is typically called via Protocol.getOrCreateSessionEndpoints()
+// which provides caching. Direct calls should only be used when caching is not desired.
+func endpointsFromSession(session sessiontypes.Session) (map[protocol.EndpointAddr]endpoint, error) {
 	sf := sdk.SessionFilter{
 		Session: &session,
 	}
@@ -223,14 +219,6 @@ func endpointsFromSession(
 			// Set the session field on the endpoint for efficient lookup when sending relays.
 			session:     session,
 			rpcTypeURLs: make(map[sharedtypes.RPCType]string),
-		}
-
-		// Endpoint does not match the only allowed supplier.
-		// Skip.
-		// Used in Load Testing against a RelayMiner.
-		// Makes sure the relays can be processed by the target RelayMiner by matching the supplier address.
-		if allowedSupplierAddr != "" && endpoint.Supplier() != allowedSupplierAddr {
-			continue
 		}
 
 		// Populate rpcTypeURLs map with all available RPC types for this supplier.
@@ -258,4 +246,26 @@ func endpointsFromSession(
 	}
 
 	return endpoints, nil
+}
+
+// getOrCreateSessionEndpoints returns cached endpoints for the session, or creates and caches them.
+// This avoids redundant AllEndpoints() calls and endpoint map construction on every request.
+// The cache is keyed by sessionId since session endpoints don't change within a session's lifetime.
+func (p *Protocol) getOrCreateSessionEndpoints(session sessiontypes.Session) (map[protocol.EndpointAddr]endpoint, error) {
+	sessionID := session.SessionId
+
+	// Check cache first
+	if cached, ok := p.sessionEndpointsCache.Load(sessionID); ok {
+		return cached.(map[protocol.EndpointAddr]endpoint), nil
+	}
+
+	// Create new endpoint map
+	endpoints, err := endpointsFromSession(session)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache it (use LoadOrStore to handle concurrent creation)
+	actual, _ := p.sessionEndpointsCache.LoadOrStore(sessionID, endpoints)
+	return actual.(map[protocol.EndpointAddr]endpoint), nil
 }
