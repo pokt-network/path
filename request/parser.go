@@ -37,6 +37,24 @@ const (
 	// bypassing reputation and other filtering logic.
 	// Example: "Target-Suppliers: pokt1abc...,pokt1def...,pokt1ghi..."
 	HTTPHeaderTargetSuppliers = "Target-Suppliers"
+
+	// WebSocket handshake headers for RelayMiner validation
+	// These headers carry RelayRequest.Meta equivalent data for connection-time validation.
+
+	// HTTPHeaderSessionID is the session identifier.
+	HTTPHeaderSessionID = "Pocket-Session-Id"
+
+	// HTTPHeaderSessionStartHeight is the session start block height.
+	HTTPHeaderSessionStartHeight = "Pocket-Session-Start-Height"
+
+	// HTTPHeaderSessionEndHeight is the session end block height.
+	HTTPHeaderSessionEndHeight = "Pocket-Session-End-Height"
+
+	// HTTPHeaderSupplierAddress is the target supplier operator address.
+	HTTPHeaderSupplierAddress = "Pocket-Supplier-Address"
+
+	// HTTPHeaderSignature is the ring signature for handshake validation (base64 encoded).
+	HTTPHeaderSignature = "Pocket-Signature"
 )
 
 // The Parser struct is responsible for parsing the authoritative service ID from the request's

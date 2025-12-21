@@ -66,6 +66,11 @@ type websocketConnection struct {
 
 	source  messageSource
 	msgChan chan<- message
+
+	// lastCloseCode stores the close code from the last disconnect.
+	// This is used to propagate close codes from endpoint to client.
+	lastCloseCode int
+	lastCloseText string
 }
 
 // upgradeClientWebsocketConnection upgrades an HTTP connection to a Websocket.
@@ -185,8 +190,36 @@ func (c *websocketConnection) connLoop() {
 // Note: This is for network transport failures, not application-level message processing errors.
 // TODO_FUTURE(#408): Revisit how we handle connection failures.
 func (c *websocketConnection) handleDisconnect(err error) {
-	c.logger.Warn().Err(err).Msgf("🔌 Handling websocket disconnection")
+	// Try to extract close code from error for better logging and propagation
+	closeCode, closeText := extractCloseInfo(err)
+	if closeCode != 0 {
+		// Store close code for propagation to the other side of the bridge
+		c.lastCloseCode = closeCode
+		c.lastCloseText = closeText
+		c.logger.Info().
+			Int("close_code", closeCode).
+			Str("close_text", closeText).
+			Str("source", string(c.source)).
+			Msg("🔌 Websocket connection closed by peer")
+	} else {
+		c.logger.Warn().Err(err).Msg("🔌 Handling websocket disconnection")
+	}
 	c.cancelCtx() // Cancel the context to signal the bridge to handle shutdown
+}
+
+// GetCloseInfo returns the close code and text from the last disconnect.
+// Returns 0 and empty string if no close code was received.
+func (c *websocketConnection) GetCloseInfo() (int, string) {
+	return c.lastCloseCode, c.lastCloseText
+}
+
+// extractCloseInfo extracts close code and text from a websocket close error.
+// Returns 0 and empty string if the error is not a close error.
+func extractCloseInfo(err error) (int, string) {
+	if closeErr, ok := err.(*websocket.CloseError); ok {
+		return closeErr.Code, closeErr.Text
+	}
+	return 0, ""
 }
 
 // pingLoop sends keep-alive ping messages to the connection and handles pong messages

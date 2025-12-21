@@ -2,6 +2,7 @@ package shannon
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -360,6 +361,22 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		return fmt.Errorf("failed to get websocket connection headers: %w", err)
 	}
 
+	// Add handshake signature for non-fallback endpoints.
+	// This allows RelayMiner to validate the connection upfront (eager validation).
+	if !wrc.selectedEndpoint.IsFallback() {
+		signature, err := wrc.generateHandshakeSignature()
+		if err != nil {
+			err = fmt.Errorf("%w: failed to generate handshake signature: %s", errCreatingWebSocketConnection, err.Error())
+			wrc.logger.Error().Err(err).Msg("❌ Failed to generate handshake signature")
+
+			wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_signature_failed", 0))
+			connectionObservationChan <- getWebsocketConnectionErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, err)
+
+			return fmt.Errorf("failed to generate handshake signature: %w", err)
+		}
+		endpointConnectionHeaders.Set(request.HTTPHeaderSignature, signature)
+	}
+
 	// Start the websocket bridge and get a completion channel.
 	// The websocketRequestContext handles message processing.
 	bridgeCompletionChan, err := websockets.StartBridge(
@@ -422,6 +439,7 @@ func getWebsocketConnectionHeaders(logger polylog.Logger, selectedEndpoint endpo
 }
 
 // getRelayMinerConnectionHeaders returns headers for RelayMiner websocket connections.
+// These headers carry RelayRequest.Meta equivalent data for connection-time validation.
 func getRelayMinerConnectionHeaders(logger polylog.Logger, selectedEndpoint endpoint) (http.Header, error) {
 	logger.With("method", "getRelayMinerConnectionHeaders")
 
@@ -433,9 +451,17 @@ func getRelayMinerConnectionHeaders(logger polylog.Logger, selectedEndpoint endp
 	}
 
 	return http.Header{
+		// Original headers
 		request.HTTPHeaderTargetServiceID: {sessionHeader.ServiceId},
 		request.HTTPHeaderAppAddress:      {sessionHeader.ApplicationAddress},
 		proxy.RPCTypeHeader:               {strconv.Itoa(int(sharedtypes.RPCType_WEBSOCKET))},
+
+		// Session metadata headers for RelayMiner validation
+		request.HTTPHeaderSessionID:          {sessionHeader.SessionId},
+		request.HTTPHeaderSessionStartHeight: {strconv.FormatInt(sessionHeader.SessionStartBlockHeight, 10)},
+		request.HTTPHeaderSessionEndHeight:   {strconv.FormatInt(sessionHeader.SessionEndBlockHeight, 10)},
+		request.HTTPHeaderSupplierAddress:    {selectedEndpoint.Supplier()},
+		// Note: Signature is added separately by addHandshakeSignature when signer is available
 	}, nil
 }
 
@@ -451,6 +477,50 @@ func getWebsocketEndpointURL(logger polylog.Logger, selectedEndpoint endpoint) (
 	}
 
 	return websocketURL, nil
+}
+
+// generateHandshakeSignature generates a ring signature for the WebSocket handshake.
+// This signature is included in the Pocket-Signature header and allows the RelayMiner
+// to validate the connection upfront (eager validation) before accepting WebSocket messages.
+// The signature is over the same data that would be in a RelayRequest.Meta with empty payload.
+func (wrc *websocketRequestContext) generateHandshakeSignature() (string, error) {
+	wrc.hydratedLogger("generateHandshakeSignature")
+
+	// Create a relay request with empty payload for signing.
+	// The signature covers the session metadata (same as for regular relay requests).
+	handshakeRelayRequest := &servicetypes.RelayRequest{
+		Meta: servicetypes.RelayRequestMetadata{
+			SessionHeader:           wrc.selectedEndpoint.Session().GetHeader(),
+			SupplierOperatorAddress: wrc.selectedEndpoint.Supplier(),
+		},
+		Payload: nil, // Empty payload for handshake
+	}
+
+	app := wrc.selectedEndpoint.Session().GetApplication()
+	if app == nil {
+		wrc.logger.Error().Msg("❌ SHOULD NEVER HAPPEN: session application is nil")
+		return "", fmt.Errorf("session application is nil")
+	}
+
+	// Sign the handshake relay request using the same signer as regular relay messages.
+	signedHandshake, err := wrc.relayRequestSigner.SignRelayRequest(handshakeRelayRequest, *app)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign handshake: %w", err)
+	}
+
+	// Extract the signature bytes from the signed request.
+	// The Meta.Signature field contains the ring signature bytes.
+	signatureBytes := signedHandshake.Meta.Signature
+
+	// Encode as base64 for transport in HTTP header.
+	signatureBase64 := base64.StdEncoding.EncodeToString(signatureBytes)
+
+	wrc.logger.Debug().
+		Str("session_id", signedHandshake.Meta.SessionHeader.SessionId).
+		Int("signature_length", len(signatureBytes)).
+		Msg("Generated handshake signature")
+
+	return signatureBase64, nil
 }
 
 // ---------- Client Message Processing ----------
