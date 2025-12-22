@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,6 +16,10 @@ import (
 	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 )
+
+// errInvalidJSON is returned when response bytes are not valid JSON.
+// This error triggers retry when RetryOnInvalidJSON is enabled.
+var errInvalidJSON = errors.New("response is not valid JSON")
 
 // TODO_TECHDEBT(@adshmh): A single protocol context should handle both single/parallel calls to one or more endpoints.
 // Including:
@@ -242,8 +248,24 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			}
 		}
 
+		// Validate JSON response for JSON-RPC requests before declaring success.
+		// This catches cases where the endpoint returns HTTP 200 but with invalid JSON
+		// (e.g., "Bad Gateway" string responses from proxy errors).
+		var jsonValidationErr error
+		if err == nil && len(endpointResponses) > 0 {
+			jsonValidationErr = validateJSONResponse(rpcType, endpointResponses[0].Bytes)
+			if jsonValidationErr != nil {
+				logger.Debug().
+					Str("endpoint", string(endpointAddr)).
+					Int("status_code", statusCode).
+					Int("response_len", len(endpointResponses[0].Bytes)).
+					Msg("Response failed JSON validation - will check retry conditions")
+			}
+		}
+
 		// Check if the request was successful
-		if err == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
+		// JSON validation error is treated as a failure that can trigger retry
+		if err == nil && jsonValidationErr == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
 				responseBytes := 0
@@ -289,7 +311,12 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		}
 
 		// Store the last error, status code, and endpoint for potential retry decision
-		lastErr = err
+		// Use jsonValidationErr as the error if no protocol error occurred
+		effectiveErr := err
+		if effectiveErr == nil && jsonValidationErr != nil {
+			effectiveErr = jsonValidationErr
+		}
+		lastErr = effectiveErr
 		lastStatusCode = statusCode
 		lastEndpointAddr = endpointAddr
 
@@ -299,6 +326,12 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				Int("attempt", attempt).
 				Int("max_attempts", maxAttempts).
 				Msg("Relay request failed with error")
+		} else if jsonValidationErr != nil {
+			logger.Warn().Err(jsonValidationErr).
+				Int("status_code", statusCode).
+				Int("attempt", attempt).
+				Int("max_attempts", maxAttempts).
+				Msg("Relay request failed with invalid JSON response")
 		} else {
 			logger.Warn().
 				Int("status_code", statusCode).
@@ -323,7 +356,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				break
 			}
 
-			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, string(endpointAddr)) {
+			if !rc.shouldRetry(effectiveErr, statusCode, attemptDuration, retryConfig, string(endpointAddr)) {
 				logger.Debug().
 					Int("attempt", attempt).
 					Int("status_code", statusCode).
@@ -597,8 +630,25 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			}
 		}
 
+		// Validate JSON response for JSON-RPC requests before declaring success.
+		// This catches cases where the endpoint returns HTTP 200 but with invalid JSON
+		// (e.g., "Bad Gateway" string responses from proxy errors).
+		var jsonValidationErr error
+		if err == nil && len(responses) > 0 {
+			jsonValidationErr = validateJSONResponse(rpcType, responses[0].Bytes)
+			if jsonValidationErr != nil {
+				logger.Debug().
+					Str("endpoint", string(endpointAddr)).
+					Int("endpoint_index", index).
+					Int("status_code", statusCode).
+					Int("response_len", len(responses[0].Bytes)).
+					Msg("Response failed JSON validation in parallel path - will check retry conditions")
+			}
+		}
+
 		// Check if the request was successful
-		if err == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
+		// JSON validation error is treated as a failure that can trigger retry
+		if err == nil && jsonValidationErr == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
 				responseBytes := 0
@@ -640,7 +690,12 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		}
 
 		// Store the last error, responses, and endpoint for potential retry decision
-		lastErr = err
+		// Use jsonValidationErr as the error if no protocol error occurred
+		effectiveErr := err
+		if effectiveErr == nil && jsonValidationErr != nil {
+			effectiveErr = jsonValidationErr
+		}
+		lastErr = effectiveErr
 		lastResponses = responses
 		lastEndpointAddr = endpointAddr
 
@@ -651,6 +706,13 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				Int("attempt", attempt).
 				Int("max_attempts", maxAttempts).
 				Msgf("Parallel relay request to endpoint %d failed with error (attempt %d/%d)", index, attempt, maxAttempts)
+		} else if jsonValidationErr != nil {
+			logger.Warn().Err(jsonValidationErr).
+				Int("endpoint_index", index).
+				Int("status_code", statusCode).
+				Int("attempt", attempt).
+				Int("max_attempts", maxAttempts).
+				Msgf("Parallel relay request to endpoint %d failed with invalid JSON (attempt %d/%d)", index, attempt, maxAttempts)
 		} else {
 			logger.Warn().
 				Int("endpoint_index", index).
@@ -679,7 +741,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				break
 			}
 
-			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, string(endpointAddr)) {
+			if !rc.shouldRetry(effectiveErr, statusCode, attemptDuration, retryConfig, string(endpointAddr)) {
 				logger.Debug().
 					Int("endpoint_index", index).
 					Int("attempt", attempt).
@@ -889,4 +951,30 @@ func calculateRetryBackoff(attempt int) time.Duration {
 	default:
 		return 400 * time.Millisecond
 	}
+}
+
+// isValidJSON checks if the provided bytes are valid JSON.
+// Returns true if the bytes can be unmarshaled as JSON, false otherwise.
+// Empty responses are considered valid (empty batch response case).
+func isValidJSON(data []byte) bool {
+	// Empty responses are valid (per JSON-RPC batch spec)
+	if len(data) == 0 {
+		return true
+	}
+	// Use json.Valid for efficient validation without full unmarshaling
+	return json.Valid(data)
+}
+
+// validateJSONResponse checks if the response is valid JSON for JSON-RPC requests.
+// Returns errInvalidJSON if validation fails, nil otherwise.
+// Only validates for JSON-RPC type requests, skips validation for other RPC types.
+func validateJSONResponse(rpcType sharedtypes.RPCType, responseBytes []byte) error {
+	// Only validate JSON-RPC responses
+	if rpcType != sharedtypes.RPCType_JSON_RPC {
+		return nil
+	}
+	if !isValidJSON(responseBytes) {
+		return errInvalidJSON
+	}
+	return nil
 }
