@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"crypto/tls"
 	"net"
 
 	pathhttp "github.com/pokt-network/path/network/http"
@@ -86,16 +87,16 @@ func extractErrFromRelayError(err error) error {
 // - Error on DNS lookup of endpoint's URL.
 func isEndpointNetworkConfigError(err error) bool {
 	// Use errors.As for robust type matching (works with wrapped errors)
-	// Covers common DNS, dial, and TLS certificate issues
+	// Covers common DNS, connection, and TLS issues
 
 	// DNS resolution errors
 	if errors.As(err, &net.DNSError{}) {
 		return true
 	}
 
-	// General dial errors (includes connection refused, etc.)
+	// General network operation errors (dial, read, write, connect, etc.)
 	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Op == "dial" {
+	if errors.As(err, &opErr) {
 		return true
 	}
 
@@ -107,6 +108,12 @@ func isEndpointNetworkConfigError(err error) bool {
 		return true
 	}
 	if errors.As(err, &x509.CertificateInvalidError{}) {
+		return true
+	}
+
+	// TLS handshake / record-level errors not covered by x509
+	var tlsRecordErr *tls.RecordHeaderError
+	if errors.As(err, &tlsRecordErr) {
 		return true
 	}
 
