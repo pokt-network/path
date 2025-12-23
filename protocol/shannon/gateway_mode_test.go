@@ -109,6 +109,8 @@ func TestCentralizedGatewayMode_SessionMerging_NormalOperation(t *testing.T) {
 
 func TestCentralizedGatewayMode_SessionMerging_DuringRollover(t *testing.T) {
 	// Setup: During rollover period
+	// NEW BEHAVIOR: Returns ONLY ONE session per app (chosen by GetSessionWithExtendedValidity logic)
+	// This prevents mixing endpoints from different sessions
 	mockFullNode := &mockFullNodeForSessionMerging{
 		isInRollover: true,
 		currentSession: sessiontypes.Session{
@@ -123,7 +125,7 @@ func TestCentralizedGatewayMode_SessionMerging_DuringRollover(t *testing.T) {
 			},
 		},
 		extendedSession: sessiontypes.Session{
-			SessionId: "session-100", // Different from current
+			SessionId: "session-100", // Different from current - this will be chosen during grace period
 			Header: &sessiontypes.SessionHeader{
 				SessionStartBlockHeight: 1000,
 				SessionEndBlockHeight:   1060,
@@ -140,35 +142,21 @@ func TestCentralizedGatewayMode_SessionMerging_DuringRollover(t *testing.T) {
 	// Execute
 	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth")
 
-	// Verify: Should get 2 sessions total (1 owned app × 2 sessions)
+	// Verify: Should get ONLY 1 session (1 per owned app)
+	// GetSessionWithExtendedValidity chooses which session to use
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
 
-	expectedSessionCount := 2 // 1 owned app × (1 current + 1 extended)
+	expectedSessionCount := 1 // 1 owned app = 1 session (no merging)
 	if len(sessions) != expectedSessionCount {
-		t.Errorf("Expected %d sessions during rollover (1 app × 2 sessions), got %d", expectedSessionCount, len(sessions))
+		t.Errorf("Expected %d sessions during rollover (1 per app), got %d", expectedSessionCount, len(sessions))
 	}
 
-	// Verify we have both current and extended sessions
-	currentSessionCount := 0
-	extendedSessionCount := 0
-	for _, session := range sessions {
-		switch session.SessionId {
-		case "session-101":
-			currentSessionCount++
-		case "session-100":
-			extendedSessionCount++
-		default:
-			t.Errorf("Unexpected session ID: %s", session.SessionId)
-		}
-	}
-
-	if currentSessionCount != 1 {
-		t.Errorf("Expected 1 current session, got %d", currentSessionCount)
-	}
-	if extendedSessionCount != 1 {
-		t.Errorf("Expected 1 extended session, got %d", extendedSessionCount)
+	// Verify we got the extended session (session-100)
+	// GetSessionWithExtendedValidity should return the extended session during grace period
+	if sessions[0].SessionId != "session-100" {
+		t.Errorf("Expected extended session (session-100) during rollover, got: %s", sessions[0].SessionId)
 	}
 }
 
