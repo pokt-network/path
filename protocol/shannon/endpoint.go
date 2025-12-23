@@ -256,9 +256,36 @@ func (p *Protocol) getOrCreateSessionEndpoints(session sessiontypes.Session) (ma
 
 	// Check cache first
 	if cached, ok := p.sessionEndpointsCache.Load(sessionID); ok {
-		return cached.(map[protocol.EndpointAddr]endpoint), nil
+		cachedEndpoints := cached.(map[protocol.EndpointAddr]endpoint)
+
+		// DEFENSIVE CHECK: Verify cached endpoints match requested session start height
+		// Session IDs SHOULD be unique per session period, but if they're not (blockchain bug),
+		// this will detect, log, invalidate cache, and create fresh endpoints
+		if len(cachedEndpoints) > 0 {
+			for _, ep := range cachedEndpoints {
+				if ep.Session().Header.SessionStartBlockHeight != session.Header.SessionStartBlockHeight {
+					p.logger.Error().
+						Str("session_id", sessionID).
+						Int64("requested_session_start_height", session.Header.SessionStartBlockHeight).
+						Int64("cached_session_start_height", ep.Session().Header.SessionStartBlockHeight).
+						Str("requested_app", session.Application.Address).
+						Str("cached_app", ep.Session().Application.Address).
+						Msg("🚨 SESSION ID COLLISION: Same session ID with different start heights - invalidating cache and creating fresh endpoints")
+
+					// Invalidate the bad cache entry
+					p.sessionEndpointsCache.Delete(sessionID)
+
+					// Fall through to create new endpoints below
+					goto createEndpoints
+				}
+				break // Only check first endpoint
+			}
+		}
+
+		return cachedEndpoints, nil
 	}
 
+createEndpoints:
 	// Create new endpoint map
 	endpoints, err := endpointsFromSession(session)
 	if err != nil {
