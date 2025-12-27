@@ -167,10 +167,18 @@ func (c *websocketConnection) connLoop() {
 			return
 		}
 
-		c.msgChan <- message{
+		// Check context before sending to prevent sending on closed channel during shutdown
+		select {
+		case c.msgChan <- message{
 			data:        msg,
 			source:      c.source,
 			messageType: messageType,
+		}:
+			// Message sent successfully
+		case <-c.ctx.Done():
+			// Context canceled, stop processing messages
+			c.logger.Debug().Msg("connLoop stopped due to context cancellation")
+			return
 		}
 	}
 }
