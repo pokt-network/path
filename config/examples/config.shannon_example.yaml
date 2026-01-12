@@ -459,6 +459,14 @@ gateway_config:
             comet_bft: "http://fallback.xrplevm.io:26657"
             websocket: "ws://fallback.xrplevm.io:8546"
 
+    - id: pocket
+      type: "cosmos"
+      rpc_types: [ "json_rpc", "rest", "comet_bft" ]
+      latency_profile: "standard"
+      rpc_type_fallbacks:
+        comet_bft: json_rpc
+        rest: json_rpc
+
     # -------------------------------------------------------------------------
     # LLM / AI Services
     # -------------------------------------------------------------------------
