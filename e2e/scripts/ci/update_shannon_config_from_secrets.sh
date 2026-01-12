@@ -16,7 +16,7 @@ set -o nounset
 cd "$(dirname "$0")/../../config" || exit 1
 
 update_shannon_config_from_env() {
-    check_env_vars "SHANNON_GATEWAY_ADDRESS" "SHANNON_GATEWAY_PRIVATE_KEY" "SHANNON_OWNED_APPS_PRIVATE_KEYS"
+    check_env_vars "SHANNON_GATEWAY_ADDRESS" "SHANNON_GATEWAY_PRIVATE_KEY" "SHANNON_OWNED_APPS_PRIVATE_KEYS" "FULL_NODE_RPC_URL"
 
     # TODO_TECHDEBT: Consolidate this with PATH's .config.yaml
     local CONFIG_FILE="./.shannon.config.yaml"
