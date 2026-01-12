@@ -132,12 +132,13 @@ type ServiceProbationConfig struct {
 
 // ServiceRetryConfig holds per-service retry configuration.
 type ServiceRetryConfig struct {
-	Enabled           *bool          `yaml:"enabled,omitempty"`
-	MaxRetries        *int           `yaml:"max_retries,omitempty"`
-	RetryOn5xx        *bool          `yaml:"retry_on_5xx,omitempty"`
-	RetryOnTimeout    *bool          `yaml:"retry_on_timeout,omitempty"`
-	RetryOnConnection *bool          `yaml:"retry_on_connection,omitempty"`
-	MaxRetryLatency   *time.Duration `yaml:"max_retry_latency,omitempty"` // Only retry if failed request took less than this duration
+	Enabled            *bool          `yaml:"enabled,omitempty"`
+	MaxRetries         *int           `yaml:"max_retries,omitempty"`
+	RetryOn5xx         *bool          `yaml:"retry_on_5xx,omitempty"`
+	RetryOnTimeout     *bool          `yaml:"retry_on_timeout,omitempty"`
+	RetryOnConnection  *bool          `yaml:"retry_on_connection,omitempty"`
+	RetryOnInvalidJSON *bool          `yaml:"retry_on_invalid_json,omitempty"` // Retry when response fails JSON unmarshaling (e.g., "Bad Gateway" string responses)
+	MaxRetryLatency    *time.Duration `yaml:"max_retry_latency,omitempty"`     // Only retry if failed request took less than this duration
 }
 
 // ServiceObservationConfig holds per-service observation pipeline configuration.
@@ -367,6 +368,10 @@ func (c *UnifiedServicesConfig) HydrateDefaults() {
 	if c.Defaults.RetryConfig.RetryOnConnection == nil {
 		retryConnection := true
 		c.Defaults.RetryConfig.RetryOnConnection = &retryConnection
+	}
+	if c.Defaults.RetryConfig.RetryOnInvalidJSON == nil {
+		retryInvalidJSON := true
+		c.Defaults.RetryConfig.RetryOnInvalidJSON = &retryInvalidJSON
 	}
 	if c.Defaults.RetryConfig.MaxRetryLatency == nil {
 		maxRetryLatency := 500 * time.Millisecond
@@ -622,6 +627,9 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 		if merged.RetryConfig.RetryOnConnection == nil {
 			merged.RetryConfig.RetryOnConnection = c.Defaults.RetryConfig.RetryOnConnection
 		}
+		if merged.RetryConfig.RetryOnInvalidJSON == nil {
+			merged.RetryConfig.RetryOnInvalidJSON = c.Defaults.RetryConfig.RetryOnInvalidJSON
+		}
 		if merged.RetryConfig.MaxRetryLatency == nil {
 			merged.RetryConfig.MaxRetryLatency = c.Defaults.RetryConfig.MaxRetryLatency
 		}
@@ -733,6 +741,8 @@ type ParentConfigDefaults struct {
 	RetryOnTimeout bool
 	// RetryOnConnection from retry_config.retry_on_connection
 	RetryOnConnection bool
+	// RetryOnInvalidJSON from retry_config.retry_on_invalid_json
+	RetryOnInvalidJSON bool
 	// MaxRetryLatency from retry_config.max_retry_latency
 	MaxRetryLatency time.Duration
 	// ObservationPipelineEnabled from observation_pipeline.enabled
@@ -787,6 +797,7 @@ func (c *UnifiedServicesConfig) SetDefaultsFromParent(parent ParentConfigDefault
 	c.Defaults.RetryConfig.RetryOn5xx = &parent.RetryOn5xx
 	c.Defaults.RetryConfig.RetryOnTimeout = &parent.RetryOnTimeout
 	c.Defaults.RetryConfig.RetryOnConnection = &parent.RetryOnConnection
+	c.Defaults.RetryConfig.RetryOnInvalidJSON = &parent.RetryOnInvalidJSON
 	if parent.MaxRetryLatency > 0 {
 		c.Defaults.RetryConfig.MaxRetryLatency = &parent.MaxRetryLatency
 	}

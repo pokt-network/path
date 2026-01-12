@@ -237,6 +237,55 @@ func TestShouldRetry(t *testing.T) {
 			},
 			expected: false,
 		},
+		// RetryOnInvalidJSON tests
+		{
+			name:        "invalid JSON error with RetryOnInvalidJSON enabled",
+			err:         errInvalidJSON,
+			statusCode:  200,
+			retryConfig: &ServiceRetryConfig{Enabled: boolPtr(true), RetryOnInvalidJSON: boolPtr(true)},
+			expected:    true,
+		},
+		{
+			name:        "response is not valid json error with RetryOnInvalidJSON enabled",
+			err:         errors.New("response is not valid JSON"),
+			statusCode:  200,
+			retryConfig: &ServiceRetryConfig{Enabled: boolPtr(true), RetryOnInvalidJSON: boolPtr(true)},
+			expected:    true,
+		},
+		{
+			name:        "invalid json (case insensitive) error with RetryOnInvalidJSON enabled",
+			err:         errors.New("Invalid JSON in response body"),
+			statusCode:  200,
+			retryConfig: &ServiceRetryConfig{Enabled: boolPtr(true), RetryOnInvalidJSON: boolPtr(true)},
+			expected:    true,
+		},
+		{
+			name:        "invalid JSON error with RetryOnInvalidJSON disabled",
+			err:         errInvalidJSON,
+			statusCode:  200,
+			retryConfig: &ServiceRetryConfig{Enabled: boolPtr(true), RetryOnInvalidJSON: boolPtr(false)},
+			expected:    false,
+		},
+		{
+			name:        "invalid JSON error with RetryOnInvalidJSON nil",
+			err:         errInvalidJSON,
+			statusCode:  200,
+			retryConfig: &ServiceRetryConfig{Enabled: boolPtr(true), RetryOnInvalidJSON: nil},
+			expected:    false,
+		},
+		{
+			name:       "multiple retry conditions enabled - invalid JSON triggers",
+			err:        errInvalidJSON,
+			statusCode: 200,
+			retryConfig: &ServiceRetryConfig{
+				Enabled:            boolPtr(true),
+				RetryOn5xx:         boolPtr(true),
+				RetryOnTimeout:     boolPtr(true),
+				RetryOnConnection:  boolPtr(true),
+				RetryOnInvalidJSON: boolPtr(true),
+			},
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1165,5 +1214,198 @@ func TestMaxRetryLatencyRealWorldScenarios(t *testing.T) {
 			result := rc.shouldRetry(errors.New("internal server error"), 500, 100*time.Millisecond, config, "")
 			require.True(t, result, "Fast failures should always be retried (attempt %d)", i+1)
 		}
+	})
+}
+
+// TestIsValidJSON tests the JSON validation helper function
+func TestIsValidJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected bool
+	}{
+		{
+			name:     "valid JSON object",
+			input:    []byte(`{"jsonrpc":"2.0","result":"0x123","id":1}`),
+			expected: true,
+		},
+		{
+			name:     "valid JSON array",
+			input:    []byte(`[{"jsonrpc":"2.0","result":"0x123","id":1}]`),
+			expected: true,
+		},
+		{
+			name:     "valid JSON-RPC error response",
+			input:    []byte(`{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}`),
+			expected: true,
+		},
+		{
+			name:     "valid empty array",
+			input:    []byte(`[]`),
+			expected: true,
+		},
+		{
+			name:     "valid empty object",
+			input:    []byte(`{}`),
+			expected: true,
+		},
+		{
+			name:     "empty input is valid (per JSON-RPC batch spec)",
+			input:    []byte(``),
+			expected: true,
+		},
+		{
+			name:     "nil input is valid",
+			input:    nil,
+			expected: true,
+		},
+		{
+			name:     "Bad Gateway string is not valid JSON",
+			input:    []byte(`Bad Gateway`),
+			expected: false,
+		},
+		{
+			name:     "HTML error page is not valid JSON",
+			input:    []byte(`<!DOCTYPE html><html><body>Error</body></html>`),
+			expected: false,
+		},
+		{
+			name:     "plain text is not valid JSON",
+			input:    []byte(`Internal Server Error`),
+			expected: false,
+		},
+		{
+			name:     "malformed JSON with missing quote",
+			input:    []byte(`{"jsonrpc:"2.0"}`),
+			expected: false,
+		},
+		{
+			name:     "JSON with trailing garbage",
+			input:    []byte(`{"valid":true}garbage`),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isValidJSON(tt.input)
+			require.Equal(t, tt.expected, result, "isValidJSON result mismatch")
+		})
+	}
+}
+
+// TestValidateJSONResponse tests the JSON response validation function
+func TestValidateJSONResponse(t *testing.T) {
+	tests := []struct {
+		name          string
+		rpcType       sharedtypes.RPCType
+		responseBytes []byte
+		expectError   bool
+	}{
+		{
+			name:          "valid JSON-RPC response",
+			rpcType:       sharedtypes.RPCType_JSON_RPC,
+			responseBytes: []byte(`{"jsonrpc":"2.0","result":"0x123","id":1}`),
+			expectError:   false,
+		},
+		{
+			name:          "valid JSON-RPC batch response",
+			rpcType:       sharedtypes.RPCType_JSON_RPC,
+			responseBytes: []byte(`[{"jsonrpc":"2.0","result":"0x1","id":1},{"jsonrpc":"2.0","result":"0x2","id":2}]`),
+			expectError:   false,
+		},
+		{
+			name:          "Bad Gateway string for JSON-RPC request",
+			rpcType:       sharedtypes.RPCType_JSON_RPC,
+			responseBytes: []byte(`Bad Gateway`),
+			expectError:   true,
+		},
+		{
+			name:          "HTML error page for JSON-RPC request",
+			rpcType:       sharedtypes.RPCType_JSON_RPC,
+			responseBytes: []byte(`<!DOCTYPE html><html><body>502 Bad Gateway</body></html>`),
+			expectError:   true,
+		},
+		{
+			name:          "REST request skips JSON validation (valid JSON)",
+			rpcType:       sharedtypes.RPCType_REST,
+			responseBytes: []byte(`{"valid":true}`),
+			expectError:   false,
+		},
+		{
+			name:          "REST request skips JSON validation (invalid JSON)",
+			rpcType:       sharedtypes.RPCType_REST,
+			responseBytes: []byte(`Bad Gateway`),
+			expectError:   false, // REST doesn't validate JSON
+		},
+		{
+			name:          "WebSocket request skips JSON validation",
+			rpcType:       sharedtypes.RPCType_WEBSOCKET,
+			responseBytes: []byte(`Bad Gateway`),
+			expectError:   false, // WebSocket doesn't validate JSON
+		},
+		{
+			name:          "Unknown RPC type skips JSON validation",
+			rpcType:       sharedtypes.RPCType_UNKNOWN_RPC,
+			responseBytes: []byte(`Bad Gateway`),
+			expectError:   false, // Unknown doesn't validate JSON
+		},
+		{
+			name:          "empty response for JSON-RPC is valid",
+			rpcType:       sharedtypes.RPCType_JSON_RPC,
+			responseBytes: []byte(``),
+			expectError:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateJSONResponse(tt.rpcType, tt.responseBytes)
+			if tt.expectError {
+				require.Error(t, err, "expected validation error")
+				require.ErrorIs(t, err, errInvalidJSON, "expected errInvalidJSON")
+			} else {
+				require.NoError(t, err, "expected no validation error")
+			}
+		})
+	}
+}
+
+// TestRetryOnInvalidJSONIntegration tests the full retry flow with invalid JSON
+func TestRetryOnInvalidJSONIntegration(t *testing.T) {
+	rc := &requestContext{}
+
+	t.Run("invalid_json_with_retry_enabled_and_fast_response", func(t *testing.T) {
+		config := &ServiceRetryConfig{
+			Enabled:            boolPtr(true),
+			RetryOnInvalidJSON: boolPtr(true),
+			MaxRetryLatency:    durationPtr(500 * time.Millisecond),
+		}
+		// Response came back quickly (50ms) but with invalid JSON
+		result := rc.shouldRetry(errInvalidJSON, 200, 50*time.Millisecond, config, "")
+		require.True(t, result, "Fast invalid JSON responses should be retried")
+	})
+
+	t.Run("invalid_json_with_retry_enabled_but_slow_response", func(t *testing.T) {
+		config := &ServiceRetryConfig{
+			Enabled:            boolPtr(true),
+			RetryOnInvalidJSON: boolPtr(true),
+			MaxRetryLatency:    durationPtr(500 * time.Millisecond),
+		}
+		// Response came back slowly (1 second) with invalid JSON
+		result := rc.shouldRetry(errInvalidJSON, 200, 1*time.Second, config, "")
+		require.False(t, result, "Slow invalid JSON responses should NOT be retried (time budget exceeded)")
+	})
+
+	t.Run("bad_gateway_string_with_retry_enabled", func(t *testing.T) {
+		config := &ServiceRetryConfig{
+			Enabled:            boolPtr(true),
+			RetryOnInvalidJSON: boolPtr(true),
+			MaxRetryLatency:    durationPtr(500 * time.Millisecond),
+		}
+		// "Bad Gateway" string error (the actual error message from JSON unmarshal failure)
+		err := errors.New("response is not valid JSON")
+		result := rc.shouldRetry(err, 200, 50*time.Millisecond, config, "")
+		require.True(t, result, "Bad Gateway string errors should be retried")
 	})
 }

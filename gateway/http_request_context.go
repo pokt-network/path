@@ -913,6 +913,28 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration
 		}
 	}
 
+	// Check for invalid JSON errors if configured
+	// This catches cases where the endpoint returns HTTP 200 but with non-JSON body
+	// (e.g., "Bad Gateway" string responses from proxy errors)
+	if retryConfig.RetryOnInvalidJSON != nil && *retryConfig.RetryOnInvalidJSON {
+		errMsg := strings.ToLower(err.Error())
+		if strings.Contains(errMsg, "not valid json") || strings.Contains(errMsg, "invalid json") {
+			// Record retry metric
+			domain, _ := shannonmetrics.ExtractDomainOrHost(endpointDomain)
+			metrics.RecordRetryDistribution(domain, string(rc.detectedRPCType), string(rc.serviceID), metrics.RetryReasonInvalidJSON)
+
+			if rc.logger != nil {
+				rc.logger.Debug().
+					Str("service_id", string(rc.serviceID)).
+					Err(err).
+					Dur("request_duration_ms", requestDuration).
+					Str("retry_reason", "invalid_json").
+					Msg("[RETRY] Will retry due to invalid JSON response")
+			}
+			return true
+		}
+	}
+
 	if rc.logger != nil {
 		rc.logger.Debug().
 			Str("service_id", string(rc.serviceID)).

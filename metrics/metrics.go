@@ -63,9 +63,10 @@ const (
 
 	// --- Retry reasons
 
-	RetryReason5xx        = "retry_on_5xx"
-	RetryReasonTimeout    = "retry_on_timeout"
-	RetryReasonConnection = "retry_on_connection"
+	RetryReason5xx         = "retry_on_5xx"
+	RetryReasonTimeout     = "retry_on_timeout"
+	RetryReasonConnection  = "retry_on_connection"
+	RetryReasonInvalidJSON = "retry_on_invalid_json"
 
 	// --- Retry results
 
