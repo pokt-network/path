@@ -205,24 +205,30 @@ func (rc *requestContext) InitFromHTTPRequest(httpReq *http.Request) error {
 // ValidateRPCType detects and validates the RPC type for this request.
 // It fails fast if the detected RPC type is not in the service's configured rpc_types.
 func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
-	logger := rc.logger.With("method", "ValidateRPCType").With("service_id", rc.serviceID)
+	// PERF: Use inline fields instead of creating new logger to avoid allocation
 
 	// Skip if no validator configured
 	if rc.rpcTypeValidator == nil {
-		logger.Warn().Msg("No RPC type validator configured - skipping validation")
+		rc.logger.Warn().
+			Str("method", "ValidateRPCType").
+			Msg("No RPC type validator configured - skipping validation")
 		return nil
 	}
 
 	// Get service's configured RPC types for detection
 	unifiedConfig := rc.protocol.GetUnifiedServicesConfig()
 	if unifiedConfig == nil {
-		logger.Warn().Msg("No unified config available - skipping RPC type validation")
+		rc.logger.Warn().
+			Str("method", "ValidateRPCType").
+			Msg("No unified config available - skipping RPC type validation")
 		return nil
 	}
 
 	serviceRPCTypes := unifiedConfig.GetServiceRPCTypes(rc.serviceID)
 	if len(serviceRPCTypes) == 0 {
-		logger.Warn().Msg("No RPC types configured for service - skipping validation")
+		rc.logger.Warn().
+			Str("method", "ValidateRPCType").
+			Msg("No RPC types configured for service - skipping validation")
 		return nil
 	}
 
@@ -230,7 +236,10 @@ func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
 	detector := NewRPCTypeDetector()
 	rpcType, err := detector.DetectRPCType(httpReq, string(rc.serviceID), serviceRPCTypes)
 	if err != nil {
-		logger.Error().Err(err).Msg("RPC type detection failed")
+		rc.logger.Error().
+			Str("method", "ValidateRPCType").
+			Err(err).
+			Msg("RPC type detection failed")
 
 		// Update gateway observations
 		rc.updateGatewayObservations(err)
@@ -248,12 +257,18 @@ func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
 
 	// Store detected RPC type
 	rc.detectedRPCType = rpcType
-	logger = logger.With("detected_rpc_type", rpcType.String())
-	logger.Debug().Msg("RPC type detected successfully")
+	rc.logger.Debug().
+		Str("method", "ValidateRPCType").
+		Str("detected_rpc_type", rpcType.String()).
+		Msg("RPC type detected successfully")
 
 	// Validate detected RPC type against service configuration
 	if err := rc.rpcTypeValidator.ValidateRPCType(rc.serviceID, rpcType); err != nil {
-		logger.Error().Err(err).Msg("RPC type validation failed")
+		rc.logger.Error().
+			Str("method", "ValidateRPCType").
+			Str("detected_rpc_type", rpcType.String()).
+			Err(err).
+			Msg("RPC type validation failed")
 
 		// Update gateway observations
 		rc.updateGatewayObservations(err)
@@ -271,7 +286,10 @@ func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
 		return err
 	}
 
-	logger.Debug().Msg("RPC type validation successful")
+	rc.logger.Debug().
+		Str("method", "ValidateRPCType").
+		Str("detected_rpc_type", rpcType.String()).
+		Msg("RPC type validation successful")
 	return nil
 }
 
@@ -315,7 +333,7 @@ func (rc *requestContext) BuildQoSContextFromHTTP(httpReq *http.Request) error {
 //
 // TODO_TECHDEBT: Either rename to `PrepareProtocol` or return the built protocol context.
 func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Request) error {
-	logger := rc.logger.With("method", "BuildProtocolContextsFromHTTPRequest").With("service_id", rc.serviceID)
+	// PERF: Use inline fields instead of creating new logger to avoid allocation
 
 	// Get RPC type from QoS-detected payload
 	payloads := rc.qosCtx.GetServicePayloads()
@@ -324,8 +342,10 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	}
 	rpcType := payloads[0].RPCType
 
-	logger = logger.With("rpc_type", rpcType.String())
-	logger.Debug().Msg("Using detected RPC type for endpoint selection")
+	rc.logger.Debug().
+		Str("method", "BuildProtocolContextsFromHTTPRequest").
+		Str("rpc_type", rpcType.String()).
+		Msg("Using detected RPC type for endpoint selection")
 
 	// Retrieve the list of available endpoints for the requested service.
 	// Filter endpoints to only those supporting the detected RPC type.
@@ -334,7 +354,10 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 		// error encountered: use the supplied observations as protocol observations.
 		rc.updateProtocolObservations(&endpointLookupObs)
 		// log and return the error
-		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Err(err).Msg("no available endpoints could be found for the request")
+		rc.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).
+			Str("method", "BuildProtocolContextsFromHTTPRequest").
+			Err(err).
+			Msg("no available endpoints could be found for the request")
 		return fmt.Errorf("%w: no available endpoints could be found for the request: %w", errBuildProtocolContextsFromHTTPRequest, err)
 	}
 
@@ -349,12 +372,14 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 		// no protocol context will be built: use the endpointLookup observation.
 		rc.updateProtocolObservations(&endpointLookupObs)
 		// log and return the error
-		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msgf("no endpoints could be selected for the request from %d available endpoints", len(availableEndpoints))
+		rc.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).
+			Str("method", "BuildProtocolContextsFromHTTPRequest").
+			Msgf("no endpoints could be selected for the request from %d available endpoints", len(availableEndpoints))
 		return fmt.Errorf("%w: no endpoints could be selected from %d available endpoints", errBuildProtocolContextsFromHTTPRequest, len(availableEndpoints))
 	}
 
 	// Log TLD diversity of selected endpoints
-	shannonmetrics.LogEndpointTLDDiversity(logger, selectedEndpoints)
+	shannonmetrics.LogEndpointTLDDiversity(rc.logger, selectedEndpoints)
 
 	// Prepare Protocol contexts for all selected endpoints
 	numSelectedEndpoints := len(selectedEndpoints)
@@ -363,28 +388,42 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	var lastProtocolCtxSetupErrObs *protocolobservations.Observations
 
 	for i, endpointAddr := range selectedEndpoints {
-		logger.Debug().Msgf("Building protocol context for endpoint %d/%d: %s", i+1, numSelectedEndpoints, endpointAddr)
+		rc.logger.Debug().
+			Str("method", "BuildProtocolContextsFromHTTPRequest").
+			Msgf("Building protocol context for endpoint %d/%d: %s", i+1, numSelectedEndpoints, endpointAddr)
 		// filterByReputation=true: Normal requests respect reputation filtering
 		protocolCtx, protocolCtxSetupErrObs, err := rc.protocol.BuildHTTPRequestContextForEndpoint(rc.context, rc.serviceID, endpointAddr, rpcType, httpReq, true)
 		if err != nil {
 			lastProtocolCtxSetupErrObs = &protocolCtxSetupErrObs
-			logger.Warn().Err(err).Str("endpoint_addr", string(endpointAddr)).Msgf("Failed to build protocol context for endpoint %d/%d, skipping", i+1, numSelectedEndpoints)
+			rc.logger.Warn().
+				Str("method", "BuildProtocolContextsFromHTTPRequest").
+				Err(err).
+				Str("endpoint_addr", string(endpointAddr)).
+				Msgf("Failed to build protocol context for endpoint %d/%d, skipping", i+1, numSelectedEndpoints)
 			// Continue with other endpoints rather than failing completely
 			continue
 		}
 		rc.protocolContexts = append(rc.protocolContexts, protocolCtx)
-		logger.Debug().Msgf("Successfully built protocol context for endpoint %d/%d: %s", i+1, numSelectedEndpoints, endpointAddr)
+		rc.logger.Debug().
+			Str("method", "BuildProtocolContextsFromHTTPRequest").
+			Msgf("Successfully built protocol context for endpoint %d/%d: %s", i+1, numSelectedEndpoints, endpointAddr)
 	}
 
 	if len(rc.protocolContexts) == 0 {
-		logger.Error().Msgf("Zero protocol contexts were built for the request with %d selected endpoints", numSelectedEndpoints)
+		rc.logger.Error().
+			Str("method", "BuildProtocolContextsFromHTTPRequest").
+			Msgf("Zero protocol contexts were built for the request with %d selected endpoints", numSelectedEndpoints)
 		// error encountered: use the supplied observations as protocol observations.
 		rc.updateProtocolObservations(lastProtocolCtxSetupErrObs)
-		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msg(errHTTPRequestRejectedByProtocol.Error())
+		rc.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).
+			Str("method", "BuildProtocolContextsFromHTTPRequest").
+			Msg(errHTTPRequestRejectedByProtocol.Error())
 		return errHTTPRequestRejectedByProtocol
 	}
 
-	logger.Debug().Msgf("Successfully built %d protocol contexts for the request with %d selected endpoints", len(rc.protocolContexts), numSelectedEndpoints)
+	rc.logger.Debug().
+		Str("method", "BuildProtocolContextsFromHTTPRequest").
+		Msgf("Successfully built %d protocol contexts for the request with %d selected endpoints", len(rc.protocolContexts), numSelectedEndpoints)
 
 	return nil
 }

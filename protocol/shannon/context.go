@@ -228,14 +228,12 @@ func (rc *requestContext) sendSingleRelay(payload protocol.Payload) (protocol.Re
 func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payload) ([]protocol.Response, error) {
 	maxBatchPayloads := rc.concurrencyConfig.MaxBatchPayloads
 
-	logger := rc.logger.With(
-		"method", "handleParallelRelayRequests",
-		"num_payloads", len(payloads),
-		"service_id", rc.serviceID,
-		"max_concurrent", maxBatchPayloads,
-	)
-
-	logger.Debug().Msg("Starting parallel relay processing with worker pool")
+	// PERF: Use inline fields instead of creating new logger to avoid allocation
+	rc.logger.Debug().
+		Str("method", "handleParallelRelayRequests").
+		Int("num_payloads", len(payloads)).
+		Int("max_concurrent", maxBatchPayloads).
+		Msg("Starting parallel relay processing with worker pool")
 
 	// Initialize observations channel for thread-safe collection from workers
 	rc.observationsChan = make(chan *protocolobservations.ShannonEndpointObservation, len(payloads))
@@ -278,7 +276,7 @@ func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payloa
 			}
 
 			if err != nil {
-				logger.Warn().Err(err).
+				rc.logger.Warn().Err(err).
 					Msgf("Parallel relay request %d failed after %dms", i, duration.Milliseconds())
 			}
 		})
@@ -384,7 +382,7 @@ func (rc *requestContext) getSelectedEndpoint() endpoint {
 //  2. Network conditions (session rollover periods)
 func (rc *requestContext) executeRelayRequestStrategy(payload protocol.Payload) (protocol.Response, error) {
 	selectedEndpoint := rc.getSelectedEndpoint()
-	rc.hydrateLogger("executeRelayRequestStrategy")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation on every request
 
 	switch {
 
@@ -442,8 +440,8 @@ func buildHeaders(payload protocol.Payload) map[string]string {
 //   - Captures RelayMinerError data for reporting (but doesn't use it for classification).
 //   - Required to fulfill the FullNode interface.
 func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.Response, error) {
-	rc.hydrateLogger("sendProtocolRelay")
-	rc.logger = hydrateLoggerWithPayload(rc.logger, &payload)
+	// PERF: Removed hydrateLogger() and hydrateLoggerWithPayload() calls.
+	// Use inline fields when logging payload data instead of creating new logger instances.
 
 	selectedEndpoint := rc.getSelectedEndpoint()
 	defaultResponse := protocol.Response{
@@ -927,7 +925,7 @@ func (rc *requestContext) trackRelayMinerError(relayResponse *servicetypes.Relay
 	}
 
 	relayMinerErr := relayResponse.RelayMinerError
-	rc.hydrateLogger("trackRelayMinerError")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation
 
 	// Log RelayMinerError details for visibility
 	rc.logger.With(
@@ -950,7 +948,7 @@ func (rc *requestContext) trackRelayMinerError(relayResponse *servicetypes.Relay
 //   - Records internal error on request for observations.
 //   - Logs error entry.
 func (rc *requestContext) handleInternalError(internalErr error) (protocol.Response, error) {
-	rc.hydrateLogger("handleInternalError")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation
 
 	// Log the internal error.
 	rc.logger.Error().Err(internalErr).Msg("Internal error occurred. This should be investigated as a bug.")
@@ -972,7 +970,7 @@ func (rc *requestContext) handleEndpointError(
 	endpointQueryTime time.Time,
 	endpointErr error,
 ) (protocol.Response, error) {
-	rc.hydrateLogger("handleEndpointError")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation
 	selectedEndpoint := rc.getSelectedEndpoint()
 	selectedEndpointAddr := selectedEndpoint.Addr()
 
@@ -1068,9 +1066,11 @@ func (rc *requestContext) handleEndpointSuccess(
 	endpointQueryTime time.Time,
 	endpointResponse *protocol.Response,
 ) error {
-	rc.hydrateLogger("handleEndpointSuccess")
-	rc.logger = rc.logger.With("endpoint_response_payload_len", len(endpointResponse.Bytes))
-	rc.logger.Debug().Msg("Successfully deserialized the response received from the selected endpoint.")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation
+	// Use inline field for endpoint_response_payload_len instead of creating new logger
+	rc.logger.Debug().
+		Int("endpoint_response_payload_len", len(endpointResponse.Bytes)).
+		Msg("Successfully deserialized the response received from the selected endpoint.")
 
 	selectedEndpoint := rc.getSelectedEndpoint()
 	selectedEndpointAddr := selectedEndpoint.Addr()
