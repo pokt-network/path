@@ -451,15 +451,15 @@ gateway_config:
       rpc_type_fallbacks:
         comet_bft: json_rpc
 
-      fallback:
-        enabled: true
-        send_all_traffic: false
-        endpoints:
-          - default_url: "http://fallback.xrplevm.io"
-            json_rpc: "http://fallback.xrplevm.io:8545"
-            rest: "http://fallback.xrplevm.io:1317"
-            comet_bft: "http://fallback.xrplevm.io:26657"
-            websocket: "ws://fallback.xrplevm.io:8546"
+#      fallback:
+#        enabled: true
+#        send_all_traffic: false
+#        endpoints:
+#          - default_url: "http://fallback.xrplevm.io"
+#            json_rpc: "http://fallback.xrplevm.io:8545"
+#            rest: "http://fallback.xrplevm.io:1317"
+#            comet_bft: "http://fallback.xrplevm.io:26657"
+#            websocket: "ws://fallback.xrplevm.io:8546"
 
     - id: pocket
       type: "cosmos"
