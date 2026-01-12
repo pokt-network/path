@@ -445,9 +445,11 @@ gateway_config:
 
     # Cosmos chain with EVM support (like XRPL EVM)
     - id: xrplevm
-      type: "cosmos"
-      rpc_types: ["json_rpc", "rest", "comet_bft", "websocket"]
-      latency_profile: "slow"
+      type: "cosmos"  # Cosmos SDK chain with EVM support
+      rpc_types: ["json_rpc", "comet_bft", "websocket"]  # Suppliers don't support REST
+      latency_profile: "standard"
+      rpc_type_fallbacks:
+        comet_bft: json_rpc
 
       fallback:
         enabled: true
