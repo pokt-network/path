@@ -359,48 +359,16 @@ func createDetailedHTTPTrace(metrics *httpRequestMetrics) *httptrace.ClientTrace
 	}
 }
 
-// logRequestMetrics logs comprehensive request metrics for debugging failed requests.
-// Only called when a request fails to avoid verbose logging on successful requests.
+// logRequestMetrics logs request metrics for debugging failed requests.
+// Only called when a request fails. Uses DEBUG level to avoid log noise at high volume.
 func (h *HTTPClientWithDebugMetrics) logRequestMetrics(logger polylog.Logger, metrics httpRequestMetrics) {
-	// Calculate derived timings for easier analysis
-	connectionEstablishmentTime := metrics.dnsLookupTime + metrics.connectTime + metrics.tlsTime
-	requestTransmissionTime := metrics.wroteHeadersTime + metrics.wroteRequestTime
-
-	// Log detailed failure metrics using the provided structured logger
-	logger.With(
-		// Request identification
-		"http_client_debug_url", metrics.url,
-		"http_client_debug_total_ms", metrics.totalTime.Milliseconds(),
-		"http_client_debug_timeout_ms", metrics.contextTimeout.Milliseconds(),
-		"http_client_debug_status_code", metrics.statusCode,
-
-		// Phase 1: DNS Resolution
-		"http_client_debug_dns_lookup_ms", metrics.dnsLookupTime.Milliseconds(),
-
-		// Phase 2: Connection Management
-		"http_client_debug_get_conn_ms", metrics.getConnTime.Milliseconds(), // Time to get connection from pool
-		"http_client_debug_connection_reused", metrics.connectionReused, // Was connection reused?
-		"http_client_debug_connect_ms", metrics.connectTime.Milliseconds(), // TCP connection time (if new)
-		"http_client_debug_tls_ms", metrics.tlsTime.Milliseconds(), // TLS handshake time (if new)
-		"http_client_debug_connection_establishment_ms", connectionEstablishmentTime.Milliseconds(), // Total setup time
-
-		// Phase 3: Request Transmission
-		"http_client_debug_wrote_headers_ms", metrics.wroteHeadersTime.Milliseconds(), // Time to write headers
-		"http_client_debug_wrote_request_ms", metrics.wroteRequestTime.Milliseconds(), // Time to write body
-		"http_client_debug_request_transmission_ms", requestTransmissionTime.Milliseconds(), // Total write time
-
-		// Phase 4: Response Waiting
-		"http_client_debug_first_byte_ms", metrics.firstByteTime.Milliseconds(), // Time waiting for server response
-
-		// Connection details
-		"http_client_debug_remote_addr", metrics.remoteAddr,
-		"http_client_debug_local_addr", metrics.localAddr,
-
-		// System state
-		"http_client_debug_goroutines", metrics.goroutineCount,
-		"http_client_debug_active_requests", h.activeRequests.Load(),
-		"http_client_debug_total_requests", h.totalRequests.Load(),
-		"http_client_debug_timeout_errors", h.timeoutErrors.Load(),
-		"http_client_debug_connection_errors", h.connectionErrors.Load(),
-	).Error().Err(metrics.error).Msg("HTTP request failed - detailed phase breakdown for timeout debugging")
+	// Log concise failure metrics at DEBUG level to avoid log spam on timeouts
+	logger.Debug().
+		Err(metrics.error).
+		Str("url", metrics.url).
+		Int64("total_ms", metrics.totalTime.Milliseconds()).
+		Int64("timeout_ms", metrics.contextTimeout.Milliseconds()).
+		Int("status_code", metrics.statusCode).
+		Str("remote_addr", metrics.remoteAddr).
+		Msg("HTTP request failed")
 }

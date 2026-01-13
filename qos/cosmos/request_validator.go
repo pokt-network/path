@@ -33,12 +33,19 @@ type requestValidator struct {
 
 // validateHTTPRequest validates an HTTP request and routes to appropriate sub-validator
 // Returns (context, true) on success or (errorContext, false) on failure
-func (rv *requestValidator) validateHTTPRequest(req *http.Request) (gateway.RequestQoSContext, bool) {
+//
+// Fallback logic for RPC type detection (Cosmos):
+//  1. If detectedRPCType != UNKNOWN_RPC, use it (gateway already detected via header)
+//  2. Else, check path (for REST vs COMET_BFT distinction)
+//  3. Else, check payload (for JSONRPC vs REST)
+//  4. Else, default to JSON_RPC
+func (rv *requestValidator) validateHTTPRequest(req *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
 	logger := rv.logger.With(
 		"qos", "Cosmos",
 		"method", "validateHTTPRequest",
 		"path", req.URL.Path,
 		"http_method", req.Method,
+		"detected_rpc_type", detectedRPCType.String(),
 	)
 
 	// Read the request body with a size limit to prevent OOM attacks.
@@ -55,19 +62,39 @@ func (rv *requestValidator) validateHTTPRequest(req *http.Request) (gateway.Requ
 		return rv.createHTTPBodyReadFailureContext(err), false
 	}
 
+	// Step 1: If gateway detected the RPC type, use it
+	if detectedRPCType != sharedtypes.RPCType_UNKNOWN_RPC {
+		logger.Debug().Msg("Using gateway-detected RPC type")
+
+		// Route based on detected type
+		switch detectedRPCType {
+		case sharedtypes.RPCType_JSON_RPC:
+			logger.Debug().Msg("Routing to JSONRPC validator (gateway-detected)")
+			return rv.validateJSONRPCRequest(body)
+		case sharedtypes.RPCType_REST, sharedtypes.RPCType_COMET_BFT:
+			logger.Debug().Msg("Routing to REST validator (gateway-detected)")
+			return rv.validateRESTRequest(req.URL, req.Method, body)
+		default:
+			// Unexpected RPC type for Cosmos - log and fall through to detection
+			logger.Warn().Msgf("Unexpected RPC type %s for Cosmos, falling back to detection", detectedRPCType.String())
+		}
+	}
+
+	// Step 2-3: Gateway couldn't detect (UNKNOWN_RPC) or unexpected type - use existing detection logic
 	// Determine request type and route to appropriate validator
 	if isJSONRPCRequest(req.Method, body) {
-		logger.Debug().Msg("Routing to JSONRPC validator")
+		logger.Debug().Msg("Routing to JSONRPC validator (payload-detected)")
 
 		// Validate the JSONRPC request.
 		// Builds and returns a context to handle the request.
 		// Uses a specialized context for handling invalid requests.
 		return rv.validateJSONRPCRequest(body)
 	} else {
-		logger.Debug().Msg("Routing to REST validator")
+		logger.Debug().Msg("Routing to REST validator (payload-detected)")
 
 		// Build and returns a request context to handle the REST request.
 		// Uses a specialized context for handling invalid requests.
+		// This will call determineRESTRPCType to distinguish between REST and COMET_BFT (path-based detection)
 		return rv.validateRESTRequest(req.URL, req.Method, body)
 	}
 }

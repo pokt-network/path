@@ -22,17 +22,16 @@ import (
 // Error-to-Signal Mapping Tests
 // =============================================================================
 
-func TestMapErrorToSignal_PermanentSanction(t *testing.T) {
-	signal := mapErrorToSignal(
+func TestErrorTypeToSignal_FatalError(t *testing.T) {
+	signal := errorTypeToSignal(
 		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_SERVICE_NOT_CONFIGURED,
-		protocolobservations.ShannonSanctionType_SHANNON_SANCTION_PERMANENT,
 		100*time.Millisecond,
 	)
 
 	require.Equal(t, reputation.SignalTypeFatalError, signal.Type)
 }
 
-func TestMapErrorToSignal_SessionSanction_Timeout(t *testing.T) {
+func TestErrorTypeToSignal_Timeout(t *testing.T) {
 	tests := []struct {
 		name      string
 		errorType protocolobservations.ShannonEndpointErrorType
@@ -45,9 +44,8 @@ func TestMapErrorToSignal_SessionSanction_Timeout(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			signal := mapErrorToSignal(
+			signal := errorTypeToSignal(
 				tt.errorType,
-				protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION,
 				5*time.Second,
 			)
 
@@ -58,7 +56,7 @@ func TestMapErrorToSignal_SessionSanction_Timeout(t *testing.T) {
 	}
 }
 
-func TestMapErrorToSignal_SessionSanction_ConnectionError(t *testing.T) {
+func TestErrorTypeToSignal_ConnectionError(t *testing.T) {
 	tests := []struct {
 		name      string
 		errorType protocolobservations.ShannonEndpointErrorType
@@ -71,9 +69,8 @@ func TestMapErrorToSignal_SessionSanction_ConnectionError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			signal := mapErrorToSignal(
+			signal := errorTypeToSignal(
 				tt.errorType,
-				protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION,
 				100*time.Millisecond,
 			)
 
@@ -83,7 +80,7 @@ func TestMapErrorToSignal_SessionSanction_ConnectionError(t *testing.T) {
 	}
 }
 
-func TestMapErrorToSignal_SessionSanction_ServiceError(t *testing.T) {
+func TestErrorTypeToSignal_ServiceError(t *testing.T) {
 	tests := []struct {
 		name      string
 		errorType protocolobservations.ShannonEndpointErrorType
@@ -95,9 +92,8 @@ func TestMapErrorToSignal_SessionSanction_ServiceError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			signal := mapErrorToSignal(
+			signal := errorTypeToSignal(
 				tt.errorType,
-				protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION,
 				200*time.Millisecond,
 			)
 
@@ -107,7 +103,7 @@ func TestMapErrorToSignal_SessionSanction_ServiceError(t *testing.T) {
 	}
 }
 
-func TestMapErrorToSignal_SessionSanction_ValidationError(t *testing.T) {
+func TestErrorTypeToSignal_ValidationError(t *testing.T) {
 	tests := []struct {
 		name      string
 		errorType protocolobservations.ShannonEndpointErrorType
@@ -119,9 +115,8 @@ func TestMapErrorToSignal_SessionSanction_ValidationError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			signal := mapErrorToSignal(
+			signal := errorTypeToSignal(
 				tt.errorType,
-				protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION,
 				150*time.Millisecond,
 			)
 
@@ -131,7 +126,7 @@ func TestMapErrorToSignal_SessionSanction_ValidationError(t *testing.T) {
 	}
 }
 
-func TestMapErrorToSignal_DoNotSanction(t *testing.T) {
+func TestErrorTypeToSignal_NonPenalizedErrors(t *testing.T) {
 	tests := []struct {
 		name         string
 		errorType    protocolobservations.ShannonEndpointErrorType
@@ -156,9 +151,8 @@ func TestMapErrorToSignal_DoNotSanction(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			signal := mapErrorToSignal(
+			signal := errorTypeToSignal(
 				tt.errorType,
-				protocolobservations.ShannonSanctionType_SHANNON_SANCTION_DO_NOT_SANCTION,
 				50*time.Millisecond,
 			)
 
@@ -167,14 +161,13 @@ func TestMapErrorToSignal_DoNotSanction(t *testing.T) {
 	}
 }
 
-func TestMapErrorToSignal_UnknownSanctionType(t *testing.T) {
-	signal := mapErrorToSignal(
+func TestErrorTypeToSignal_UnknownErrorType(t *testing.T) {
+	signal := errorTypeToSignal(
 		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNKNOWN,
-		protocolobservations.ShannonSanctionType_SHANNON_SANCTION_UNSPECIFIED,
 		100*time.Millisecond,
 	)
 
-	// Unknown sanction type defaults to minor error
+	// Unknown error type defaults to minor error
 	require.Equal(t, reputation.SignalTypeMinorError, signal.Type)
 }
 
@@ -246,7 +239,7 @@ func TestReputation_SignalRecording(t *testing.T) {
 
 	serviceID := protocol.ServiceID("test-service")
 	endpointAddr := protocol.EndpointAddr("supplier1-https://endpoint.example.com")
-	key := reputation.NewEndpointKey(serviceID, endpointAddr)
+	key := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
 
 	// Initially, endpoint should not have a score (new endpoint)
 	_, err := svc.GetScore(ctx, key)
@@ -317,8 +310,8 @@ func TestReputation_FilterByReputation(t *testing.T) {
 	// - bad endpoint: score 20 (below threshold of 30)
 	// - new endpoint: no score (should be allowed - treated as initial score)
 
-	goodKey := reputation.NewEndpointKey(serviceID, "supplier1-https://good.example.com")
-	badKey := reputation.NewEndpointKey(serviceID, "supplier2-https://bad.example.com")
+	goodKey := reputation.NewEndpointKey(serviceID, "supplier1-https://good.example.com", sharedtypes.RPCType_JSON_RPC)
+	badKey := reputation.NewEndpointKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_JSON_RPC)
 
 	// Record signals to establish scores
 	// Good endpoint: 1 success -> 80 + 1 = 81
@@ -342,7 +335,7 @@ func TestReputation_FilterByReputation(t *testing.T) {
 	require.Less(t, badScore.Value, reputation.DefaultMinThreshold)
 
 	// Filter endpoints by reputation
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
 
 	// Should have 2 endpoints: good and new (bad should be filtered out)
 	require.Len(t, filtered, 2)
@@ -370,7 +363,7 @@ func TestReputation_DisabledNoFiltering(t *testing.T) {
 	}
 
 	// Filter should return all endpoints unchanged
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
 	require.Equal(t, endpoints, filtered)
 }
 
@@ -392,7 +385,7 @@ func TestReputation_ScoreRecovery(t *testing.T) {
 	require.NoError(t, svc.Start(ctx))
 	defer func() { _ = svc.Stop() }()
 
-	key := reputation.NewEndpointKey("eth", "supplier1-https://endpoint.com")
+	key := reputation.NewEndpointKey("eth", "supplier1-https://endpoint.com", sharedtypes.RPCType_JSON_RPC)
 
 	// Drop score below threshold with critical errors
 	// Initial: 80, after 3 critical errors: 80 - 75 = 5
@@ -456,7 +449,7 @@ func TestReputation_HotPathVerification(t *testing.T) {
 
 	serviceID := protocol.ServiceID("eth")
 	endpointAddr := protocol.EndpointAddr("supplier1-https://endpoint.example.com")
-	endpointKey := reputation.NewEndpointKey(serviceID, endpointAddr)
+	endpointKey := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
 
 	// Simulate handleEndpointSuccess recording a signal
 	latency := 100 * time.Millisecond
@@ -471,9 +464,8 @@ func TestReputation_HotPathVerification(t *testing.T) {
 	require.Equal(t, int64(1), score.SuccessCount)
 
 	// Simulate handleEndpointError recording an error signal
-	errorSignal := mapErrorToSignal(
+	errorSignal := errorTypeToSignal(
 		protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_TIMEOUT,
-		protocolobservations.ShannonSanctionType_SHANNON_SANCTION_SESSION,
 		5*time.Second,
 	)
 	err = p.reputationService.RecordSignal(ctx, endpointKey, errorSignal)
@@ -545,6 +537,7 @@ func TestReputation_StorageTypeConfiguration(t *testing.T) {
 	tests := []struct {
 		name        string
 		config      reputation.Config
+		redisConfig *reputation.RedisConfig // Global redis config (separate from reputation config)
 		expectError bool
 		errContains string
 	}{
@@ -575,10 +568,10 @@ func TestReputation_StorageTypeConfiguration(t *testing.T) {
 				InitialScore: 80,
 				MinThreshold: 30,
 				StorageType:  "redis",
-				Redis:        nil, // No redis config
 			},
+			redisConfig: nil, // No redis config
 			expectError: true,
-			errContains: "redis storage requires redis configuration",
+			errContains: "redis storage requires global redis_config",
 		},
 		{
 			name: "redis storage with invalid address errors",
@@ -587,10 +580,10 @@ func TestReputation_StorageTypeConfiguration(t *testing.T) {
 				InitialScore: 80,
 				MinThreshold: 30,
 				StorageType:  "redis",
-				Redis: &reputation.RedisConfig{
-					Address:     "localhost:59999", // Invalid port, won't connect
-					DialTimeout: 500 * time.Millisecond,
-				},
+			},
+			redisConfig: &reputation.RedisConfig{
+				Address:     "localhost:59999", // Invalid port, won't connect
+				DialTimeout: 500 * time.Millisecond,
 			},
 			expectError: true,
 			errContains: "failed to create redis storage",
@@ -622,10 +615,10 @@ func TestReputation_StorageTypeConfiguration(t *testing.T) {
 			case "memory", "":
 				store = reputationstorage.NewMemoryStorage(tt.config.RecoveryTimeout)
 			case "redis":
-				if tt.config.Redis == nil {
-					err = fmt.Errorf("redis storage requires redis configuration")
+				if tt.redisConfig == nil {
+					err = fmt.Errorf("redis storage requires global redis_config to be set")
 				} else {
-					store, err = reputationstorage.NewRedisStorage(ctx, *tt.config.Redis, tt.config.RecoveryTimeout)
+					store, err = reputationstorage.NewRedisStorage(ctx, *tt.redisConfig, tt.config.RecoveryTimeout)
 					if err != nil {
 						err = fmt.Errorf("failed to create redis storage: %w", err)
 					}
@@ -851,9 +844,9 @@ func TestReputation_KeyGranularityPerSupplier(t *testing.T) {
 	require.IsType(t, &reputation.SupplierKeyBuilder{}, keyBuilder)
 
 	// Build keys - endpoints 1 and 2 should have the SAME key
-	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr)
-	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr)
-	key3 := keyBuilder.BuildKey(serviceID, endpoint3Addr)
+	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr, sharedtypes.RPCType_JSON_RPC)
+	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr, sharedtypes.RPCType_JSON_RPC)
+	key3 := keyBuilder.BuildKey(serviceID, endpoint3Addr, sharedtypes.RPCType_JSON_RPC)
 
 	// Verify keys 1 and 2 are the same (same supplier)
 	require.Equal(t, key1, key2, "Endpoints from same supplier should have same key")
@@ -879,7 +872,7 @@ func TestReputation_KeyGranularityPerSupplier(t *testing.T) {
 	}
 
 	// Filter by reputation
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
 
 	// Both endpoint1 and endpoint2 should be filtered out (same supplier, same low score)
 	// endpoint3 should pass (new endpoint, initial score)
@@ -932,9 +925,9 @@ func TestReputation_KeyGranularityPerDomain(t *testing.T) {
 	require.IsType(t, &reputation.DomainKeyBuilder{}, keyBuilder)
 
 	// Build keys - endpoints 1 and 2 should have the SAME key (same domain)
-	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr)
-	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr)
-	key3 := keyBuilder.BuildKey(serviceID, endpoint3Addr)
+	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr, sharedtypes.RPCType_JSON_RPC)
+	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr, sharedtypes.RPCType_JSON_RPC)
+	key3 := keyBuilder.BuildKey(serviceID, endpoint3Addr, sharedtypes.RPCType_JSON_RPC)
 
 	// Verify keys 1 and 2 are the same (same domain: nodefleet.net)
 	require.Equal(t, key1, key2, "Endpoints from same domain should have same key")
@@ -960,7 +953,7 @@ func TestReputation_KeyGranularityPerDomain(t *testing.T) {
 	}
 
 	// Filter by reputation
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
 
 	// Both endpoint1 and endpoint2 should be filtered out (same domain, same low score)
 	// endpoint3 should pass (different domain, new endpoint, initial score)
@@ -1012,8 +1005,8 @@ func TestReputation_KeyGranularityDefault(t *testing.T) {
 	require.IsType(t, &reputation.EndpointKeyBuilder{}, keyBuilder)
 
 	// Build keys - each endpoint should have a DIFFERENT key
-	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr)
-	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr)
+	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr, sharedtypes.RPCType_JSON_RPC)
+	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr, sharedtypes.RPCType_JSON_RPC)
 
 	// Verify keys are different (per-endpoint granularity)
 	require.NotEqual(t, key1, key2, "Each endpoint should have its own key")
@@ -1037,7 +1030,7 @@ func TestReputation_KeyGranularityDefault(t *testing.T) {
 	}
 
 	// Filter by reputation
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
 
 	// Only endpoint1 should be filtered out
 	require.Len(t, filtered, 1)
@@ -1048,180 +1041,199 @@ func TestReputation_KeyGranularityDefault(t *testing.T) {
 }
 
 // =============================================================================
-// determineReputationSignal Tests
+// RPC-Type-Aware Reputation Tests
 // =============================================================================
 
-// TestDetermineReputationSignal_SingleSuccess verifies that a successful
-// JSON-RPC response returns a success signal.
-func TestDetermineReputationSignal_SingleSuccess(t *testing.T) {
-	logger := polyzero.NewLogger()
-	rc := &requestContext{logger: logger}
+// TestReputationRecording_SeparateRPCTypes verifies that the same endpoint
+// gets separate reputation scores for different RPC types.
+// This is the key test for the RPC-type-aware reputation feature.
+func TestReputationRecording_SeparateRPCTypes(t *testing.T) {
+	ctx := context.Background()
 
-	// Valid JSON-RPC success response
-	responseBytes := []byte(`{"jsonrpc":"2.0","id":1,"result":"0x1234"}`)
-	latency := 100 * time.Millisecond
+	config := reputation.Config{
+		Enabled:         true,
+		InitialScore:    80,
+		MinThreshold:    30,
+		RecoveryTimeout: 5 * time.Minute,
+	}
+	config.HydrateDefaults()
 
-	signal := rc.determineReputationSignal(responseBytes, latency)
-	require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
-	require.Equal(t, latency, signal.Latency)
-}
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
 
-// TestDetermineReputationSignal_SingleError verifies that a JSON-RPC error
-// response returns a minor error signal.
-func TestDetermineReputationSignal_SingleError(t *testing.T) {
-	logger := polyzero.NewLogger()
-	rc := &requestContext{logger: logger}
+	serviceID := protocol.ServiceID("eth")
+	endpointAddr := protocol.EndpointAddr("supplier1-https://node.example.com")
 
-	// JSON-RPC error response
-	responseBytes := []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}`)
-	latency := 100 * time.Millisecond
+	// Create separate keys for different RPC types
+	jsonRpcKey := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
+	websocketKey := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_WEBSOCKET)
 
-	signal := rc.determineReputationSignal(responseBytes, latency)
-	require.Equal(t, reputation.SignalTypeMinorError, signal.Type)
-	require.Equal(t, "jsonrpc_error", signal.Reason)
-}
+	// Scenario: Same endpoint, different RPC type reliability
+	// - JSON-RPC works well: record success
+	// - WebSocket has issues: record failure
 
-// TestDetermineReputationSignal_BatchAllSuccess verifies that a batch
-// response with all successful items returns a success signal.
-func TestDetermineReputationSignal_BatchAllSuccess(t *testing.T) {
-	logger := polyzero.NewLogger()
-	rc := &requestContext{logger: logger}
+	// JSON-RPC: Record success
+	err := svc.RecordSignal(ctx, jsonRpcKey, reputation.NewSuccessSignal(100*time.Millisecond))
+	require.NoError(t, err)
 
-	// Batch JSON-RPC success response
-	responseBytes := []byte(`[
-		{"jsonrpc":"2.0","id":1,"result":"0x1234"},
-		{"jsonrpc":"2.0","id":2,"result":"0x5678"},
-		{"jsonrpc":"2.0","id":3,"result":"0x9abc"}
-	]`)
-	latency := 150 * time.Millisecond
-
-	signal := rc.determineReputationSignal(responseBytes, latency)
-	require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
-	require.Equal(t, latency, signal.Latency)
-}
-
-// TestDetermineReputationSignal_BatchWithError verifies that a batch
-// response containing any error returns a minor error signal.
-func TestDetermineReputationSignal_BatchWithError(t *testing.T) {
-	logger := polyzero.NewLogger()
-	rc := &requestContext{logger: logger}
-
-	// Batch with one error
-	responseBytes := []byte(`[
-		{"jsonrpc":"2.0","id":1,"result":"0x1234"},
-		{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Invalid params"}},
-		{"jsonrpc":"2.0","id":3,"result":"0x9abc"}
-	]`)
-	latency := 150 * time.Millisecond
-
-	signal := rc.determineReputationSignal(responseBytes, latency)
-	require.Equal(t, reputation.SignalTypeMinorError, signal.Type)
-	require.Equal(t, "jsonrpc_batch_error", signal.Reason)
-}
-
-// TestDetermineReputationSignal_BatchAllErrors verifies that a batch
-// response with all errors returns a minor error signal.
-func TestDetermineReputationSignal_BatchAllErrors(t *testing.T) {
-	logger := polyzero.NewLogger()
-	rc := &requestContext{logger: logger}
-
-	// Batch with all errors
-	responseBytes := []byte(`[
-		{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}},
-		{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Invalid params"}}
-	]`)
-	latency := 150 * time.Millisecond
-
-	signal := rc.determineReputationSignal(responseBytes, latency)
-	require.Equal(t, reputation.SignalTypeMinorError, signal.Type)
-	require.Equal(t, "jsonrpc_batch_error", signal.Reason)
-}
-
-// TestDetermineReputationSignal_EmptyResponse verifies that an empty
-// response is treated as success (HTTP worked).
-func TestDetermineReputationSignal_EmptyResponse(t *testing.T) {
-	logger := polyzero.NewLogger()
-	rc := &requestContext{logger: logger}
-
-	latency := 50 * time.Millisecond
-
-	tests := []struct {
-		name     string
-		response []byte
-	}{
-		{"nil response", nil},
-		{"empty slice", []byte{}},
-		{"whitespace only", []byte("   \n\t  ")},
+	// WebSocket: Record critical error (connection failed)
+	// After 3 errors: 80 - 75 = 5 (below threshold)
+	for i := 0; i < 3; i++ {
+		err := svc.RecordSignal(ctx, websocketKey, reputation.NewCriticalErrorSignal("connection_error", 200*time.Millisecond))
+		require.NoError(t, err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			signal := rc.determineReputationSignal(tt.response, latency)
-			require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
-		})
-	}
+	// Verify separate scores exist
+	jsonRpcScore, err := svc.GetScore(ctx, jsonRpcKey)
+	require.NoError(t, err)
+	websocketScore, err := svc.GetScore(ctx, websocketKey)
+	require.NoError(t, err)
+
+	t.Logf("JSON-RPC score: %.1f", jsonRpcScore.Value)
+	t.Logf("WebSocket score: %.1f", websocketScore.Value)
+
+	// JSON-RPC should have high score (success increased it)
+	require.Greater(t, jsonRpcScore.Value, config.InitialScore, "JSON-RPC should have score above initial")
+	require.GreaterOrEqual(t, jsonRpcScore.Value, config.MinThreshold, "JSON-RPC should be above threshold")
+
+	// WebSocket should have low score (errors decreased it)
+	require.Less(t, websocketScore.Value, config.InitialScore, "WebSocket should have score below initial")
+	require.Less(t, websocketScore.Value, config.MinThreshold, "WebSocket should be below threshold")
+
+	// The keys should be different
+	require.NotEqual(t, jsonRpcKey.String(), websocketKey.String(), "Keys should be different")
+	require.Contains(t, jsonRpcKey.String(), ":json_rpc", "JSON-RPC key should contain :json_rpc")
+	require.Contains(t, websocketKey.String(), ":websocket", "WebSocket key should contain :websocket")
+
+	t.Log("Verified: Same endpoint has separate reputation scores for different RPC types")
 }
 
-// TestDetermineReputationSignal_NonJSONResponse verifies that non-JSON
-// responses are treated as success (HTTP worked, format is different).
-func TestDetermineReputationSignal_NonJSONResponse(t *testing.T) {
+// TestReputationFiltering_RPCTypeAware verifies that reputation filtering
+// respects RPC type when selecting endpoints.
+func TestReputationFiltering_RPCTypeAware(t *testing.T) {
+	ctx := context.Background()
 	logger := polyzero.NewLogger()
-	rc := &requestContext{logger: logger}
 
-	latency := 75 * time.Millisecond
+	config := reputation.Config{
+		Enabled:         true,
+		InitialScore:    80,
+		MinThreshold:    30,
+		RecoveryTimeout: 5 * time.Minute,
+	}
+	config.HydrateDefaults()
 
-	tests := []struct {
-		name     string
-		response []byte
-	}{
-		{"plain text", []byte("Hello, World!")},
-		{"html", []byte("<html><body>Error</body></html>")},
-		{"invalid json", []byte("{invalid json")},
-		{"partial json", []byte(`{"key": "value`)},
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	p := &Protocol{
+		logger:            logger,
+		reputationService: svc,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			signal := rc.determineReputationSignal(tt.response, latency)
-			require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
-		})
+	serviceID := protocol.ServiceID("eth")
+	endpointAddr := protocol.EndpointAddr("supplier1-https://node.example.com")
+
+	// Create test endpoints
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		endpointAddr: &mockEndpoint{addr: endpointAddr},
 	}
+
+	// Setup: Endpoint has high JSON-RPC score, low WebSocket score
+	jsonRpcKey := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
+	websocketKey := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_WEBSOCKET)
+
+	// JSON-RPC: Record success to establish a good score
+	// Initial: 80, after success: 81
+	err := svc.RecordSignal(ctx, jsonRpcKey, reputation.NewSuccessSignal(100*time.Millisecond))
+	require.NoError(t, err)
+
+	// WebSocket: Drop score below threshold
+	// Initial: 80, after 3 critical errors: 80 - 75 = 5
+	for i := 0; i < 3; i++ {
+		err := svc.RecordSignal(ctx, websocketKey, reputation.NewCriticalErrorSignal("connection_error", 200*time.Millisecond))
+		require.NoError(t, err)
+	}
+
+	// Verify scores
+	jsonRpcScore, err := svc.GetScore(ctx, jsonRpcKey)
+	require.NoError(t, err)
+	websocketScore, err := svc.GetScore(ctx, websocketKey)
+	require.NoError(t, err)
+	t.Logf("JSON-RPC score: %.1f", jsonRpcScore.Value)
+	t.Logf("WebSocket score: %.1f", websocketScore.Value)
+
+	require.GreaterOrEqual(t, jsonRpcScore.Value, config.MinThreshold, "JSON-RPC should be above threshold")
+	require.Less(t, websocketScore.Value, config.MinThreshold, "WebSocket should be below threshold")
+
+	// Filter for JSON-RPC → endpoint should be included
+	filteredJsonRpc := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
+	require.Len(t, filteredJsonRpc, 1, "JSON-RPC filtering should include endpoint (high score)")
+	require.Contains(t, filteredJsonRpc, endpointAddr, "Endpoint should be included for JSON-RPC")
+
+	// Filter for WebSocket → endpoint should be excluded
+	filteredWebsocket := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger)
+	require.Len(t, filteredWebsocket, 0, "WebSocket filtering should exclude endpoint (low score)")
+	require.NotContains(t, filteredWebsocket, endpointAddr, "Endpoint should be excluded for WebSocket")
+
+	t.Log("Verified: Filtering respects RPC type - same endpoint included for JSON-RPC, excluded for WebSocket")
 }
 
-// TestDetermineReputationSignal_ValidJSONNotJSONRPC verifies that valid JSON
-// that is not a JSON-RPC response is treated as success.
-func TestDetermineReputationSignal_ValidJSONNotJSONRPC(t *testing.T) {
+// TestReputationWebSocketRecording_RPCType verifies that WebSocket connection
+// observations use the WEBSOCKET RPC type in reputation keys.
+func TestReputationWebSocketRecording_RPCType(t *testing.T) {
+	ctx := context.Background()
 	logger := polyzero.NewLogger()
-	rc := &requestContext{logger: logger}
 
-	latency := 100 * time.Millisecond
+	config := reputation.Config{
+		Enabled:         true,
+		InitialScore:    80,
+		MinThreshold:    30,
+		RecoveryTimeout: 5 * time.Minute,
+	}
+	config.HydrateDefaults()
 
-	tests := []struct {
-		name     string
-		response []byte
-	}{
-		{"generic object", []byte(`{"status":"ok","data":123}`)},
-		{"array of numbers", []byte(`[1, 2, 3, 4, 5]`)},
-		{"nested object", []byte(`{"outer":{"inner":"value"}}`)},
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	p := &Protocol{
+		logger:            logger,
+		reputationService: svc,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			signal := rc.determineReputationSignal(tt.response, latency)
-			require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
-		})
+	serviceID := protocol.ServiceID("eth")
+	endpointURL := "wss://node.example.com/ws"
+
+	// Create a WebSocket connection observation with error
+	obs := &protocolobservations.ShannonWebsocketConnectionObservation{
+		EndpointUrl: endpointURL,
+		ErrorType:   &[]protocolobservations.ShannonEndpointErrorType{protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_WEBSOCKET_CONNECTION_FAILED}[0],
 	}
-}
 
-// TestDetermineReputationSignal_EmptyBatch verifies that an empty batch
-// response is treated as success.
-func TestDetermineReputationSignal_EmptyBatch(t *testing.T) {
-	logger := polyzero.NewLogger()
-	rc := &requestContext{logger: logger}
+	// Record the WebSocket observation
+	p.recordSignalFromWebsocketConnectionObservation(serviceID, obs)
 
-	responseBytes := []byte(`[]`)
-	latency := 100 * time.Millisecond
+	// Give it a moment to process (fire-and-forget)
+	time.Sleep(50 * time.Millisecond)
 
-	signal := rc.determineReputationSignal(responseBytes, latency)
-	require.Equal(t, reputation.SignalTypeSuccess, signal.Type)
+	// Verify that the score was recorded with WEBSOCKET RPC type
+	websocketKey := reputation.NewEndpointKey(serviceID, protocol.EndpointAddr(endpointURL), sharedtypes.RPCType_WEBSOCKET)
+	score, err := svc.GetScore(ctx, websocketKey)
+	require.NoError(t, err)
+
+	// Score should be lower than initial due to the error
+	require.Less(t, score.Value, config.InitialScore, "WebSocket error should decrease score")
+
+	// Verify that a JSON-RPC key for the same endpoint has no score (different key)
+	jsonRpcKey := reputation.NewEndpointKey(serviceID, protocol.EndpointAddr(endpointURL), sharedtypes.RPCType_JSON_RPC)
+	_, err = svc.GetScore(ctx, jsonRpcKey)
+	// This should error because no score exists for JSON-RPC key (only WebSocket was recorded)
+	require.Error(t, err, "JSON-RPC key should have no score (WebSocket uses different key)")
+
+	t.Log("Verified: WebSocket observations use WEBSOCKET RPC type in reputation keys")
 }

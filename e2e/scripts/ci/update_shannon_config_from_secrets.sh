@@ -16,7 +16,7 @@ set -o nounset
 cd "$(dirname "$0")/../../config" || exit 1
 
 update_shannon_config_from_env() {
-    check_env_vars "SHANNON_GATEWAY_ADDRESS" "SHANNON_GATEWAY_PRIVATE_KEY" "SHANNON_OWNED_APPS_PRIVATE_KEYS"
+    check_env_vars "SHANNON_GATEWAY_ADDRESS" "SHANNON_GATEWAY_PRIVATE_KEY" "SHANNON_OWNED_APPS_PRIVATE_KEYS" "FULL_NODE_RPC_URL"
 
     # TODO_TECHDEBT: Consolidate this with PATH's .config.yaml
     local CONFIG_FILE="./.shannon.config.yaml"
@@ -27,9 +27,12 @@ update_shannon_config_from_env() {
 
     # Update the PATH Shannon config to reflect secrets on GitHub.
     yq -i '
-	.shannon_config.gateway_config.gateway_address = env(SHANNON_GATEWAY_ADDRESS) |
-	.shannon_config.gateway_config.gateway_private_key_hex = env(SHANNON_GATEWAY_PRIVATE_KEY) |
-	.shannon_config.gateway_config.owned_apps_private_keys_hex = (env(SHANNON_OWNED_APPS_PRIVATE_KEYS) | split(","))
+	.gateway_config.gateway_address = env(SHANNON_GATEWAY_ADDRESS) |
+	.gateway_config.gateway_private_key_hex = env(SHANNON_GATEWAY_PRIVATE_KEY) |
+	.full_node_config.rpc_url = env(FULL_NODE_RPC_URL) |
+  .full_node_config.grpc_config.host_port = "sauron-grpc.infra.pocket.network:443" |
+  .full_node_config.grpc_config.insecure = false |
+	.gateway_config.owned_apps_private_keys_hex = (env(SHANNON_OWNED_APPS_PRIVATE_KEYS) | split(","))
     ' $CONFIG_FILE
 }
 

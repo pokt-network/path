@@ -29,7 +29,7 @@ func (p *Protocol) getSession(
 	appAddr string,
 	serviceID protocol.ServiceID,
 ) (sessiontypes.Session, error) {
-	logger.Info().Msgf("About to get a session for app %s for service %s", appAddr, serviceID)
+	logger.Debug().Msgf("About to get a session for app %s for service %s", appAddr, serviceID)
 
 	var err error
 	var session sessiontypes.Session

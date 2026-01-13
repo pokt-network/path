@@ -10,6 +10,8 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/pokt-network/path/metrics"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
@@ -46,9 +48,6 @@ type websocketRequestContext struct {
 
 	// metricsReporter is used to export metrics based on observations made in handling service requests.
 	metricsReporter RequestResponseReporter
-
-	// dataReporter is used to export, to the data pipeline, observations made in handling service requests.
-	dataReporter RequestResponseReporter
 
 	// QoS related request context
 	serviceID  protocol.ServiceID
@@ -104,7 +103,7 @@ func (wrc *websocketRequestContext) buildQoSContextFromHTTP(_ *http.Request) err
 	if !isValid {
 		// Update gateway observations for websocket rejection
 		wrc.updateGatewayObservations(errWebsocketRequestRejectedByQoS)
-		logger.Info().Msg("Websocket request rejected by QoS")
+		logger.Debug().Msg("Websocket request rejected by QoS")
 		return errWebsocketRequestRejectedByQoS
 	}
 
@@ -142,7 +141,7 @@ func (wrc *websocketRequestContext) handleWebsocketRequest(
 	// Set the received_time in gateway observations to mark connection establishment
 	wrc.gatewayObservations.ReceivedTime = timestamppb.New(time.Now())
 
-	logger.Info().Msg("🔌 Websocket connection established successfully")
+	logger.Info().Msg("Websocket connection established successfully")
 
 	return nil
 }
@@ -197,7 +196,7 @@ func (wrc *websocketRequestContext) buildProtocolContextAndStartBridge(
 	}
 
 	wrc.protocolCtx = protocolCtx
-	logger.Info().Msgf("Successfully built protocol context and started bridge for websocket endpoint: %s", selectedEndpoint)
+	logger.Debug().Msgf("Successfully built protocol context and started bridge for websocket endpoint: %s", selectedEndpoint)
 	return connectionObservationChan, nil
 }
 
@@ -324,15 +323,38 @@ func (wrc *websocketRequestContext) handleConnectionObservation(protocolObs *pro
 		if obsData, ok := shannonReqObs.GetObservationData().(*protocolobservations.ShannonRequestObservations_WebsocketConnectionObservation); ok {
 			// Handle connection lifecycle events
 			connObs := obsData.WebsocketConnectionObservation
+
+			// Extract domain for metrics
+			domain, domainErr := shannonmetrics.ExtractDomainOrHost(connObs.GetEndpointUrl())
+			if domainErr != nil {
+				domain = shannonmetrics.ErrDomain
+			}
+			serviceID := string(wrc.serviceID)
+
 			switch connObs.GetEventType() {
 			case protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_ESTABLISHED:
 				wrc.logger.Debug().Msg("Received connection establishment observation from protocol layer")
+				// Record successful connection establishment metric
+				metrics.RecordWebsocketConnectionEstablished(domain, serviceID)
 				wrc.broadcastWebsocketConnectionEstablished(protocolObs)
+
 			case protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_CLOSED:
 				wrc.logger.Debug().Msg("Received connection closure observation from protocol layer")
+				// Calculate connection duration from timestamps
+				var durationSeconds float64
+				if connObs.GetConnectionEstablishedTimestamp() != nil && connObs.GetConnectionClosedTimestamp() != nil {
+					establishedTime := connObs.GetConnectionEstablishedTimestamp().AsTime()
+					closedTime := connObs.GetConnectionClosedTimestamp().AsTime()
+					durationSeconds = closedTime.Sub(establishedTime).Seconds()
+				}
+				// Record connection closure metric with duration
+				metrics.RecordWebsocketConnectionClosed(domain, serviceID, durationSeconds)
 				wrc.broadcastWebsocketConnectionClosed(protocolObs)
+
 			case protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_ESTABLISHMENT_FAILED:
 				wrc.logger.Debug().Msg("Received connection establishment failure observation from protocol layer")
+				// Record connection failure metric
+				metrics.RecordWebsocketConnectionFailed(domain, serviceID)
 				wrc.broadcastWebsocketConnectionEstablished(protocolObs) // Treat as establishment event for metrics
 			}
 		} else {
@@ -378,9 +400,6 @@ func (wrc *websocketRequestContext) BroadcastMessageObservations(
 		}
 		if wrc.metricsReporter != nil {
 			wrc.metricsReporter.Publish(observations)
-		}
-		if wrc.dataReporter != nil {
-			wrc.dataReporter.Publish(observations)
 		}
 	}()
 }
@@ -435,9 +454,6 @@ func (wrc *websocketRequestContext) broadcastWebsocketConnectionClosed(protocolO
 	// Broadcast the combined observations to BOTH metrics and data pipeline
 	if wrc.metricsReporter != nil {
 		wrc.metricsReporter.Publish(observations)
-	}
-	if wrc.dataReporter != nil {
-		wrc.dataReporter.Publish(observations)
 	}
 }
 

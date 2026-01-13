@@ -9,7 +9,9 @@ import (
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 	"github.com/pokt-network/path/websockets"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
 
 // Protocol defines the core functionality of a protocol from the perspective of a gateway.
@@ -26,6 +28,7 @@ type Protocol interface {
 	AvailableHTTPEndpoints(
 		context.Context,
 		protocol.ServiceID,
+		sharedtypes.RPCType,
 		*http.Request,
 	) (protocol.EndpointAddrList, protocolobservations.Observations, error)
 
@@ -53,11 +56,15 @@ type Protocol interface {
 	//
 	// Return observation if the context setup fails.
 	// Used as protocol observation for the request when no protocol context exists.
+	// filterByReputation controls whether to filter endpoints by reputation score.
+	// Pass true for normal requests (respects reputation), false for health checks (reaches all endpoints).
 	BuildHTTPRequestContextForEndpoint(
-		context.Context,
-		protocol.ServiceID,
-		protocol.EndpointAddr,
-		*http.Request,
+		ctx context.Context,
+		serviceID protocol.ServiceID,
+		endpointAddr protocol.EndpointAddr,
+		rpcType sharedtypes.RPCType,
+		httpReq *http.Request,
+		filterByReputation bool,
 	) (ProtocolRequestContext, protocolobservations.Observations, error)
 
 	// BuildWebsocketRequestContextForEndpoint builds and returns a ProtocolRequestContextWebsocket containing a single selected endpoint.
@@ -113,6 +120,36 @@ type Protocol interface {
 
 	// CheckWebsocketConnection checks if the websocket connection to the endpoint is established.
 	CheckWebsocketConnection(context.Context, protocol.ServiceID, protocol.EndpointAddr) *protocolobservations.Observations
+
+	// GetReputationService returns the reputation service instance used by the protocol.
+	// This is used by the health check executor to record health check results.
+	GetReputationService() reputation.ReputationService
+
+	// GetEndpointsForHealthCheck returns a function that gets endpoints for health checks.
+	// The returned function takes a service ID and returns endpoint info suitable for health checks.
+	// Note: This does NOT filter by reputation - health checks should run against all endpoints.
+	GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]EndpointInfo, error)
+
+	// GetUnifiedServicesConfig returns the unified services configuration.
+	// This is used by components that need access to per-service configuration overrides.
+	GetUnifiedServicesConfig() *UnifiedServicesConfig
+
+	// GetConcurrencyConfig returns the concurrency configuration.
+	// This is used by components that need to respect concurrency limits.
+	GetConcurrencyConfig() ConcurrencyConfig
+
+	// UnblacklistSupplier removes a supplier from the blacklist.
+	// Called when a health check succeeds for a previously blacklisted supplier.
+	// Returns true if the supplier was blacklisted and has been removed.
+	UnblacklistSupplier(serviceID protocol.ServiceID, supplierAddr string) bool
+
+	// IsSupplierBlacklisted checks if a supplier is currently blacklisted.
+	IsSupplierBlacklisted(serviceID protocol.ServiceID, supplierAddr string) bool
+
+	// IsSessionActive checks if a session is currently active for a service.
+	// Used by health check executor to detect session rollover before attempting health checks.
+	// Returns true if the session is still in the current active sessions list.
+	IsSessionActive(ctx context.Context, serviceID protocol.ServiceID, sessionID string) bool
 
 	// health.Check interface is used to verify protocol instance's health status.
 	health.Check

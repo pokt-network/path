@@ -1,13 +1,10 @@
 package shannon
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
-	"math/rand"
 	"net/http"
 	"strconv"
 	"sync"
@@ -22,12 +19,11 @@ import (
 	sdk "github.com/pokt-network/shannon-sdk"
 
 	"github.com/pokt-network/path/gateway"
+	"github.com/pokt-network/path/metrics"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
-	reputationmetrics "github.com/pokt-network/path/metrics/reputation"
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
-	"github.com/pokt-network/path/qos/jsonrpc"
 	"github.com/pokt-network/path/reputation"
 )
 
@@ -36,20 +32,9 @@ import (
 // TODO_TECHDEBT(@olshansk): Cleanup the code in this file by:
 // - Renaming this to request_context.go
 // - Moving HTTP request code to a dedicated file
-
-// TODO_TECHDEBT(@adshmh): Make this threshold configurable.
-//
-// Maximum time to wait before using a fallback endpoint.
-// TODO_TECHDEBT(@adshmh): Make this threshold configurable.
-const maxWaitBeforeFallbackMillisecond = 1_000
-
-// Maximum endpoint payload length for error logging (100 chars)
-const maxEndpointPayloadLenForLogging = 100
-
 // MaxConcurrentRelaysPerRequest limits the number of concurrent relay goroutines per request.
 // This prevents DoS attacks via large batch requests that could spawn unbounded goroutines.
-// TODO_IMPROVE: Make this configurable via gateway settings.
-const MaxConcurrentRelaysPerRequest = 5500
+// ✅ DONE: Now configurable via concurrency_config.max_batch_payloads in YAML (default: 5500)
 
 // requestContext provides all the functionality required by the gateway package
 // for handling a single service request.
@@ -65,7 +50,6 @@ type RelayRequestSigner interface {
 }
 
 // requestContext captures all data required for handling a single service request.
-// TODO_TECHDEBT(@adshmh): add sanctionedEndpointsStore to the request context.
 type requestContext struct {
 	logger polylog.Logger
 
@@ -130,10 +114,28 @@ type requestContext struct {
 	// Passed from Protocol, used to create task groups for batch requests.
 	relayPool pond.Pool
 
+	// concurrencyConfig controls concurrency limits for request processing.
+	// Used to enforce max batch payloads and other concurrency constraints.
+	// This is the GLOBAL config - per-service overrides are retrieved via unifiedServicesConfig.
+	concurrencyConfig gateway.ConcurrencyConfig
+
+	// unifiedServicesConfig provides access to per-service configuration overrides.
+	// Used to get per-service concurrency limits (max_batch_payloads, max_parallel_endpoints).
+	unifiedServicesConfig *gateway.UnifiedServicesConfig
+
 	// reputationService tracks endpoint reputation scores.
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
-	// When nil, only binary sanctions are used.
+	// When nil, no reputation-based filtering is applied.
 	reputationService reputation.ReputationService
+
+	// tieredSelector provides access to tier-based selection and probation status.
+	// Used to check if endpoints are in probation when recording success signals.
+	// If non-nil and endpoint is in probation, RecoverySuccessSignal is used instead of SuccessSignal.
+	tieredSelector *reputation.TieredSelector
+
+	// supplierBlacklist tracks suppliers with validation/signature errors.
+	// Used to blacklist suppliers on errors and skip domain reputation penalty.
+	supplierBlacklist *supplierBlacklist
 }
 
 // HandleServiceRequest:
@@ -157,8 +159,12 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 
 	// TODO_TECHDEBT: Account for different payloads having different RPC types
 	// OR refactor the single/parallel code flow altogether
-	// Store the current RPC type for use in observations
-	rc.currentRPCType = payloads[0].RPCType
+	// Store the current RPC type for use in observations.
+	// Only override if payload has an explicit RPC type (non-zero value).
+	// This preserves the default set in BuildHTTPRequestContextForEndpoint for health checks.
+	if payloads[0].RPCType != sharedtypes.RPCType_UNKNOWN_RPC {
+		rc.currentRPCType = payloads[0].RPCType
+	}
 
 	// For single payload, handle directly without additional overhead.
 	if len(payloads) == 1 {
@@ -166,8 +172,18 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 		return []protocol.Response{response}, err
 	}
 
-	if len(payloads) > MaxConcurrentRelaysPerRequest {
-		response, err := rc.handleInternalError(fmt.Errorf("HandleServiceRequest: batch of payloads larger than allowed: %d, received: %d ", MaxConcurrentRelaysPerRequest, len(payloads)))
+	// Enforce configured max batch payload limit to prevent resource exhaustion
+	// Use per-service override if available, otherwise fall back to global config
+	maxBatchPayloads := rc.concurrencyConfig.MaxBatchPayloads
+	if rc.unifiedServicesConfig != nil {
+		if mergedConfig := rc.unifiedServicesConfig.GetMergedServiceConfig(rc.serviceID); mergedConfig != nil {
+			if mergedConfig.ConcurrencyConfig != nil && mergedConfig.ConcurrencyConfig.MaxBatchPayloads != nil {
+				maxBatchPayloads = *mergedConfig.ConcurrencyConfig.MaxBatchPayloads
+			}
+		}
+	}
+	if len(payloads) > maxBatchPayloads {
+		response, err := rc.handleInternalError(fmt.Errorf("HandleServiceRequest: batch of payloads larger than allowed: %d, received: %d ", maxBatchPayloads, len(payloads)))
 		return []protocol.Response{response}, err
 	}
 
@@ -210,25 +226,25 @@ func (rc *requestContext) sendSingleRelay(payload protocol.Payload) (protocol.Re
 // Uses pond worker pool for bounded concurrency and channels for thread-safe observation collection.
 // This prevents DoS attacks via large batch requests that could spawn unbounded goroutines.
 func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payload) ([]protocol.Response, error) {
-	logger := rc.logger.With(
-		"method", "handleParallelRelayRequests",
-		"num_payloads", len(payloads),
-		"service_id", rc.serviceID,
-		"max_concurrent", MaxConcurrentRelaysPerRequest,
-	)
+	maxBatchPayloads := rc.concurrencyConfig.MaxBatchPayloads
 
-	logger.Debug().Msg("Starting parallel relay processing with worker pool")
+	// PERF: Use inline fields instead of creating new logger to avoid allocation
+	rc.logger.Debug().
+		Str("method", "handleParallelRelayRequests").
+		Int("num_payloads", len(payloads)).
+		Int("max_concurrent", maxBatchPayloads).
+		Msg("Starting parallel relay processing with worker pool")
 
 	// Initialize observations channel for thread-safe collection from workers
 	rc.observationsChan = make(chan *protocolobservations.ShannonEndpointObservation, len(payloads))
 
 	// Start collector goroutine to gather observations from workers
-	// Cap at MaxConcurrentRelaysPerRequest since batch size is already limited to that
+	// Cap at max_batch_payloads since batch size is already limited to that
 	observationsCollected := make(chan struct{})
 	go func() {
 		defer close(observationsCollected)
 		for obs := range rc.observationsChan {
-			if len(rc.endpointObservations) < MaxConcurrentRelaysPerRequest {
+			if len(rc.endpointObservations) < maxBatchPayloads {
 				rc.endpointObservations = append(rc.endpointObservations, obs)
 			}
 			// Silently drop excess observations (shouldn't happen with batch size limit)
@@ -260,7 +276,7 @@ func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payloa
 			}
 
 			if err != nil {
-				logger.Warn().Err(err).
+				rc.logger.Warn().Err(err).
 					Msgf("Parallel relay request %d failed after %dms", i, duration.Milliseconds())
 			}
 		})
@@ -360,20 +376,13 @@ func (rc *requestContext) getSelectedEndpoint() endpoint {
 	return rc.selectedEndpoint
 }
 
-// setSelectedEndpoint sets the selected endpoint in a thread-safe manner.
-func (rc *requestContext) setSelectedEndpoint(endpoint endpoint) {
-	rc.selectedEndpointMutex.Lock()
-	defer rc.selectedEndpointMutex.Unlock()
-	rc.selectedEndpoint = endpoint
-}
-
 // executeRelayRequestStrategy determines and executes the appropriate relay strategy.
 // In particular, it includes logic that accounts for:
 //  1. Endpoint type (fallback vs protocol endpoint)
 //  2. Network conditions (session rollover periods)
 func (rc *requestContext) executeRelayRequestStrategy(payload protocol.Payload) (protocol.Response, error) {
 	selectedEndpoint := rc.getSelectedEndpoint()
-	rc.hydrateLogger("executeRelayRequestStrategy")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation on every request
 
 	switch {
 
@@ -391,21 +400,12 @@ func (rc *requestContext) executeRelayRequestStrategy(payload protocol.Payload) 
 		rc.logger.Debug().Msg("Executing fallback relay")
 		return rc.sendFallbackRelay(selectedEndpoint, payload)
 
-	// ** Priority 2: Check Network conditions **
-	// Session rollover periods
-	// - Protocol relay with fallback protection during session rollover periods
-	// - Sends requests in parallel to ensure reliability during network transitions
-	//
-	// TODO_DELETE(@adshmh): No session rollover fallback for hey service.
-	case rc.fullNode.IsInSessionRollover() && rc.serviceID != "hey":
-		rc.logger.Debug().Msg("Executing protocol relay with fallback protection during session rollover periods")
-		// TODO_TECHDEBT(@adshmh): Separate error handling for fallback and Shannon endpoints.
-		return rc.sendRelayWithFallback(payload)
-
 	// ** Default **
 	// Standard protocol relay
 	// - Standard protocol relay through Shannon network
-	// - Used during stable network periods with protocol endpoints
+	// - During session rollover: Uses merged endpoints from current + extended sessions
+	// - During normal operation: Uses endpoints from current session only
+	// - Fallback endpoints only used when no session endpoints are available
 	default:
 		rc.logger.Debug().Msg("Executing standard protocol relay")
 		return rc.sendProtocolRelay(payload)
@@ -428,128 +428,6 @@ func buildHeaders(payload protocol.Payload) map[string]string {
 	return headers
 }
 
-// sendRelayWithFallback:
-// - Attempts Shannon endpoint with timeout
-// - Falls back to random fallback endpoint on failure/timeout
-// - Shields user from endpoint errors
-// - Updates the request context's selectedEndpoint for use by logging, metrics, and data logic.
-// TODO_TECHDEBT(@adshmh): This is an interim solution to be replaced with intelligent fallback.
-func (rc *requestContext) sendRelayWithFallback(payload protocol.Payload) (protocol.Response, error) {
-	rc.hydrateLogger("sendRelayWithFallback")
-
-	// Convert timeout to time.Duration
-	relayTimeout := time.Duration(maxWaitBeforeFallbackMillisecond) * time.Millisecond
-
-	// Capture Shannon endpoint before async relay for timeout reputation tracking.
-	// The selected endpoint may change when fallback is used.
-	shannonEndpoint := rc.getSelectedEndpoint()
-	startTime := time.Now()
-
-	// Create a cancellable context for the Shannon relay.
-	// This allows us to cancel the request if we timeout and fallback,
-	// preventing double signal recording (timeout + error from canceled request).
-	shannonCtx, cancelShannon := context.WithCancel(rc.context)
-
-	// Setup Shannon endpoint request:
-	// - Create channel for async response
-	// - Initialize response variables
-	endpointResponseReceivedChan := make(chan error, 1)
-	var (
-		endpointResponse protocol.Response
-		endpointErr      error
-	)
-
-	// Send Shannon relay in parallel:
-	// - Execute request asynchronously
-	// - Signal completion via channel
-	go func() {
-		// Use the cancellable context for the relay
-		originalCtx := rc.context
-		rc.context = shannonCtx
-		endpointResponse, endpointErr = rc.sendProtocolRelay(payload)
-		rc.context = originalCtx
-		// Signal the completion of Shannon Network relay.
-		endpointResponseReceivedChan <- endpointErr
-	}()
-
-	// Wait for Shannon response or timeout:
-	// - If successful, return Pocket Network response from RelayMiner
-	// - If error or timeout, fallback to a random fallback endpoint
-	select {
-
-	// RelayMiner responded (success or failure)
-	case err := <-endpointResponseReceivedChan:
-		cancelShannon() // Clean up context
-		// Successfully received and validated a response from the shannon endpoint.
-		// No need to use the fallback endpoint's response.
-		if err == nil {
-			return endpointResponse, nil
-		}
-
-		// TODO_TECHDEBT(@adshmh): Verify correct observations/sanctions when using fallback due to endpoint error.
-		// Note: Error signal already recorded by handleEndpointError in sendProtocolRelay path.
-		rc.logger.Info().Err(err).Msg("Got a response from Pocket Network, but it contained an error. Using a fallback endpoint instead")
-
-		// Shannon endpoint failed, use fallback
-		return rc.sendRelayToARandomFallbackEndpoint(payload)
-
-	// RelayMiner timed out. Use a random fallback endpoint.
-	case <-time.After(relayTimeout):
-		// Cancel the Shannon relay context to stop the in-flight request.
-		// This prevents double signal recording: the timeout signal is recorded here,
-		// and the canceled request won't record an additional error signal because
-		// context cancellation errors are not the endpoint's fault.
-		cancelShannon()
-
-		rc.logger.Info().Msg("Timed out waiting for Pocket Network to respond. Using a fallback endpoint.")
-
-		// Record timeout signal for the Shannon endpoint that didn't respond in time.
-		// This is a major error as it indicates endpoint unresponsiveness.
-		rc.recordTimeoutSignal(shannonEndpoint, startTime)
-
-		// Use a random fallback endpoint
-		return rc.sendRelayToARandomFallbackEndpoint(payload)
-	}
-}
-
-// sendRelayToARandomFallbackEndpoint:
-// - Selects random fallback endpoint
-// - Routes payload via selected endpoint
-// - Returns error if no endpoints available
-// - Updates the request context's selectedEndpoint for use by logging, metrics, and data logic.
-func (rc *requestContext) sendRelayToARandomFallbackEndpoint(payload protocol.Payload) (protocol.Response, error) {
-	if len(rc.fallbackEndpoints) == 0 {
-		rc.logger.Warn().Msg("SHOULD HAPPEN RARELY: no fallback endpoints available for the service")
-		return protocol.Response{}, fmt.Errorf("no fallback endpoints available")
-	}
-
-	rc.hydrateLogger("sendRelayToARandomFallbackEndpoint")
-
-	// Select random fallback endpoint:
-	// - Convert map to slice for random selection
-	// - Pick random index
-	allFallbackEndpoints := make([]endpoint, 0, len(rc.fallbackEndpoints))
-	for _, endpoint := range rc.fallbackEndpoints {
-		allFallbackEndpoints = append(allFallbackEndpoints, endpoint)
-	}
-	fallbackEndpoint := allFallbackEndpoints[rand.Intn(len(allFallbackEndpoints))]
-
-	// TODO_TECHDEBT(@adshmh): Support tracking both the selected and fallback endpoints.
-	// This is needed to support accurate visibility/sanctions against both Shannon and fallback endpoints.
-	//
-	// Update the selected endpoint to the randomly selected fallback endpoint
-	// This ensures observations reflect the actually used endpoint
-	rc.setSelectedEndpoint(fallbackEndpoint)
-
-	// Use the randomly selected fallback endpoint to send a relay.
-	relayResponse, err := rc.sendFallbackRelay(fallbackEndpoint, payload)
-	if err != nil {
-		rc.logger.Warn().Err(err).Msg("SHOULD NEVER HAPPEN: fallback endpoint returned an error.")
-	}
-
-	return relayResponse, err
-}
-
 // TODO_TECHDEBT(@adshmh): Refactor to split the selection of and interactions with the fallback endpoint.
 // Aspects to consider in the refactor:
 // - Individual request's settings, e.g. those determined by QoS.
@@ -562,8 +440,8 @@ func (rc *requestContext) sendRelayToARandomFallbackEndpoint(payload protocol.Pa
 //   - Captures RelayMinerError data for reporting (but doesn't use it for classification).
 //   - Required to fulfill the FullNode interface.
 func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.Response, error) {
-	rc.hydrateLogger("sendProtocolRelay")
-	rc.logger = hydrateLoggerWithPayload(rc.logger, &payload)
+	// PERF: Removed hydrateLogger() and hydrateLoggerWithPayload() calls.
+	// Use inline fields when logging payload data instead of creating new logger instances.
 
 	selectedEndpoint := rc.getSelectedEndpoint()
 	defaultResponse := protocol.Response{
@@ -590,6 +468,41 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		return defaultResponse, err
 	}
 
+	// Debug logging: capture session and supplier details for debugging "supplier does not belong to session" errors
+	session := selectedEndpoint.Session()
+	supplierAddr := selectedEndpoint.Supplier()
+
+	// Verify the supplier is actually in the session's Suppliers list
+	supplierInSession := false
+	for _, s := range session.Suppliers {
+		if s.OperatorAddress == supplierAddr {
+			supplierInSession = true
+			break
+		}
+	}
+
+	if !supplierInSession {
+		// This is a critical bug - the endpoint was created with a supplier not in the session
+		rc.logger.Error().
+			Str("session_id", session.SessionId).
+			Int64("session_start_height", session.Header.SessionStartBlockHeight).
+			Int64("session_end_height", session.Header.SessionEndBlockHeight).
+			Str("supplier_operator_address", supplierAddr).
+			Int("session_supplier_count", len(session.Suppliers)).
+			Str("app_address", session.Header.ApplicationAddress).
+			Msg("BUG: Supplier not found in session's Suppliers list - relay will fail")
+	}
+
+	rc.logger.Debug().
+		Str("session_id", session.SessionId).
+		Int64("session_start_height", session.Header.SessionStartBlockHeight).
+		Int64("session_end_height", session.Header.SessionEndBlockHeight).
+		Str("supplier_operator_address", supplierAddr).
+		Int("session_supplier_count", len(session.Suppliers)).
+		Str("app_address", session.Header.ApplicationAddress).
+		Bool("supplier_in_session", supplierInSession).
+		Msg("Sending relay with session details")
+
 	// Marshal relay request to bytes
 	relayRequestBz, err := signedRelayReq.Marshal()
 	if err != nil {
@@ -606,9 +519,36 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		} else {
 			targetServerURL = rc.loadTestingConfig.RelayMinerConfig.URL
 		}
-	// Default: use the selected endoint's URL
+	// Default: use the RPC-type-specific URL from the selected endpoint
 	default:
-		targetServerURL = selectedEndpoint.PublicURL()
+		targetServerURL = selectedEndpoint.GetURL(rc.currentRPCType)
+
+		// FALLBACK HANDLING: If the URL is empty, it means the endpoint doesn't support
+		// the originally requested RPC type. This happens when RPC type fallback occurred
+		// during endpoint selection (e.g., COMET_BFT → JSON_RPC).
+		// Try to find which RPC type the endpoint actually supports.
+		if targetServerURL == "" {
+			// Try common RPC types in priority order
+			fallbackTypes := []sharedtypes.RPCType{
+				sharedtypes.RPCType_JSON_RPC,
+				sharedtypes.RPCType_REST,
+				sharedtypes.RPCType_COMET_BFT,
+				sharedtypes.RPCType_GRPC,
+			}
+
+			for _, rpcType := range fallbackTypes {
+				if url := selectedEndpoint.GetURL(rpcType); url != "" {
+					targetServerURL = url
+					rc.logger.Debug().
+						Str("requested_rpc_type", rc.currentRPCType.String()).
+						Str("actual_rpc_type", rpcType.String()).
+						Str("endpoint", string(selectedEndpoint.Addr())).
+						Msg("Endpoint doesn't support requested RPC type, using supported type from endpoint")
+					rc.currentRPCType = rpcType // Update to the actual RPC type
+					break
+				}
+			}
+		}
 	}
 
 	// TODO_TECHDEBT(@adshmh): Add a new struct to track details about the HTTP call.
@@ -620,10 +560,12 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// Send the HTTP request to the protocol endpoint.
 	httpRelayResponseBz, httpStatusCode, err := rc.sendHTTPRequest(payload, targetServerURL, relayRequestBz)
 	if err != nil {
+		// Log at Debug level - individual relay failures are expected and handled by retry logic.
+		// Only final failures (all retries exhausted) should be logged at higher levels.
 		rc.logger.With(
 			"http_relay_response_preview", polylog.Preview(string(httpRelayResponseBz)),
 			"http_status_code", httpStatusCode,
-		).Error().Err(err).Msg("HTTP relay failed.")
+		).Debug().Err(err).Msg("HTTP relay failed, may retry")
 		return defaultResponse, err
 	}
 
@@ -645,7 +587,7 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 			Bytes:          httpRelayResponseBz,
 			HTTPStatusCode: httpStatusCode,
 			// Intentionally leaving the endpoint address empty.
-			// Ensuring no sanctions/invalidation rules apply to LoadTesting backend server
+			// Ensuring no reputation penalties/filtering apply to LoadTesting backend server
 			EndpointAddr: "",
 		}, nil
 	}
@@ -730,16 +672,44 @@ func (rc *requestContext) validateAndProcessResponse(
 	rc.trackRelayMinerError(response)
 
 	if err != nil {
-		// Log raw payload for error tracking
-		responseStr := string(httpRelayResponseBz)
-		rc.logger.With(
-			"endpoint_payload", responseStr[:min(len(responseStr), maxEndpointPayloadLenForLogging)],
-			"endpoint_payload_length", len(httpRelayResponseBz),
-			"validation_error", err.Error(),
-		).Warn().Err(err).Msg("Failed to validate the payload from the selected endpoint. Relay request will fail.")
+		// Check if this is a supplier-specific validation error (signature, pubkey, etc.)
+		// These errors should blacklist the supplier, NOT penalize the domain's reputation.
+		if isSupplierValidationError(err) && rc.supplierBlacklist != nil {
+			supplierAddrStr := string(supplierAddr)
+			blacklistReason := getBlacklistReason(err)
+
+			// For signature/pubkey errors, check if we should retry.
+			// Nil pubkey errors are rate-limited to avoid hammering the fullnode.
+			if isPubkeyRelatedError(err) {
+				isNilPubkey := errors.Is(err, sdk.ErrRelayResponseValidationNilSupplierPubKey)
+				if retryResponse := rc.retryValidationWithCacheInvalidation(supplierAddrStr, httpRelayResponseBz, isNilPubkey); retryResponse != nil {
+					// Retry succeeded - return the valid response
+					rc.logger.Info().
+						Str("supplier", supplierAddrStr).
+						Msg("Signature verification succeeded after cache invalidation")
+					return retryResponse, nil
+				}
+			}
+
+			rc.supplierBlacklist.Blacklist(rc.serviceID, supplierAddrStr, err.Error())
+
+			// Extract domain for metrics
+			domain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
+			if domainErr != nil {
+				domain = shannonmetrics.ErrDomain
+			}
+			metrics.RecordSupplierBlacklist(domain, supplierAddrStr, string(rc.serviceID), blacklistReason)
+
+			rc.logger.Warn().
+				Str("supplier", supplierAddrStr).
+				Str("domain", domain).
+				Str("reason", blacklistReason).
+				Msg("Supplier blacklisted for validation error")
+		}
 
 		// Check if this is a validation error that requires raw payload analysis
 		if errors.Is(err, sdk.ErrRelayResponseValidationUnmarshal) || errors.Is(err, sdk.ErrRelayResponseValidationBasicValidation) {
+			responseStr := string(httpRelayResponseBz)
 			return nil, fmt.Errorf("raw_payload: %s: %w", responseStr, errMalformedEndpointPayload)
 		}
 
@@ -756,6 +726,80 @@ func (rc *requestContext) validateAndProcessResponse(
 	}
 
 	return response, nil
+}
+
+// retryValidationWithCacheInvalidation invalidates the account cache for the supplier
+// and retries signature verification. This handles cases where the cached pubkey is stale.
+//
+// For nil pubkey errors, retries are rate-limited to avoid hammering the fullnode.
+// Public keys never change once set, so there's no need to re-query for valid pubkeys.
+//
+// Returns the valid response if retry succeeds, nil if it fails or retry is skipped.
+func (rc *requestContext) retryValidationWithCacheInvalidation(
+	supplierAddr string,
+	httpRelayResponseBz []byte,
+	isNilPubkey bool,
+) *servicetypes.RelayResponse {
+	// Get the caching account fetcher to invalidate the cache
+	accountClient := rc.fullNode.GetAccountClient()
+	cachingFetcher := GetCachingAccountFetcher(accountClient)
+
+	if cachingFetcher == nil {
+		// Not using caching - can't invalidate
+		rc.logger.Debug().
+			Str("supplier", supplierAddr).
+			Msg("Cannot retry validation - not using caching account fetcher")
+		return nil
+	}
+
+	// For nil pubkey errors, check if we should retry (rate limiting)
+	// Nil pubkey suppliers are only retried every 15 minutes to avoid burning fullnode queries
+	if isNilPubkey {
+		if !cachingFetcher.ShouldRetryNilPubkey(supplierAddr) {
+			rc.logger.Debug().
+				Str("supplier", supplierAddr).
+				Msg("Skipping nil pubkey retry - interval not yet passed")
+			return nil
+		}
+	}
+
+	// Invalidate the cache for this supplier
+	cachingFetcher.InvalidateCache(supplierAddr)
+
+	rc.logger.Info().
+		Str("supplier", supplierAddr).
+		Bool("is_nil_pubkey", isNilPubkey).
+		Msg("Invalidated account cache, retrying signature verification")
+
+	// Retry validation
+	retryResponse, retryErr := rc.fullNode.ValidateRelayResponse(
+		sdk.SupplierAddress(supplierAddr),
+		httpRelayResponseBz,
+	)
+
+	if retryErr != nil {
+		// If this was a nil pubkey error and retry still failed, track it for rate limiting
+		if isNilPubkey && errors.Is(retryErr, sdk.ErrRelayResponseValidationNilSupplierPubKey) {
+			cachingFetcher.TrackNilPubkey(supplierAddr)
+		}
+
+		rc.logger.Warn().
+			Err(retryErr).
+			Str("supplier", supplierAddr).
+			Bool("is_nil_pubkey", isNilPubkey).
+			Msg("Signature verification failed after cache invalidation")
+		return nil
+	}
+
+	// If retry succeeded for a nil pubkey supplier, log the recovery
+	if isNilPubkey {
+		rc.logger.Info().
+			Str("supplier", supplierAddr).
+			Msg("Nil pubkey supplier recovered - pubkey now available")
+		metrics.RecordSupplierPubkeyRecovered(supplierAddr)
+	}
+
+	return retryResponse
 }
 
 // deserializeRelayResponse deserializes the relay response payload into a protocol.Response
@@ -825,13 +869,11 @@ func buildUnsignedRelayRequest(
 //   - This bypasses protocol-level request processing and validation.
 //   - This DOES NOT get sent to a RelayMiner.
 //   - Returns the response received from the fallback endpoint.
-//   - Used in cases, such as, when all endpoints are sanctioned for a service ID.
+//   - Used in cases, such as, when all endpoints are filtered out (low reputation) for a service ID.
 func (rc *requestContext) sendFallbackRelay(
 	fallbackEndpoint endpoint,
 	payload protocol.Payload,
 ) (protocol.Response, error) {
-	startTime := time.Now()
-
 	// Get the fallback URL for the fallback endpoint.
 	// If the RPC type is unknown or not configured, it will default URL.
 	endpointFallbackURL := fallbackEndpoint.GetURL(payload.RPCType)
@@ -847,8 +889,6 @@ func (rc *requestContext) sendFallbackRelay(
 	)
 
 	if err != nil {
-		// Record error signal for fallback endpoint HTTP failure (connection error, timeout, etc.)
-		rc.recordFallbackEndpointSignal(fallbackEndpoint, startTime, reputation.NewMajorErrorSignal("http_error", time.Since(startTime)))
 		return protocol.Response{
 			EndpointAddr: fallbackEndpoint.Addr(),
 		}, err
@@ -859,17 +899,10 @@ func (rc *requestContext) sendFallbackRelay(
 	//
 	// Non-2xx HTTP status code: build and return an error.
 	if httpStatusCode != http.StatusOK {
-		// Record error signal for non-2xx HTTP status code
-		rc.recordFallbackEndpointSignal(fallbackEndpoint, startTime, reputation.NewCriticalErrorSignal("http_non_2xx", time.Since(startTime)))
 		return protocol.Response{
 			EndpointAddr: fallbackEndpoint.Addr(),
 		}, fmt.Errorf("%w %w: %d", errSendHTTPRelay, errEndpointNon2XXHTTPStatusCode, httpStatusCode)
 	}
-
-	// Check for JSON-RPC errors in successful HTTP responses
-	latency := time.Since(startTime)
-	signal := rc.determineReputationSignal(httpResponseBz, latency)
-	rc.recordFallbackEndpointSignal(fallbackEndpoint, startTime, signal)
 
 	// Build and return the fallback response
 	return protocol.Response{
@@ -892,14 +925,14 @@ func (rc *requestContext) trackRelayMinerError(relayResponse *servicetypes.Relay
 	}
 
 	relayMinerErr := relayResponse.RelayMinerError
-	rc.hydrateLogger("trackRelayMinerError")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation
 
 	// Log RelayMinerError details for visibility
 	rc.logger.With(
 		"relay_miner_error_codespace", relayMinerErr.Codespace,
 		"relay_miner_error_code", relayMinerErr.Code,
 		"relay_miner_error_message", relayMinerErr.Message,
-	).Info().Msg("RelayMiner returned an error in RelayResponse (captured for reporting)")
+	).Debug().Msg("RelayMiner returned an error in RelayResponse (captured for reporting)")
 
 	// Store RelayMinerError data in request context for use in observations
 	rc.currentRelayMinerError = &protocolobservations.ShannonRelayMinerError{
@@ -915,7 +948,7 @@ func (rc *requestContext) trackRelayMinerError(relayResponse *servicetypes.Relay
 //   - Records internal error on request for observations.
 //   - Logs error entry.
 func (rc *requestContext) handleInternalError(internalErr error) (protocol.Response, error) {
-	rc.hydrateLogger("handleInternalError")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation
 
 	// Log the internal error.
 	rc.logger.Error().Err(internalErr).Msg("Internal error occurred. This should be investigated as a bug.")
@@ -937,21 +970,24 @@ func (rc *requestContext) handleEndpointError(
 	endpointQueryTime time.Time,
 	endpointErr error,
 ) (protocol.Response, error) {
-	rc.hydrateLogger("handleEndpointError")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation
 	selectedEndpoint := rc.getSelectedEndpoint()
 	selectedEndpointAddr := selectedEndpoint.Addr()
 
-	// Error classification based on trusted error sources only
-	endpointErrorType, recommendedSanctionType := classifyRelayError(rc.logger, endpointErr)
+	// Classify error and get reputation signal directly
+	// See ERROR_CLASSIFICATION.md for detailed error category documentation
+	latency := time.Since(endpointQueryTime)
+	endpointErrorType, signal := classifyErrorAsSignal(rc.logger, endpointErr, latency)
 
-	// Enhanced logging with error type and error source classification
+	// Debug level - individual endpoint errors are expected and handled by retry logic
 	isMalformedPayloadErr := isMalformedEndpointPayloadError(endpointErrorType)
-	rc.logger.Error().
+	rc.logger.Debug().
 		Err(endpointErr).
 		Str("error_type", endpointErrorType.String()).
-		Str("sanction_type", recommendedSanctionType.String()).
+		Str("signal_type", string(signal.Type)).
+		Float64("signal_impact", signal.GetDefaultImpact()).
 		Bool("is_malformed_payload_error", isMalformedPayloadErr).
-		Msg("relay error occurred. Service request will fail.")
+		Msg("Relay error occurred, may retry")
 
 	// Build enhanced observation with RelayMinerError data from request context
 	endpointObs := buildEndpointErrorObservation(
@@ -961,12 +997,11 @@ func (rc *requestContext) handleEndpointError(
 		time.Now(), // Timestamp: endpoint query completed.
 		endpointErrorType,
 		fmt.Sprintf("relay error: %v", endpointErr),
-		recommendedSanctionType,
 		rc.currentRelayMinerError, // Use RelayMinerError data from request context
 		rc.currentRPCType,         // Use RPC type from request context
 	)
 
-	// Track endpoint error observation for metrics and sanctioning
+	// Track endpoint error observation for metrics
 	// Use channel if available (parallel processing), otherwise append directly (single relay)
 	if rc.observationsChan != nil {
 		rc.observationsChan <- endpointObs
@@ -975,27 +1010,45 @@ func (rc *requestContext) handleEndpointError(
 	}
 
 	// Record reputation signal if reputation service is enabled.
-	// This provides gradual scoring in addition to binary sanctions.
-	if rc.reputationService != nil {
-		latency := time.Since(endpointQueryTime)
-		signal := mapErrorToSignal(endpointErrorType, recommendedSanctionType, latency)
-		endpointKey := rc.reputationService.KeyBuilderForService(rc.serviceID).BuildKey(rc.serviceID, selectedEndpointAddr)
+	// This provides gradual scoring based on error severity.
+	//
+	// SKIP domain reputation penalty if supplier is blacklisted for validation errors.
+	// Validation errors (signature, pubkey) are supplier-specific issues and should
+	// not penalize other suppliers at the same domain.
+	supplierAddr := selectedEndpoint.Supplier()
+	isBlacklisted := rc.supplierBlacklist != nil && rc.supplierBlacklist.IsBlacklisted(rc.serviceID, supplierAddr)
 
-		// Extract domain for metrics
-		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
-		if domainErr != nil {
-			endpointDomain = shannonmetrics.ErrDomain
-		}
+	if rc.reputationService != nil && !isBlacklisted {
+		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
+		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
 
 		// Fire-and-forget: don't block request on reputation recording
 		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
 			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for error")
-			reputationmetrics.RecordError("record_signal", "storage_error")
-		} else {
-			// Record signal metric on success
-			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
 		}
+	} else if isBlacklisted {
+		rc.logger.Debug().
+			Str("supplier", supplierAddr).
+			Msg("Skipping domain reputation penalty for blacklisted supplier")
 	}
+
+	// Record relay metric for failed request
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	rpcTypeStr := metrics.NormalizeRPCType(rc.currentRPCType.String())
+	reputationSignal := mapSignalTypeToMetricSignal(signal.Type)
+
+	// Extract status code from error if possible, otherwise use "error"
+	statusCodeStr := "error"
+	if statusCode, ok := extractHTTPStatusCode(endpointErr); ok {
+		statusCodeStr = metrics.GetStatusCodeCategory(statusCode)
+	}
+
+	// Determine relay type - errors are recorded as normal type (probation detection requires success)
+	relayType := metrics.RelayTypeNormal
+	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
 	// Return error.
 	return protocol.Response{EndpointAddr: selectedEndpointAddr},
@@ -1013,9 +1066,11 @@ func (rc *requestContext) handleEndpointSuccess(
 	endpointQueryTime time.Time,
 	endpointResponse *protocol.Response,
 ) error {
-	rc.hydrateLogger("handleEndpointSuccess")
-	rc.logger = rc.logger.With("endpoint_response_payload_len", len(endpointResponse.Bytes))
-	rc.logger.Debug().Msg("Successfully deserialized the response received from the selected endpoint.")
+	// PERF: Removed hydrateLogger() call to avoid logger allocation
+	// Use inline field for endpoint_response_payload_len instead of creating new logger
+	rc.logger.Debug().
+		Int("endpoint_response_payload_len", len(endpointResponse.Bytes)).
+		Msg("Successfully deserialized the response received from the selected endpoint.")
 
 	selectedEndpoint := rc.getSelectedEndpoint()
 	selectedEndpointAddr := selectedEndpoint.Addr()
@@ -1040,173 +1095,130 @@ func (rc *requestContext) handleEndpointSuccess(
 	}
 
 	// Record reputation signal if reputation service is enabled.
-	// Check for JSON-RPC errors in the response to record the appropriate signal type.
+	latency := time.Since(endpointQueryTime)
+	var reputationSignal string
+	var relayType string
+
 	if rc.reputationService != nil {
-		latency := time.Since(endpointQueryTime)
-		endpointKey := rc.reputationService.KeyBuilderForService(rc.serviceID).BuildKey(rc.serviceID, selectedEndpointAddr)
+		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
+		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
 
-		// Extract domain for metrics
-		endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(selectedEndpoint.PublicURL())
-		if domainErr != nil {
-			endpointDomain = shannonmetrics.ErrDomain
+		// Check if endpoint is in probation - use RecoverySuccessSignal (+15) for probation,
+		// SuccessSignal (+1) for normal requests. This helps low-scoring endpoints recover faster.
+		var signal reputation.Signal
+		if rc.tieredSelector != nil && rc.tieredSelector.Config().Probation.Enabled && rc.tieredSelector.IsInProbation(endpointKey) {
+			// Probation endpoint succeeded - use recovery signal for stronger positive reinforcement
+			signal = reputation.NewRecoverySuccessSignal(latency)
+			reputationSignal = metrics.SignalOK
+			relayType = metrics.RelayTypeProbation
+
+			// Record that a request was routed to a probation endpoint
+			probationDomain, _ := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
+			if probationDomain == "" {
+				probationDomain = shannonmetrics.ErrDomain
+			}
+			metrics.RecordProbationEvent(probationDomain, metrics.NormalizeRPCType(rc.currentRPCType.String()), string(rc.serviceID), metrics.ProbationEventRouted)
+
+			rc.logger.Debug().
+				Str("endpoint", string(selectedEndpointAddr)).
+				Str("service_id", string(rc.serviceID)).
+				Dur("latency", latency).
+				Msg("Recording recovery success signal for probation endpoint")
+		} else {
+			// Normal request - use standard success signal
+			signal = reputation.NewSuccessSignal(latency)
+			reputationSignal = metrics.SignalOK
+			relayType = metrics.RelayTypeNormal
 		}
-
-		// Determine signal type based on response content.
-		// HTTP transport succeeded, but check if the response contains a JSON-RPC error.
-		signal := rc.determineReputationSignal(endpointResponse.Bytes, latency)
 
 		// Fire-and-forget: don't block request on reputation recording
 		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
-			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal")
-			reputationmetrics.RecordError("record_signal", "storage_error")
-		} else {
-			// Record signal metric on success
-			reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
+			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for success")
 		}
+
+		// Record additional latency penalty signals if applicable
+		// This is done by checking the per-service latency config and determining
+		// if the response was slow enough to warrant an additional penalty signal
+		rc.recordLatencyPenaltySignalsIfNeeded(endpointKey, latency)
+	} else {
+		reputationSignal = metrics.SignalOK
+		relayType = metrics.RelayTypeNormal
 	}
+
+	// Record relay metric for successful request
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	statusCodeStr := metrics.GetStatusCodeCategory(endpointResponse.HTTPStatusCode)
+	rpcTypeStr := metrics.NormalizeRPCType(rc.currentRPCType.String())
+	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
 	// Return relay response received from endpoint.
 	return nil
 }
 
-// determineReputationSignal analyzes the response content to determine the appropriate reputation signal.
-// HTTP transport succeeded, but the response may contain a JSON-RPC error that should affect reputation.
-// Returns a success signal if no JSON-RPC error is detected, or a minor error signal for JSON-RPC errors.
-// Handles both single JSON-RPC responses and batch responses (array of responses).
-func (rc *requestContext) determineReputationSignal(responseBytes []byte, latency time.Duration) reputation.Signal {
-	// Skip empty responses
-	if len(responseBytes) == 0 {
-		return reputation.NewSuccessSignal(latency)
+// recordLatencyPenaltySignalsIfNeeded checks if the response latency exceeds penalty thresholds
+// and records additional penalty signals (slow_response, very_slow_response) if needed.
+// This allows endpoints to be penalized for slow responses even when the request succeeds.
+func (rc *requestContext) recordLatencyPenaltySignalsIfNeeded(
+	endpointKey reputation.EndpointKey,
+	latency time.Duration,
+) {
+	// Get the latency config for this service (respects per-service overrides)
+	latencyConfig := rc.getLatencyConfigForService()
+
+	// Check if an additional latency penalty signal is needed
+	penaltySignalType := reputation.ClassifyLatency(latency, latencyConfig)
+	if penaltySignalType == nil {
+		return // No penalty needed
 	}
 
-	// Trim whitespace to check the first character
-	trimmed := bytes.TrimSpace(responseBytes)
-	if len(trimmed) == 0 {
-		return reputation.NewSuccessSignal(latency)
+	// Create and record the appropriate penalty signal
+	var penaltySignal reputation.Signal
+	switch *penaltySignalType {
+	case reputation.SignalTypeSlowResponse:
+		penaltySignal = reputation.NewSlowResponseSignal(latency)
+	case reputation.SignalTypeVerySlowResponse:
+		penaltySignal = reputation.NewVerySlowResponseSignal(latency)
+	default:
+		return // Unknown signal type, skip
 	}
-
-	// Check if this is a batch response (starts with '[')
-	if trimmed[0] == '[' {
-		return rc.determineBatchReputationSignal(responseBytes, latency)
-	}
-
-	// Try to parse as single JSON-RPC response
-	return rc.determineSingleReputationSignal(responseBytes, latency)
-}
-
-// determineSingleReputationSignal handles a single JSON-RPC response.
-func (rc *requestContext) determineSingleReputationSignal(responseBytes []byte, latency time.Duration) reputation.Signal {
-	var jsonrpcResp jsonrpc.Response
-	if err := json.Unmarshal(responseBytes, &jsonrpcResp); err != nil {
-		// Can't parse as JSON-RPC - treat as success (HTTP worked, response format may be different)
-		return reputation.NewSuccessSignal(latency)
-	}
-
-	// Check for JSON-RPC error in the response
-	if jsonrpcResp.IsError() {
-		rc.logger.Debug().
-			Int("jsonrpc_error_code", jsonrpcResp.Error.Code).
-			Str("jsonrpc_error_message", jsonrpcResp.Error.Message).
-			Msg("Response contains JSON-RPC error, recording minor error signal for reputation")
-		return reputation.NewMinorErrorSignal("jsonrpc_error")
-	}
-
-	// No JSON-RPC error detected - return success signal
-	return reputation.NewSuccessSignal(latency)
-}
-
-// determineBatchReputationSignal handles a batch JSON-RPC response (array of responses).
-// Returns minor error if ANY response in the batch contains an error.
-func (rc *requestContext) determineBatchReputationSignal(responseBytes []byte, latency time.Duration) reputation.Signal {
-	var batchResp []jsonrpc.Response
-	if err := json.Unmarshal(responseBytes, &batchResp); err != nil {
-		// Can't parse as batch JSON-RPC - treat as success
-		return reputation.NewSuccessSignal(latency)
-	}
-
-	// Check each response in the batch for errors
-	errorCount := 0
-	for _, resp := range batchResp {
-		if resp.IsError() {
-			errorCount++
-		}
-	}
-
-	// If any response has an error, record minor error
-	if errorCount > 0 {
-		rc.logger.Debug().
-			Int("batch_size", len(batchResp)).
-			Int("error_count", errorCount).
-			Msg("Batch response contains JSON-RPC errors, recording minor error signal for reputation")
-		return reputation.NewMinorErrorSignal("jsonrpc_batch_error")
-	}
-
-	// All responses in batch succeeded
-	return reputation.NewSuccessSignal(latency)
-}
-
-// recordTimeoutSignal records a reputation signal for an endpoint that timed out.
-// This is used when a Shannon endpoint doesn't respond within the fallback timeout window.
-func (rc *requestContext) recordTimeoutSignal(timedOutEndpoint endpoint, startTime time.Time) {
-	if rc.reputationService == nil || timedOutEndpoint == nil {
-		return
-	}
-
-	latency := time.Since(startTime)
-	endpointKey := reputation.NewEndpointKey(rc.serviceID, timedOutEndpoint.Addr())
-
-	// Extract domain for metrics
-	endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(timedOutEndpoint.PublicURL())
-	if domainErr != nil {
-		endpointDomain = shannonmetrics.ErrDomain
-	}
-
-	// Timeout is a major error - indicates endpoint unresponsiveness
-	signal := reputation.NewMajorErrorSignal("timeout", latency)
-
-	rc.logger.Debug().
-		Str("endpoint_addr", string(timedOutEndpoint.Addr())).
-		Str("endpoint_domain", endpointDomain).
-		Dur("latency", latency).
-		Msg("Recording timeout signal for unresponsive Shannon endpoint")
 
 	// Fire-and-forget: don't block request on reputation recording
-	if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
-		rc.logger.Warn().Err(err).Msg("Failed to record timeout reputation signal")
-		reputationmetrics.RecordError("record_signal", "storage_error")
-	} else {
-		reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
+	if err := rc.reputationService.RecordSignal(rc.context, endpointKey, penaltySignal); err != nil {
+		rc.logger.Warn().Err(err).
+			Str("signal_type", string(*penaltySignalType)).
+			Dur("latency", latency).
+			Msg("Failed to record latency penalty signal")
 	}
 }
 
-// recordFallbackEndpointSignal records a reputation signal for a fallback endpoint.
-// This tracks the health of fallback endpoints used during session rollover or when Shannon endpoints fail.
-func (rc *requestContext) recordFallbackEndpointSignal(fallbackEndpoint endpoint, startTime time.Time, signal reputation.Signal) {
-	if rc.reputationService == nil || fallbackEndpoint == nil {
-		return
-	}
+// getLatencyConfigForService returns the latency config for the current service.
+// This fetches the config from the reputation service, which handles per-service overrides.
+func (rc *requestContext) getLatencyConfigForService() reputation.LatencyConfig {
+	return rc.reputationService.GetLatencyConfigForService(rc.serviceID)
+}
 
-	endpointKey := reputation.NewEndpointKey(rc.serviceID, fallbackEndpoint.Addr())
-
-	// Extract domain for metrics - use the fallback URL
-	endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(fallbackEndpoint.PublicURL())
-	if domainErr != nil {
-		endpointDomain = shannonmetrics.ErrDomain
-	}
-
-	rc.logger.Debug().
-		Str("endpoint_addr", string(fallbackEndpoint.Addr())).
-		Str("endpoint_domain", endpointDomain).
-		Str("signal_type", string(signal.Type)).
-		Bool("is_fallback", true).
-		Msg("Recording signal for fallback endpoint")
-
-	// Fire-and-forget: don't block request on reputation recording
-	if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
-		rc.logger.Warn().Err(err).Msg("Failed to record fallback endpoint reputation signal")
-		reputationmetrics.RecordError("record_signal", "storage_error")
-	} else {
-		reputationmetrics.RecordSignal(string(rc.serviceID), string(signal.Type), endpointDomain)
+// mapSignalTypeToMetricSignal converts a reputation.SignalType to a metrics signal string
+func mapSignalTypeToMetricSignal(signalType reputation.SignalType) string {
+	switch signalType {
+	case reputation.SignalTypeSuccess, reputation.SignalTypeRecoverySuccess:
+		return metrics.SignalOK
+	case reputation.SignalTypeSlowResponse:
+		return metrics.SignalSlow
+	case reputation.SignalTypeVerySlowResponse:
+		return metrics.SignalSlowASF
+	case reputation.SignalTypeMinorError:
+		return metrics.SignalMinorError
+	case reputation.SignalTypeMajorError:
+		return metrics.SignalMajorError
+	case reputation.SignalTypeCriticalError:
+		return metrics.SignalCriticalError
+	case reputation.SignalTypeFatalError:
+		return metrics.SignalFatalError
+	default:
+		return metrics.SignalOK
 	}
 }
 

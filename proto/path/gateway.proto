@@ -40,6 +40,14 @@ enum GatewayRequestErrorKind {
   // Websocket connection establishment failed.
   // e.g. Failed to upgrade HTTP connection to Websocket or connect to endpoint.
   GATEWAY_REQUEST_ERROR_KIND_WEBSOCKET_CONNECTION_FAILED = 4;
+
+  // RPC type is not supported by the service.
+  // e.g. Service configured for json_rpc but received a REST request.
+  GATEWAY_REQUEST_ERROR_KIND_UNSUPPORTED_RPC_TYPE = 5;
+
+  // RPC type detection failed.
+  // e.g. Could not determine RPC type from request headers and payload.
+  GATEWAY_REQUEST_ERROR_KIND_RPC_TYPE_DETECTION_ERROR = 6;
 }
 
 // GatewayObservations is the set of observations on a service request, made from the perspective of a gateway.

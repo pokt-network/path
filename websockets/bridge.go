@@ -180,7 +180,7 @@ func (b *bridge) validateComponents() error {
 //
 // Full data flow: Client <---clientConn---> PATH Bridge <---endpointConn---> Relay Miner Bridge <------> Endpoint
 func (b *bridge) start() {
-	b.logger.Info().Msg("🏗️ Websocket bridge operation started successfully")
+	b.logger.Info().Msg("Websocket bridge operation started successfully")
 
 	// Listen for the context to be canceled and shut down the bridge
 	go func() {
@@ -259,7 +259,38 @@ func (b *bridge) shutdown(err error) {
 // - 1011 (Internal Error): Server encountered an unexpected condition; reconnection may help
 // - 1002 (Protocol Error): Protocol violation; client should not reconnect automatically
 // - 1003 (Unsupported Data): Data type cannot be accepted; client should not reconnect
+//
+// Close Code Propagation:
+// - If the endpoint (RelayMiner) sent a close code, propagate it to the client
+// - If the client sent a close code, propagate it to the endpoint (RelayMiner)
+// - This allows session expiration (4000) and other codes to flow bidirectionally
 func (b *bridge) determineCloseCodeAndMessage(err error) (int, string) {
+	// Check if the endpoint connection has a close code to propagate to client.
+	// This is important for session expiration (4000) and other endpoint-initiated closes.
+	if b.endpointConn != nil {
+		endpointCloseCode, endpointCloseText := b.endpointConn.GetCloseInfo()
+		if endpointCloseCode != 0 {
+			b.logger.Info().
+				Int("endpoint_close_code", endpointCloseCode).
+				Str("endpoint_close_text", endpointCloseText).
+				Msg("Propagating endpoint close code to client")
+			return endpointCloseCode, endpointCloseText
+		}
+	}
+
+	// Check if the client connection has a close code to propagate to endpoint.
+	// This allows client-initiated closes (e.g., browser tab closed) to reach the RelayMiner.
+	if b.clientConn != nil {
+		clientCloseCode, clientCloseText := b.clientConn.GetCloseInfo()
+		if clientCloseCode != 0 {
+			b.logger.Info().
+				Int("client_close_code", clientCloseCode).
+				Str("client_close_text", clientCloseText).
+				Msg("Propagating client close code to endpoint")
+			return clientCloseCode, clientCloseText
+		}
+	}
+
 	// Check for specific error types using errors.Is for proper error chain handling
 	switch {
 	case errors.Is(err, ErrBridgeContextCanceled):
@@ -364,6 +395,15 @@ func (b *bridge) handleEndpointMessage(msg message) {
 // If the channel is full or closed, the message observations are dropped.
 // This is done to avoid blocking the main thread.
 func (b *bridge) sendMessageObservations(msgObservations *observation.RequestResponseObservations) {
+	// Use a recover to handle the case where the channel is closed.
+	// This can happen during shutdown when the defer in handleEndpointMessage
+	// runs after shutdown() has closed the channel.
+	defer func() {
+		if r := recover(); r != nil {
+			b.logger.Debug().Msgf("sendMessageObservations: channel closed, dropping observations (panic: %v)", r)
+		}
+	}()
+
 	select {
 	case b.messageObservationsChan <- msgObservations:
 		// Successfully sent

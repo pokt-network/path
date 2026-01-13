@@ -41,7 +41,7 @@ func responseUnmarshallerGeneric(
 			"jsonrpc_request_method", jsonrpcReq.Method,
 			"jsonrpc_response_error_code", jsonrpcResp.Error.Code,
 			"jsonrpc_response_error_message", jsonrpcResp.Error.Message,
-		).Info().Msg("Received JSONRPC error response from endpoint.")
+		).Debug().Msg("Received JSONRPC error response from endpoint.")
 	}
 
 	return responseGeneric{

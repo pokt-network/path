@@ -3,6 +3,12 @@ package reputation
 import (
 	"errors"
 	"math/rand"
+	"sync"
+
+	"github.com/pokt-network/poktroll/pkg/polylog"
+
+	"github.com/pokt-network/path/metrics"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 )
 
 // ErrNoEndpointsAvailable is returned when no endpoints are available for selection.
@@ -12,16 +18,40 @@ var ErrNoEndpointsAvailable = errors.New("no endpoints available for selection")
 // It groups endpoints into tiers based on their reputation scores and
 // selects from the highest available tier.
 type TieredSelector struct {
+	logger       polylog.Logger
 	config       TieredSelectionConfig
 	minThreshold float64
+
+	// probationEndpoints tracks which endpoints are currently in probation.
+	// An endpoint enters probation when its score falls below the probation threshold.
+	// Map key is the endpoint key, value is true if the endpoint is in probation.
+	probationEndpoints   map[EndpointKey]bool
+	probationEndpointsMu sync.RWMutex
 }
 
 // NewTieredSelector creates a new TieredSelector with the given configuration.
 func NewTieredSelector(config TieredSelectionConfig, minThreshold float64) *TieredSelector {
 	return &TieredSelector{
-		config:       config,
-		minThreshold: minThreshold,
+		config:             config,
+		minThreshold:       minThreshold,
+		probationEndpoints: make(map[EndpointKey]bool),
 	}
+}
+
+// NewTieredSelectorWithLogger creates a new TieredSelector with the given configuration and logger.
+func NewTieredSelectorWithLogger(logger polylog.Logger, config TieredSelectionConfig, minThreshold float64) *TieredSelector {
+	return &TieredSelector{
+		logger:             logger.With("component", "tiered_selector"),
+		config:             config,
+		minThreshold:       minThreshold,
+		probationEndpoints: make(map[EndpointKey]bool),
+	}
+}
+
+// SetLogger sets the logger for the TieredSelector.
+// This can be used to add logging after creation.
+func (s *TieredSelector) SetLogger(logger polylog.Logger) {
+	s.logger = logger.With("component", "tiered_selector")
 }
 
 // SelectEndpoint selects one endpoint using cascade-down tier logic.
@@ -107,4 +137,115 @@ func (s *TieredSelector) Config() TieredSelectionConfig {
 // MinThreshold returns the minimum threshold for Tier 3.
 func (s *TieredSelector) MinThreshold() float64 {
 	return s.minThreshold
+}
+
+// IsInProbation returns true if the endpoint is currently in probation.
+func (s *TieredSelector) IsInProbation(key EndpointKey) bool {
+	s.probationEndpointsMu.RLock()
+	defer s.probationEndpointsMu.RUnlock()
+	return s.probationEndpoints[key]
+}
+
+// UpdateProbationStatus updates probation tracking based on current scores.
+// Returns the list of endpoints currently in probation.
+// An endpoint enters probation when: score < probationThreshold AND score >= minThreshold
+// An endpoint exits probation when: score >= probationThreshold
+func (s *TieredSelector) UpdateProbationStatus(endpoints map[EndpointKey]float64) []EndpointKey {
+	if !s.config.Probation.Enabled {
+		return nil
+	}
+
+	probationThreshold := s.config.Probation.Threshold
+	inProbation := make([]EndpointKey, 0)
+
+	s.probationEndpointsMu.Lock()
+	defer s.probationEndpointsMu.Unlock()
+
+	// Update probation status for all endpoints
+	for key, score := range endpoints {
+		wasInProbation := s.probationEndpoints[key]
+		// Endpoint is in probation if: score is below the probation threshold but above min threshold
+		isInProbation := score < probationThreshold && score >= s.minThreshold
+
+		if isInProbation {
+			s.probationEndpoints[key] = true
+			inProbation = append(inProbation, key)
+
+			// Log probation entry and record metric
+			if !wasInProbation {
+				// With per-domain key granularity, EndpointAddr is already the domain
+				// Try URL extraction first, fallback to raw EndpointAddr
+				domain, err := shannonmetrics.ExtractDomainOrHost(string(key.EndpointAddr))
+				if err != nil || domain == "" {
+					domain = string(key.EndpointAddr)
+				}
+				metrics.RecordProbationEvent(domain, metrics.NormalizeRPCType(key.RPCType.String()), string(key.ServiceID), metrics.ProbationEventEntered)
+
+				if s.logger != nil {
+					s.logger.Debug().
+						Str("endpoint", string(key.EndpointAddr)).
+						Str("service_id", string(key.ServiceID)).
+						Float64("score", score).
+						Float64("probation_threshold", probationThreshold).
+						Float64("min_threshold", s.minThreshold).
+						Msg("[PROBATION] Endpoint ENTERED probation")
+				}
+			}
+		} else if wasInProbation {
+			// Endpoint has recovered or fallen below a min threshold
+			delete(s.probationEndpoints, key)
+
+			// Log probation exit and record metric
+			// With per-domain key granularity, EndpointAddr is already the domain
+			// Try URL extraction first, fallback to raw EndpointAddr
+			domain, err := shannonmetrics.ExtractDomainOrHost(string(key.EndpointAddr))
+			if err != nil || domain == "" {
+				domain = string(key.EndpointAddr)
+			}
+			metrics.RecordProbationEvent(domain, metrics.NormalizeRPCType(key.RPCType.String()), string(key.ServiceID), metrics.ProbationEventExited)
+
+			if s.logger != nil {
+				exitReason := "recovered"
+				if score < s.minThreshold {
+					exitReason = "below_min_threshold"
+				}
+				s.logger.Debug().
+					Str("endpoint", string(key.EndpointAddr)).
+					Str("service_id", string(key.ServiceID)).
+					Float64("score", score).
+					Float64("probation_threshold", probationThreshold).
+					Float64("min_threshold", s.minThreshold).
+					Str("exit_reason", exitReason).
+					Msg("[PROBATION] Endpoint EXITED probation")
+			}
+		}
+	}
+
+	return inProbation
+}
+
+// ShouldRouteToProbation determines if this request should be routed to a probation endpoint.
+// Returns true with probability = traffic_percent / 100.
+// For example, if traffic_percent = 10, returns true 10% of the time.
+func (s *TieredSelector) ShouldRouteToProbation() bool {
+	if !s.config.Probation.Enabled {
+		return false
+	}
+
+	// Random number between 0 and 99
+	r := rand.Intn(100)
+	// Return true if the random number is less than traffic percent
+	// e.g., if traffic_percent = 10, true when r is 0-9 (10% of the time)
+	shouldRoute := float64(r) < s.config.Probation.TrafficPercent
+
+	// Log probation routing decision
+	if s.logger != nil && shouldRoute {
+		s.logger.Debug().
+			Int("random_value", r).
+			Float64("traffic_percent", s.config.Probation.TrafficPercent).
+			Bool("routed_to_probation", shouldRoute).
+			Msg("[PROBATION] Routing request to probation endpoint")
+	}
+
+	return shouldRoute
 }

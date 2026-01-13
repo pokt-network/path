@@ -204,10 +204,56 @@ func (ss *serviceState) isCosmosStatusValid(check endpointCheckCosmosStatus) err
 
 // validateBlockHeightSyncAllowance returns an error if:
 //   - The endpoint's block height is outside the latest block height minus the sync allowance.
+//
+// Returns nil (passes) if:
+//   - sync_allowance is 0 (check disabled)
+//   - No perceived block number yet (no chain data to compare against)
+//   - Endpoint has no block number observation (latestBlockHeight is 0)
 func (ss *serviceState) validateBlockHeightSyncAllowance(latestBlockHeight uint64) error {
 	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
+
+	// If sync allowance is 0, the check is disabled
+	if syncAllowance == 0 {
+		ss.logger.Warn().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Msg("🔍 Sync allowance check DISABLED (sync_allowance=0)")
+		return nil
+	}
+
+	// If we don't have a perceived block number yet, skip the check (no data to compare against)
+	if ss.perceivedBlockNumber == 0 {
+		ss.logger.Warn().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Uint64("sync_allowance", syncAllowance).
+			Msg("🔍 Sync allowance check SKIPPED (no perceived block number yet)")
+		return nil
+	}
+
+	// If endpoint has no block number observation, skip the check (no endpoint data to validate)
+	if latestBlockHeight == 0 {
+		ss.logger.Warn().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Uint64("perceived_block", ss.perceivedBlockNumber).
+			Uint64("sync_allowance", syncAllowance).
+			Msg("🔍 Sync allowance check SKIPPED (endpoint has no block number observation)")
+		return nil
+	}
+
+	ss.logger.Warn().
+		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+		Uint64("sync_allowance", syncAllowance).
+		Uint64("perceived_block", ss.perceivedBlockNumber).
+		Uint64("endpoint_block", latestBlockHeight).
+		Msg("🔍 Sync allowance check ENABLED")
+
 	minAllowedBlockNumber := ss.perceivedBlockNumber - syncAllowance
 	if latestBlockHeight < minAllowedBlockNumber {
+		ss.logger.Warn().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Uint64("endpoint_block", latestBlockHeight).
+			Uint64("min_allowed_block", minAllowedBlockNumber).
+			Uint64("sync_allowance", syncAllowance).
+			Msg("❌ Endpoint failed sync allowance check - too far behind")
 		return fmt.Errorf("%w: block number %d is outside the sync allowance relative to min allowed block number %d and sync allowance %d",
 			errOutsideSyncAllowanceBlockNumberObs, latestBlockHeight, minAllowedBlockNumber, syncAllowance)
 	}

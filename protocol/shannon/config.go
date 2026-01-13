@@ -11,6 +11,7 @@ import (
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
+	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/network/grpc"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
@@ -79,15 +80,40 @@ type (
 		// All relays will be sent to a fixed URL.
 		// Allows measuring performance of PATH and full node(s) in isolation.
 		LoadTestingConfig *LoadTestingConfig `yaml:"load_testing_config"`
-		// Optional.
-		// Configures the endpoint sanction system parameters.
-		// If not specified, sensible defaults will be used.
-		SanctionConfig SanctionConfig `yaml:"sanction_config"`
 
-		// Optional.
-		// Configures the endpoint reputation system.
-		// If not specified or disabled, binary sanctions will be used instead.
+		// Configures the endpoint reputation system for endpoint quality tracking.
+		// Reputation is MANDATORY and cannot be disabled - it is the unified QoS system.
+		// Reputation scores are updated by both user requests and health check probes.
 		ReputationConfig reputation.Config `yaml:"reputation_config"`
+
+		// Configures active health checks - proactive endpoint quality probing.
+		// Health checks run periodically and feed results into the reputation system.
+		// If not configured, legacy hardcoded QoS checks are used (deprecated).
+		// Note: These types are defined in gateway package to avoid import cycles.
+		ActiveHealthChecksConfig gateway.ActiveHealthChecksConfig `yaml:"active_health_checks,omitempty"`
+
+		// Configures automatic retry behavior for failed requests.
+		RetryConfig gateway.RetryConfig `yaml:"retry_config,omitempty"`
+
+		// Configures the observation pipeline for async response processing.
+		// When enabled, responses are passed through to clients without heavy parsing,
+		// reducing latency. Deep parsing is done asynchronously via configurable sampling.
+		ObservationPipelineConfig gateway.ObservationPipelineConfig `yaml:"observation_pipeline,omitempty"`
+
+		// Configures concurrency limits for request processing.
+		// Controls parallel endpoint queries and batch request limits to prevent resource exhaustion.
+		ConcurrencyConfig gateway.ConcurrencyConfig `yaml:"concurrency_config,omitempty"`
+
+		// UnifiedServices is the unified YAML-driven service configuration.
+		// This consolidates all per-service settings (type, rpc_types, fallback, health_checks)
+		// into a single structure with defaults and per-service overrides.
+		// When configured, this replaces the hardcoded service definitions in service_qos_config.go.
+		UnifiedServices gateway.UnifiedServicesConfig `yaml:",inline"`
+
+		// RedisConfig is the global Redis configuration passed from the top-level config.
+		// Used by reputation storage (when storage_type is "redis") and leader election.
+		// This is set programmatically, not from YAML.
+		RedisConfig *reputation.RedisConfig `yaml:"-"`
 	}
 
 	// TODO_TECHDEBT(@adshmh): Make configuration and implementation explicit:
@@ -133,19 +159,6 @@ type (
 		// - A single RelayMiner will receive all the relays.
 		SupplierAddr string `yaml:"supplier_addr"`
 	}
-
-	// SanctionConfig holds configurable parameters for the endpoint sanction system.
-	// All fields are optional and will use sensible defaults if not specified.
-	SanctionConfig struct {
-		// SessionSanctionDuration is the TTL for session-based sanctions.
-		// Endpoints with session sanctions will be excluded from selection for this duration.
-		// Default: 1 hour
-		SessionSanctionDuration time.Duration `yaml:"session_sanction_duration"`
-
-		// CacheCleanupInterval is the interval for purging expired sanction entries from the cache.
-		// Default: 10 minutes
-		CacheCleanupInterval time.Duration `yaml:"cache_cleanup_interval"`
-	}
 )
 
 func (gc GatewayConfig) Validate() error {
@@ -180,6 +193,18 @@ func (gc GatewayConfig) Validate() error {
 	if ltc := gc.LoadTestingConfig; ltc != nil {
 		if err := ltc.Validate(); err != nil {
 			return err
+		}
+	}
+
+	// Validate retry config
+	if err := gc.RetryConfig.Validate(nil); err != nil {
+		return fmt.Errorf("retry_config validation failed: %w", err)
+	}
+
+	// Validate concurrency config if set
+	if gc.ConcurrencyConfig.MaxParallelEndpoints > 0 || gc.ConcurrencyConfig.MaxConcurrentRelays > 0 || gc.ConcurrencyConfig.MaxBatchPayloads > 0 {
+		if err := gc.ConcurrencyConfig.Validate(nil); err != nil {
+			return fmt.Errorf("concurrency_config validation failed: %w", err)
 		}
 	}
 
@@ -264,9 +289,12 @@ func (c FullNodeConfig) Validate() error {
 
 // getServiceFallbackMap returns the fallback endpoint information for each
 // service ID from the YAML config, including the SendAllTraffic setting.
+// It merges both global service_fallback config and per-service fallback from unified_services.
+// Per-service fallback from unified_services takes precedence over global fallback.
 func (gc GatewayConfig) getServiceFallbackMap() map[protocol.ServiceID]serviceFallback {
 	configs := make(map[protocol.ServiceID]serviceFallback, len(gc.ServiceFallback))
 
+	// First, process global service_fallback configuration
 	for _, serviceFallbackConfig := range gc.ServiceFallback {
 		endpoints := make(map[protocol.EndpointAddr]endpoint, len(serviceFallbackConfig.FallbackEndpoints))
 
@@ -299,6 +327,45 @@ func (gc GatewayConfig) getServiceFallbackMap() map[protocol.ServiceID]serviceFa
 		}
 	}
 
+	// Second, process per-service fallback from unified services config
+	// This overrides global fallback if both are defined for the same service
+	if gc.UnifiedServices.HasServices() {
+		for _, svc := range gc.UnifiedServices.Services {
+			if svc.Fallback != nil && svc.Fallback.Enabled {
+				endpoints := make(map[protocol.EndpointAddr]endpoint, len(svc.Fallback.Endpoints))
+
+				// Create fallback endpoints from the unified config
+				for _, endpointMap := range svc.Fallback.Endpoints {
+					rpcTypeURLs := make(map[sharedtypes.RPCType]string, len(endpointMap))
+
+					for rpcTypeStr, url := range endpointMap {
+						// Convert string keys to RPC types
+						rpcType, err := sharedtypes.GetRPCTypeFromConfig(rpcTypeStr)
+						if err != nil {
+							// This should not happen if validation passed, but skip invalid RPC types
+							continue
+						}
+						rpcTypeURLs[rpcType] = url
+					}
+
+					// Create fallback endpoint struct from the configuration and add
+					// it to the map of endpoints for the service by its EndpointAddr.
+					fallbackEndpoint := fallbackEndpoint{
+						defaultURL:  endpointMap[defaultURLKey],
+						rpcTypeURLs: rpcTypeURLs,
+					}
+					endpoints[fallbackEndpoint.Addr()] = fallbackEndpoint
+				}
+
+				// Per-service fallback overrides global fallback for this service
+				configs[svc.ID] = serviceFallback{
+					SendAllTraffic: svc.Fallback.SendAllTraffic,
+					Endpoints:      endpoints,
+				}
+			}
+		}
+	}
+
 	return configs
 }
 
@@ -322,17 +389,6 @@ func (c *CacheConfig) hydrateDefaults() CacheConfig {
 		c.SessionTTL = defaultSessionCacheTTL
 	}
 	return *c
-}
-
-// HydrateDefaults applies default values to SanctionConfig
-func (sc *SanctionConfig) HydrateDefaults() SanctionConfig {
-	if sc.SessionSanctionDuration == 0 {
-		sc.SessionSanctionDuration = defaultSessionSanctionExpiration
-	}
-	if sc.CacheCleanupInterval == 0 {
-		sc.CacheCleanupInterval = defaultSanctionCacheCleanupInterval
-	}
-	return *sc
 }
 
 // isValidURL returns true if the supplied URL string can be parsed into a valid URL accepted by the Shannon SDK.
@@ -409,3 +465,6 @@ func (ltc *LoadTestingConfig) Validate() error {
 
 	return nil
 }
+
+// Note: Health check, observation pipeline, and retry config types are defined in the gateway package
+// to avoid import cycles. Use gateway.ActiveHealthChecksConfig, gateway.ObservationPipelineConfig, and gateway.RetryConfig.

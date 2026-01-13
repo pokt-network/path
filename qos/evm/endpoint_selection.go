@@ -47,7 +47,7 @@ func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrL
 		With("chain_id", ss.serviceQoSConfig.getEVMChainID()).
 		With("service_id", ss.serviceQoSConfig.GetServiceID()).
 		With("num_endpoints", numEndpoints)
-	logger.Info().Msgf("filtering %d available endpoints to select up to %d.", len(availableEndpoints), numEndpoints)
+	logger.Debug().Msgf("filtering %d available endpoints to select up to %d.", len(availableEndpoints), numEndpoints)
 
 	// Filter valid endpoints
 	filteredEndpointsAddr, _, err := ss.filterValidEndpointsWithDetails(availableEndpoints)
@@ -63,7 +63,7 @@ func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrL
 	}
 
 	// Use the diversity-aware selection
-	logger.Info().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(availableEndpoints))
+	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(availableEndpoints))
 	return selector.SelectEndpointsWithDiversity(logger, filteredEndpointsAddr, numEndpoints), nil
 }
 
@@ -76,7 +76,7 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 		With("service_id", ss.serviceQoSConfig.GetServiceID())
 
 	availableCount := len(availableEndpoints)
-	logger.Info().Msgf("filtering %d available endpoints.", availableCount)
+	logger.Debug().Msgf("filtering %d available endpoints.", availableCount)
 
 	filteredEndpointsAddr, validationResults, err := ss.filterValidEndpointsWithDetails(availableEndpoints)
 	if err != nil {
@@ -98,7 +98,7 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 		}, nil
 	}
 
-	logger.Info().Msgf("filtered %d endpoints from %d available endpoints", validCount, availableCount)
+	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", validCount, availableCount)
 
 	// Select random endpoint from valid candidates
 	selectedEndpointAddr := filteredEndpointsAddr[rand.Intn(validCount)]
@@ -129,7 +129,7 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 		return nil, nil, errEmptyEndpointListObs
 	}
 
-	logger.Info().Msgf("About to filter through %d available endpoints", len(availableEndpoints))
+	logger.Debug().Msgf("About to filter through %d available endpoints", len(availableEndpoints))
 
 	var filteredEndpointsAddr protocol.EndpointAddrList
 	var validationResults []*qosobservations.EndpointValidationResult
@@ -138,21 +138,25 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 	// which can be used to assign a rank/score to a valid endpoint to guide endpoint selection.
 	for _, availableEndpointAddr := range availableEndpoints {
 		logger := logger.With("endpoint_addr", availableEndpointAddr)
-		logger.Info().Msg("processing endpoint")
+		logger.Debug().Msg("processing endpoint")
 
 		endpoint, found := ss.endpointStore.endpoints[availableEndpointAddr]
 		if !found {
-			logger.Warn().Msgf("❓ SKIPPING endpoint %s because it was not found in PATH's endpoint store.", availableEndpointAddr)
+			// It is valid for an endpoint to not be in the store yet (e.g., first request,
+			// no observations collected). Treat it as a fresh endpoint and allow it.
+			// It will be added to the store once observations are collected.
+			logger.Warn().
+				Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+				Uint64("sync_allowance", ss.serviceQoSConfig.getSyncAllowance()).
+				Msg("🔍 Sync allowance check SKIPPED (endpoint not yet in store - fresh endpoint)")
 
-			// Create validation result for endpoint not found
-			failureDetails := "endpoint not found in PATH's endpoint store"
+			// Create validation result for endpoint not in store (but still valid)
 			result := &qosobservations.EndpointValidationResult{
-				EndpointAddr:   string(availableEndpointAddr),
-				Success:        false,
-				FailureReason:  qosobservations.EndpointValidationFailureReason_ENDPOINT_VALIDATION_FAILURE_REASON_ENDPOINT_NOT_FOUND.Enum(),
-				FailureDetails: &failureDetails,
+				EndpointAddr: string(availableEndpointAddr),
+				Success:      true,
 			}
 			validationResults = append(validationResults, result)
+			filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
 			continue
 		}
 
@@ -180,7 +184,7 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 		}
 		validationResults = append(validationResults, result)
 		filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
-		logger.Info().Msgf("✅ endpoint passed validation: %s", availableEndpointAddr)
+		logger.Debug().Msgf("endpoint passed validation: %s", availableEndpointAddr)
 	}
 
 	return filteredEndpointsAddr, validationResults, nil
@@ -263,25 +267,72 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
 }
 
 // isBlockNumberValid returns an error if:
-//   - The endpoint has not had an observation of its response to a `eth_blockNumber` request.
 //   - The endpoint's block height is less than the perceived block height minus the sync allowance.
+//
+// Returns nil (passes) if:
+//   - sync_allowance is 0 (check disabled)
+//   - No perceived block number yet (no chain data to compare against)
+//   - Endpoint has no block number observation (no endpoint data to validate)
 func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error {
-	if ss.perceivedBlockNumber == 0 {
-		return errNoBlockNumberObs
+	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
+
+	// If sync allowance is 0, the check is disabled
+	if syncAllowance == 0 {
+		ss.logger.Warn().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Msg("🔍 Sync allowance check DISABLED (sync_allowance=0)")
+		return nil
 	}
 
-	if check.parsedBlockNumberResponse == nil {
-		return errNoBlockNumberObs
+	// If we don't have a perceived block number yet, skip the check (no data to compare against)
+	if ss.perceivedBlockNumber == 0 {
+		ss.logger.Warn().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Uint64("sync_allowance", syncAllowance).
+			Msg("🔍 Sync allowance check SKIPPED (no perceived block number yet)")
+		return nil
 	}
+
+	// If endpoint has no block number observation, skip the check (no endpoint data to validate)
+	if check.parsedBlockNumberResponse == nil {
+		ss.logger.Warn().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Uint64("perceived_block", ss.perceivedBlockNumber).
+			Uint64("sync_allowance", syncAllowance).
+			Msg("🔍 Sync allowance check SKIPPED (endpoint has no block number observation)")
+		return nil
+	}
+
+	ss.logger.Warn().
+		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+		Uint64("sync_allowance", syncAllowance).
+		Msg("🔍 Sync allowance check ENABLED")
 
 	// Dereference pointer to show actual block number instead of memory address in error logs
 	parsedBlockNumber := *check.parsedBlockNumberResponse
 
 	// If the endpoint's block height is less than the perceived block height minus the sync allowance,
 	// then the endpoint is behind the chain and should be filtered out.
-	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
 	minAllowedBlockNumber := ss.perceivedBlockNumber - syncAllowance
+
+	// Log the sync allowance validation details
+	ss.logger.Warn().
+		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+		Uint64("endpoint_block", parsedBlockNumber).
+		Uint64("perceived_block", ss.perceivedBlockNumber).
+		Uint64("sync_allowance", syncAllowance).
+		Uint64("min_allowed_block", minAllowedBlockNumber).
+		Int64("blocks_behind", int64(ss.perceivedBlockNumber)-int64(parsedBlockNumber)).
+		Bool("within_allowance", parsedBlockNumber >= minAllowedBlockNumber).
+		Msg("🔍 Sync allowance validation")
+
 	if parsedBlockNumber < minAllowedBlockNumber {
+		ss.logger.Warn().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Uint64("endpoint_block", parsedBlockNumber).
+			Uint64("min_allowed_block", minAllowedBlockNumber).
+			Uint64("sync_allowance", syncAllowance).
+			Msg("❌ Endpoint failed sync allowance check - too far behind")
 		return fmt.Errorf("%w: block number %d is outside the sync allowance relative to min allowed block number %d and sync allowance %d",
 			errOutsideSyncAllowanceBlockNumberObs, parsedBlockNumber, minAllowedBlockNumber, syncAllowance)
 	}
@@ -293,15 +344,32 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 //   - The endpoint has not had an observation of its response to a `eth_chainId` request.
 //   - The endpoint's chain ID does not match the expected chain ID in the service state.
 func (ss *serviceState) isChainIDValid(check endpointCheckChainID) error {
+	expectedChainID := ss.serviceQoSConfig.getEVMChainID()
+
 	if check.chainID == nil {
+		ss.logger.Debug().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Str("expected_chain_id", string(expectedChainID)).
+			Msg("🔍 Chain ID check: endpoint has no chain ID observation")
 		return errNoChainIDObs
 	}
 
 	// Dereference pointer to show actual chain ID instead of memory address in error logs
 	chainID := *check.chainID
 
-	expectedChainID := ss.serviceQoSConfig.getEVMChainID()
+	ss.logger.Debug().
+		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+		Str("endpoint_chain_id", string(chainID)).
+		Str("expected_chain_id", string(expectedChainID)).
+		Bool("chain_id_matches", chainID == expectedChainID).
+		Msg("🔍 Chain ID validation")
+
 	if chainID != expectedChainID {
+		ss.logger.Debug().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Str("endpoint_chain_id", string(chainID)).
+			Str("expected_chain_id", string(expectedChainID)).
+			Msg("❌ Endpoint failed chain ID check - mismatch")
 		return fmt.Errorf("%w: chain ID %s does not match expected chain ID %s",
 			errInvalidChainIDObs, chainID, expectedChainID)
 	}

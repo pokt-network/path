@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/path/protocol"
@@ -20,16 +22,18 @@ func TestEndpointKey_String(t *testing.T) {
 			key: EndpointKey{
 				ServiceID:    "eth",
 				EndpointAddr: "supplier1-https://endpoint.com",
+				RPCType:      sharedtypes.RPCType_JSON_RPC,
 			},
-			expected: "eth:supplier1-https://endpoint.com",
+			expected: "eth:supplier1-https://endpoint.com:json_rpc",
 		},
 		{
 			name: "key with special characters in URL",
 			key: EndpointKey{
 				ServiceID:    "poly",
 				EndpointAddr: "pokt1abc-https://relay.example.com:8545/rpc",
+				RPCType:      sharedtypes.RPCType_REST,
 			},
-			expected: "poly:pokt1abc-https://relay.example.com:8545/rpc",
+			expected: "poly:pokt1abc-https://relay.example.com:8545/rpc:rest",
 		},
 	}
 
@@ -44,7 +48,7 @@ func TestNewEndpointKey(t *testing.T) {
 	serviceID := protocol.ServiceID("eth")
 	endpointAddr := protocol.EndpointAddr("supplier1-https://endpoint.com")
 
-	key := NewEndpointKey(serviceID, endpointAddr)
+	key := NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
 
 	require.Equal(t, serviceID, key.ServiceID)
 	require.Equal(t, endpointAddr, key.EndpointAddr)
@@ -157,7 +161,7 @@ func TestConfig_HydrateDefaults(t *testing.T) {
 func TestDefaultConfig(t *testing.T) {
 	config := DefaultConfig()
 
-	require.False(t, config.Enabled, "should be disabled by default")
+	require.True(t, config.Enabled, "should be enabled by default")
 	require.Equal(t, InitialScore, config.InitialScore)
 	require.Equal(t, DefaultMinThreshold, config.MinThreshold)
 	require.Equal(t, DefaultRecoveryTimeout, config.RecoveryTimeout)
@@ -416,8 +420,8 @@ func TestService_KeyBuilderForService_WithOverrides(t *testing.T) {
 		Enabled:        true,
 		KeyGranularity: KeyGranularityEndpoint, // Default is per-endpoint
 		ServiceOverrides: map[string]ServiceConfig{
-			"eth": {KeyGranularity: KeyGranularityDomain},     // eth uses per-domain
-			"sol": {KeyGranularity: KeyGranularitySupplier},   // sol uses per-supplier
+			"eth": {KeyGranularity: KeyGranularityDomain},   // eth uses per-domain
+			"sol": {KeyGranularity: KeyGranularitySupplier}, // sol uses per-supplier
 		},
 	}
 	store := newMockStorage()

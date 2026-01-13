@@ -12,7 +12,8 @@ const QoSType = "cosmossdk"
 // defaultCosmosSDKBlockNumberSyncAllowance is the default sync allowance for CosmosSDK-based chains.
 // This number indicates how many blocks behind the perceived
 // block number the endpoint may be and still be considered valid.
-const defaultCosmosSDKBlockNumberSyncAllowance = 5
+// 0 means disabled (no sync allowance check).
+const defaultCosmosSDKBlockNumberSyncAllowance = 0
 
 // ServiceQoSConfig defines the base interface for service QoS configurations.
 // This avoids circular dependency with the config package.
@@ -42,6 +43,23 @@ func NewCosmosSDKServiceQoSConfig(
 		cosmosSDKChainID: cosmosSDKChainID,
 		evmChainID:       evmChainID,
 		supportedAPIs:    supportedAPIs,
+	}
+}
+
+// NewCosmosSDKServiceQoSConfigWithSyncAllowance creates a new CosmosSDK service configuration with custom sync allowance.
+func NewCosmosSDKServiceQoSConfigWithSyncAllowance(
+	serviceID protocol.ServiceID,
+	cosmosSDKChainID string,
+	evmChainID string,
+	supportedAPIs map[sharedtypes.RPCType]struct{},
+	syncAllowance uint64,
+) CosmosSDKServiceQoSConfig {
+	return cosmosSDKServiceQoSConfig{
+		serviceID:        serviceID,
+		cosmosSDKChainID: cosmosSDKChainID,
+		evmChainID:       evmChainID,
+		supportedAPIs:    supportedAPIs,
+		syncAllowance:    syncAllowance,
 	}
 }
 
