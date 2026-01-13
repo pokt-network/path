@@ -57,7 +57,11 @@ type (
 
 // healthCheckJSON is the JSON structure of the response body
 // returned by the `/healthz` endpoint along with the status code.
+//
+// Deprecated: Use /health for liveness, /ready for readiness, and /config for configuration.
 type healthCheckJSON struct {
+	// Deprecated indicates this endpoint is deprecated
+	Deprecated string `json:"deprecated"`
 	// Status is either "ready" or "not_ready". "not_ready" indicates
 	// that the service is still warming up its caches, etc.
 	Status healthCheckStatus `json:"status"`
@@ -74,7 +78,8 @@ type healthCheckJSON struct {
 //
 // It will return a 200 OK status code if all components are ready or
 // a 503 Service Unavailable status code if any component is not ready.
-
+//
+// Deprecated: Use /health for liveness, /ready for readiness, and /config for configuration.
 func (c *Checker) HealthzHandler(w http.ResponseWriter, req *http.Request) {
 	readyStates := c.getComponentReadyStates()
 	status := getStatus(readyStates)
@@ -84,6 +89,12 @@ func (c *Checker) HealthzHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+
+	// Add deprecation headers per RFC 8594
+	w.Header().Set("Deprecation", "true")
+	w.Header().Set("Sunset", "2025-06-01")
+	w.Header().Set("Link", `</health>; rel="successor-version", </ready>; rel="successor-version", </config>; rel="successor-version"`)
+	w.Header().Set("Content-Type", "application/json")
 
 	if status == statusReady {
 		w.WriteHeader(http.StatusOK)
@@ -107,6 +118,7 @@ func (c *Checker) getHealthCheckResponse(status healthCheckStatus, readyStates m
 	}
 
 	healthCheckJSON := healthCheckJSON{
+		Deprecated:           "This endpoint is deprecated. Use /health for liveness, /ready for readiness, and /config for configuration.",
 		Status:               status,
 		ReadyStates:          readyStates,
 		ImageTag:             imageTag,

@@ -122,9 +122,14 @@ var _ protocol.Endpoint = protocolEndpoint{}
 //   - It is identified by its Supplier address and Relay MinerURL.
 type protocolEndpoint struct {
 	supplier string
-	url      string
-	// TODO_TECHDEBT(@commoddity): Investigate if we should allow supporting additional RPC type endpoints.
-	websocketUrl string
+
+	// Multi-RPC-type URL support: maps each RPC type to its specific URL
+	// This replaces the previous url/websocketUrl fields to support all RPC types
+	rpcTypeURLs map[sharedtypes.RPCType]string
+
+	// defaultURL is used for logging/display purposes only
+	// CRITICAL: Do NOT use defaultURL for actual routing - always use GetURL(rpcType)
+	defaultURL string
 
 	// TODO_IMPROVE: If the same endpoint is in the session of multiple apps at the same time,
 	// the first app will be chosen. A randomization among the apps in this (unlikely) scenario
@@ -142,25 +147,37 @@ func (e protocolEndpoint) IsFallback() bool {
 // For protocol-level concerns: the (app/session, URL) should be taken into account; e.g. a healthy endpoint may have been maxed out for a particular app.
 // For QoS-level concerns: only the URL of the endpoint matters; e.g. an unhealthy endpoint should be skipped regardless of the app/session to which it is attached.
 func (e protocolEndpoint) Addr() protocol.EndpointAddr {
-	return protocol.EndpointAddr(fmt.Sprintf("%s-%s", e.supplier, e.url))
+	return protocol.EndpointAddr(fmt.Sprintf("%s-%s", e.supplier, e.defaultURL))
 }
 
 // PublicURL returns the URL of the endpoint.
+// Returns defaultURL for display/logging purposes.
 func (e protocolEndpoint) PublicURL() string {
-	return e.url
+	return e.defaultURL
 }
 
-// GetURL returns the public URL for any RPC type (regular endpoints don't vary by RPC type)
-func (e protocolEndpoint) GetURL(_ sharedtypes.RPCType) string {
-	return e.url
+// GetURL returns the RPC-type-specific URL for the endpoint.
+// If the requested RPC type is not available, returns empty string.
+// CRITICAL: Callers must check for empty string and skip the endpoint if not supported.
+func (e protocolEndpoint) GetURL(rpcType sharedtypes.RPCType) string {
+	if rpcType == sharedtypes.RPCType_UNKNOWN_RPC {
+		return e.defaultURL
+	}
+	if url, ok := e.rpcTypeURLs[rpcType]; ok {
+		return url
+	}
+	// RPC type not supported by this endpoint - return empty string
+	return ""
 }
 
-// WebsocketURL returns the URL of the endpoint.
+// WebsocketURL returns the websocket URL of the endpoint.
+// Deprecated: Use GetURL(sharedtypes.RPCType_WEBSOCKET) instead.
 func (e protocolEndpoint) WebsocketURL() (string, error) {
-	if e.websocketUrl == "" {
+	url := e.GetURL(sharedtypes.RPCType_WEBSOCKET)
+	if url == "" {
 		return "", fmt.Errorf("websocket URL is not set")
 	}
-	return e.websocketUrl, nil
+	return url, nil
 }
 
 // Session returns a pointer to the session associated with the endpoint.
@@ -176,14 +193,10 @@ func (e protocolEndpoint) Supplier() string {
 // endpointsFromSession returns the list of all endpoints from a Shannon session.
 // It returns a map for efficient lookup, as the main/only consumer of this function uses
 // the return value for selecting an endpoint for sending a relay.
-func endpointsFromSession(
-	session sessiontypes.Session,
-	// TODO_TECHDEBT(@adshmh): Refactor load testing logic to make it more visible.
-	//
-	// The only supplier allowed from the session.
-	// Used in Load Testing against a single RelayMiner.
-	allowedSupplierAddr string,
-) (map[protocol.EndpointAddr]endpoint, error) {
+//
+// Note: This function is typically called via Protocol.getOrCreateSessionEndpoints()
+// which provides caching. Direct calls should only be used when caching is not desired.
+func endpointsFromSession(session sessiontypes.Session) (map[protocol.EndpointAddr]endpoint, error) {
 	sf := sdk.SessionFilter{
 		Session: &session,
 	}
@@ -204,37 +217,28 @@ func endpointsFromSession(
 		endpoint := protocolEndpoint{
 			supplier: string(supplierEndpoints[0].Supplier()),
 			// Set the session field on the endpoint for efficient lookup when sending relays.
-			session: session,
+			session:     session,
+			rpcTypeURLs: make(map[sharedtypes.RPCType]string),
 		}
 
-		// Endpoint does not match the only allowed supplier.
-		// Skip.
-		// Used in Load Testing against a RelayMiner.
-		// Makes sure the relays can be processed by the target RelayMiner by matching the supplier address.
-		if allowedSupplierAddr != "" && endpoint.Supplier() != allowedSupplierAddr {
-			continue
-		}
-
-		// Set the URL of the endpoint based on the RPC type.
-		// Each supplier endpoint may have multiple RPC types, so we need to set the URL for each.
-		//
-		// IMPORTANT: As of PATH PR #345 the only supported RPC types are:
-		// 	- `JSON_RPC`
-		// 	- `WEBSOCKET`
-		//
-		// References:
-		// 	- PATH PR #345 - https://github.com/pokt-network/path/pull/345
-		// 	- poktroll `RPCType` enum - https://github.com/pokt-network/poktroll/blob/main/x/shared/types/service.pb.go#L31
+		// Populate rpcTypeURLs map with all available RPC types for this supplier.
+		// This replaces the previous hardcoded handling of only JSON_RPC and WEBSOCKET.
+		// Now supports all RPC types: json_rpc, rest, comet_bft, websocket, grpc.
 		for _, supplierRPCTypeEndpoint := range supplierEndpoints {
-			switch supplierRPCTypeEndpoint.RPCType() {
+			rpcType := supplierRPCTypeEndpoint.RPCType()
+			url := supplierRPCTypeEndpoint.Endpoint().Url
 
-			// If the endpoint is a `WEBSOCKET` RPC type endpoint, set the websocket URL.
-			case sharedtypes.RPCType_WEBSOCKET:
-				endpoint.websocketUrl = supplierRPCTypeEndpoint.Endpoint().Url
+			// Skip UNKNOWN_RPC types
+			if rpcType == sharedtypes.RPCType_UNKNOWN_RPC {
+				continue
+			}
 
-			// Currently only `WEBSOCKET` & `JSON_RPC` types are supported, so `JSON_RPC` is the default.
-			default:
-				endpoint.url = supplierRPCTypeEndpoint.Endpoint().Url
+			endpoint.rpcTypeURLs[rpcType] = url
+
+			// Set defaultURL to first URL found (for logging/display only)
+			// CRITICAL: This is NOT used for routing - GetURL(rpcType) is used instead
+			if endpoint.defaultURL == "" {
+				endpoint.defaultURL = url
 			}
 		}
 
@@ -242,4 +246,53 @@ func endpointsFromSession(
 	}
 
 	return endpoints, nil
+}
+
+// getOrCreateSessionEndpoints returns cached endpoints for the session, or creates and caches them.
+// This avoids redundant AllEndpoints() calls and endpoint map construction on every request.
+// The cache is keyed by sessionId since session endpoints don't change within a session's lifetime.
+func (p *Protocol) getOrCreateSessionEndpoints(session sessiontypes.Session) (map[protocol.EndpointAddr]endpoint, error) {
+	sessionID := session.SessionId
+
+	// Check cache first
+	if cached, ok := p.sessionEndpointsCache.Load(sessionID); ok {
+		cachedEndpoints := cached.(map[protocol.EndpointAddr]endpoint)
+
+		// DEFENSIVE CHECK: Verify cached endpoints match requested session start height
+		// Session IDs SHOULD be unique per session period, but if they're not (blockchain bug),
+		// this will detect, log, invalidate cache, and create fresh endpoints
+		if len(cachedEndpoints) > 0 {
+			for _, ep := range cachedEndpoints {
+				if ep.Session().Header.SessionStartBlockHeight != session.Header.SessionStartBlockHeight {
+					p.logger.Error().
+						Str("session_id", sessionID).
+						Int64("requested_session_start_height", session.Header.SessionStartBlockHeight).
+						Int64("cached_session_start_height", ep.Session().Header.SessionStartBlockHeight).
+						Str("requested_app", session.Application.Address).
+						Str("cached_app", ep.Session().Application.Address).
+						Msg("🚨 SESSION ID COLLISION: Same session ID with different start heights - invalidating cache and creating fresh endpoints")
+
+					// Invalidate the bad cache entry
+					p.sessionEndpointsCache.Delete(sessionID)
+
+					// Fall through to create new endpoints below
+					goto createEndpoints
+				}
+				break // Only check first endpoint
+			}
+		}
+
+		return cachedEndpoints, nil
+	}
+
+createEndpoints:
+	// Create new endpoint map
+	endpoints, err := endpointsFromSession(session)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache it (use LoadOrStore to handle concurrent creation)
+	actual, _ := p.sessionEndpointsCache.LoadOrStore(sessionID, endpoints)
+	return actual.(map[protocol.EndpointAddr]endpoint), nil
 }

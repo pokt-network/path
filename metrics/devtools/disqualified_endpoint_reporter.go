@@ -39,7 +39,7 @@ type DisqualifiedEndpointReporter struct {
 // It is used by the `/disqualified_endpoints` URL path in the router to provide
 // useful information about currently disqualified endpoints for development and debugging.
 func (r *DisqualifiedEndpointReporter) ReportEndpointStatus(serviceID protocol.ServiceID, httpReq *http.Request) (DisqualifiedEndpointResponse, error) {
-	r.Logger.Info().Msgf("Reporting disqualified endpoints for service ID: %s", serviceID)
+	r.Logger.Debug().Msgf("Reporting disqualified endpoints for service ID: %s", serviceID)
 
 	var serviceEndpointsCount int
 	serviceEndpointsCount, err := r.ProtocolLevelReporter.GetTotalServiceEndpointsCount(serviceID, httpReq)
@@ -47,7 +47,7 @@ func (r *DisqualifiedEndpointReporter) ReportEndpointStatus(serviceID protocol.S
 		return DisqualifiedEndpointResponse{}, err
 	}
 
-	r.Logger.Info().Msgf("DisqualifiedEndpointReporter.Report: Successfully got available endpoints for service ID: %s", serviceID)
+	r.Logger.Debug().Msgf("DisqualifiedEndpointReporter.Report: Successfully got available endpoints for service ID: %s", serviceID)
 
 	details := DisqualifiedEndpointResponse{
 		TotalServiceEndpointsCount: serviceEndpointsCount,
@@ -65,7 +65,7 @@ func (r *DisqualifiedEndpointReporter) ReportEndpointStatus(serviceID protocol.S
 		qoSLevelReporter.HydrateDisqualifiedEndpointsResponse(qosServiceID, &details)
 	}
 
-	r.Logger.Info().Msgf("DisqualifiedEndpointReporter.Report: Successfully hydrated disqualified endpoint details for service ID: %s", serviceID)
+	r.Logger.Debug().Msgf("DisqualifiedEndpointReporter.Report: Successfully hydrated disqualified endpoint details for service ID: %s", serviceID)
 
 	details.DisqualifiedServiceEndpointsCount = details.GetDisqualifiedEndpointsCount()
 

@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/path/protocol"
@@ -16,7 +18,7 @@ func TestMemoryStorage_GetSet(t *testing.T) {
 	storage := NewMemoryStorage(0) // No TTL
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "supplier1-https://endpoint.com")
+	key := reputation.NewEndpointKey("eth", "supplier1-https://endpoint.com", sharedtypes.RPCType_JSON_RPC)
 	score := reputation.Score{
 		Value:        85.5,
 		LastUpdated:  time.Now(),
@@ -46,9 +48,9 @@ func TestMemoryStorage_GetMultiple(t *testing.T) {
 
 	// Setup test data
 	keys := []reputation.EndpointKey{
-		reputation.NewEndpointKey("eth", "endpoint1"),
-		reputation.NewEndpointKey("eth", "endpoint2"),
-		reputation.NewEndpointKey("eth", "endpoint3"),
+		reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC),
+		reputation.NewEndpointKey("eth", "endpoint2", sharedtypes.RPCType_JSON_RPC),
+		reputation.NewEndpointKey("eth", "endpoint3", sharedtypes.RPCType_JSON_RPC),
 	}
 
 	scores := map[reputation.EndpointKey]reputation.Score{
@@ -75,7 +77,7 @@ func TestMemoryStorage_Delete(t *testing.T) {
 	storage := NewMemoryStorage(0)
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "endpoint1")
+	key := reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 	score := reputation.Score{Value: 85, LastUpdated: time.Now()}
 
 	// Set and verify
@@ -105,9 +107,9 @@ func TestMemoryStorage_List(t *testing.T) {
 
 	// Setup test data for multiple services
 	scores := map[reputation.EndpointKey]reputation.Score{
-		reputation.NewEndpointKey("eth", "endpoint1"):  {Value: 80},
-		reputation.NewEndpointKey("eth", "endpoint2"):  {Value: 85},
-		reputation.NewEndpointKey("poly", "endpoint1"): {Value: 90},
+		reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC):  {Value: 80},
+		reputation.NewEndpointKey("eth", "endpoint2", sharedtypes.RPCType_JSON_RPC):  {Value: 85},
+		reputation.NewEndpointKey("poly", "endpoint1", sharedtypes.RPCType_JSON_RPC): {Value: 90},
 	}
 
 	err := storage.SetMultiple(ctx, scores)
@@ -138,7 +140,7 @@ func TestMemoryStorage_TTL(t *testing.T) {
 	storage := NewMemoryStorage(ttl)
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "endpoint1")
+	key := reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 	score := reputation.Score{Value: 85, LastUpdated: time.Now()}
 
 	// Set with TTL
@@ -161,7 +163,7 @@ func TestMemoryStorage_Close(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage(0)
 
-	key := reputation.NewEndpointKey("eth", "endpoint1")
+	key := reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 	score := reputation.Score{Value: 85, LastUpdated: time.Now()}
 
 	// Set before close
@@ -194,8 +196,8 @@ func TestMemoryStorage_Cleanup(t *testing.T) {
 
 	// Add entries
 	scores := map[reputation.EndpointKey]reputation.Score{
-		reputation.NewEndpointKey("eth", "endpoint1"): {Value: 80},
-		reputation.NewEndpointKey("eth", "endpoint2"): {Value: 85},
+		reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC): {Value: 80},
+		reputation.NewEndpointKey("eth", "endpoint2", sharedtypes.RPCType_JSON_RPC): {Value: 85},
 	}
 	err := storage.SetMultiple(ctx, scores)
 	require.NoError(t, err)
@@ -216,7 +218,7 @@ func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
 	storage := NewMemoryStorage(0)
 	defer storage.Close()
 
-	key := reputation.NewEndpointKey("eth", "endpoint1")
+	key := reputation.NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
 
 	// Run concurrent reads and writes
 	done := make(chan bool)

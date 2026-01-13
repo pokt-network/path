@@ -49,18 +49,22 @@ type Gateway struct {
 	// sending the service payload to an endpoint.
 	Protocol
 
+	// RPCTypeValidator validates detected RPC types against service configuration.
+	// Used to fail fast with clear errors for unsupported RPC types.
+	RPCTypeValidator *RPCTypeValidator
+
 	// MetricsReporter is used to export metrics based on observations made in handling service requests.
 	MetricsReporter RequestResponseReporter
-
-	// DataReporter is used to export, to the data pipeline, observations made in handling service requests.
-	// It is declared separately from the `MetricsReporter` to be consistent with the gateway package's role
-	// of explicitly defining PATH gateway's components and their interactions.
-	DataReporter RequestResponseReporter
 
 	// WebsocketMessageBufferSize is the buffer size for websocket message observation channels.
 	// Configurable to balance memory usage vs throughput for websocket connections.
 	// Default: DefaultWebsocketMessageBufferSize (100)
 	WebsocketMessageBufferSize int
+
+	// ObservationQueue handles async, sampled observation processing for QoS data extraction.
+	// When enabled, sampled requests are queued for deep parsing (block height, chain ID, etc.)
+	// without blocking the hot path. This is optional - if nil, no async observation processing occurs.
+	ObservationQueue *ObservationQueue
 }
 
 // HandleServiceRequest implements PATH gateway's service request processing.
@@ -111,8 +115,9 @@ func (g Gateway) handleHTTPServiceRequest(
 		gatewayObservations: getUserRequestGatewayObservations(httpReq),
 		protocol:            g.Protocol,
 		httpRequestParser:   g.HTTPRequestParser,
+		rpcTypeValidator:    g.RPCTypeValidator,
 		metricsReporter:     g.MetricsReporter,
-		dataReporter:        g.DataReporter,
+		observationQueue:    g.ObservationQueue,
 	}
 
 	defer func() {
@@ -123,10 +128,22 @@ func (g Gateway) handleHTTPServiceRequest(
 		gatewayRequestCtx.BroadcastAllObservations()
 	}()
 
+	// Capture HTTP request metadata early for async observation processing.
+	// This must happen before the body is consumed by downstream parsing.
+	gatewayRequestCtx.captureHTTPRequestMetadata(httpReq)
+
 	// Initialize the GatewayRequestContext struct using the HTTP request.
 	// e.g. extract the target service ID from the HTTP request.
 	err := gatewayRequestCtx.InitFromHTTPRequest(httpReq)
 	if err != nil {
+		return
+	}
+
+	// Validate RPC type before QoS processing.
+	// This fails fast if the detected RPC type is not in the service's configured rpc_types.
+	err = gatewayRequestCtx.ValidateRPCType(httpReq)
+	if err != nil {
+		logger.Error().Err(err).Msg("❌ RPC type validation failed")
 		return
 	}
 
@@ -195,7 +212,6 @@ func (g Gateway) handleWebSocketRequest(
 		protocol:            g.Protocol,
 		httpRequestParser:   g.HTTPRequestParser,
 		metricsReporter:     g.MetricsReporter,
-		dataReporter:        g.DataReporter,
 		// Note: We do NOT close messageObservationsChan here because Websocket connections
 		// outlive the HTTP handler. The channel will be closed when the Websocket actually disconnects.
 		messageObservationsChan: make(chan *observation.RequestResponseObservations, websocketBufferSize),
@@ -229,5 +245,5 @@ func (g Gateway) handleWebSocketRequest(
 	//   - Complete connection duration (from establishment to termination)
 	//   - Final connection status and termination reason
 	// This ensures we send only ONE connection observation per Websocket connection.
-	logger.Info().Msg("✅ Websocket connection and bridge shutdown complete, ready to broadcast final observations")
+	logger.Debug().Msg("Websocket connection and bridge shutdown complete, ready to broadcast final observations")
 }

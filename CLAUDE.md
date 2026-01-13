@@ -92,6 +92,86 @@ PATH uses Tilt for local development with Kubernetes (kind). The development sta
 - Grafana for observability
 - Rate limiting and authentication services
 
+## API Usage
+
+### Making Requests to PATH Gateway
+
+PATH requires the service ID to be specified via the `Target-Service-Id` HTTP header, not in the URL path.
+
+**Correct format:**
+```bash
+curl -X POST http://localhost:3069/v1 \
+  -H "Content-Type: application/json" \
+  -H "Target-Service-Id: eth" \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+```
+
+**Common services:**
+- `eth` - Ethereum mainnet (supports: json_rpc, websocket)
+- `solana` - Solana mainnet (supports: json_rpc)
+- `poly` - Polygon (supports: json_rpc, websocket)
+- `xrplevm` - XRPL EVM (supports: json_rpc, rest, comet_bft, websocket)
+
+**RPC Type Detection:**
+PATH automatically detects the RPC type from the request:
+- **JSON-RPC**: POST with `{"jsonrpc":"2.0",...}` body
+  ```bash
+  curl -X POST http://localhost:3069/v1 \
+    -H "Target-Service-Id: eth" \
+    -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+  ```
+- **REST** (Cosmos SDK): GET/POST to Cosmos REST API paths
+  ```bash
+  # Cosmos SDK REST API (gRPC-gateway)
+  curl -X GET http://localhost:3069/v1/cosmos/base/tendermint/v1beta1/blocks/latest \
+    -H "Target-Service-Id: xrplevm"
+  ```
+- **CometBFT RPC**: GET/POST to CometBFT RPC paths
+  ```bash
+  # CometBFT JSON-RPC over HTTP
+  curl -X GET http://localhost:3069/v1/status \
+    -H "Target-Service-Id: xrplevm"
+  ```
+- **WebSocket**: WebSocket upgrade requests (for subscriptions)
+
+### Advanced Headers
+
+**Target-Suppliers** (Optional)
+Restricts relay requests to a specific list of supplier addresses, bypassing reputation and endpoint selection logic.
+
+Format: Comma-separated list of supplier addresses
+```bash
+# Send request only to specific suppliers
+curl -X POST http://localhost:3069/v1 \
+  -H "Target-Service-Id: eth" \
+  -H "Target-Suppliers: pokt1abc123...,pokt1def456...,pokt1ghi789..." \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+```
+
+**Use cases:**
+- Testing specific supplier endpoints
+- Debugging supplier-specific issues
+- Directing traffic to trusted suppliers for sensitive operations
+- Load testing specific infrastructure providers
+
+**Behavior:**
+- When `Target-Suppliers` header is present, PATH will:
+  - Filter available endpoints to only those from the specified suppliers
+  - Skip reputation-based filtering (allows targeting suppliers with low reputation)
+  - Still apply RPC type filtering (only endpoints supporting the requested RPC type)
+  - Log filtered supplier list and endpoint counts
+- If none of the specified suppliers are available in the current session, the request will fail
+- Header takes precedence over load testing configuration (if any)
+
+**App-Address** (Delegated Mode Only)
+Specifies the target application address when PATH is running in delegated mode.
+```bash
+curl -X POST http://localhost:3069/v1 \
+  -H "Target-Service-Id: eth" \
+  -H "App-Address: pokt1app..." \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+```
+
 ## Testing Strategy
 
 - **Unit Tests** - Standard Go tests with `-short` flag

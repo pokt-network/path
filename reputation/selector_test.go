@@ -3,6 +3,8 @@ package reputation
 import (
 	"testing"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/path/protocol"
@@ -20,9 +22,9 @@ func TestTieredSelector_AllTiersPopulated(t *testing.T) {
 	}, 30)
 
 	endpoints := map[EndpointKey]float64{
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier1-endpoint")): 85, // Tier 1
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier2-endpoint")): 60, // Tier 2
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3-endpoint")): 40, // Tier 3
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier1-endpoint"), sharedtypes.RPCType_JSON_RPC): 85, // Tier 1
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier2-endpoint"), sharedtypes.RPCType_JSON_RPC): 60, // Tier 2
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3-endpoint"), sharedtypes.RPCType_JSON_RPC): 40, // Tier 3
 	}
 
 	// Run multiple times to verify tier 1 is always selected
@@ -42,9 +44,9 @@ func TestTieredSelector_Tier1Empty_SelectsFromTier2(t *testing.T) {
 	}, 30)
 
 	endpoints := map[EndpointKey]float64{
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier2-endpoint-a")): 60, // Tier 2
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier2-endpoint-b")): 55, // Tier 2
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3-endpoint")):   40, // Tier 3
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier2-endpoint-a"), sharedtypes.RPCType_JSON_RPC): 60, // Tier 2
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier2-endpoint-b"), sharedtypes.RPCType_JSON_RPC): 55, // Tier 2
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3-endpoint"), sharedtypes.RPCType_JSON_RPC):   40, // Tier 3
 	}
 
 	// Run multiple times to verify tier 2 is always selected (no tier 1 available)
@@ -64,8 +66,8 @@ func TestTieredSelector_Tier1And2Empty_SelectsFromTier3(t *testing.T) {
 	}, 30)
 
 	endpoints := map[EndpointKey]float64{
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3-endpoint-a")): 45, // Tier 3
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3-endpoint-b")): 35, // Tier 3
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3-endpoint-a"), sharedtypes.RPCType_JSON_RPC): 45, // Tier 3
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3-endpoint-b"), sharedtypes.RPCType_JSON_RPC): 35, // Tier 3
 	}
 
 	// Run multiple times to verify tier 3 is always selected (no tier 1 or 2 available)
@@ -86,8 +88,8 @@ func TestTieredSelector_AllTiersEmpty_ReturnsError(t *testing.T) {
 
 	// All endpoints below min threshold (should have been filtered earlier)
 	endpoints := map[EndpointKey]float64{
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("low-score-a")): 25,
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("low-score-b")): 10,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("low-score-a"), sharedtypes.RPCType_JSON_RPC): 25,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("low-score-b"), sharedtypes.RPCType_JSON_RPC): 10,
 	}
 
 	_, tier, err := selector.SelectEndpoint(endpoints)
@@ -118,9 +120,9 @@ func TestTieredSelector_Disabled_RandomSelection(t *testing.T) {
 
 	// Mix of tiers
 	endpoints := map[EndpointKey]float64{
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier1")): 85,
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier2")): 60,
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3")): 40,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier1"), sharedtypes.RPCType_JSON_RPC): 85,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier2"), sharedtypes.RPCType_JSON_RPC): 60,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("tier3"), sharedtypes.RPCType_JSON_RPC): 40,
 	}
 
 	// When disabled, tier should be 0 (no tiering)
@@ -139,8 +141,8 @@ func TestTieredSelector_CustomThresholds(t *testing.T) {
 	}, 40)
 
 	endpoints := map[EndpointKey]float64{
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("score-75")): 75, // Tier 2 with custom thresholds
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("score-55")): 55, // Tier 3 with custom thresholds
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("score-75"), sharedtypes.RPCType_JSON_RPC): 75, // Tier 2 with custom thresholds
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("score-55"), sharedtypes.RPCType_JSON_RPC): 55, // Tier 3 with custom thresholds
 	}
 
 	selected, tier, err := selector.SelectEndpoint(endpoints)
@@ -161,13 +163,13 @@ func TestTieredSelector_GroupByTier(t *testing.T) {
 	}, 30)
 
 	endpoints := map[EndpointKey]float64{
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t1-a")): 90,
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t1-b")): 70, // Exactly at threshold
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t2-a")): 65,
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t2-b")): 50, // Exactly at threshold
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t3-a")): 45,
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t3-b")): 30, // Exactly at min threshold
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("low")):  25, // Below threshold
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t1-a"), sharedtypes.RPCType_JSON_RPC): 90,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t1-b"), sharedtypes.RPCType_JSON_RPC): 70, // Exactly at threshold
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t2-a"), sharedtypes.RPCType_JSON_RPC): 65,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t2-b"), sharedtypes.RPCType_JSON_RPC): 50, // Exactly at threshold
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t3-a"), sharedtypes.RPCType_JSON_RPC): 45,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("t3-b"), sharedtypes.RPCType_JSON_RPC): 30, // Exactly at min threshold
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("low"), sharedtypes.RPCType_JSON_RPC):  25, // Below threshold
 	}
 
 	tier1, tier2, tier3 := selector.GroupByTier(endpoints)
@@ -263,9 +265,9 @@ func TestTieredSelector_RandomWithinTier(t *testing.T) {
 
 	// All endpoints in Tier 1
 	endpoints := map[EndpointKey]float64{
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("endpoint-a")): 90,
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("endpoint-b")): 85,
-		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("endpoint-c")): 80,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("endpoint-a"), sharedtypes.RPCType_JSON_RPC): 90,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("endpoint-b"), sharedtypes.RPCType_JSON_RPC): 85,
+		NewEndpointKey(protocol.ServiceID("eth"), protocol.EndpointAddr("endpoint-c"), sharedtypes.RPCType_JSON_RPC): 80,
 	}
 
 	// Track selections over multiple iterations

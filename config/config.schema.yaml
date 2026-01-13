@@ -11,157 +11,610 @@ description: "PATH Gateway Configuration YAML: this file is used to configure a 
 type: object
 additionalProperties: false
 required:
-  - shannon_config
+  - full_node_config
+  - gateway_config
 
 properties:
-  # Shannon Configuration
-  shannon_config:
-    description: "Configuration for the Shannon gateway; if specified, the PATH instance will use the Shannon version of the Pocket protocol."
+  # Full Node Configuration
+  full_node_config:
+    description: "Configuration for the Shannon full node. This configuration is used to connect to the Shannon full node to get data from the Pocket blockchain."
     type: object
     additionalProperties: false
     required:
-      - full_node_config
-      - gateway_config
+      - rpc_url
+      - grpc_config
     properties:
-      full_node_config:
-        description: "Configuration for the Shannon full node. This configuration is used to connect to the Shannon full node to get data from the Pocket blockchain."
+      rpc_url:
+        description: "HTTP URL for the Shannon full node."
+        type: string
+        pattern: "^(tcp|http|https)://.*$"
+      grpc_config:
+        description: "gRPC configuration for the Shannon full node."
         type: object
         additionalProperties: false
         required:
-          - rpc_url
-          - grpc_config
+          - host_port
         properties:
-          rpc_url:
-            description: "HTTP URL for the Shannon full node."
+          host_port:
+            description: "Host and port for gRPC connections, eg. 127.0.0.1:4040"
             type: string
-            pattern: "^(tcp|http|https)://.*$"
-          grpc_config:
-            description: "gRPC configuration for the Shannon full node."
-            type: object
-            additionalProperties: false
-            required:
-              - host_port
-            properties:
-              host_port:
-                description: "Host and port for gRPC connections, eg. 127.0.0.1:4040"
-                type: string
-                pattern: "^[^:]+:[0-9]+$"
-              insecure:
-                description: "Indicates if the gRPC connection is insecure. Must be specified if the full node is notusing TLS."
-                type: boolean
-                default: false
-              base_delay:
-                description: "Base delay for gRPC retries."
-                type: string
-              max_delay:
-                description: "Maximum delay for gRPC retries."
-                type: string
-              min_connect_timeout:
-                description: "Minimum connection timeout for gRPC."
-                type: string
-              keep_alive_time:
-                description: "Keep-alive time for gRPC connections."
-                type: string
-              keep_alive_timeout:
-                description: "Keep-alive timeout for gRPC connections."
-                type: string
-          lazy_mode:
-            description: "Indicates if lazy mode is enabled for full node connections."
+            pattern: "^[^:]+:[0-9]+$"
+          insecure:
+            description: "Indicates if the gRPC connection is insecure. Must be specified if the full node is not using TLS."
+            type: boolean
+            default: false
+          base_delay:
+            description: "Base delay for gRPC retries."
+            type: string
+          max_delay:
+            description: "Maximum delay for gRPC retries."
+            type: string
+          min_connect_timeout:
+            description: "Minimum connection timeout for gRPC."
+            type: string
+          keep_alive_time:
+            description: "Keep-alive time for gRPC connections."
+            type: string
+          keep_alive_timeout:
+            description: "Keep-alive timeout for gRPC connections."
+            type: string
+      lazy_mode:
+        description: "Indicates if lazy mode is enabled for full node connections."
+        type: boolean
+        default: true
+      session_rollover_blocks:
+        description: "Grace period after session end where rollover issues may occur (in blocks)."
+        type: integer
+        minimum: 1
+      cache_config:
+        description: "Configuration for the cache."
+        type: object
+        additionalProperties: false
+        properties:
+          app_ttl:
+            description: "TTL for the app cache."
+            type: string
+            pattern: "^[0-9]+[smh]$"
+          session_ttl:
+            description: "TTL for the session cache."
+            type: string
+            pattern: "^[0-9]+[smh]$"
+
+  # Gateway Configuration
+  gateway_config:
+    description: "Configuration for the Shannon gateway, including all required addresses and private keys for all Shannon actors."
+    type: object
+    additionalProperties: false
+    required:
+      - gateway_mode
+      - gateway_address
+      - gateway_private_key_hex
+    properties:
+      gateway_mode:
+        description: "Mode of the gateway operation."
+        type: string
+        enum: ["centralized", "delegated", "permissionless"]
+      gateway_address:
+        description: "Address of the Shannon gateway."
+        type: string
+        pattern: "^pokt1[0-9a-zA-Z]{38}$"
+      gateway_private_key_hex:
+        description: "Private key of the Shannon gateway in hexadecimal format."
+        type: string
+        pattern: "^[0-9a-fA-F]{64}$"
+      owned_apps_private_keys_hex:
+        type: array
+        description: "Private keys of Shannon Applications owned by the Gateway in hexadecimal format."
+        items:
+          type: string
+          pattern: "^[0-9a-fA-F]{64}$"
+      service_fallback:
+        description: "Fallback endpoints for the Shannon gateway. An array of service fallback configurations."
+        type: array
+        uniqueItems: true
+        items:
+          type: object
+          additionalProperties: false
+          required:
+            - service_id
+            - fallback_endpoints
+          properties:
+            service_id:
+              description: "The service ID for this fallback configuration."
+              type: string
+            fallback_endpoints:
+              description: "Array of fallback endpoint configurations for this service."
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                required:
+                  - default_url
+                patternProperties:
+                  "^(default_url|json_rpc|rest|comet_bft|websocket)$":
+                    type: string
+                    anyOf:
+                      - pattern: "^(http|https)://.*$"
+                      - pattern: "^(http|https|ws|wss)://.*$"
+            send_all_traffic:
+              description: "Whether to send all traffic to fallback endpoints for this service."
+              type: boolean
+              default: false
+
+      # Reputation Configuration
+      reputation_config:
+        description: "Configuration for the endpoint reputation system. Tracks endpoint reliability via scores (0-100). When disabled, requests are relayed to any endpoint in the session without quality filtering."
+        type: object
+        additionalProperties: false
+        properties:
+          enabled:
+            description: "Enable/disable the reputation system. When false, PATH operates in simple relay mode without endpoint quality tracking. Default: true"
             type: boolean
             default: true
-          session_rollover_blocks:
-            description: "Grace period after session end where rollover issues may occur (in blocks)."
+          storage_type:
+            description: "Storage backend for reputation data. Options: 'memory' or 'redis'."
+            type: string
+            enum: ["memory", "redis"]
+            default: "memory"
+          initial_score:
+            description: "Starting score for new endpoints (0-100 scale). Default: 80"
             type: integer
-            minimum: 1
-          cache_config:
-            description: "Configuration for the cache."
+            minimum: 0
+            maximum: 100
+            default: 80
+          min_threshold:
+            description: "Minimum score required for endpoint selection. Default: 30"
+            type: integer
+            minimum: 0
+            maximum: 100
+            default: 30
+          recovery_timeout:
+            description: "Time after which inactive endpoint scores can be re-evaluated. Default: 5m"
+            type: string
+            pattern: "^[0-9]+[smh]$"
+          tiered_selection:
+            description: "Configuration for tiered endpoint selection based on reputation scores."
             type: object
             additionalProperties: false
             properties:
-              app_ttl:
-                description: "TTL for the app cache."
+              enabled:
+                description: "Enable/disable tiered selection."
+                type: boolean
+                default: false
+              tier1_threshold:
+                description: "Minimum score for tier 1 (highest priority). Default: 70"
+                type: integer
+                minimum: 0
+                maximum: 100
+              tier2_threshold:
+                description: "Minimum score for tier 2. Default: 50"
+                type: integer
+                minimum: 0
+                maximum: 100
+              probation:
+                description: "Configuration for probation system for recovering endpoints."
+                type: object
+                additionalProperties: false
+                properties:
+                  enabled:
+                    description: "Enable/disable probation system."
+                    type: boolean
+                    default: false
+                  threshold:
+                    description: "Score threshold below which endpoints enter probation."
+                    type: integer
+                    minimum: 0
+                    maximum: 100
+                  traffic_percent:
+                    description: "Percentage of traffic to route to probation endpoints."
+                    type: integer
+                    minimum: 0
+                    maximum: 100
+                  recovery_multiplier:
+                    description: "Multiplier for score recovery during probation."
+                    type: number
+                    minimum: 1.0
+          latency:
+            description: "Configuration for latency-aware reputation scoring. Fast responses get bonuses, slow responses get penalties."
+            type: object
+            additionalProperties: false
+            properties:
+              enabled:
+                description: "Enable/disable latency-aware scoring. Default: true"
+                type: boolean
+                default: true
+              fast_threshold:
+                description: "Maximum latency for 'fast' responses (get bonus). Default: 100ms"
                 type: string
-                pattern: "^[0-9]+[smh]$"
-              session_ttl:
-                description: "TTL for the session cache."
+                pattern: "^[0-9]+m?s$"
+              normal_threshold:
+                description: "Maximum latency for 'normal' responses (standard impact). Default: 500ms"
                 type: string
-                pattern: "^[0-9]+[smh]$"
+                pattern: "^[0-9]+m?s$"
+              slow_threshold:
+                description: "Maximum latency for 'slow' responses (reduced impact). Default: 1000ms"
+                type: string
+                pattern: "^[0-9]+m?s$"
+              penalty_threshold:
+                description: "Latency that triggers slow_response penalty signal. Default: 2000ms"
+                type: string
+                pattern: "^[0-9]+m?s$"
+              severe_threshold:
+                description: "Latency that triggers very_slow_response penalty signal. Default: 5000ms"
+                type: string
+                pattern: "^[0-9]+m?s$"
+              fast_bonus:
+                description: "Multiplier for success impact when response is fast. Default: 2.0"
+                type: number
+                minimum: 1.0
+              slow_penalty:
+                description: "Multiplier for success impact when response is slow. Default: 0.5"
+                type: number
+                minimum: 0.0
+                maximum: 1.0
+              very_slow_penalty:
+                description: "Multiplier for success impact when response is very slow. Default: 0.0"
+                type: number
+                minimum: 0.0
+                maximum: 1.0
+              service_profiles:
+                description: "Service-specific latency profiles. Keys are profile names (evm, cosmos, solana, llm) or service IDs. Values override global thresholds."
+                type: object
+                additionalProperties:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    fast_threshold:
+                      description: "Maximum latency for 'fast' responses for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
+                    normal_threshold:
+                      description: "Maximum latency for 'normal' responses for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
+                    slow_threshold:
+                      description: "Maximum latency for 'slow' responses for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
+                    penalty_threshold:
+                      description: "Latency that triggers penalty for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
+                    severe_threshold:
+                      description: "Latency that triggers severe penalty for this profile."
+                      type: string
+                      pattern: "^[0-9]+m?s$"
+          signal_impacts:
+            description: "Configuration for signal impact values. Controls how much each signal type affects the reputation score."
+            type: object
+            additionalProperties: false
+            properties:
+              success:
+                description: "Score change for successful responses. Default: +1"
+                type: number
+              minor_error:
+                description: "Score change for minor errors (validation issues). Default: -3"
+                type: number
+              major_error:
+                description: "Score change for major errors (timeout, connection). Default: -10"
+                type: number
+              critical_error:
+                description: "Score change for critical errors (HTTP 5xx). Default: -25"
+                type: number
+              fatal_error:
+                description: "Score change for fatal errors (config issues). Default: -50"
+                type: number
+              recovery_success:
+                description: "Score change for successful probation recovery. Default: +15"
+                type: number
+              slow_response:
+                description: "Score change for slow responses (above penalty_threshold). Default: -1"
+                type: number
+              very_slow_response:
+                description: "Score change for very slow responses (above severe_threshold). Default: -3"
+                type: number
 
-      gateway_config:
-        description: "Configuration for the Shannon gateway, including all required addresses and private keys for all Shannon actors."
+      # Retry Configuration
+      retry_config:
+        description: "Configuration for automatic retry on transient errors."
         type: object
         additionalProperties: false
-        required:
-          - gateway_mode
-          - gateway_address
-          - gateway_private_key_hex
         properties:
-          gateway_mode:
-            description: "Mode of the gateway operation."
+          enabled:
+            description: "Enable/disable automatic retry."
+            type: boolean
+            default: false
+          max_retries:
+            description: "Maximum number of retry attempts."
+            type: integer
+            minimum: 0
+            default: 1
+          retry_on_5xx:
+            description: "Retry on 5xx server errors."
+            type: boolean
+            default: true
+          retry_on_timeout:
+            description: "Retry on timeout errors."
+            type: boolean
+            default: true
+          retry_on_connection:
+            description: "Retry on connection errors."
+            type: boolean
+            default: true
+          max_retry_latency:
+            description: "Maximum latency budget for retries. Only retry if failed request took less than this duration. Prevents retrying requests that already consumed significant time."
             type: string
-            enum: ["centralized", "delegated", "permissionless"]
-          gateway_address:
-            description: "Address of the Shannon gateway."
-            type: string
-            pattern: "^pokt1[0-9a-zA-Z]{38}$"
-          gateway_private_key_hex:
-            description: "Private key of the Shannon gateway in hexadecimal format."
-            type: string
-            pattern: "^[0-9a-fA-F]{64}$"
-          owned_apps_private_keys_hex:
+            pattern: "^[0-9]+m?s$"
+            default: "500ms"
+
+      # Observation Pipeline Configuration
+      observation_pipeline:
+        description: "Configuration for the async observation processing pipeline."
+        type: object
+        additionalProperties: false
+        properties:
+          enabled:
+            description: "Enable/disable the observation pipeline for async processing."
+            type: boolean
+            default: false
+          sample_rate:
+            description: "Percentage of requests to sample for deep parsing (0.0 to 1.0)."
+            type: number
+            minimum: 0.0
+            maximum: 1.0
+            default: 0.1
+          worker_count:
+            description: "Number of async parser workers."
+            type: integer
+            minimum: 1
+            default: 4
+          queue_size:
+            description: "Max pending observations before dropping (non-blocking)."
+            type: integer
+            minimum: 1
+            default: 1000
+
+      # Active Health Checks Configuration
+      active_health_checks:
+        description: "Configuration for active health checks - proactive endpoint monitoring."
+        type: object
+        additionalProperties: false
+        properties:
+          enabled:
+            description: "Enable/disable health checks."
+            type: boolean
+            default: false
+          coordination:
+            description: "Leader election configuration for multi-instance deployments."
+            type: object
+            additionalProperties: false
+            properties:
+              type:
+                description: "Coordination type: 'none' or 'leader_election'."
+                type: string
+                enum: ["none", "leader_election"]
+                default: "none"
+              lease_duration:
+                description: "Leader lease duration."
+                type: string
+              renew_interval:
+                description: "Leader lease renew interval."
+                type: string
+              key:
+                description: "Redis key for leader election."
+                type: string
+          external:
+            description: "External URL for health check rules. Local rules override external rules on conflict."
+            type: object
+            additionalProperties: false
+            properties:
+              url:
+                description: "URL to fetch health check rules from (e.g., GitHub raw file)."
+                type: string
+              refresh_interval:
+                description: "How often to re-fetch the external config. 0 means only fetch at startup."
+                type: string
+              timeout:
+                description: "HTTP timeout for fetching the external config."
+                type: string
+                default: "30s"
+          local:
+            description: "Local health check configurations per service. These override any checks from external with the same service_id + name."
             type: array
-            description: "Private keys of Shannon Applications owned by the Gateway in hexadecimal format."
-            items:
-              type: string
-              pattern: "^[0-9a-fA-F]{64}$"
-          # TODO_CONSIDERATION(@adshmh): Consider renaming this to gateway_owned_endpoints to enable other use-cases.
-          # E.g. A gateway that uses Shannon as a fallback rather than its own URLs as a fallback.
-          # Note that this would require renaming all instances of fallback in the codebase.
-          service_fallback:
-            description: "Fallback endpoints for the Shannon gateway. An array of service fallback configurations. Each service_id must be unique within the array."
-            type: array
-            uniqueItems: true
             items:
               type: object
               additionalProperties: false
               required:
                 - service_id
-                - fallback_endpoints
               properties:
                 service_id:
-                  description: "The service ID for this fallback configuration. Must be unique within the service_fallback array."
+                  description: "Service ID to run health checks for."
                   type: string
-                fallback_endpoints:
-                  description: "Array of fallback endpoint configurations for this service. Each endpoint can define URLs for different RPC types."
+                check_interval:
+                  description: "Interval between health checks."
+                  type: string
+                enabled:
+                  description: "Enable/disable health checks for this service."
+                  type: boolean
+                  default: true
+                checks:
+                  description: "List of health check configurations."
                   type: array
                   items:
                     type: object
                     additionalProperties: false
                     required:
-                      - default_url
+                      - name
+                      - type
+                    properties:
+                      name:
+                        description: "Name of the health check."
+                        type: string
+                      type:
+                        description: "Type of health check (e.g., 'jsonrpc')."
+                        type: string
+                      method:
+                        description: "HTTP method (GET, POST)."
+                        type: string
+                      path:
+                        description: "Request path."
+                        type: string
+                      body:
+                        description: "Request body (for POST)."
+                        type: string
+                      expected_status_code:
+                        description: "Expected HTTP status code."
+                        type: integer
+                      expected_response_contains:
+                        description: "String that response should contain."
+                        type: string
+                      timeout:
+                        description: "Request timeout."
+                        type: string
+                      reputation_signal:
+                        description: "Reputation signal to emit on failure."
+                        type: string
+                        enum: ["minor_error", "major_error", "critical_error"]
+
+      # ====================================
+      # UNIFIED SERVICE CONFIGURATION
+      # ====================================
+      # This section consolidates all per-service settings into a single structure.
+      # Services are defined once and inherit from defaults.
+
+      # Latency Profiles - Named profiles that services can reference
+      latency_profiles:
+        description: "Named latency profiles that services can reference. Built-in profiles (evm, solana, cosmos, llm, generic) are always available."
+        type: object
+        additionalProperties:
+          type: object
+          additionalProperties: false
+          required:
+            - fast_threshold
+            - normal_threshold
+            - slow_threshold
+            - penalty_threshold
+            - severe_threshold
+          properties:
+            fast_threshold:
+              description: "Maximum latency for 'fast' responses (get bonus)."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            normal_threshold:
+              description: "Maximum latency for 'normal' responses."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            slow_threshold:
+              description: "Maximum latency for 'slow' responses."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            penalty_threshold:
+              description: "Latency that triggers penalty signal."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            severe_threshold:
+              description: "Latency that triggers severe penalty signal."
+              type: string
+              pattern: "^[0-9]+m?s$"
+            fast_bonus:
+              description: "Multiplier for success impact when response is fast."
+              type: number
+              minimum: 1.0
+            slow_penalty:
+              description: "Multiplier for success impact when response is slow."
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+            very_slow_penalty:
+              description: "Multiplier for success when response is very slow."
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+
+      # Note: Service defaults are inherited from gateway_config top-level settings:
+      # - reputation_config.tiered_selection -> default tiered selection
+      # - reputation_config.tiered_selection.probation -> default probation
+      # - retry_config -> default retry settings
+      # - observation_pipeline -> default observation settings
+      # - active_health_checks -> default health check settings
+      #
+      # Services only need to specify overrides in the services[] array.
+
+      # Services - Array of per-service configurations
+      services:
+        description: "List of configured services. Each service inherits from gateway_config settings unless explicitly overridden."
+        type: array
+        uniqueItems: true
+        items:
+          type: object
+          additionalProperties: false
+          required:
+            - id
+          properties:
+            id:
+              description: "Unique service identifier (e.g., 'eth', 'base', 'poly')."
+              type: string
+            type:
+              description: "QoS type for this service. Overrides default."
+              type: string
+              enum: ["evm", "solana", "cosmos", "generic", "passthrough"]
+            rpc_types:
+              description: "Supported RPC types for this service."
+              type: array
+              items:
+                type: string
+                enum: ["json_rpc", "rest", "websocket", "comet_bft", "grpc"]
+            latency_profile:
+              description: "Latency profile name for this service."
+              type: string
+            reputation_config:
+              $ref: "#/definitions/service_reputation_config"
+            latency:
+              $ref: "#/definitions/service_latency_config"
+            tiered_selection:
+              $ref: "#/definitions/service_tiered_selection_config"
+            probation:
+              $ref: "#/definitions/service_probation_config"
+            retry_config:
+              $ref: "#/definitions/service_retry_config"
+            observation_pipeline:
+              $ref: "#/definitions/service_observation_config"
+            concurrency_config:
+              $ref: "#/definitions/service_concurrency_config"
+            fallback:
+              description: "Fallback endpoint configuration (no defaults - must be explicitly set per-service)."
+              type: object
+              additionalProperties: false
+              properties:
+                enabled:
+                  description: "Enable/disable fallback for this service."
+                  type: boolean
+                send_all_traffic:
+                  description: "Send all traffic to fallback endpoints."
+                  type: boolean
+                endpoints:
+                  description: "Fallback endpoint URLs."
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: false
                     patternProperties:
                       "^(default_url|json_rpc|rest|comet_bft|websocket)$":
                         type: string
                         anyOf:
                           - pattern: "^(http|https)://.*$"
                           - pattern: "^(http|https|ws|wss)://.*$"
-                send_all_traffic:
-                  description: "Whether to send all traffic to fallback endpoints for this service, regardless of protocol endpoint health."
-                  type: boolean
-                  default: false
-          sanction_config:
-            description: "Configuration for the endpoint sanction system. Controls how long misbehaving endpoints are excluded from selection."
-            type: object
-            additionalProperties: false
-            properties:
-              session_sanction_duration:
-                description: "Duration that session-based sanctions remain active. Endpoints with session sanctions will be excluded from selection for this duration. Format: Go duration string (e.g., '30m', '1h', '2h'). Default: 1h"
-                type: string
-                pattern: "^[0-9]+[smh]$"
-              cache_cleanup_interval:
-                description: "Interval for purging expired sanction entries from the cache. Format: Go duration string (e.g., '5m', '10m'). Default: 10m"
-                type: string
-                pattern: "^[0-9]+[smh]$"
+            rpc_type_fallbacks:
+              description: "RPC type fallback mappings. When no endpoints are found for the requested RPC type, PATH will automatically retry with the fallback RPC type. This is a temporary workaround for suppliers that stake with incorrect RPC types. Example: {comet_bft: json_rpc, rest: json_rpc}"
+              type: object
+              additionalProperties: false
+              patternProperties:
+                "^(json_rpc|rest|comet_bft|websocket|grpc)$":
+                  type: string
+                  enum: ["json_rpc", "rest", "comet_bft", "websocket", "grpc"]
+            health_checks:
+              $ref: "#/definitions/service_health_check_override"
+
   # Logger Configuration (optional)
   logger_config:
     description: "Optional configuration for the logger. If not specified, info level will be used."
@@ -195,6 +648,34 @@ properties:
       idle_timeout:
         description: "Idle timeout duration for the router."
         type: string
+      websocket_message_buffer_size:
+        description: "Buffer size for websocket messages."
+        type: integer
+
+  # Concurrency Configuration (optional)
+  concurrency_config:
+    description: "Optional configuration for controlling concurrency limits in request processing. These limits protect against resource exhaustion from batch requests and parallel relays."
+    type: object
+    additionalProperties: false
+    properties:
+      max_parallel_endpoints:
+        description: "Maximum number of endpoints to query in parallel per request. Higher values reduce latency but increase load. Range: 1-10."
+        type: integer
+        minimum: 1
+        maximum: 10
+        default: 1
+      max_concurrent_relays:
+        description: "Global limit on concurrent relay goroutines across all requests. Prevents resource exhaustion from too many simultaneous relays. Range: 100-10000."
+        type: integer
+        minimum: 100
+        maximum: 10000
+        default: 5500
+      max_batch_payloads:
+        description: "Maximum number of payloads allowed in a batch request. Must be less than or equal to max_concurrent_relays. Range: 1-10000."
+        type: integer
+        minimum: 1
+        maximum: 10000
+        default: 5500
 
   # Hydrator Configuration (optional)
   hydrator_config:
@@ -207,19 +688,19 @@ properties:
         type: string
         pattern: "^[0-9]+ms$"
         default: "10000ms"
-      max_concurrent_endpoint_check_workers:
+      max_endpoint_check_workers:
         description: "Maximum number of workers that will concurrently check endpoints."
         type: integer
         default: 100
       qos_disabled_service_ids:
-        description: "List of service IDs for which QoS checks will be disabled. By default all configured services will have QoS checks enabled. Primarily just used for testing & development."
+        description: "List of service IDs for which QoS checks will be disabled."
         type: array
         items:
           type: string
 
   # Data Reporter Configuration (optional)
   data_reporter_config:
-    description: "Configuration for the HTTP data reporter that accepts JSON via POST and feeds into pipelines writing to services like BigQuery (e.g., Fluentd with HTTP input and BigQuery output plugins)."
+    description: "Configuration for the HTTP data reporter."
     type: object
     additionalProperties: false
     required:
@@ -230,6 +711,291 @@ properties:
         type: string
         pattern: "^(http|https)://.*$"
       post_timeout_ms:
-        description: "Timeout in milliseconds for HTTP POST operations. If zero or negative, a default timeout of 10000ms (10s) is used."
+        description: "Timeout in milliseconds for HTTP POST operations."
         type: integer
         default: 10000
+
+  # Messaging Configuration (optional)
+  messaging_config:
+    description: "Configuration for messaging/pubsub."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable messaging."
+        type: boolean
+        default: false
+
+  # Redis Configuration (optional)
+  redis_config:
+    description: "Global Redis configuration. Used by reputation storage (when storage_type is 'redis') and leader election for health checks."
+    type: object
+    additionalProperties: false
+    properties:
+      address:
+        description: "Redis server address (host:port)."
+        type: string
+        default: "localhost:6379"
+      password:
+        description: "Redis password (optional)."
+        type: string
+      db:
+        description: "Redis database number."
+        type: integer
+        default: 0
+      pool_size:
+        description: "Connection pool size."
+        type: integer
+        default: 10
+      dial_timeout:
+        description: "Connection timeout."
+        type: string
+      read_timeout:
+        description: "Read operation timeout."
+        type: string
+      write_timeout:
+        description: "Write operation timeout."
+        type: string
+
+# ====================================
+# DEFINITIONS - Reusable schema components
+# ====================================
+definitions:
+  # Per-service reputation configuration
+  service_reputation_config:
+    description: "Per-service reputation configuration overrides."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable reputation for this service."
+        type: boolean
+      initial_score:
+        description: "Starting score for new endpoints (0-100)."
+        type: number
+        minimum: 0
+        maximum: 100
+      min_threshold:
+        description: "Minimum score for endpoint selection."
+        type: number
+        minimum: 0
+        maximum: 100
+      key_granularity:
+        description: "How endpoints are grouped for scoring."
+        type: string
+        enum: ["per-endpoint", "per-domain", "per-supplier"]
+      recovery_timeout:
+        description: "Duration after which a low-scoring endpoint can recover (e.g., '5m', '1h')."
+        type: string
+        pattern: "^[0-9]+[smh]$"
+
+  # Per-service latency configuration
+  service_latency_config:
+    description: "Per-service latency configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable latency-aware scoring."
+        type: boolean
+      target_ms:
+        description: "Target response time in milliseconds (for monitoring)."
+        type: integer
+        minimum: 0
+      penalty_weight:
+        description: "Weight of latency penalties (0.0 to 1.0)."
+        type: number
+        minimum: 0.0
+        maximum: 1.0
+
+  # Per-service tiered selection configuration
+  service_tiered_selection_config:
+    description: "Per-service tiered selection configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable tiered selection."
+        type: boolean
+      tier1_threshold:
+        description: "Minimum score for tier 1."
+        type: number
+        minimum: 0
+        maximum: 100
+      tier2_threshold:
+        description: "Minimum score for tier 2."
+        type: number
+        minimum: 0
+        maximum: 100
+
+  # Per-service probation configuration
+  service_probation_config:
+    description: "Per-service probation configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable probation system."
+        type: boolean
+      threshold:
+        description: "Score threshold for probation."
+        type: number
+        minimum: 0
+        maximum: 100
+      traffic_percent:
+        description: "Traffic percentage to probation endpoints."
+        type: number
+        minimum: 0
+        maximum: 100
+      recovery_multiplier:
+        description: "Score recovery multiplier during probation."
+        type: number
+        minimum: 1.0
+
+  # Per-service retry configuration
+  service_retry_config:
+    description: "Per-service retry configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable automatic retries."
+        type: boolean
+      max_retries:
+        description: "Maximum retry attempts."
+        type: integer
+        minimum: 0
+      retry_on_5xx:
+        description: "Retry on 5xx errors."
+        type: boolean
+      retry_on_timeout:
+        description: "Retry on timeout errors."
+        type: boolean
+      retry_on_connection:
+        description: "Retry on connection errors."
+        type: boolean
+      max_retry_latency:
+        description: "Maximum latency budget for retries."
+        type: string
+        pattern: "^[0-9]+m?s$"
+
+  # Per-service observation pipeline configuration
+  # Note: worker_count and queue_size are GLOBAL only (gateway_config.observation_pipeline)
+  service_observation_config:
+    description: "Per-service observation pipeline configuration. Only sample_rate can be overridden per-service."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable async observation processing."
+        type: boolean
+      sample_rate:
+        description: "Fraction of requests to deep-parse (0.0 to 1.0)."
+        type: number
+        minimum: 0.0
+        maximum: 1.0
+
+  # Per-service concurrency configuration
+  # Note: max_concurrent_relays is GLOBAL only (cannot be overridden per-service)
+  service_concurrency_config:
+    description: "Per-service concurrency configuration. Allows fine-tuning parallel execution and batch limits per service."
+    type: object
+    additionalProperties: false
+    properties:
+      max_parallel_endpoints:
+        description: "Maximum endpoints to query in parallel for this service. Use >1 for unreliable services to reduce latency. Range: 1-10."
+        type: integer
+        minimum: 1
+        maximum: 10
+      max_batch_payloads:
+        description: "Maximum payloads in a batch request for this service. Lower for heavy services, higher for light services. Range: 1-10000."
+        type: integer
+        minimum: 1
+        maximum: 10000
+
+  # Per-service health check configuration
+  service_health_check_override:
+    description: "Per-service health check configuration."
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: "Enable/disable health checks for this service."
+        type: boolean
+      interval:
+        description: "Health check interval for this service."
+        type: string
+        pattern: "^[0-9]+[smh]$"
+      sync_allowance:
+        description: "Number of blocks behind the latest that an endpoint can be before considered out of sync. 0 means disabled (no sync check). Default: 0 (disabled)."
+        type: integer
+        minimum: 0
+        default: 0
+      external:
+        description: "External URL for fetching health check rules for this service."
+        type: object
+        additionalProperties: false
+        properties:
+          url:
+            description: "URL to fetch health check rules from."
+            type: string
+            format: uri
+          refresh_interval:
+            description: "How often to re-fetch external config (e.g., '1h', '30m'). 0 means only fetch at startup."
+            type: string
+            pattern: "^[0-9]+[smh]$"
+          timeout:
+            description: "HTTP timeout for fetching external config."
+            type: string
+            pattern: "^[0-9]+[smh]$"
+      local:
+        description: "Local health check rules that override external rules with the same name."
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required:
+            - name
+            - type
+          properties:
+            name:
+              description: "Health check name."
+              type: string
+            type:
+              description: "RPC protocol type (must match service's rpc_types): json_rpc, rest, comet_bft, websocket, grpc."
+              type: string
+              enum: ["json_rpc", "rest", "comet_bft", "websocket", "grpc"]
+            enabled:
+              description: "Enable/disable this check."
+              type: boolean
+            method:
+              description: "HTTP method."
+              type: string
+              enum: ["GET", "POST"]
+            path:
+              description: "Request path."
+              type: string
+            headers:
+              description: "Request headers."
+              type: object
+              additionalProperties:
+                type: string
+            body:
+              description: "Request body."
+              type: string
+            expected_status_code:
+              description: "Expected HTTP status code."
+              type: integer
+            expected_response_contains:
+              description: "Expected substring in response."
+              type: string
+            timeout:
+              description: "Request timeout."
+              type: string
+            archival:
+              description: "Is this an archival check."
+              type: boolean
+            reputation_signal:
+              description: "Signal type on failure."
+              type: string
+              enum: ["minor_error", "major_error", "critical_error", "fatal_error"]

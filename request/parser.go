@@ -31,6 +31,30 @@ const (
 	// HTTPHeaderAppAddress is the key of the entry in HTTP headers that holds the target app's address
 	// in delegated mode. The target app will be used for sending the relay request.
 	HTTPHeaderAppAddress = "App-Address"
+
+	// HTTPHeaderTargetSuppliers is the key of the entry in HTTP headers that holds a comma-separated list
+	// of supplier addresses. When present, only suppliers from this list will be used for relays,
+	// bypassing reputation and other filtering logic.
+	// Example: "Target-Suppliers: pokt1abc...,pokt1def...,pokt1ghi..."
+	HTTPHeaderTargetSuppliers = "Target-Suppliers"
+
+	// WebSocket handshake headers for RelayMiner validation
+	// These headers carry RelayRequest.Meta equivalent data for connection-time validation.
+
+	// HTTPHeaderSessionID is the session identifier.
+	HTTPHeaderSessionID = "Pocket-Session-Id"
+
+	// HTTPHeaderSessionStartHeight is the session start block height.
+	HTTPHeaderSessionStartHeight = "Pocket-Session-Start-Height"
+
+	// HTTPHeaderSessionEndHeight is the session end block height.
+	HTTPHeaderSessionEndHeight = "Pocket-Session-End-Height"
+
+	// HTTPHeaderSupplierAddress is the target supplier operator address.
+	HTTPHeaderSupplierAddress = "Pocket-Supplier-Address"
+
+	// HTTPHeaderSignature is the ring signature for handshake validation (base64 encoded).
+	HTTPHeaderSignature = "Pocket-Signature"
 )
 
 // The Parser struct is responsible for parsing the authoritative service ID from the request's

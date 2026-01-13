@@ -1,157 +1,512 @@
 # yaml-language-server: $schema=../config.schema.yaml
 #
-# The above schema URL may be used to validate this file using the `yaml-language-server` VSCode extension.
-# See: https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml
+# PATH Gateway Configuration for Shannon Protocol
+# ================================================
+# This example shows ALL available configuration options with documentation.
 #
-# Use the following if you need it to point to the local schema file:
-# yaml-language-server: $schema=../../../config/config.schema.yaml
+# Configuration follows a hierarchical structure:
+# 1. Global settings (redis, router, logger, data_reporter)
+# 2. Full node connection settings
+# 3. Gateway settings with unified service configuration
+#
+# Services inherit from gateway_config settings and can override any setting.
+# Only specify what differs from defaults to keep configs clean.
 
-#################################################
-### Example Shannon Configuration YAML Format ###
-#################################################
+# =============================================================================
+# GLOBAL CONFIGURATIONS
+# =============================================================================
 
-# DEV_NOTE: The `gateway_private_key_hex` and `owned_apps_private_keys_hex`
-# fields in this file are just random hex codes to bypass schema validation.
+# Redis Configuration (optional)
+# Required for: reputation storage (when storage_type is "redis"), leader election
+redis_config:
+  address: "localhost:6379"
+  password: ""
+  db: 0
+  pool_size: 10
+  dial_timeout: 5s
+  read_timeout: 3s
+  write_timeout: 3s
 
-shannon_config:
-  full_node_config:
-    # If this config is used for Shannon E2E tests, do not change rpc_url
-    # Otherwise, replace with the correct full node RPC url.
-    rpc_url: https://shannon-grove-rpc.mainnet.poktroll.com
-    grpc_config:
-      # If this config is used for Shannon E2E tests, do not change host_port
-      # Otherwise, replace with the correct full node GRPC host:port.
-      host_port: shannon-grove-grpc.mainnet.poktroll.com:443
-    # Setting this to true disables all caching of full node data.
-    lazy_mode: false
-    # Session rollover blocks is a temporary fix to handle session rollover issues.
-    # Should be removed when the rollover issue is solved at the protocol level.
-    session_rollover_blocks: 10
-    # If lazy_mode is true, the cache_config may not be set.
-    cache_config:
-      # The TTL for the session cache.
-      #  TODO_NEXT(@commoddity): Session refresh handling should be significantly reworked as part of the next changes following PATH PR #297.
-      # The proposed change is to align session refreshes with actual session expiry time,
-      # using the session expiry block and the Shannon SDK's block client.
-      # When this is done, session cache TTL can be removed altogether.
-      session_ttl: 30s
+# Router Configuration (optional)
+# Controls the HTTP server settings
+router_config:
+  port: 3069
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 120s
+  websocket_message_buffer_size: 8192
 
-  gateway_config:
-    # If this config is used for Shannon E2E tests, do not change gateway_mode
-    # Otherwise, replace with the correct gateway mode: centralized|delegated|permissionless
-    gateway_mode: "centralized"
+# Data Reporter Configuration (optional)
+# For sending telemetry data to external systems
+data_reporter_config:
+  target_url: "https://telemetry.pocket.network/v1/observations"
+  post_timeout_ms: 10000
 
-    # README: gateway_address MUST BE replaced with the correct gateway address.
-    gateway_address: pokt1up7zlytnmvlsuxzpzvlrta95347w322adsxslw
-
-    # README: gateway_private_key_hex MUST BE replaced with the correct gateway private key secret
-    # See the following link for instructions on creating a Shannon gateway.
-    # https://dev.poktroll.com/operate/quickstart/docker_compose_walkthrough#d-creating-a-gateway-deploying-an-gateway-server
-    gateway_private_key_hex: 40af4e7e1b311c76a573610fe115cd2adf1eeade709cd77ca31ad4472509d388
-
-    owned_apps_private_keys_hex:
-      # README: the application private key MUST BE replaced with the correct application private key secret
-      - 40af4e7e1b311c76a573610fe115cd2adf1eeade709cd77ca31ad4472509d388
-    
-    # service_fallback is an array of service fallback configurations.
-    # One service may have multiple fallback endpoint URLs for each RPC type.
-    service_fallback:
-      - service_id: xrplevm
-        send_all_traffic: false
-        fallback_endpoints:
-        # In the case of services that supports multiple RPC types,
-        # all RPC type URLs must be specified, including the default URL.
-        # However, only RPC-type specific URLs are used for requests.
-        - default_url: "http://12.34.56.78"
-          json_rpc: "http://12.34.56.78:8545"
-          rest: "http://12.34.56.78:1317"
-          comet_bft: "http://12.34.56.78:26657"
-          websocket: "http://12.34.56.78:8546"
-      - service_id: eth
-        send_all_traffic: false
-        fallback_endpoints:
-        # In the case of services that support only one RPC type,
-        # only `default_url` is specified and the other RPC type URLs are omitted.
-        - default_url: "https://eth.rpc.backup.io"
-
-    # Optional sanction configuration
-    # Controls how long misbehaving endpoints are excluded from selection
-    sanction_config:
-      # How long session-based sanctions last before the endpoint can be selected again
-      # Default: 1h (1 hour)
-      session_sanction_duration: 30m
-      # How often expired sanctions are cleaned up from memory
-      # Default: 10m (10 minutes)
-      cache_cleanup_interval: 5m
-
-    # Optional reputation configuration
-    # Provides gradual endpoint scoring based on reliability patterns
-    # Works in addition to binary sanctions, not as a replacement
-    reputation_config:
-      # Enable/disable the reputation system
-      # Default: false (only binary sanctions are used)
-      enabled: true
-      # Storage backend for reputation data
-      # Options: "memory" (single instance) or "redis" (multi-instance deployments)
-      # Default: "memory"
-      storage_type: "memory"
-      # Starting score for new endpoints (0-100 scale)
-      # Default: 80
-      initial_score: 80
-      # Minimum score required for endpoint selection
-      # Endpoints below this threshold are filtered out
-      # Default: 30
-      min_threshold: 30
-      # Time after which inactive endpoint scores can be re-evaluated
-      # Default: 5m
-      recovery_timeout: 5m
-      # How endpoints are grouped for scoring (global default)
-      # Options:
-      #   "per-endpoint" - Each endpoint URL scored independently (finest granularity, default)
-      #   "per-domain"   - Endpoints from the same hosting domain share a score (e.g., nodefleet.net)
-      #   "per-supplier" - All endpoint URLs from the same supplier share a score
-      # Default: "per-endpoint"
-      key_granularity: "per-endpoint"
-      # Per-service overrides for key granularity
-      # Allows different services to use different scoring strategies
-      # service_overrides:
-      #   eth:
-      #     # Use per-domain for eth to group endpoints by hosting provider
-      #     key_granularity: "per-domain"
-      #   sol:
-      #     # Use per-supplier for sol to group by supplier
-      #     key_granularity: "per-supplier"
-      # Tiered endpoint selection configuration
-      # When enabled, endpoints are grouped into tiers based on reputation score
-      # and selection prefers higher-tier endpoints using cascade-down logic
-      tiered_selection:
-        # Enable/disable tiered selection
-        # Default: true (when reputation is enabled)
-        enabled: true
-        # Minimum score for Tier 1 (Premium tier)
-        # Endpoints with scores >= tier1_threshold are selected first
-        # Default: 70
-        tier1_threshold: 70
-        # Minimum score for Tier 2 (Good tier)
-        # Endpoints with scores >= tier2_threshold but < tier1_threshold
-        # are selected only if no Tier 1 endpoints are available
-        # Default: 50
-        tier2_threshold: 50
-        # Tier 3 (Fair tier) uses min_threshold as its minimum score
-        # Endpoints in Tier 3 are selected only if Tier 1 and 2 are empty
-      # Redis configuration (only used when storage_type is "redis")
-      # redis:
-      #   address: "localhost:6379"
-      #   password: ""
-      #   db: 0
-      #   key_prefix: "path:reputation:"
-      #   pool_size: 10
-      #   dial_timeout: 5s
-      #   read_timeout: 3s
-      #   write_timeout: 3s
-
-# Optional logger configuration
+# Logger Configuration (optional)
+# Valid levels: debug, info, warn, error
 logger_config:
-  # Valid values are: debug, info, warn, error
-  # Defaults to info if not specified
-  level: "error"
+  level: "info"
+
+# Concurrency Configuration (optional)
+# Controls parallel request processing and batch limits
+concurrency_config:
+  max_parallel_endpoints: 1      # How many endpoints to query in parallel per request (1-10)
+  max_concurrent_relays: 5500    # Global limit on concurrent relay goroutines (100-10000)
+  max_batch_payloads: 5500       # Max payloads in batch request (1-10000, ≤ max_concurrent_relays)
+
+# =============================================================================
+# FULL NODE CONFIGURATION
+# =============================================================================
+# Connection settings for the Shannon blockchain full node
+
+full_node_config:
+  # HTTP URL for the Shannon full node RPC
+  rpc_url: http://localhost:26657
+
+  # gRPC configuration for full node
+  grpc_config:
+    host_port: localhost:9090
+    # Set to true if not using TLS
+    insecure: true
+
+  # When true, disables caching of full node data
+  lazy_mode: false
+
+  # Grace period for session rollover (in blocks)
+  session_rollover_blocks: 10
+
+  # Cache settings (only used when lazy_mode is false)
+  cache_config:
+    session_ttl: 30s
+
+# =============================================================================
+# GATEWAY CONFIGURATION
+# =============================================================================
+
+gateway_config:
+  # Gateway operation mode: centralized, delegated, permissionless
+  gateway_mode: "centralized"
+
+  # Gateway address (pokt1... format)
+  # MUST be replaced with your actual gateway address
+  gateway_address: "pokt1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+  # Gateway private key in hex format (64 characters)
+  # MUST be replaced with your actual private key
+  gateway_private_key_hex: "0000000000000000000000000000000000000000000000000000000000000000"
+
+  # Application private keys owned by this gateway
+  owned_apps_private_keys_hex:
+    - "0000000000000000000000000000000000000000000000000000000000000001"
+    - "0000000000000000000000000000000000000000000000000000000000000002"
+
+  # ===========================================================================
+  # GLOBAL REPUTATION CONFIGURATION
+  # ===========================================================================
+  # These settings apply globally and serve as defaults for all services.
+  # Per-service overrides can be specified in the services[] array.
+
+  reputation_config:
+    # Enable/disable the entire reputation system
+    # When false, all endpoints are treated equally (no quality filtering)
+    enabled: true
+
+    # Storage backend: "memory" or "redis"
+    # - memory: Single instance only, data lost on restart
+    # - redis: Multi-instance deployments, persistent data
+    # NOTE: This is GLOBAL ONLY - cannot be overridden per-service
+    storage_type: "memory"
+
+    # Global initial score (can be overridden per-service)
+    initial_score: 80
+
+    # Global minimum threshold (can be overridden per-service)
+    min_threshold: 30
+
+    # Time before inactive low-scoring endpoints can recover
+    recovery_timeout: 5m
+
+    # Tiered endpoint selection
+    # Cascade: tier1 first, then tier2, then tier3
+    tiered_selection:
+      enabled: true
+      tier1_threshold: 70    # Premium tier (highest priority)
+      tier2_threshold: 50    # Good tier
+
+      # Probation system for recovering endpoints
+      # Low-scoring endpoints get limited traffic to prove reliability
+      probation:
+        enabled: true
+        threshold: 10          # Score below which endpoint enters probation
+        traffic_percent: 10    # % of traffic routed to probation endpoints
+        recovery_multiplier: 2.0  # Boost for successful probation requests
+
+    # Signal impacts - how much each signal type affects reputation score
+    # Tune these to control how aggressively endpoints are penalized or rewarded
+    # Positive values = score increase, Negative values = score decrease
+    signal_impacts:
+      success: 1              # Successful response (default: +1)
+      minor_error: -3         # Validation issues, unknown errors (default: -3)
+      major_error: -10        # Timeout, connection errors (default: -10)
+      critical_error: -25     # HTTP 5xx errors (default: -25)
+      fatal_error: -50        # Config/setup errors (default: -50)
+      recovery_success: 15    # Successful probation recovery (default: +15)
+      slow_response: -1       # Response slower than penalty_threshold (default: -1)
+      very_slow_response: -3  # Response slower than severe_threshold (default: -3)
+
+  # ===========================================================================
+  # GLOBAL RETRY CONFIGURATION (optional)
+  # ===========================================================================
+  # Global retry settings - per-service overrides in services[] array
+
+  retry_config:
+    enabled: true
+    max_retries: 1
+    max_retry_latency: 500ms  # Only retry if failed request took < 500ms
+    retry_on_5xx: true
+    retry_on_timeout: true
+    retry_on_connection: true
+
+  # ===========================================================================
+  # GLOBAL OBSERVATION PIPELINE (optional)
+  # ===========================================================================
+  # Async processing of request/response data for QoS extraction
+
+  observation_pipeline:
+    enabled: true
+    sample_rate: 0.1      # 10% of requests are deeply parsed
+    worker_count: 4       # Async worker pool size
+    queue_size: 1000      # Max pending observations before dropping
+
+  # ===========================================================================
+  # GLOBAL ACTIVE HEALTH CHECKS
+  # ===========================================================================
+  # Proactive endpoint monitoring - runs health checks on all endpoints
+  # Per-service health check rules can be defined in services[].health_checks
+
+  active_health_checks:
+    enabled: true
+
+    # Leader election for multi-instance deployments
+    # Only the leader runs health checks to avoid duplicate traffic
+    coordination:
+      type: "leader_election"  # "none" or "leader_election"
+      lease_duration: "15s"
+      renew_interval: "5s"
+      key: "path:health:leader"
+
+    # External health check rules URL
+    # --------------------------------
+    # PATH can fetch health check rules from a remote URL, enabling centralized
+    # management of health checks across multiple PATH instances. This is useful for:
+    #   - Sharing health check rules across a fleet of gateways
+    #   - Updating health checks without redeploying PATH
+    #   - Maintaining a single source of truth for health check definitions
+    #
+    # The URL should return a YAML file with this structure:
+    #
+    #   rules:
+    #     - service_id: "eth"           # Which service this check applies to
+    #       name: "eth_blockNumber"     # Unique name for this check
+    #       type: "json_rpc"             # RPC type: json_rpc, rest, comet_bft, websocket, grpc
+    #       method: "POST"              # HTTP method
+    #       path: "/"                   # Request path
+    #       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'
+    #       expected_status_code: 200   # Expected HTTP status
+    #       expected_response_contains: "result"  # Optional: response must contain
+    #       timeout: "5s"               # Check timeout
+    #       reputation_signal: "minor_error"  # Signal on failure: minor_error, major_error, critical_error, fatal_error
+    #       archival: false             # If true, only run on archival endpoints
+    #
+    # Rules are fetched at startup and refreshed at `refresh_interval`.
+    # Local rules (below or in services[].health_checks.local) override
+    # external rules with the same service_id + name combination.
+    external:
+      url: "https://raw.githubusercontent.com/pokt-network/path/main/config/health_checks.yaml"
+      refresh_interval: "1h"   # How often to re-fetch external rules
+      timeout: "30s"           # HTTP timeout for fetching the URL
+
+    # Local health check rules (override external rules with same service_id + name)
+    # Uncomment and customize as needed:
+    # local:
+    #   - service_id: "eth"
+    #     name: "eth_blockNumber"
+    #     type: "json_rpc"
+    #     method: "POST"
+    #     path: "/"
+    #     body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'
+    #     expected_status_code: 200
+    #     timeout: "5s"
+    #     reputation_signal: "minor_error"
+    local: []
+
+  # ===========================================================================
+  # LATENCY PROFILES
+  # ===========================================================================
+  # Named profiles that services can reference via `latency_profile`
+  # Built-in profiles always available: evm, solana, cosmos, llm, generic, standard
+
+  latency_profiles:
+    # Fast profile - for low-latency chains like Ethereum L2s
+    fast:
+      fast_threshold: 50ms       # Below this: +bonus
+      normal_threshold: 200ms    # Below this: neutral
+      slow_threshold: 500ms      # Below this: -small penalty
+      penalty_threshold: 1000ms  # Triggers slow_response signal
+      severe_threshold: 3000ms   # Triggers very_slow_response signal
+      fast_bonus: 2.0            # Success impact multiplier for fast responses
+      slow_penalty: 0.5          # Success impact multiplier for slow responses
+      very_slow_penalty: 0.0     # Success impact multiplier for very slow
+
+    # Standard profile - default for most services
+    standard:
+      fast_threshold: 100ms
+      normal_threshold: 500ms
+      slow_threshold: 1000ms
+      penalty_threshold: 2000ms
+      severe_threshold: 5000ms
+      fast_bonus: 2.0
+      slow_penalty: 0.5
+      very_slow_penalty: 0.0
+
+    # Slow profile - for cosmos chains and slower services
+    slow:
+      fast_threshold: 200ms
+      normal_threshold: 1000ms
+      slow_threshold: 2000ms
+      penalty_threshold: 5000ms
+      severe_threshold: 10000ms
+      fast_bonus: 2.0
+      slow_penalty: 0.5
+      very_slow_penalty: 0.0
+
+    # LLM profile - for AI/ML inference services
+    llm:
+      fast_threshold: 2s
+      normal_threshold: 10s
+      slow_threshold: 30s
+      penalty_threshold: 60s
+      severe_threshold: 120s
+      fast_bonus: 1.5
+      slow_penalty: 0.7
+      very_slow_penalty: 0.3
+
+  # ===========================================================================
+  # SERVICE CONFIGURATIONS
+  # ===========================================================================
+  # Define services with their per-service overrides.
+  # Each service inherits from gateway_config settings and can override:
+  # - type: QoS type (evm, solana, cosmos, generic, passthrough)
+  # - rpc_types: Supported RPC types
+  # - latency_profile: Reference to a named profile
+  # - reputation_config: Per-service reputation overrides
+  # - tiered_selection: Per-service tier thresholds
+  # - probation: Per-service probation settings
+  # - retry_config: Per-service retry settings
+  # - concurrency_config: Per-service concurrency overrides (max_parallel_endpoints, max_batch_payloads)
+  # - observation_pipeline: Per-service sample rate
+  # - fallback: Fallback endpoints (no defaults - must be explicitly configured)
+  # - health_checks: Per-service health check rules
+
+  services:
+    # -------------------------------------------------------------------------
+    # EVM Services
+    # -------------------------------------------------------------------------
+    - id: eth
+      type: "evm"
+      rpc_types: ["json_rpc", "websocket"]
+      latency_profile: "fast"
+
+      # Override reputation settings for a high-value chain
+      reputation_config:
+        initial_score: 80
+        min_threshold: 30
+        recovery_timeout: 10m
+
+      # Stricter tier thresholds for ETH
+      tiered_selection:
+        tier1_threshold: 80
+        tier2_threshold: 40
+
+      # Aggressive probation for ETH
+      probation:
+        threshold: 5
+        traffic_percent: 5
+        recovery_multiplier: 5.0
+
+      # More retries for ETH
+      retry_config:
+        max_retries: 2
+
+      # Higher sample rate for ETH traffic
+      observation_pipeline:
+        sample_rate: 0.2
+
+      # Fallback endpoints (no defaults - must be explicitly configured)
+      fallback:
+        enabled: true
+        send_all_traffic: false  # Only use if session endpoints unavailable
+        endpoints:
+          - default_url: "https://eth.api.pocket.network"
+
+      # Per-service health checks
+      health_checks:
+        interval: 10s
+        sync_allowance: 50
+        local:
+          # Basic block number check
+          - name: "eth_blockNumber"
+            type: "json_rpc"
+            method: "POST"
+            path: "/"
+            body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'
+            expected_status_code: 200
+            timeout: "5s"
+            reputation_signal: "minor_error"
+
+          # Chain ID validation
+          - name: "eth_chainId"
+            type: "json_rpc"
+            method: "POST"
+            path: "/"
+            body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}'
+            expected_status_code: 200
+            expected_response_contains: "0x1"
+            timeout: "5s"
+            reputation_signal: "critical_error"
+
+          # Archival check (historical data)
+          - name: "eth_archival"
+            type: "json_rpc"
+            method: "POST"
+            path: "/"
+            body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x28C6c06298d514Db089934071355E5743bf21d60","0xe4e1c0"]}'
+            expected_status_code: 200
+            expected_response_contains: "0x314214a541a8e719f516"
+            timeout: "10s"
+            reputation_signal: "critical_error"
+            archival: true
+
+    - id: base
+      type: "evm"
+      rpc_types: ["json_rpc", "websocket"]
+      latency_profile: "fast"
+      # Uses all other defaults
+
+    - id: poly
+      type: "evm"
+      latency_profile: "fast"
+      # Uses all other defaults
+
+    - id: op
+      type: "evm"
+      latency_profile: "fast"
+      # Uses all other defaults
+
+    - id: arb
+      type: "evm"
+      latency_profile: "fast"
+      # Uses all other defaults
+
+    # -------------------------------------------------------------------------
+    # Solana Service
+    # -------------------------------------------------------------------------
+    - id: solana
+      type: "solana"
+      rpc_types: ["json_rpc"]
+      latency_profile: "standard"
+      # Uses all other defaults
+
+    # -------------------------------------------------------------------------
+    # Cosmos SDK Services
+    # -------------------------------------------------------------------------
+    - id: cosmoshub
+      type: "cosmos"
+      rpc_types: ["json_rpc", "rest", "comet_bft"]
+      latency_profile: "slow"
+
+      # RPC type fallback configuration
+      # Temporary workaround for suppliers that stake with incorrect RPC types.
+      # When no endpoints are found for the requested RPC type, PATH will
+      # automatically retry with the fallback type.
+      # Remove this once suppliers update their stakes to correct RPC types.
+      rpc_type_fallbacks:
+        comet_bft: json_rpc  # Fall back to json_rpc if no comet_bft endpoints
+        rest: json_rpc       # Fall back to json_rpc if no rest endpoints
+
+    - id: osmosis
+      type: "cosmos"
+      rpc_types: ["json_rpc", "rest", "comet_bft"]
+      latency_profile: "slow"
+
+      # Example: only fallback comet_bft
+      rpc_type_fallbacks:
+        comet_bft: json_rpc
+
+    # Cosmos chain with EVM support (like XRPL EVM)
+    - id: xrplevm
+      type: "cosmos"  # Cosmos SDK chain with EVM support
+      rpc_types: ["json_rpc", "comet_bft", "websocket"]  # Suppliers don't support REST
+      latency_profile: "standard"
+      rpc_type_fallbacks:
+        comet_bft: json_rpc
+
+#      fallback:
+#        enabled: true
+#        send_all_traffic: false
+#        endpoints:
+#          - default_url: "http://fallback.xrplevm.io"
+#            json_rpc: "http://fallback.xrplevm.io:8545"
+#            rest: "http://fallback.xrplevm.io:1317"
+#            comet_bft: "http://fallback.xrplevm.io:26657"
+#            websocket: "ws://fallback.xrplevm.io:8546"
+
+    - id: pocket
+      type: "cosmos"
+      rpc_types: [ "json_rpc", "rest", "comet_bft" ]
+      latency_profile: "standard"
+      rpc_type_fallbacks:
+        comet_bft: json_rpc
+        rest: json_rpc
+
+    # -------------------------------------------------------------------------
+    # LLM / AI Services
+    # -------------------------------------------------------------------------
+    - id: deepseek
+      type: "passthrough"
+      latency_profile: "llm"
+
+      # Higher initial score for curated LLM endpoints
+      reputation_config:
+        initial_score: 90
+
+      # Override latency profile with inline config
+      # This takes precedence over latency_profile
+      latency:
+        target_ms: 5000      # 5 second target
+        penalty_weight: 0.1  # Reduced penalty weight for LLMs
+
+      # Don't retry LLM requests (they're expensive)
+      retry_config:
+        enabled: false
+
+    # -------------------------------------------------------------------------
+    # Generic / Passthrough Services
+    # -------------------------------------------------------------------------
+    - id: custom-api
+      type: "generic"
+      latency_profile: "slow"
+      retry_config:
+        max_retries: 2
+
+      # Per-service concurrency overrides (optional)
+      # Use these to override global concurrency_config for specific services
+      # concurrency_config:
+      #   # max_parallel_endpoints: Race multiple endpoints in parallel (1-10)
+      #   # Use >1 for unreliable services to get faster responses
+      #   # ⚠️ WARNING: Values >1 multiply token burn (e.g., 3 endpoints = 3x cost)
+      #   max_parallel_endpoints: 3
+      #
+      #   # max_batch_payloads: Limit batch size for this service (1-10000)
+      #   # Useful for heavy services that process large batches
+      #   max_batch_payloads: 100

@@ -5,10 +5,12 @@ import (
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
+	qostypes "github.com/pokt-network/path/qos/types"
 )
 
 // QoS implements gateway.QoSService by providing:
@@ -31,46 +33,43 @@ type QoS struct {
 	*evmRequestValidator
 }
 
-// NewQoSInstance builds and returns an instance of the EVM QoS service.
-func NewQoSInstance(logger polylog.Logger, config EVMServiceQoSConfig) *QoS {
-	evmChainID := config.getEVMChainID()
-	serviceId := config.GetServiceID()
+// NewSimpleQoSInstance creates a minimal EVM QoS instance without chain-specific validation.
+// Validation (chain ID, archival checks) is now handled by active health checks.
+// This constructor only requires the service ID and provides JSON-RPC request parsing.
+func NewSimpleQoSInstance(logger polylog.Logger, serviceID protocol.ServiceID) *QoS {
+	return NewSimpleQoSInstanceWithSyncAllowance(logger, serviceID, 0)
+}
 
+// NewSimpleQoSInstanceWithSyncAllowance creates a minimal EVM QoS instance with custom sync allowance.
+// Validation (chain ID, archival checks) is now handled by active health checks.
+// If syncAllowance is 0, the default value is used.
+func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID protocol.ServiceID, syncAllowance uint64) *QoS {
 	logger = logger.With(
 		"qos_instance", "evm",
-		"service_id", serviceId,
-		"evm_chain_id", evmChainID,
+		"service_id", serviceID,
 	)
 
 	store := &endpointStore{
-		logger: logger,
-		// Initialize the endpoint store with an empty map.
+		logger:    logger,
 		endpoints: make(map[protocol.EndpointAddr]endpoint),
+	}
+
+	// Create a minimal config wrapper for backward compatibility with serviceState
+	minimalConfig := &simpleServiceConfig{
+		serviceID:     serviceID,
+		syncAllowance: syncAllowance,
 	}
 
 	serviceState := &serviceState{
 		logger:           logger,
-		serviceQoSConfig: config,
+		serviceQoSConfig: minimalConfig,
 		endpointStore:    store,
-	}
-
-	// TODO_CONSIDERATION(@olshansk): Archival checks are currently optional to enable iteration
-	// and optionality. In the future, evaluate whether it should be mandatory for all EVM services.
-	if config.archivalCheckEnabled() {
-		serviceState.archivalState = archivalState{
-			logger:              logger.With("state", "archival"),
-			archivalCheckConfig: config.getEVMArchivalCheckConfig(),
-			// Initialize the balance consensus map.
-			// It keeps track and maps a balance (at the configured address and contract)
-			// to the number of occurrences seen across all endpoints.
-			balanceConsensus: make(map[string]int),
-		}
 	}
 
 	evmRequestValidator := &evmRequestValidator{
 		logger:       logger,
-		serviceID:    serviceId,
-		chainID:      evmChainID,
+		serviceID:    serviceID,
+		chainID:      "", // No chain ID validation - handled by health checks
 		serviceState: serviceState,
 	}
 
@@ -81,13 +80,37 @@ func NewQoSInstance(logger polylog.Logger, config EVMServiceQoSConfig) *QoS {
 	}
 }
 
+// simpleServiceConfig is a minimal config for services without chain-specific params.
+type simpleServiceConfig struct {
+	serviceID     protocol.ServiceID
+	syncAllowance uint64 // If 0, uses default
+}
+
+func (c *simpleServiceConfig) GetServiceID() protocol.ServiceID { return c.serviceID }
+func (c *simpleServiceConfig) GetServiceQoSType() string        { return QoSType }
+func (c *simpleServiceConfig) getEVMChainID() string            { return "" }
+func (c *simpleServiceConfig) getSyncAllowance() uint64 {
+	if c.syncAllowance == 0 {
+		return defaultEVMBlockNumberSyncAllowance
+	}
+	return c.syncAllowance
+}
+func (c *simpleServiceConfig) getEVMArchivalCheckConfig() evmArchivalCheckConfig {
+	return evmArchivalCheckConfig{}
+}
+func (c *simpleServiceConfig) archivalCheckEnabled() bool { return false }
+func (c *simpleServiceConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
+	return map[sharedtypes.RPCType]struct{}{sharedtypes.RPCType_JSON_RPC: {}}
+}
+
 // ParseHTTPRequest builds a request context from an HTTP request.
 // Returns (requestContext, true) if the request is valid JSONRPC
 // Returns (errorContext, false) if the request is not valid JSONRPC.
 //
 // Implements gateway.QoSService interface.
-func (qos *QoS) ParseHTTPRequest(_ context.Context, req *http.Request) (gateway.RequestQoSContext, bool) {
-	return qos.validateHTTPRequest(req)
+// Fallback logic for EVM: header → jsonrpc (EVM only supports JSON-RPC)
+func (qos *QoS) ParseHTTPRequest(_ context.Context, req *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
+	return qos.validateHTTPRequest(req, detectedRPCType)
 }
 
 // ParseWebsocketRequest builds a request context from the provided Websocket request.
@@ -105,6 +128,38 @@ func (qos *QoS) ParseWebsocketRequest(_ context.Context) (gateway.RequestQoSCont
 //   - takes a pointer to the DisqualifiedEndpointResponse
 //   - called by the devtools.DisqualifiedEndpointReporter to fill it with the QoS-specific data.
 func (qos *QoS) HydrateDisqualifiedEndpointsResponse(serviceID protocol.ServiceID, details *devtools.DisqualifiedEndpointResponse) {
-	qos.logger.Info().Msgf("hydrating disqualified endpoints response for service ID: %s", serviceID)
+	qos.logger.Debug().Msgf("hydrating disqualified endpoints response for service ID: %s", serviceID)
 	details.QoSLevelDisqualifiedEndpoints = qos.getDisqualifiedEndpointsResponse(serviceID)
+}
+
+// UpdateFromExtractedData updates QoS state from extracted observation data.
+// Called by the observation pipeline after async parsing completes.
+// This updates the perceived block number without blocking user requests.
+//
+// Implements gateway.QoSService interface.
+func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *qostypes.ExtractedData) error {
+	if data == nil {
+		return nil
+	}
+
+	// Only update if we extracted a valid block height
+	if data.BlockHeight <= 0 {
+		return nil
+	}
+
+	qos.serviceStateLock.Lock()
+	defer qos.serviceStateLock.Unlock()
+
+	// Update perceived block number to maximum across all endpoints
+	blockNumber := uint64(data.BlockHeight)
+	if blockNumber > qos.perceivedBlockNumber {
+		qos.logger.Debug().
+			Str("endpoint", string(endpointAddr)).
+			Uint64("old_block", qos.perceivedBlockNumber).
+			Uint64("new_block", blockNumber).
+			Msg("Updating perceived block number from observation pipeline")
+		qos.perceivedBlockNumber = blockNumber
+	}
+
+	return nil
 }

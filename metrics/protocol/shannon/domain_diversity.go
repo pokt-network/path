@@ -70,5 +70,5 @@ func LogEndpointTLDDiversity(logger polylog.Logger, endpoints protocol.EndpointA
 	for tld, count := range tldCounts {
 		tldDistribution = append(tldDistribution, fmt.Sprintf("%s=%d", tld, count))
 	}
-	logger.Info().Msgf("Endpoint TLD diversity: %s", strings.Join(tldDistribution, ", "))
+	logger.Debug().Msgf("Endpoint TLD diversity: %s", strings.Join(tldDistribution, ", "))
 }

@@ -88,7 +88,7 @@ func translateContextSetupErrorToRequestErrorType(err error) protocolobservation
 	// Due to one or more of the following:
 	// - Any of the gateway mode errors above
 	// - Error fetching a session for one or more apps.
-	// - One or more available endpoints are sanctioned.
+	// - One or more available endpoints are filtered out (low reputation).
 	case errors.Is(err, errProtocolContextSetupNoEndpoints):
 		return protocolobservations.ShannonRequestErrorType_SHANNON_REQUEST_ERROR_INTERNAL_NO_ENDPOINTS_AVAILABLE
 
@@ -128,8 +128,7 @@ func buildEndpointSuccessObservation(
 
 // builds a Shannon endpoint error observation to include:
 // - endpoint details
-// - the encountered error
-// - any sanctions resulting from the error.
+// - the encountered error (error type and details)
 // - relay miner error if present: for tracking/cross referencing against endpoint errors.
 func buildEndpointErrorObservation(
 	logger polylog.Logger,
@@ -138,7 +137,6 @@ func buildEndpointErrorObservation(
 	endpointResponseTimestamp time.Time,
 	errorType protocolobservations.ShannonEndpointErrorType,
 	errorDetails string,
-	sanctionType protocolobservations.ShannonSanctionType,
 	relayMinerError *protocolobservations.ShannonRelayMinerError,
 	rpcType sharedtypes.RPCType,
 ) *protocolobservations.ShannonEndpointObservation {
@@ -149,10 +147,10 @@ func buildEndpointErrorObservation(
 	endpointObs.EndpointQueryTimestamp = timestamppb.New(endpointQueryTimestamp)
 	endpointObs.EndpointResponseTimestamp = timestamppb.New(endpointResponseTimestamp)
 
-	// Update the observation with error details and any resulting sanctions
+	// Update the observation with error details
+	// Note: Sanctions have been removed - reputation system now handles all error scoring
 	endpointObs.ErrorType = &errorType
 	endpointObs.ErrorDetails = &errorDetails
-	endpointObs.RecommendedSanction = &sanctionType
 	// Track RelayMiner error
 	endpointObs.RelayMinerError = relayMinerError
 
@@ -217,36 +215,6 @@ func buildEndpointObservationFromSession(
 		SessionEndHeight:   header.SessionEndBlockHeight,
 		EndpointBackendServiceHttpResponseStatusCode:  &defaultStatusCode,
 		EndpointBackendServiceHttpResponsePayloadSize: &defaultPayloadSize,
-	}
-}
-
-// builds a Shannon endpoint from an endpoint observation.
-// Used to identify an endpoint for applying sanctions.
-func buildEndpointFromObservation(
-	observation *protocolobservations.ShannonEndpointObservation,
-) endpoint {
-	session := buildSessionFromObservation(observation)
-	return &protocolEndpoint{
-		session:  session,
-		supplier: observation.GetSupplier(),
-		url:      observation.GetEndpointUrl(),
-	}
-}
-
-// builds the details of a session from an endpoint observation.
-// Used to identify an endpoint for applying sanctions.
-func buildSessionFromObservation(
-	observation *protocolobservations.ShannonEndpointObservation,
-) sessiontypes.Session {
-	return sessiontypes.Session{
-		// Only Session Header is required for processing observations.
-		Header: &sessiontypes.SessionHeader{
-			ApplicationAddress:      observation.GetEndpointAppAddress(),
-			ServiceId:               observation.GetSessionServiceId(),
-			SessionId:               observation.GetSessionId(),
-			SessionStartBlockHeight: observation.GetSessionStartHeight(),
-			SessionEndBlockHeight:   observation.GetSessionEndHeight(),
-		},
 	}
 }
 

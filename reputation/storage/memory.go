@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
 )
@@ -165,12 +167,15 @@ func (m *MemoryStorage) List(ctx context.Context, serviceID string) ([]reputatio
 		}
 
 		// Parse the key string back to EndpointKey
-		// Format: "serviceID:endpointAddr"
-		parts := strings.SplitN(keyStr, ":", 2)
-		if len(parts) == 2 {
+		// Format: "serviceID:endpointAddr:rpcType"
+		parts := strings.SplitN(keyStr, ":", 3)
+		if len(parts) == 3 {
+			// Parse RPC type from string
+			rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[parts[2]])
 			keys = append(keys, reputation.NewEndpointKey(
 				protocol.ServiceID(parts[0]),
 				protocol.EndpointAddr(parts[1]),
+				rpcType,
 			))
 		}
 	}

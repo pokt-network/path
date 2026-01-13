@@ -62,6 +62,8 @@ func (p *Protocol) getActiveGatewaySessions(
 }
 
 // getGatewayModePermittedRelaySigner returns the relay request signer matching the supplied gateway mode.
+// Returns the pre-initialized signer for supported modes, which uses SignerContext caching
+// for optimal ring signature performance.
 func (p *Protocol) getGatewayModePermittedRelaySigner(
 	gatewayMode protocol.GatewayMode,
 ) (RelayRequestSigner, error) {
@@ -69,19 +71,11 @@ func (p *Protocol) getGatewayModePermittedRelaySigner(
 
 	// Centralized gateway mode uses the gateway's private key to sign the relay requests.
 	case protocol.GatewayModeCentralized:
-		return &signer{
-			accountClient: *p.GetAccountClient(),
-			//  Centralized gateway mode uses the gateway's private key to sign the relay requests.
-			privateKeyHex: p.gatewayPrivateKeyHex,
-		}, nil
+		return p.relaySigner, nil
 
 	// Delegated gateway mode uses the gateway's private key to sign the relay requests (i.e. the same as the Centralized gateway mode)
 	case protocol.GatewayModeDelegated:
-		return &signer{
-			accountClient: *p.GetAccountClient(),
-			//  Delegated gateway mode uses the gateway's private key to sign the relay requests (i.e. the same as the Centralized gateway mode)
-			privateKeyHex: p.gatewayPrivateKeyHex,
-		}, nil
+		return p.relaySigner, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported gateway mode: %s", gatewayMode)

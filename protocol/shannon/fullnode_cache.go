@@ -152,7 +152,10 @@ func NewCachingFullNode(
 		),
 	)
 
-	// Account cache: infinite for app lifetime; no early refresh needed.
+	// Account cache with effectively infinite TTL (1 year).
+	// Public keys NEVER change once set, so we cache them forever.
+	// Only accounts with valid pubkeys are cached.
+	// Accounts with nil pubkeys are NOT cached - they are blacklisted and retried periodically.
 	accountCache := sturdyc.New[*accounttypes.QueryAccountResponse](
 		accountCacheCapacity,
 		numShards,
@@ -198,6 +201,7 @@ func NewCachingFullNode(
 		sharedParamsCache: sharedParamsCache,
 		blockHeightCache:  blockHeightCache,
 		// Wrap the underlying account fetcher with a SturdyC caching layer.
+		// Uses 1 hour TTL with invalidation on signature verification failure.
 		cachingAccountClient: getCachingAccountClient(
 			logger,
 			accountCache,
@@ -238,7 +242,11 @@ func (cfn *cachingFullNode) GetSession(
 		sessionKey,
 		func(fetchCtx context.Context) (sessiontypes.Session, error) {
 			logger.Debug().Str("session_key", sessionKey).Msgf("Fetching session from full node")
-			return cfn.lazyFullNode.GetSession(ctx, serviceID, appAddr)
+			session, fetchErr := cfn.lazyFullNode.GetSession(ctx, serviceID, appAddr)
+			if fetchErr != nil {
+				return session, fetchErr
+			}
+			return session, nil
 		},
 	)
 

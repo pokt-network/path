@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pokt-network/poktroll/pkg/polylog"
+
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -12,12 +14,23 @@ import (
 // All reads are served from local cache (<1μs), writes update cache immediately
 // and queue async writes to backend storage.
 type service struct {
+	logger            polylog.Logger
 	config            Config
 	storage           Storage
 	defaultKeyBuilder KeyBuilder
 
 	// serviceKeyBuilders caches KeyBuilders for services with overrides
 	serviceKeyBuilders map[string]KeyBuilder
+
+	// serviceConfigs stores per-service reputation config overrides
+	// These override global InitialScore, MinThreshold for specific services
+	serviceConfigs   map[string]ServiceConfig
+	serviceConfigsMu sync.RWMutex
+
+	// serviceLatencyProfiles stores per-service latency profile configurations
+	// These override global latency thresholds for specific services
+	serviceLatencyProfiles   map[string]LatencyConfig
+	serviceLatencyProfilesMu sync.RWMutex
 
 	// Local cache for fast reads
 	mu    sync.RWMutex
@@ -52,14 +65,16 @@ func NewService(config Config, store Storage) ReputationService {
 	}
 
 	return &service{
-		config:             config,
-		storage:            store,
-		defaultKeyBuilder:  NewKeyBuilder(config.KeyGranularity),
-		serviceKeyBuilders: serviceKeyBuilders,
-		cache:              make(map[string]Score),
-		writeCh:            make(chan writeRequest, config.SyncConfig.WriteBufferSize),
-		stopCh:             make(chan struct{}),
-		stoppedCh:          make(chan struct{}),
+		config:                 config,
+		storage:                store,
+		defaultKeyBuilder:      NewKeyBuilder(config.KeyGranularity),
+		serviceKeyBuilders:     serviceKeyBuilders,
+		serviceConfigs:         make(map[string]ServiceConfig),
+		serviceLatencyProfiles: make(map[string]LatencyConfig),
+		cache:                  make(map[string]Score),
+		writeCh:                make(chan writeRequest, config.SyncConfig.WriteBufferSize),
+		stopCh:                 make(chan struct{}),
+		stoppedCh:              make(chan struct{}),
 	}
 }
 
@@ -70,13 +85,16 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 		return nil
 	}
 
-	impact := signal.GetDefaultImpact()
+	// Calculate impact using latency-aware scoring if applicable
+	impact := s.calculateImpact(key.ServiceID, signal)
 
 	s.mu.Lock()
 	score, exists := s.cache[key.String()]
 	if !exists {
+		// Use per-service InitialScore if configured, otherwise global default
+		initialScore := s.GetInitialScoreForService(key.ServiceID)
 		score = Score{
-			Value:       s.config.InitialScore,
+			Value:       initialScore,
 			LastUpdated: time.Now(),
 		}
 	}
@@ -89,6 +107,11 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 		score.SuccessCount++
 	} else if signal.IsNegative() {
 		score.ErrorCount++
+	}
+
+	// Update latency metrics if signal includes latency data
+	if signal.Latency > 0 {
+		score.LatencyMetrics.UpdateLatency(signal.Latency)
 	}
 
 	s.cache[key.String()] = score
@@ -110,7 +133,8 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 // for RecoveryTimeout, it is automatically reset to InitialScore.
 func (s *service) GetScore(ctx context.Context, key EndpointKey) (Score, error) {
 	if !s.config.Enabled {
-		return Score{Value: s.config.InitialScore}, nil
+		// Use per-service InitialScore if configured, otherwise global default
+		return Score{Value: s.GetInitialScoreForService(key.ServiceID)}, nil
 	}
 
 	s.mu.RLock()
@@ -121,8 +145,8 @@ func (s *service) GetScore(ctx context.Context, key EndpointKey) (Score, error) 
 		return Score{}, ErrNotFound
 	}
 
-	// Check if score should be recovered
-	if s.shouldRecover(score) {
+	// Check if score should be recovered (using per-service MinThreshold)
+	if s.shouldRecover(score, key.ServiceID) {
 		score = s.recoverScore(ctx, key)
 	}
 
@@ -131,18 +155,40 @@ func (s *service) GetScore(ctx context.Context, key EndpointKey) (Score, error) 
 
 // shouldRecover returns true if the score is below threshold and
 // hasn't received signals for RecoveryTimeout.
-func (s *service) shouldRecover(score Score) bool {
-	if score.Value >= s.config.MinThreshold {
+// Uses per-service MinThreshold and RecoveryTimeout if configured, otherwise global defaults.
+//
+// IMPORTANT: Time-based recovery is only applied when BOTH health checks AND probation
+// are disabled for the service. If either is enabled, those systems handle recovery instead.
+func (s *service) shouldRecover(score Score, serviceID protocol.ServiceID) bool {
+	minThreshold := s.GetMinThresholdForService(serviceID)
+	if score.Value >= minThreshold {
 		return false // Score is above threshold, no recovery needed
 	}
-	return time.Since(score.LastUpdated) >= s.config.RecoveryTimeout
+
+	// Check if health checks or probation are enabled for this service.
+	// If either is enabled, they handle recovery - skip time-based recovery.
+	s.serviceConfigsMu.RLock()
+	svcConfig, exists := s.serviceConfigs[string(serviceID)]
+	s.serviceConfigsMu.RUnlock()
+
+	if exists {
+		if svcConfig.HealthChecksEnabled || svcConfig.ProbationEnabled {
+			return false // Health checks or probation will handle recovery
+		}
+	}
+
+	recoveryTimeout := s.GetRecoveryTimeoutForService(serviceID)
+	return time.Since(score.LastUpdated) >= recoveryTimeout
 }
 
 // recoverScore resets an endpoint's score to InitialScore.
 // Called when an endpoint is eligible for recovery.
+// Uses per-service InitialScore if configured, otherwise global default.
 func (s *service) recoverScore(ctx context.Context, key EndpointKey) Score {
+	// Use per-service InitialScore if configured
+	initialScore := s.GetInitialScoreForService(key.ServiceID)
 	score := Score{
-		Value:       s.config.InitialScore,
+		Value:       initialScore,
 		LastUpdated: time.Now(),
 		// Reset counts to indicate fresh start
 		SuccessCount: 0,
@@ -164,11 +210,13 @@ func (s *service) recoverScore(ctx context.Context, key EndpointKey) Score {
 
 // GetScores retrieves reputation scores for multiple endpoints.
 // Always reads from local cache for minimal latency.
+// Uses per-service InitialScore if configured, otherwise global default.
 func (s *service) GetScores(ctx context.Context, keys []EndpointKey) (map[EndpointKey]Score, error) {
 	if !s.config.Enabled {
 		result := make(map[EndpointKey]Score, len(keys))
 		for _, key := range keys {
-			result[key] = Score{Value: s.config.InitialScore}
+			// Use per-service InitialScore if configured
+			result[key] = Score{Value: s.GetInitialScoreForService(key.ServiceID)}
 		}
 		return result, nil
 	}
@@ -210,7 +258,7 @@ func (s *service) FilterByScore(ctx context.Context, keys []EndpointKey, minThre
 			key:          key,
 			score:        score,
 			exists:       exists,
-			needRecovery: exists && s.shouldRecover(score),
+			needRecovery: exists && s.shouldRecover(score, key.ServiceID),
 		}
 	}
 	s.mu.RUnlock()
@@ -226,8 +274,8 @@ func (s *service) FilterByScore(ctx context.Context, keys []EndpointKey, minThre
 	var result []EndpointKey
 	for _, ks := range keyScores {
 		if !ks.exists {
-			// Unknown endpoints get the initial score
-			if s.config.InitialScore >= minThreshold {
+			// Unknown endpoints get the per-service initial score
+			if s.GetInitialScoreForService(ks.key.ServiceID) >= minThreshold {
 				result = append(result, ks.key)
 			}
 			continue
@@ -242,13 +290,14 @@ func (s *service) FilterByScore(ctx context.Context, keys []EndpointKey, minThre
 }
 
 // ResetScore resets an endpoint's score to the initial value.
+// Uses per-service InitialScore if configured, otherwise global default.
 func (s *service) ResetScore(ctx context.Context, key EndpointKey) error {
 	if !s.config.Enabled {
 		return nil
 	}
 
 	score := Score{
-		Value:       s.config.InitialScore,
+		Value:       s.GetInitialScoreForService(key.ServiceID),
 		LastUpdated: time.Now(),
 	}
 
@@ -274,6 +323,147 @@ func (s *service) KeyBuilderForService(serviceID protocol.ServiceID) KeyBuilder 
 	}
 	// Fall back to default
 	return s.defaultKeyBuilder
+}
+
+// SetServiceConfig sets per-service reputation configuration overrides.
+// This allows different services to have different initial scores and min thresholds.
+func (s *service) SetServiceConfig(serviceID protocol.ServiceID, config ServiceConfig) {
+	s.serviceConfigsMu.Lock()
+	defer s.serviceConfigsMu.Unlock()
+	s.serviceConfigs[string(serviceID)] = config
+
+	// Also update key builder if granularity is specified
+	if config.KeyGranularity != "" {
+		s.serviceKeyBuilders[string(serviceID)] = NewKeyBuilder(config.KeyGranularity)
+	}
+}
+
+// GetInitialScoreForService returns the initial score for a service.
+// Uses per-service config if set, otherwise falls back to global default.
+func (s *service) GetInitialScoreForService(serviceID protocol.ServiceID) float64 {
+	s.serviceConfigsMu.RLock()
+	svcConfig, exists := s.serviceConfigs[string(serviceID)]
+	s.serviceConfigsMu.RUnlock()
+
+	if exists && svcConfig.InitialScore > 0 {
+		return svcConfig.InitialScore
+	}
+	return s.config.InitialScore
+}
+
+// GetMinThresholdForService returns the min threshold for a service.
+// Uses per-service config if set, otherwise falls back to global default.
+func (s *service) GetMinThresholdForService(serviceID protocol.ServiceID) float64 {
+	s.serviceConfigsMu.RLock()
+	svcConfig, exists := s.serviceConfigs[string(serviceID)]
+	s.serviceConfigsMu.RUnlock()
+
+	if exists && svcConfig.MinThreshold > 0 {
+		return svcConfig.MinThreshold
+	}
+	return s.config.MinThreshold
+}
+
+// GetRecoveryTimeoutForService returns the recovery timeout for a service.
+// Uses per-service config if set, otherwise falls back to global default.
+func (s *service) GetRecoveryTimeoutForService(serviceID protocol.ServiceID) time.Duration {
+	s.serviceConfigsMu.RLock()
+	svcConfig, exists := s.serviceConfigs[string(serviceID)]
+	s.serviceConfigsMu.RUnlock()
+
+	if exists && svcConfig.RecoveryTimeout > 0 {
+		return svcConfig.RecoveryTimeout
+	}
+	return s.config.RecoveryTimeout
+}
+
+// SetLatencyProfile sets per-service latency profile configuration.
+// This allows different services to have different latency thresholds and bonuses/penalties.
+func (s *service) SetLatencyProfile(serviceID protocol.ServiceID, latencyConfig LatencyConfig) {
+	s.serviceLatencyProfilesMu.Lock()
+	defer s.serviceLatencyProfilesMu.Unlock()
+	s.serviceLatencyProfiles[string(serviceID)] = latencyConfig
+}
+
+// GetLatencyConfigForService returns the latency config for a service.
+// Uses per-service latency profile if set, otherwise falls back to global default.
+// This method is exported to satisfy the ReputationService interface.
+func (s *service) GetLatencyConfigForService(serviceID protocol.ServiceID) LatencyConfig {
+	s.serviceLatencyProfilesMu.RLock()
+	latencyConfig, exists := s.serviceLatencyProfiles[string(serviceID)]
+	s.serviceLatencyProfilesMu.RUnlock()
+
+	if exists {
+		return latencyConfig
+	}
+	return s.config.Latency
+}
+
+// getLatencyConfigForService is a convenience wrapper for GetLatencyConfigForService.
+// Kept for backward compatibility with internal callers.
+func (s *service) getLatencyConfigForService(serviceID protocol.ServiceID) LatencyConfig {
+	return s.GetLatencyConfigForService(serviceID)
+}
+
+// calculateImpact calculates the score impact for a signal, applying latency-aware
+// adjustments if the signal has latency data and latency scoring is enabled.
+// This respects per-service latency configuration and configurable signal impacts.
+func (s *service) calculateImpact(serviceID protocol.ServiceID, signal Signal) float64 {
+	// Get latency config for the service (handles per-service overrides)
+	latencyConfig := s.getLatencyConfigForService(serviceID)
+
+	// Get base impact from configurable signal impacts (falls back to defaults)
+	baseImpact := s.config.SignalImpacts.GetImpact(signal.Type)
+
+	var impact float64
+	// If latency is disabled or signal has no latency, use base impact
+	if !latencyConfig.Enabled || signal.Latency == 0 {
+		impact = baseImpact
+	} else {
+		// Apply latency-aware impact calculation for success signals
+		result := signal.CalculateLatencyAwareImpactWithConfig(latencyConfig, baseImpact)
+		impact = result.FinalImpact
+
+		// Log latency scoring details
+		if s.logger != nil && result.LatencyCategory != "skipped" {
+			s.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Str("signal_type", string(signal.Type)).
+				Str("latency_category", result.LatencyCategory).
+				Dur("latency", result.Latency).
+				Float64("base_impact", result.BaseImpact).
+				Float64("modifier", result.Modifier).
+				Float64("final_impact", result.FinalImpact).
+				Dur("fast_threshold", result.Config.FastThreshold).
+				Dur("normal_threshold", result.Config.NormalThreshold).
+				Dur("slow_threshold", result.Config.SlowThreshold).
+				Float64("fast_bonus", result.Config.FastBonus).
+				Float64("slow_penalty", result.Config.SlowPenalty).
+				Msg("[LATENCY_SCORE] Applied latency scoring")
+		}
+	}
+
+	// Apply recovery multiplier if set (used by probation system to boost recovery)
+	// Only applies to positive signals (success, recovery_success)
+	if impact > 0 {
+		multiplier := signal.GetRecoveryMultiplier()
+		if multiplier != 1.0 && s.logger != nil {
+			s.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Float64("original_impact", impact).
+				Float64("recovery_multiplier", multiplier).
+				Float64("boosted_impact", impact*multiplier).
+				Msg("[RECOVERY_MULTIPLIER] Applied recovery multiplier")
+		}
+		impact *= multiplier
+	}
+
+	return impact
+}
+
+// SetLogger sets the logger for the reputation service.
+func (s *service) SetLogger(logger polylog.Logger) {
+	s.logger = logger.With("component", "reputation_service")
 }
 
 // Start begins background sync processes.

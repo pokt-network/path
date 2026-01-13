@@ -129,7 +129,7 @@ func (as *archivalState) calculateArchivalBlockNumberLocked(perceivedBlockNumber
 		}
 	}
 
-	as.logger.Info().Msgf("Calculated archival block number: %s", blockNumHex)
+	as.logger.Debug().Msgf("Calculated archival block number: %s", blockNumHex)
 	as.blockNumberHex = blockNumHex
 }
 
@@ -183,7 +183,7 @@ func (as *archivalState) updateExpectedBalanceLocked(updatedEndpoints map[protoc
 			as.balanceConsensus[balance] = count
 			if count >= archivalConsensusThreshold {
 				as.expectedBalance = balance
-				as.logger.Info().
+				as.logger.Debug().
 					Str("archival_block_number", as.blockNumberHex).
 					Str("contract_address", as.archivalCheckConfig.contractAddress).
 					Str("expected_balance", balance).

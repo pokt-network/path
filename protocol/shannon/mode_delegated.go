@@ -24,6 +24,14 @@ import (
 // - Users must select a specific app for each relay request (currently via HTTP request headers).
 //
 // getDelegatedGatewayModeActiveSession returns active sessions for the selected app under Delegated gateway mode, for the supplied HTTP request.
+//
+// During session rollover periods:
+//   - Fetches BOTH current session AND extended (previous) session for the app
+//   - Merges endpoints from both sessions to ensure continuity during rollover
+//   - Extended session is only added if it differs from current session
+//
+// During normal operation:
+//   - Fetches only the current session for the app
 func (p *Protocol) getDelegatedGatewayModeActiveSession(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
@@ -39,13 +47,14 @@ func (p *Protocol) getDelegatedGatewayModeActiveSession(
 		return nil, err
 	}
 
-	session, err := p.getSession(ctx, logger, extractedAppAddr, serviceID)
+	// Always fetch current session
+	currentSession, err := p.getSession(ctx, logger, extractedAppAddr, serviceID)
 	if err != nil {
 		return nil, err
 	}
 
 	// Skip the session's app if it is not staked for the requested service.
-	selectedApp := session.Application
+	selectedApp := currentSession.Application
 	if !appIsStakedForService(serviceID, selectedApp) {
 		err = fmt.Errorf("%w: Trying to use app %s that is not staked for the service %s", errProtocolContextSetupAppNotStaked, selectedApp.Address, serviceID)
 		logger.Error().Err(err).Msgf("SHOULD NEVER HAPPEN: %s", err.Error())
@@ -54,7 +63,31 @@ func (p *Protocol) getDelegatedGatewayModeActiveSession(
 
 	logger.Debug().Msgf("successfully verified the gateway (%s) has delegation for the selected app (%s) for service (%s).", p.gatewayAddr, selectedApp.Address, serviceID)
 
-	return []sessiontypes.Session{session}, nil
+	sessions := []sessiontypes.Session{currentSession}
+
+	// During rollover: ALSO fetch extended (previous) session for continuity
+	if p.IsInSessionRollover() {
+		extendedSession, err := p.GetSessionWithExtendedValidity(ctx, serviceID, extractedAppAddr)
+		if err != nil {
+			logger.Warn().Err(err).
+				Str("app_address", extractedAppAddr).
+				Msg("Failed to get extended session during rollover - continuing with current session only")
+			return sessions, nil
+		}
+
+		// Only add extended session if it's different from current session
+		// (i.e., it's actually the previous session)
+		if extendedSession.SessionId != currentSession.SessionId {
+			sessions = append(sessions, extendedSession)
+			logger.Debug().
+				Str("app_address", extractedAppAddr).
+				Str("current_session_id", currentSession.SessionId).
+				Str("extended_session_id", extendedSession.SessionId).
+				Msg("✨ Added extended session endpoints during rollover period")
+		}
+	}
+
+	return sessions, nil
 }
 
 // appIsStakedForService returns true if the supplied application is staked for the supplied service ID.

@@ -17,10 +17,13 @@ func newMockSessionRolloverState() *sessionRolloverState {
 	// For tests that need block height functionality, we'll set up the rollover state manually
 	var mockBlockClient *sdk.BlockClient = nil
 
+	// Use a test RPC URL (won't be used in tests that don't actually connect)
+	const testRpcURL = "http://localhost:26657"
+
 	// Use the default rollover blocks value for testing
 	const testSessionRolloverBlocks = 24
 
-	return newSessionRolloverState(context.Background(), logger, mockBlockClient, testSessionRolloverBlocks)
+	return newSessionRolloverState(context.Background(), logger, mockBlockClient, testRpcURL, testSessionRolloverBlocks)
 }
 
 func Test_getSessionRolloverState(t *testing.T) {

@@ -131,7 +131,7 @@ func SelectEndpointsWithDiversity(
 		}
 	}
 
-	logger.Info().Msgf("[Parallel Requests] TLD diversity achieved: %d endpoints across %d different TLDs (diversity: %.1f%%, duplicate TLDs: %d)",
+	logger.Debug().Msgf("[Parallel Requests] TLD diversity achieved: %d endpoints across %d different TLDs (diversity: %.1f%%, duplicate TLDs: %d)",
 		len(selectedEndpoints), len(usedTLDs),
 		float64(len(usedTLDs))/float64(len(selectedEndpoints))*100, fallbackSelections)
 	return selectedEndpoints

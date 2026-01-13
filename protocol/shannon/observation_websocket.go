@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
-	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
@@ -56,8 +55,9 @@ func getWebsocketMessageErrorObservation(
 	msgData []byte,
 	messageError error,
 ) protocolobservations.Observations {
-	// Error classification based on trusted error sources only
-	endpointErrorType, recommendedSanctionType := classifyRelayError(logger, messageError)
+	// Classify error to get error type
+	// Reputation signals are handled separately in websocket_context.go
+	endpointErrorType, _ := classifyErrorAsSignal(logger, messageError, 0)
 
 	// Create a new Websocket message observation for error
 	wsMessageObs := buildWebsocketMessageErrorObservation(
@@ -65,7 +65,6 @@ func getWebsocketMessageErrorObservation(
 		int64(len(msgData)),
 		endpointErrorType,
 		fmt.Sprintf("websocket message error: %v", messageError),
-		recommendedSanctionType,
 	)
 
 	return protocolobservations.Observations{
@@ -139,7 +138,9 @@ func getWebsocketConnectionErrorObservation(
 	selectedEndpoint endpoint,
 	err error,
 ) *protocolobservations.Observations {
-	endpointErrorType, recommendedSanctionType := classifyRelayError(logger, err)
+	// Classify error to get error type
+	// Reputation signals are handled separately in websocket_context.go
+	endpointErrorType, _ := classifyErrorAsSignal(logger, err, 0)
 
 	return &protocolobservations.Observations{
 		Shannon: &protocolobservations.ShannonObservationsList{
@@ -156,7 +157,6 @@ func getWebsocketConnectionErrorObservation(
 							selectedEndpoint,
 							endpointErrorType,
 							err.Error(),
-							recommendedSanctionType,
 							protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_ESTABLISHMENT_FAILED,
 						),
 					},
@@ -204,7 +204,6 @@ func buildWebsocketMessageErrorObservation(
 	msgSize int64,
 	errorType protocolobservations.ShannonEndpointErrorType,
 	errorDetails string,
-	sanctionType protocolobservations.ShannonSanctionType,
 ) *protocolobservations.ShannonWebsocketMessageObservation {
 	session := *endpoint.Session()
 	sessionHeader := session.GetHeader()
@@ -227,9 +226,8 @@ func buildWebsocketMessageErrorObservation(
 		MessagePayloadSize: msgSize,
 
 		// Error information
-		ErrorType:           &errorType,
-		ErrorDetails:        &errorDetails,
-		RecommendedSanction: &sanctionType,
+		ErrorType:    &errorType,
+		ErrorDetails: &errorDetails,
 	}
 }
 
@@ -271,7 +269,6 @@ func buildWebsocketConnectionErrorObservation(
 	endpoint endpoint,
 	errorType protocolobservations.ShannonEndpointErrorType,
 	errorDetails string,
-	sanctionType protocolobservations.ShannonSanctionType,
 	eventType protocolobservations.ShannonWebsocketConnectionObservation_ConnectionEventType,
 ) *protocolobservations.ShannonWebsocketConnectionObservation {
 	return &protocolobservations.ShannonWebsocketConnectionObservation{
@@ -288,39 +285,11 @@ func buildWebsocketConnectionErrorObservation(
 		SessionEndHeight:   endpoint.Session().GetHeader().SessionEndBlockHeight,
 
 		// Error information
-		ErrorType:           &errorType,
-		ErrorDetails:        &errorDetails,
-		RecommendedSanction: &sanctionType,
+		ErrorType:    &errorType,
+		ErrorDetails: &errorDetails,
 
 		// Connection lifecycle
 		ConnectionEstablishedTimestamp: timestamppb.New(time.Now()),
 		EventType:                      eventType,
-	}
-}
-
-// builds a Shannon endpoint from an endpoint observation.
-// Used to identify an endpoint for applying sanctions.
-func buildEndpointFromWebSocketConnectionObservation(
-	observation *protocolobservations.ShannonWebsocketConnectionObservation,
-) endpoint {
-	session := buildSessionFromWebSocketConnectionObservation(observation)
-	return &protocolEndpoint{
-		session:  session,
-		supplier: observation.GetSupplier(),
-		url:      observation.GetEndpointUrl(),
-	}
-}
-
-func buildSessionFromWebSocketConnectionObservation(
-	observation *protocolobservations.ShannonWebsocketConnectionObservation,
-) sessiontypes.Session {
-	return sessiontypes.Session{
-		Header: &sessiontypes.SessionHeader{
-			ApplicationAddress:      observation.GetEndpointAppAddress(),
-			ServiceId:               observation.GetSessionServiceId(),
-			SessionId:               observation.GetSessionId(),
-			SessionStartBlockHeight: observation.GetSessionStartHeight(),
-			SessionEndBlockHeight:   observation.GetSessionEndHeight(),
-		},
 	}
 }

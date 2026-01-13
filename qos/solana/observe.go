@@ -25,19 +25,19 @@ func (es *EndpointStore) UpdateEndpointsFromObservations(
 		"qos_instance", "solana",
 		"method", "UpdateEndpointsFromObservations",
 	)
-	logger.Info().Msgf("About to update endpoints from %d observations.", len(endpointObservations))
+	logger.Debug().Msgf("About to update endpoints from %d observations.", len(endpointObservations))
 
 	updatedEndpoints := make(map[protocol.EndpointAddr]endpoint)
 	for _, observation := range endpointObservations {
 		if observation == nil {
-			logger.Info().Msg("💡 Solana EndpointStore received a nil observation. SKIPPING...")
+			logger.Debug().Msg(" Solana EndpointStore received a nil observation. SKIPPING...")
 			continue
 		}
 
 		endpointAddr := protocol.EndpointAddr(observation.EndpointAddr)
 
 		logger := logger.With("endpoint_addr", endpointAddr)
-		logger.Info().Msg("processing observation for endpoint.")
+		logger.Debug().Msg("processing observation for endpoint.")
 
 		// It is a valid scenario for an endpoint to not be present in the store.
 		// E.g. when the first observation(s) are received for an endpoint.
@@ -47,7 +47,7 @@ func (es *EndpointStore) UpdateEndpointsFromObservations(
 		isEndpointMutatedByObservation := endpoint.applyObservation(observation)
 		// If the observation did not mutate the endpoint, there is no need to update the stored endpoint entry.
 		if !isEndpointMutatedByObservation {
-			logger.Info().Msg("💡 Endpoint was not mutated by observations. SKIPPING update of internal endpoint store.")
+			logger.Debug().Msg(" Endpoint was not mutated by observations. SKIPPING update of internal endpoint store.")
 			continue
 		}
 

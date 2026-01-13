@@ -59,12 +59,12 @@ func TestExtractDomainOrHost(t *testing.T) {
 		{
 			name:     "IPv4 address with HTTPS",
 			rawURL:   "https://192.168.1.1:8080/path",
-			expected: "1.1",
+			expected: "192.168.1.1", // IP addresses returned as-is
 		},
 		{
 			name:     "IPv4 address with HTTP",
 			rawURL:   "http://10.0.0.1:3000",
-			expected: "0.1",
+			expected: "10.0.0.1", // IP addresses returned as-is
 		},
 		{
 			name:     "IPv6 address",
@@ -79,7 +79,7 @@ func TestExtractDomainOrHost(t *testing.T) {
 		{
 			name:     "Public IPv4 address",
 			rawURL:   "https://203.0.113.42:8545",
-			expected: "113.42",
+			expected: "203.0.113.42", // IP addresses returned as-is
 		},
 
 		// Localhost variants
@@ -138,7 +138,7 @@ func TestExtractDomainOrHost(t *testing.T) {
 		{
 			name:     "Subdomain of internal",
 			rawURL:   "https://api.service.local:8080",
-			expected: "service.local",
+			expected: "api.service.local", // Internal domains returned as-is
 		},
 		{
 			name:     "Internal with uppercase",
@@ -195,6 +195,33 @@ func TestExtractDomainOrHost(t *testing.T) {
 			name:     "URL with auth",
 			rawURL:   "https://user:pass@example.com/path",
 			expected: "example.com",
+		},
+
+		// URLs without scheme (should auto-prepend https://)
+		{
+			name:     "Hostname without scheme",
+			rawURL:   "mainnet.eu.nodefleet.net",
+			expected: "nodefleet.net",
+		},
+		{
+			name:     "Hostname without scheme - simple domain",
+			rawURL:   "example.com",
+			expected: "example.com",
+		},
+		{
+			name:     "Hostname without scheme - with subdomain",
+			rawURL:   "api.example.com",
+			expected: "example.com",
+		},
+		{
+			name:     "Hostname without scheme - with port",
+			rawURL:   "api.example.com:8080",
+			expected: "example.com",
+		},
+		{
+			name:     "Hostname without scheme - deep subdomain",
+			rawURL:   "relayminer.shannon-mainnet.eu.nodefleet.net",
+			expected: "nodefleet.net",
 		},
 
 		// Error cases
@@ -255,12 +282,11 @@ func TestFallbackDomainExtraction(t *testing.T) {
 		expected    string
 		expectError bool
 	}{
-		// IP addresses (should be handled before fallback, but testing the function directly)
-		{
-			name:     "IPv4 address",
-			host:     "192.168.1.1",
-			expected: "192.168.1.1",
-		},
+		// NOTE: IP addresses, localhost, and internal domains are now handled
+		// BEFORE fallbackDomainExtraction is called. These tests verify the function's
+		// behavior if called directly (edge cases that shouldn't happen in production).
+
+		// IPv6 addresses (no dots, so returned as-is)
 		{
 			name:     "IPv6 address",
 			host:     "::1",
@@ -272,7 +298,7 @@ func TestFallbackDomainExtraction(t *testing.T) {
 			expected: "fe80::1%lo0",
 		},
 
-		// Localhost variants (should be handled before fallback, but testing directly)
+		// Single-part hostnames (returned as-is)
 		{
 			name:     "localhost",
 			host:     "localhost",
@@ -283,6 +309,8 @@ func TestFallbackDomainExtraction(t *testing.T) {
 			host:     "LOCALHOST",
 			expected: "LOCALHOST",
 		},
+
+		// Multi-part hostnames (fallback takes last 2 parts)
 		{
 			name:     "localhost.localdomain",
 			host:     "localhost.localdomain",
@@ -291,10 +319,8 @@ func TestFallbackDomainExtraction(t *testing.T) {
 		{
 			name:     "localhost subdomain",
 			host:     "api.localhost.test",
-			expected: "localhost.test",
+			expected: "localhost.test", // Last 2 parts
 		},
-
-		// Private domains (should be handled before fallback, but testing directly)
 		{
 			name:     "local TLD",
 			host:     "myservice.local",
@@ -673,7 +699,7 @@ func TestExtractDomainOrHost_RealWorldScenarios(t *testing.T) {
 		{
 			name:        "Self-hosted relay miner",
 			rawURL:      "https://relay.mycompany.internal:8545",
-			expected:    "mycompany.internal",
+			expected:    "relay.mycompany.internal", // Internal domains returned as-is
 			description: "Self-hosted internal relay miner",
 		},
 		{
@@ -685,7 +711,7 @@ func TestExtractDomainOrHost_RealWorldScenarios(t *testing.T) {
 		{
 			name:        "IP-based endpoint",
 			rawURL:      "https://203.0.113.42:8545",
-			expected:    "113.42",
+			expected:    "203.0.113.42", // IP addresses returned as-is
 			description: "Direct IP address endpoint",
 		},
 		{
