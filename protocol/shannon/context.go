@@ -1099,14 +1099,30 @@ func (rc *requestContext) handleEndpointSuccess(
 	var reputationSignal string
 	var relayType string
 
+	// Check if backend returned a 5xx server error.
+	// 5xx errors are server-side failures and should penalize reputation.
+	// 4xx errors are NOT penalized as they're often client-side issues (bad request, auth, etc.).
+	backendHTTPStatus := endpointResponse.HTTPStatusCode
+	isBackend5xx := backendHTTPStatus >= 500
+
 	if rc.reputationService != nil {
 		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
 		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
 
-		// Check if endpoint is in probation - use RecoverySuccessSignal (+15) for probation,
-		// SuccessSignal (+1) for normal requests. This helps low-scoring endpoints recover faster.
 		var signal reputation.Signal
-		if rc.tieredSelector != nil && rc.tieredSelector.Config().Probation.Enabled && rc.tieredSelector.IsInProbation(endpointKey) {
+
+		// Backend returned 5xx server error - record error signal instead of success
+		if isBackend5xx {
+			signal = reputation.NewCriticalErrorSignal("backend_5xx", latency)
+			reputationSignal = metrics.SignalCriticalError
+			relayType = metrics.RelayTypeNormal
+
+			rc.logger.Debug().
+				Int("backend_http_status", backendHTTPStatus).
+				Str("endpoint", string(selectedEndpointAddr)).
+				Str("service_id", string(rc.serviceID)).
+				Msg("Backend returned 5xx error - recording critical error signal for reputation")
+		} else if rc.tieredSelector != nil && rc.tieredSelector.Config().Probation.Enabled && rc.tieredSelector.IsInProbation(endpointKey) {
 			// Probation endpoint succeeded - use recovery signal for stronger positive reinforcement
 			signal = reputation.NewRecoverySuccessSignal(latency)
 			reputationSignal = metrics.SignalOK
@@ -1136,12 +1152,17 @@ func (rc *requestContext) handleEndpointSuccess(
 			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for success")
 		}
 
-		// Record additional latency penalty signals if applicable
-		// This is done by checking the per-service latency config and determining
-		// if the response was slow enough to warrant an additional penalty signal
-		rc.recordLatencyPenaltySignalsIfNeeded(endpointKey, latency)
+		// Record additional latency penalty signals if applicable (only for actual successes)
+		if !isBackend5xx {
+			rc.recordLatencyPenaltySignalsIfNeeded(endpointKey, latency)
+		}
 	} else {
-		reputationSignal = metrics.SignalOK
+		// No reputation service - just set the signal for metrics
+		if isBackend5xx {
+			reputationSignal = metrics.SignalCriticalError
+		} else {
+			reputationSignal = metrics.SignalOK
+		}
 		relayType = metrics.RelayTypeNormal
 	}
 
@@ -1274,42 +1295,3 @@ func prepareURLFromPayload(endpointURL string, payload protocol.Payload) string 
 	return url
 }
 
-// hydrateLogger:
-// - Enhances the base logger with information from the request context.
-// - Includes:
-//   - Method name
-//   - Service ID
-//   - Selected endpoint supplier
-//   - Selected endpoint URL
-func (rc *requestContext) hydrateLogger(methodName string) {
-	logger := rc.logger.With(
-		"request_type", "http",
-		"method", methodName,
-		"service_id", rc.serviceID,
-	)
-
-	defer func() {
-		rc.logger = logger
-	}()
-
-	// No endpoint specified on request context.
-	// - This should never happen.
-	selectedEndpoint := rc.getSelectedEndpoint()
-	if selectedEndpoint == nil {
-		return
-	}
-
-	logger = logger.With(
-		"selected_endpoint_supplier", selectedEndpoint.Supplier(),
-		"selected_endpoint_url", selectedEndpoint.PublicURL(),
-	)
-
-	sessionHeader := selectedEndpoint.Session().Header
-	if sessionHeader == nil {
-		return
-	}
-
-	logger = logger.With(
-		"selected_endpoint_app", sessionHeader.ApplicationAddress,
-	)
-}

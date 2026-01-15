@@ -12,8 +12,130 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/metrics"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/heuristic"
+	"github.com/pokt-network/path/reputation"
 )
+
+// responseCheckResult contains the result of response success check.
+type responseCheckResult struct {
+	// Success indicates if the response should be treated as successful.
+	Success bool
+	// HeuristicResult contains the heuristic analysis result if payload was analyzed.
+	// This is nil if no heuristic analysis was performed.
+	HeuristicResult *heuristic.AnalysisResult
+}
+
+// checkResponseSuccess performs a comprehensive check to determine if a response
+// should be considered successful. It combines HTTP status code checks with
+// heuristic payload analysis to catch errors that might slip through with
+// only HTTP status validation.
+//
+// This catches cases where the endpoint returns HTTP 200 but the payload
+// contains a JSON-RPC error or other error indicators.
+//
+// Parameters:
+//   - err: Any error returned from the protocol layer
+//   - statusCode: HTTP status code from the endpoint
+//   - responseBytes: Response payload bytes
+//   - rpcType: RPC type for protocol-specific heuristic analysis
+//   - logger: Logger for debugging
+//
+// Returns responseCheckResult with success status and optional heuristic result.
+func checkResponseSuccess(
+	err error,
+	statusCode int,
+	responseBytes []byte,
+	rpcType sharedtypes.RPCType,
+	logger polylog.Logger,
+) responseCheckResult {
+	// Protocol error - definitely not successful
+	if err != nil {
+		return responseCheckResult{Success: false}
+	}
+
+	// HTTP status code check (original logic)
+	httpSuccess := statusCode == 0 || (statusCode >= 200 && statusCode < 300)
+	if !httpSuccess {
+		return responseCheckResult{Success: false}
+	}
+
+	// Heuristic payload analysis - catch errors that slip through HTTP status
+	// This detects JSON-RPC errors, malformed responses, HTML error pages, etc.
+	if len(responseBytes) > 0 {
+		result := heuristic.Analyze(responseBytes, statusCode, rpcType)
+		if result.ShouldRetry {
+			logger.Debug().
+				Str("heuristic_reason", result.Reason).
+				Float64("heuristic_confidence", result.Confidence).
+				Str("heuristic_details", result.Details).
+				Msg("Heuristic analysis detected error in response payload despite HTTP success status")
+			return responseCheckResult{Success: false, HeuristicResult: &result}
+		}
+	}
+
+	return responseCheckResult{Success: true}
+}
+
+// recordHeuristicErrorToReputation records a correcting error signal to reputation
+// when heuristic analysis detects an error that the protocol layer missed.
+//
+// This is needed because the protocol layer records a success signal based on HTTP 200,
+// but the payload may contain a JSON-RPC error or other error indicators. This function
+// records a correcting negative signal to offset the incorrect success signal.
+func recordHeuristicErrorToReputation(
+	ctx context.Context,
+	reputationSvc reputation.ReputationService,
+	serviceID protocol.ServiceID,
+	endpointAddr protocol.EndpointAddr,
+	rpcType sharedtypes.RPCType,
+	heuristicResult *heuristic.AnalysisResult,
+	logger polylog.Logger,
+) {
+	if reputationSvc == nil || heuristicResult == nil {
+		return
+	}
+
+	keyBuilder := reputationSvc.KeyBuilderForService(serviceID)
+	endpointKey := keyBuilder.BuildKey(serviceID, endpointAddr, rpcType)
+
+	// Determine signal severity based on heuristic confidence and reason
+	var signal reputation.Signal
+	var metricSignal string
+
+	// High confidence heuristic errors (JSON-RPC errors, HTML pages) are more severe
+	// Note: latency=0 for heuristic errors since this is a payload analysis, not timing
+	if heuristicResult.Confidence >= 0.95 {
+		signal = reputation.NewMajorErrorSignal("heuristic_"+heuristicResult.Reason, 0)
+		metricSignal = metrics.SignalMajorError
+	} else {
+		signal = reputation.NewMinorErrorSignal("heuristic_" + heuristicResult.Reason)
+		metricSignal = metrics.SignalMinorError
+	}
+
+	// Fire-and-forget: don't block request on reputation recording
+	if err := reputationSvc.RecordSignal(ctx, endpointKey, signal); err != nil {
+		logger.Warn().Err(err).Msg("Failed to record heuristic error signal to reputation")
+	}
+
+	// Record metric for heuristic-detected errors
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(endpointAddr))
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	rpcTypeStr := metrics.NormalizeRPCType(rpcType.String())
+	// Use "heuristic_error" as status code category since HTTP was 200
+	metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), "heuristic_error", metricSignal, metrics.RelayTypeNormal, 0)
+
+	logger.Debug().
+		Str("endpoint", string(endpointAddr)).
+		Str("service_id", string(serviceID)).
+		Str("heuristic_reason", heuristicResult.Reason).
+		Float64("heuristic_confidence", heuristicResult.Confidence).
+		Str("reputation_signal", metricSignal).
+		Msg("Recorded heuristic error signal to reputation")
+}
 
 // TODO_TECHDEBT(@adshmh): A single protocol context should handle both single/parallel calls to one or more endpoints.
 // Including:
@@ -242,14 +364,18 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			}
 		}
 
-		// Check if the request was successful
-		if err == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
+		// Extract response bytes for heuristic analysis
+		var responseBytesForHeuristic []byte
+		if len(endpointResponses) > 0 {
+			responseBytesForHeuristic = endpointResponses[0].Bytes
+		}
+
+		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, rpcType, logger)
+		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
-				responseBytes := 0
-				if len(endpointResponses) > 0 {
-					responseBytes = len(endpointResponses[0].Bytes)
-				}
+				responseBytes := len(responseBytesForHeuristic)
 				logger.Warn().
 					Str("endpoint", string(endpointAddr)).
 					Int("response_count", len(endpointResponses)).
@@ -286,6 +412,21 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), batchCount, totalLatency)
 
 			return nil
+		}
+
+		// If heuristic detected an error, record a correcting signal to reputation.
+		// This is needed because the protocol layer recorded a success signal (HTTP 200),
+		// but the payload contains an error.
+		if checkResult.HeuristicResult != nil && endpointAddr != "" {
+			recordHeuristicErrorToReputation(
+				rc.context,
+				rc.protocol.GetReputationService(),
+				rc.serviceID,
+				endpointAddr,
+				rpcType,
+				checkResult.HeuristicResult,
+				logger,
+			)
 		}
 
 		// Store the last error, status code, and endpoint for potential retry decision
@@ -597,14 +738,18 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			}
 		}
 
-		// Check if the request was successful
-		if err == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
+		// Extract response bytes for heuristic analysis
+		var responseBytesForHeuristic []byte
+		if len(responses) > 0 {
+			responseBytesForHeuristic = responses[0].Bytes
+		}
+
+		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, rpcType, logger)
+		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
-				responseBytes := 0
-				if len(responses) > 0 {
-					responseBytes = len(responses[0].Bytes)
-				}
+				responseBytes := len(responseBytesForHeuristic)
 				logger.Warn().
 					Str("endpoint", string(endpointAddr)).
 					Int("endpoint_index", index).
@@ -637,6 +782,21 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				logger.Debug().Msgf("Request to endpoint %d canceled after success on attempt %d", index, attempt)
 			}
 			return
+		}
+
+		// If heuristic detected an error, record a correcting signal to reputation.
+		// This is needed because the protocol layer recorded a success signal (HTTP 200),
+		// but the payload contains an error.
+		if checkResult.HeuristicResult != nil && endpointAddr != "" {
+			recordHeuristicErrorToReputation(
+				ctx,
+				rc.protocol.GetReputationService(),
+				rc.serviceID,
+				endpointAddr,
+				rpcType,
+				checkResult.HeuristicResult,
+				logger,
+			)
 		}
 
 		// Store the last error, responses, and endpoint for potential retry decision
