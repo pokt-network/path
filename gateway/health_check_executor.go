@@ -236,6 +236,7 @@ func (e *HealthCheckExecutor) getUnifiedServicesHealthChecks() []ServiceHealthCh
 			cfg := ServiceHealthCheckConfig{
 				ServiceID:     svc.ID,
 				CheckInterval: merged.HealthChecks.Interval,
+				SyncAllowance: merged.HealthChecks.SyncAllowance,
 				Checks:        finalChecks,
 			}
 			configs = append(configs, cfg)
@@ -602,6 +603,12 @@ func (e *HealthCheckExecutor) mergeServiceConfigs(
 		merged.Enabled = local.Enabled
 	} else {
 		merged.Enabled = external.Enabled
+	}
+
+	if local.SyncAllowance != nil {
+		merged.SyncAllowance = local.SyncAllowance
+	} else {
+		merged.SyncAllowance = external.SyncAllowance
 	}
 
 	// Build a map of local checks by name

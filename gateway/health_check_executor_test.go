@@ -174,6 +174,72 @@ func TestConfigMerging(t *testing.T) {
 	t.Log("Config merging test passed")
 }
 
+// TestConfigMergingSyncAllowance tests that sync_allowance is properly merged from external to local configs.
+func TestConfigMergingSyncAllowance(t *testing.T) {
+	executor := &HealthCheckExecutor{
+		config: &ActiveHealthChecksConfig{},
+		logger: polyzero.NewLogger(),
+	}
+
+	enabled := true
+	externalSyncAllowance := 50
+	localSyncAllowance := 100
+
+	// External config with sync_allowance
+	external := []ServiceHealthCheckConfig{
+		{
+			ServiceID:     "arb-one",
+			CheckInterval: 10 * time.Second,
+			Enabled:       &enabled,
+			SyncAllowance: &externalSyncAllowance,
+			Checks: []HealthCheckConfig{
+				{Name: "eth_blockNumber", Type: HealthCheckTypeJSONRPC, Method: "POST", Path: "/"},
+			},
+		},
+		{
+			ServiceID:     "eth",
+			CheckInterval: 10 * time.Second,
+			Enabled:       &enabled,
+			SyncAllowance: &externalSyncAllowance,
+			Checks: []HealthCheckConfig{
+				{Name: "eth_blockNumber", Type: HealthCheckTypeJSONRPC, Method: "POST", Path: "/"},
+			},
+		},
+	}
+
+	// Local config overrides sync_allowance for arb-one, eth has no local override
+	local := []ServiceHealthCheckConfig{
+		{
+			ServiceID:     "arb-one",
+			SyncAllowance: &localSyncAllowance, // Override with different value
+			Checks: []HealthCheckConfig{
+				{Name: "eth_chainId", Type: HealthCheckTypeJSONRPC, Method: "POST", Path: "/"},
+			},
+		},
+	}
+
+	// Merge configs
+	merged := executor.mergeConfigs(external, local)
+
+	// Find services by ID
+	serviceMap := make(map[string]ServiceHealthCheckConfig)
+	for _, cfg := range merged {
+		serviceMap[string(cfg.ServiceID)] = cfg
+	}
+
+	// Check arb-one - should have local sync_allowance
+	arbOneCfg := serviceMap["arb-one"]
+	require.NotNil(t, arbOneCfg.SyncAllowance, "Expected arb-one to have sync_allowance")
+	require.Equal(t, localSyncAllowance, *arbOneCfg.SyncAllowance, "Expected local sync_allowance (100) to override external (50)")
+
+	// Check eth - should have external sync_allowance (no local override)
+	ethCfg := serviceMap["eth"]
+	require.NotNil(t, ethCfg.SyncAllowance, "Expected eth to have sync_allowance from external")
+	require.Equal(t, externalSyncAllowance, *ethCfg.SyncAllowance, "Expected external sync_allowance (50) when no local override")
+
+	t.Log("SyncAllowance merging test passed")
+}
+
 // TestMapSignalType tests the mapping of signal type strings to reputation signals.
 func TestMapSignalType(t *testing.T) {
 	executor := &HealthCheckExecutor{
