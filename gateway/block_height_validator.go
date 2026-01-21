@@ -13,10 +13,9 @@ import (
 
 // BlockHeightValidator validates block heights from health check responses.
 type BlockHeightValidator struct {
-	logger         polylog.Logger
-	externalCache  *ExternalReferenceCache
-	qosInstances   map[protocol.ServiceID]QoSService
-	getPerceivedFn func(protocol.ServiceID) uint64
+	logger        polylog.Logger
+	externalCache *ExternalReferenceCache
+	qosInstances  map[protocol.ServiceID]QoSService
 }
 
 // NewBlockHeightValidator creates a new block height validator.
@@ -67,18 +66,14 @@ func (v *BlockHeightValidator) ValidateBlockHeight(
 		return nil
 	}
 
-	// Apply tolerance
-	adjustedReference := v.applyTolerance(referenceHeight, validation.Reference.Tolerance, validation.Operator)
-
 	// Perform comparison
-	passed := v.compareHeights(endpointHeight, adjustedReference, validation.Operator)
+	passed := v.compareHeightsWithTolerance(endpointHeight, referenceHeight, validation.Reference.Tolerance, validation.Operator)
 
 	// Log validation result
 	logEvent := v.logger.Debug().
 		Str("service_id", string(serviceID)).
 		Int64("endpoint_height", endpointHeight).
 		Int64("reference_height", referenceHeight).
-		Int64("adjusted_reference", adjustedReference).
 		Int64("tolerance", validation.Reference.Tolerance).
 		Str("operator", string(validation.Operator)).
 		Str("reference_type", string(validation.Reference.Type)).
@@ -91,10 +86,9 @@ func (v *BlockHeightValidator) ValidateBlockHeight(
 
 	logEvent.Msg("❌ Block height validation failed")
 	return fmt.Errorf(
-		"block height validation failed: endpoint height %d %s adjusted reference %d (reference: %d, tolerance: %d)",
+		"block height validation failed: endpoint height %d %s reference %d (tolerance: %d)",
 		endpointHeight,
 		validation.Operator,
-		adjustedReference,
 		referenceHeight,
 		validation.Reference.Tolerance,
 	)
@@ -191,54 +185,6 @@ func (v *BlockHeightValidator) getReferenceHeight(
 
 	default:
 		return 0, fmt.Errorf("unsupported reference type: %s", ref.Type)
-	}
-}
-
-// applyTolerance applies tolerance to the reference height based on the operator.
-func (v *BlockHeightValidator) applyTolerance(reference int64, tolerance int64, operator BlockHeightOperator) int64 {
-	switch operator {
-	case BlockHeightOperatorGreaterThanOrEqual, BlockHeightOperatorGreaterThan:
-		// For >= and >, subtract tolerance (allow endpoint to be N blocks behind)
-		return reference - tolerance
-
-	case BlockHeightOperatorLessThanOrEqual, BlockHeightOperatorLessThan:
-		// For <= and <, add tolerance (allow endpoint to be N blocks ahead)
-		return reference + tolerance
-
-	case BlockHeightOperatorEqual:
-		// For ==, tolerance creates a range [reference - tolerance, reference + tolerance]
-		// We'll handle this in compareHeights
-		return reference
-
-	default:
-		return reference
-	}
-}
-
-// compareHeights compares the endpoint height with the adjusted reference using the operator.
-func (v *BlockHeightValidator) compareHeights(endpoint int64, adjustedReference int64, operator BlockHeightOperator) bool {
-	switch operator {
-	case BlockHeightOperatorGreaterThanOrEqual:
-		return endpoint >= adjustedReference
-
-	case BlockHeightOperatorGreaterThan:
-		return endpoint > adjustedReference
-
-	case BlockHeightOperatorLessThanOrEqual:
-		return endpoint <= adjustedReference
-
-	case BlockHeightOperatorLessThan:
-		return endpoint < adjustedReference
-
-	case BlockHeightOperatorEqual:
-		// For equality, we allow a tolerance range
-		// adjustedReference is the reference value (tolerance not applied)
-		// We need to get the tolerance from somewhere... let's recalculate
-		// Actually, this is a design issue. Let me fix compareHeights to accept tolerance
-		return endpoint == adjustedReference
-
-	default:
-		return false
 	}
 }
 
