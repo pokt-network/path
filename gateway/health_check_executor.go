@@ -16,6 +16,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,6 +66,9 @@ type HealthCheckExecutor struct {
 	// This enables the same async processing pipeline for both user requests and health checks.
 	observationQueue *ObservationQueue
 
+	// blockHeightValidator validates block heights from health check responses.
+	blockHeightValidator *BlockHeightValidator
+
 	// pool is the worker pool for concurrent health check execution.
 	pool pond.Pool
 
@@ -108,6 +112,12 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 	// Create worker pool for concurrent health check execution
 	pool := pond.NewPool(maxWorkers)
 
+	// Initialize external reference cache for block height validation
+	externalCache := NewExternalReferenceCache(cfg.Logger)
+
+	// Initialize block height validator
+	blockHeightValidator := NewBlockHeightValidator(cfg.Logger, externalCache)
+
 	return &HealthCheckExecutor{
 		config:          cfg.Config,
 		reputationSvc:   cfg.ReputationSvc,
@@ -126,6 +136,7 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 		},
 		leaderElector:             cfg.LeaderElector,
 		observationQueue:          cfg.ObservationQueue,
+		blockHeightValidator:      blockHeightValidator,
 		unifiedServicesConfig:     cfg.UnifiedServicesConfig,
 		perServiceExternalConfigs: make(map[protocol.ServiceID][]HealthCheckConfig),
 	}
@@ -150,6 +161,14 @@ func (e *HealthCheckExecutor) ShouldRunChecks() bool {
 	}
 
 	return true
+}
+
+// SetQoSInstances sets the QoS instances for block height validation.
+// This should be called after QoS instances are created in the main application.
+func (e *HealthCheckExecutor) SetQoSInstances(instances map[protocol.ServiceID]QoSService) {
+	if e.blockHeightValidator != nil {
+		e.blockHeightValidator.SetQoSInstances(instances)
+	}
 }
 
 // GetServiceConfigs returns the merged health check configurations for all services.
@@ -937,6 +956,53 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 		return latency, checkErr
 	}
 
+	// Perform block height validation if configured
+	if check.BlockHeightValidation != nil && e.blockHeightValidator != nil {
+		if err := e.blockHeightValidator.ValidateBlockHeight(checkCtx, serviceID, responseBody, check.BlockHeightValidation); err != nil {
+			// Block height validation failed
+			e.logger.Debug().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Str("endpoint", string(endpointAddr)).
+				Str("check", check.Name).
+				Dur("latency", latency).
+				Msg("Block height validation failed")
+
+			// Record relay metric for block height validation failure
+			statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
+			// Use the reputation signal configured in the check, or default to major_error
+			signalType := metrics.SignalMajorError
+			if check.ReputationSignal != "" {
+				signalType = check.ReputationSignal
+			}
+			metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, signalType, metrics.RelayTypeHealthCheck, latency.Seconds())
+
+			return latency, err
+		}
+	}
+
+	// Perform error detection if configured
+	if check.ErrorDetection != nil {
+		if detectedSignal, detectedError := e.detectKnownErrors(check.ErrorDetection, httpStatusCode, responseBody); detectedError != nil {
+			// Known error pattern detected
+			e.logger.Debug().
+				Err(detectedError).
+				Str("service_id", string(serviceID)).
+				Str("endpoint", string(endpointAddr)).
+				Str("check", check.Name).
+				Int("status_code", httpStatusCode).
+				Str("detected_signal", detectedSignal).
+				Dur("latency", latency).
+				Msg("Known error pattern detected")
+
+			// Record relay metric for error detection
+			statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
+			metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, detectedSignal, metrics.RelayTypeHealthCheck, latency.Seconds())
+
+			return latency, detectedError
+		}
+	}
+
 	// Record relay metric for successful health check
 	statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
 	metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, metrics.SignalOK, metrics.RelayTypeHealthCheck, latency.Seconds())
@@ -1334,4 +1400,53 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 		Msg("Health check cycle completed")
 
 	return nil
+}
+
+// detectKnownErrors checks for known error patterns in health check responses.
+// Returns (reputationSignal, error) if a known error is detected, or ("", nil) if no errors detected.
+func (e *HealthCheckExecutor) detectKnownErrors(
+	errorDetection *ErrorDetection,
+	httpStatusCode int,
+	responseBody []byte,
+) (string, error) {
+	if errorDetection == nil {
+		return "", nil
+	}
+
+	// Check HTTP status codes
+	for _, statusCodeCheck := range errorDetection.StatusCodes {
+		if httpStatusCode == statusCodeCheck.Code {
+			return statusCodeCheck.ReputationSignal, fmt.Errorf("detected error status code: %d", statusCodeCheck.Code)
+		}
+	}
+
+	// Convert response body to lowercase string for case-insensitive matching
+	responseStr := strings.ToLower(string(responseBody))
+
+	// Check response body patterns
+	for _, patternCheck := range errorDetection.ResponsePatterns {
+		if strings.Contains(responseStr, strings.ToLower(patternCheck.Pattern)) {
+			return patternCheck.ReputationSignal, fmt.Errorf("detected error pattern in response: %s", patternCheck.Pattern)
+		}
+	}
+
+	// Check JSON-RPC error codes if the response looks like JSON-RPC
+	if len(errorDetection.JSONRPCErrorCodes) > 0 && len(responseBody) > 0 {
+		// Try to parse as JSON-RPC response
+		var jsonRPCResp struct {
+			Error *struct {
+				Code int `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(responseBody, &jsonRPCResp); err == nil && jsonRPCResp.Error != nil {
+			// Found a JSON-RPC error - check if it matches any configured error codes
+			for _, errorCodeCheck := range errorDetection.JSONRPCErrorCodes {
+				if jsonRPCResp.Error.Code == errorCodeCheck.Code {
+					return errorCodeCheck.ReputationSignal, fmt.Errorf("detected JSON-RPC error code: %d", errorCodeCheck.Code)
+				}
+			}
+		}
+	}
+
+	return "", nil
 }

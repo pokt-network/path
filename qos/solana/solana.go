@@ -114,3 +114,14 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 
 	return nil
 }
+
+// GetPerceivedBlockNumber returns the perceived current block height.
+// Used by health checks for block height validation.
+// Returns 0 if no block height has been observed yet.
+//
+// Implements gateway.QoSService interface.
+func (q *QoS) GetPerceivedBlockNumber() uint64 {
+	q.serviceStateLock.RLock()
+	defer q.serviceStateLock.RUnlock()
+	return q.perceivedBlockHeight
+}

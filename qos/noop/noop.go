@@ -97,3 +97,9 @@ func (NoOpQoS) HydrateDisqualifiedEndpointsResponse(_ protocol.ServiceID, _ *dev
 func (NoOpQoS) UpdateFromExtractedData(_ protocol.EndpointAddr, _ *qostypes.ExtractedData) error {
 	return nil
 }
+
+// GetPerceivedBlockNumber always returns 0 for the noop QoS.
+// Implements gateway.QoSService interface.
+func (NoOpQoS) GetPerceivedBlockNumber() uint64 {
+	return 0
+}

@@ -188,6 +188,8 @@ func main() {
 	// Log health check executor status (used for debugging, future shutdown coordination)
 	if healthCheckExecutor != nil {
 		logger.Info().Msg("Health check executor initialized successfully")
+		// Set QoS instances for block height validation in health checks
+		healthCheckExecutor.SetQoSInstances(qosInstances)
 	}
 
 	// Setup the request parser which maps requests to the correct QoS instance.

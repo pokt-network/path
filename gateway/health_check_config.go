@@ -79,6 +79,138 @@ const (
 )
 
 type (
+	// BlockHeightReferenceType defines the source of the reference block height.
+	BlockHeightReferenceType string
+
+	// BlockHeightOperator defines the comparison operator for block height validation.
+	BlockHeightOperator string
+)
+
+const (
+	// BlockHeightReferenceTypeStatic uses a fixed block height value.
+	BlockHeightReferenceTypeStatic BlockHeightReferenceType = "static"
+
+	// BlockHeightReferenceTypeExternal queries an external endpoint for the reference height.
+	BlockHeightReferenceTypeExternal BlockHeightReferenceType = "external"
+
+	// BlockHeightReferenceTypePerceived uses the QoS perceived block number.
+	BlockHeightReferenceTypePerceived BlockHeightReferenceType = "perceived"
+)
+
+const (
+	// BlockHeightOperatorGreaterThanOrEqual checks if endpoint height >= reference - tolerance.
+	BlockHeightOperatorGreaterThanOrEqual BlockHeightOperator = ">="
+
+	// BlockHeightOperatorGreaterThan checks if endpoint height > reference - tolerance.
+	BlockHeightOperatorGreaterThan BlockHeightOperator = ">"
+
+	// BlockHeightOperatorLessThanOrEqual checks if endpoint height <= reference + tolerance.
+	BlockHeightOperatorLessThanOrEqual BlockHeightOperator = "<="
+
+	// BlockHeightOperatorLessThan checks if endpoint height < reference + tolerance.
+	BlockHeightOperatorLessThan BlockHeightOperator = "<"
+
+	// BlockHeightOperatorEqual checks if endpoint height == reference (within tolerance if set).
+	BlockHeightOperatorEqual BlockHeightOperator = "=="
+)
+
+// Default values for block height validation
+const (
+	DefaultExternalReferenceTimeout       = 5 * time.Second
+	DefaultExternalReferenceCacheDuration = 10 * time.Second
+)
+
+type (
+	// ErrorDetection configures error pattern matching in health check responses.
+	// This allows health checks to detect and penalize known error patterns like
+	// rate limits, bad gateways, quota errors, etc.
+	ErrorDetection struct {
+		// StatusCodes defines HTTP status codes to detect and penalize.
+		StatusCodes []ErrorStatusCode `yaml:"status_codes,omitempty"`
+
+		// ResponsePatterns defines error patterns to search for in response body.
+		// Matches are case-insensitive substring searches.
+		ResponsePatterns []ErrorPattern `yaml:"response_patterns,omitempty"`
+
+		// JSONRPCErrorCodes defines JSON-RPC error codes to detect and penalize.
+		JSONRPCErrorCodes []JSONRPCErrorCode `yaml:"jsonrpc_error_codes,omitempty"`
+	}
+
+	// ErrorStatusCode defines an HTTP status code to detect and its reputation signal.
+	ErrorStatusCode struct {
+		// Code is the HTTP status code to match (e.g., 429, 502, 503).
+		Code int `yaml:"code"`
+
+		// ReputationSignal is the signal to send when this status code is detected.
+		// Values: "minor_error", "major_error", "critical_error", "fatal_error"
+		ReputationSignal string `yaml:"reputation_signal"`
+	}
+
+	// ErrorPattern defines a response body pattern to detect and its reputation signal.
+	ErrorPattern struct {
+		// Pattern is the substring to search for in the response body (case-insensitive).
+		// Examples: "rate limit", "exceeded your limit", "bad gateway", "quota"
+		Pattern string `yaml:"pattern"`
+
+		// ReputationSignal is the signal to send when this pattern is detected.
+		// Values: "minor_error", "major_error", "critical_error", "fatal_error"
+		ReputationSignal string `yaml:"reputation_signal"`
+	}
+
+	// JSONRPCErrorCode defines a JSON-RPC error code to detect and its reputation signal.
+	JSONRPCErrorCode struct {
+		// Code is the JSON-RPC error code to match (e.g., -31002, -32001).
+		Code int `yaml:"code"`
+
+		// ReputationSignal is the signal to send when this error code is detected.
+		// Values: "minor_error", "major_error", "critical_error", "fatal_error"
+		ReputationSignal string `yaml:"reputation_signal"`
+	}
+
+	// BlockHeightValidation configures block height comparison checks.
+	// This allows health checks to validate that an endpoint's block height
+	// meets certain criteria (e.g., not too far behind a reference value).
+	BlockHeightValidation struct {
+		// Operator is the comparison operator: "<", ">", "<=", ">=", "=="
+		Operator BlockHeightOperator `yaml:"operator"`
+
+		// Reference specifies where to get the reference value for comparison.
+		Reference BlockHeightReference `yaml:"reference"`
+	}
+
+	// BlockHeightReference specifies the source of the reference block height.
+	BlockHeightReference struct {
+		// Type is the reference source: "static", "external", "perceived"
+		Type BlockHeightReferenceType `yaml:"type"`
+
+		// Value is the static block height (only for type="static")
+		Value int64 `yaml:"value,omitempty"`
+
+		// Endpoint is the external RPC endpoint to query (only for type="external")
+		// Example: "https://arb-mainnet.g.alchemy.com/v2/demo"
+		Endpoint string `yaml:"endpoint,omitempty"`
+
+		// Method is the RPC method to call on external endpoint (only for type="external")
+		// Example: "eth_blockNumber" for EVM chains
+		Method string `yaml:"method,omitempty"`
+
+		// Tolerance is the allowed difference (only for type="external" and type="perceived")
+		// For external: endpoint_height >= (external_height - tolerance)
+		// For perceived: endpoint_height >= (perceived_height - tolerance)
+		// Default: 0 (no tolerance)
+		Tolerance int64 `yaml:"tolerance,omitempty"`
+
+		// Headers for external endpoint authentication (only for type="external")
+		Headers map[string]string `yaml:"headers,omitempty"`
+
+		// Timeout for external endpoint query (default: 5s)
+		Timeout time.Duration `yaml:"timeout,omitempty"`
+
+		// CacheDuration how long to cache external endpoint response (default: 10s)
+		// Prevents hammering external endpoint on every health check
+		CacheDuration time.Duration `yaml:"cache_duration,omitempty"`
+	}
+
 	// HealthCheckConfig defines a single configurable health check.
 	// This replaces hardcoded QoS checks with YAML-configurable checks.
 	HealthCheckConfig struct {
@@ -121,6 +253,17 @@ type (
 		// If specified, the check fails if this substring is not found in the response.
 		// For websocket with body: checked against any received message within timeout.
 		ExpectedResponseContains string `yaml:"expected_response_contains,omitempty"`
+
+		// BlockHeightValidation enables block height comparison checks.
+		// If specified, the health check will extract the block height from the response
+		// and compare it against a reference value using the specified operator.
+		// This is useful for detecting stuck or lagging nodes.
+		BlockHeightValidation *BlockHeightValidation `yaml:"block_height_validation,omitempty"`
+
+		// ErrorDetection enables error pattern detection in health check responses.
+		// If specified, the health check will detect known error patterns (rate limits,
+		// bad gateway errors, quota errors, etc.) and send appropriate reputation signals.
+		ErrorDetection *ErrorDetection `yaml:"error_detection,omitempty"`
 
 		// Timeout is the request timeout for this check.
 		// For websocket: how long to wait for connection + optional response.
@@ -454,6 +597,20 @@ func (hcc *HealthCheckConfig) Validate() error {
 		return fmt.Errorf("invalid reputation_signal '%s' for check %s (must be minor_error, major_error, critical_error, or fatal_error)", hcc.ReputationSignal, hcc.Name)
 	}
 
+	// Validate block height validation if provided
+	if hcc.BlockHeightValidation != nil {
+		if err := hcc.BlockHeightValidation.Validate(hcc.Name); err != nil {
+			return err
+		}
+	}
+
+	// Validate error detection if provided
+	if hcc.ErrorDetection != nil {
+		if err := hcc.ErrorDetection.Validate(hcc.Name); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -503,6 +660,119 @@ func (rc *RetryConfig) Validate(logger polylog.Logger) error {
 	// Validate max_retry_latency if set
 	if rc.MaxRetryLatency != nil && *rc.MaxRetryLatency < 0 {
 		return fmt.Errorf("retry_config.max_retry_latency cannot be negative (got %v)", *rc.MaxRetryLatency)
+	}
+
+	return nil
+}
+
+// Validate validates the BlockHeightValidation configuration.
+func (bhv *BlockHeightValidation) Validate(checkName string) error {
+	// Validate operator
+	validOperators := map[BlockHeightOperator]bool{
+		BlockHeightOperatorGreaterThanOrEqual: true,
+		BlockHeightOperatorGreaterThan:        true,
+		BlockHeightOperatorLessThanOrEqual:    true,
+		BlockHeightOperatorLessThan:           true,
+		BlockHeightOperatorEqual:              true,
+	}
+	if !validOperators[bhv.Operator] {
+		return fmt.Errorf("invalid block_height_validation.operator '%s' for check %s (must be >=, >, <=, <, or ==)", bhv.Operator, checkName)
+	}
+
+	// Validate reference
+	if err := bhv.Reference.Validate(checkName); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Validate validates the BlockHeightReference configuration.
+func (bhr *BlockHeightReference) Validate(checkName string) error {
+	// Validate type
+	validTypes := map[BlockHeightReferenceType]bool{
+		BlockHeightReferenceTypeStatic:    true,
+		BlockHeightReferenceTypeExternal:  true,
+		BlockHeightReferenceTypePerceived: true,
+	}
+	if !validTypes[bhr.Type] {
+		return fmt.Errorf("invalid block_height_validation.reference.type '%s' for check %s (must be static, external, or perceived)", bhr.Type, checkName)
+	}
+
+	// Type-specific validation
+	switch bhr.Type {
+	case BlockHeightReferenceTypeStatic:
+		if bhr.Value <= 0 {
+			return fmt.Errorf("block_height_validation.reference.value must be positive for type 'static' in check %s, got %d", checkName, bhr.Value)
+		}
+
+	case BlockHeightReferenceTypeExternal:
+		if bhr.Endpoint == "" {
+			return fmt.Errorf("block_height_validation.reference.endpoint is required for type 'external' in check %s", checkName)
+		}
+		if bhr.Method == "" {
+			return fmt.Errorf("block_height_validation.reference.method is required for type 'external' in check %s", checkName)
+		}
+
+	case BlockHeightReferenceTypePerceived:
+		// No additional validation needed for perceived type
+	}
+
+	// Tolerance must be non-negative
+	if bhr.Tolerance < 0 {
+		return fmt.Errorf("block_height_validation.reference.tolerance must be non-negative for check %s, got %d", checkName, bhr.Tolerance)
+	}
+
+	return nil
+}
+
+// HydrateDefaults applies default values to BlockHeightReference.
+func (bhr *BlockHeightReference) HydrateDefaults() {
+	if bhr.Type == BlockHeightReferenceTypeExternal {
+		if bhr.Timeout == 0 {
+			bhr.Timeout = DefaultExternalReferenceTimeout
+		}
+		if bhr.CacheDuration == 0 {
+			bhr.CacheDuration = DefaultExternalReferenceCacheDuration
+		}
+	}
+}
+
+// Validate validates the ErrorDetection configuration.
+func (ed *ErrorDetection) Validate(checkName string) error {
+	// At least one detection type must be configured
+	if len(ed.StatusCodes) == 0 && len(ed.ResponsePatterns) == 0 && len(ed.JSONRPCErrorCodes) == 0 {
+		return fmt.Errorf("error_detection must specify at least one of: status_codes, response_patterns, or jsonrpc_error_codes for check %s", checkName)
+	}
+
+	// Validate status codes
+	validSignals := map[string]bool{
+		"minor_error": true, "major_error": true, "critical_error": true, "fatal_error": true,
+	}
+	for i, statusCode := range ed.StatusCodes {
+		if statusCode.Code < 100 || statusCode.Code > 599 {
+			return fmt.Errorf("error_detection.status_codes[%d].code must be a valid HTTP status code (100-599) for check %s, got %d", i, checkName, statusCode.Code)
+		}
+		if !validSignals[statusCode.ReputationSignal] {
+			return fmt.Errorf("error_detection.status_codes[%d].reputation_signal must be minor_error, major_error, critical_error, or fatal_error for check %s, got %s", i, checkName, statusCode.ReputationSignal)
+		}
+	}
+
+	// Validate response patterns
+	for i, pattern := range ed.ResponsePatterns {
+		if pattern.Pattern == "" {
+			return fmt.Errorf("error_detection.response_patterns[%d].pattern cannot be empty for check %s", i, checkName)
+		}
+		if !validSignals[pattern.ReputationSignal] {
+			return fmt.Errorf("error_detection.response_patterns[%d].reputation_signal must be minor_error, major_error, critical_error, or fatal_error for check %s, got %s", i, checkName, pattern.ReputationSignal)
+		}
+	}
+
+	// Validate JSON-RPC error codes
+	for i, errorCode := range ed.JSONRPCErrorCodes {
+		if !validSignals[errorCode.ReputationSignal] {
+			return fmt.Errorf("error_detection.jsonrpc_error_codes[%d].reputation_signal must be minor_error, major_error, critical_error, or fatal_error for check %s, got %s", i, checkName, errorCode.ReputationSignal)
+		}
 	}
 
 	return nil

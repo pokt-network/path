@@ -406,7 +406,9 @@ gateway_config:
     - id: arb
       type: "evm"
       latency_profile: "fast"
-      # Uses all other defaults
+      # Per-service health checks with sync allowance
+      health_checks:
+        sync_allowance: 50  # Filter out nodes more than 50 blocks behind
 
     # -------------------------------------------------------------------------
     # Solana Service

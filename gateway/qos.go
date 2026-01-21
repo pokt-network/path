@@ -139,6 +139,12 @@ type QoSService interface {
 	// - Data is extracted via DataExtractor from sampled requests and health checks.
 	UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *qostypes.ExtractedData) error
 
+	// GetPerceivedBlockNumber:
+	// - Returns the perceived current block number for the service.
+	// - Used by health checks for block height validation.
+	// - Returns 0 if no block number has been observed yet.
+	GetPerceivedBlockNumber() uint64
+
 	// HydrateDisqualifiedEndpointsResponse:
 	// - Fills the disqualified endpoint response with QoS-specific data.
 	HydrateDisqualifiedEndpointsResponse(protocol.ServiceID, *devtools.DisqualifiedEndpointResponse)
