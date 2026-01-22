@@ -70,6 +70,16 @@ type Score struct {
 	// LatencyMetrics tracks response latency statistics for this endpoint.
 	// Updated from both health checks and client requests.
 	LatencyMetrics LatencyMetrics
+
+	// CriticalStrikes counts consecutive critical/fatal errors without recovery.
+	// Used by the strike system to apply extended cooldowns for persistently failing endpoints.
+	// Reset to 0 when endpoint has a successful request.
+	CriticalStrikes int
+
+	// CooldownUntil is when the endpoint's cooldown period ends.
+	// Endpoints in cooldown are excluded from selection even if their score is above threshold.
+	// Set when CriticalStrikes exceeds StrikeThreshold.
+	CooldownUntil time.Time
 }
 
 // LatencyMetrics tracks response latency statistics for an endpoint.
@@ -125,6 +135,24 @@ func (s Score) IsValid() bool {
 	return s.Value >= MinScore && s.Value <= MaxScore
 }
 
+// IsInCooldown returns true if the endpoint is currently in a strike cooldown period.
+// Endpoints in cooldown should be excluded from selection even if their score is above threshold.
+func (s Score) IsInCooldown() bool {
+	return !s.CooldownUntil.IsZero() && time.Now().Before(s.CooldownUntil)
+}
+
+// CooldownRemaining returns the remaining cooldown duration, or 0 if not in cooldown.
+func (s Score) CooldownRemaining() time.Duration {
+	if s.CooldownUntil.IsZero() {
+		return 0
+	}
+	remaining := time.Until(s.CooldownUntil)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 // Score constants define the bounds and defaults for reputation scores.
 const (
 	// MinScore is the lowest possible reputation score.
@@ -134,12 +162,28 @@ const (
 	MaxScore float64 = 100
 
 	// InitialScore is the starting score for new endpoints.
-	// Endpoints start with a moderately high score to give them a fair chance.
-	InitialScore float64 = 80
+	// Endpoints start at tier 2 level (60) requiring them to prove reliability
+	// before getting tier 1 treatment. Reduced from 80 to prevent unknown
+	// endpoints from immediately getting top-tier selection priority.
+	InitialScore float64 = 60
 
 	// DefaultMinThreshold is the minimum score required for endpoint selection.
 	// Endpoints below this threshold are excluded from selection.
 	DefaultMinThreshold float64 = 30
+)
+
+// Strike system constants control extended cooldowns for persistently failing endpoints.
+const (
+	// DefaultStrikeThreshold is the number of consecutive critical/fatal errors
+	// before an extended cooldown is applied.
+	DefaultStrikeThreshold = 3
+
+	// DefaultBaseCooldown is the initial cooldown duration after hitting the strike threshold.
+	// Each additional strike doubles this duration (exponential backoff).
+	DefaultBaseCooldown = 5 * time.Minute
+
+	// DefaultMaxCooldown is the maximum cooldown duration regardless of strike count.
+	DefaultMaxCooldown = 1 * time.Hour
 )
 
 // Key granularity options determine how endpoints are grouped for scoring.
@@ -453,7 +497,8 @@ type SignalImpactsConfig struct {
 	// FatalError is the score change for fatal errors (config issues). Default: -50
 	FatalError float64 `yaml:"fatal_error,omitempty"`
 
-	// RecoverySuccess is the score change for successful probation recovery. Default: +15
+	// RecoverySuccess is the score change for successful probation recovery. Default: +5
+	// Reduced from +15 to require sustained good behavior for recovery.
 	RecoverySuccess float64 `yaml:"recovery_success,omitempty"`
 
 	// SlowResponse is the score change for slow responses. Default: -1
@@ -471,7 +516,7 @@ func DefaultSignalImpacts() SignalImpactsConfig {
 		MajorError:       -10,
 		CriticalError:    -25,
 		FatalError:       -50,
-		RecoverySuccess:  +15,
+		RecoverySuccess:  +5, // Reduced from +15 to require sustained good behavior
 		SlowResponse:     -1,
 		VerySlowResponse: -3,
 	}

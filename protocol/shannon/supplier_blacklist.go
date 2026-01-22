@@ -35,8 +35,10 @@ type blacklistEntry struct {
 }
 
 // defaultBlacklistTTL is the default time a supplier stays blacklisted.
-// Set to 5 minutes (typical session check interval) - suppliers can recover next session.
-const defaultBlacklistTTL = 5 * time.Minute
+// Set to 30 minutes to prevent frequent recovery of known-bad suppliers.
+// Increased from 5 minutes to provide stronger protection against
+// suppliers with validation/signature errors.
+const defaultBlacklistTTL = 30 * time.Minute
 
 // newSupplierBlacklist creates a new supplier blacklist.
 func newSupplierBlacklist() *supplierBlacklist {

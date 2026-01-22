@@ -153,7 +153,7 @@ func (qos *QoS) HydrateDisqualifiedEndpointsResponse(serviceID protocol.ServiceI
 
 // UpdateFromExtractedData updates QoS state from extracted observation data.
 // Called by the observation pipeline after async parsing completes.
-// This updates the perceived block number without blocking user requests.
+// This updates the perceived block number and stores the endpoint's block number observation.
 //
 // Implements gateway.QoSService interface.
 func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *qostypes.ExtractedData) error {
@@ -166,11 +166,24 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 		return nil
 	}
 
+	blockNumber := uint64(data.BlockHeight)
+
+	// Lock the endpoint store to update the endpoint observation
+	qos.endpointStore.endpointsMu.Lock()
+	storedEndpoint := qos.endpointStore.endpoints[endpointAddr]
+
+	// Update the endpoint's block height observation in CometBFT status check
+	storedEndpoint.checkCometBFTStatus.latestBlockHeight = &blockNumber
+
+	// Store the updated endpoint back
+	qos.endpointStore.endpoints[endpointAddr] = storedEndpoint
+	qos.endpointStore.endpointsMu.Unlock()
+
+	// Lock service state to update perceived block number
 	qos.serviceStateLock.Lock()
 	defer qos.serviceStateLock.Unlock()
 
 	// Update perceived block number to maximum across all endpoints
-	blockNumber := uint64(data.BlockHeight)
 	if blockNumber > qos.perceivedBlockNumber {
 		qos.logger.Debug().
 			Str("endpoint", string(endpointAddr)).

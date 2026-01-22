@@ -339,7 +339,7 @@ func (c *UnifiedServicesConfig) HydrateDefaults() {
 		c.Defaults.Probation.Threshold = &threshold
 	}
 	if c.Defaults.Probation.TrafficPercent == nil {
-		traffic := 10.0
+		traffic := 3.0 // Reduced from 10% to minimize user-facing failures during probation
 		c.Defaults.Probation.TrafficPercent = &traffic
 	}
 	if c.Defaults.Probation.RecoveryMultiplier == nil {

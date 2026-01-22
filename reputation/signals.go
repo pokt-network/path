@@ -27,8 +27,9 @@ const (
 	SignalTypeFatalError SignalType = "fatal_error"
 
 	// SignalTypeRecoverySuccess indicates a successful request from a low-scoring endpoint.
-	// This signal has higher impact (+15) than regular success (+1) to allow endpoints
-	// to recover faster when they prove they're healthy again.
+	// This signal has moderate impact (+5) than regular success (+1) to allow endpoints
+	// to recover when they prove they're healthy again, but requires sustained good behavior.
+	// Reduced from +15 to +5 to prevent rapid recovery from critical errors.
 	// Intended for use by:
 	//   - Probation system (PR 7): when sampling traffic to low-scoring endpoints
 	//   - Health checks (PR 9): when probing excluded endpoints
@@ -113,8 +114,10 @@ func NewFatalErrorSignal(reason string) Signal {
 }
 
 // NewRecoverySuccessSignal creates a signal for a successful request from a
-// low-scoring endpoint. This has higher impact (+15) than regular success (+1)
-// to allow endpoints to recover faster when proving they're healthy.
+// low-scoring endpoint. This has moderate impact (+5) than regular success (+1)
+// to allow endpoints to recover when proving they're healthy, but requires
+// sustained good behavior to fully recover from critical errors.
+// Reduced from +15 to +5 to prevent rapid recovery.
 // Intended for use by Probation system (PR 7) and Health checks (PR 9).
 func NewRecoverySuccessSignal(latency time.Duration) Signal {
 	return Signal{
@@ -157,7 +160,7 @@ var scoreImpact = map[SignalType]float64{
 	SignalTypeMajorError:       -10, // Moderate penalty
 	SignalTypeCriticalError:    -25, // Severe penalty
 	SignalTypeFatalError:       -50, // Maximum penalty (was a permanent ban)
-	SignalTypeRecoverySuccess:  +15, // Boosted recovery - allows faster climb back
+	SignalTypeRecoverySuccess:  +5,  // Moderate recovery - requires sustained good behavior (reduced from +15)
 	SignalTypeSlowResponse:     -1,  // Small penalty for slow responses
 	SignalTypeVerySlowResponse: -3,  // Moderate penalty for very slow responses
 }

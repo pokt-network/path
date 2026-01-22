@@ -19,8 +19,8 @@ import (
 //
 // The new classification is called from context.go and websocket_context.go where errors occur.
 
-// filterByReputation filters endpoints based on their reputation score.
-// Returns only endpoints with scores above the configured minimum threshold.
+// filterByReputation filters endpoints based on their reputation score and cooldown status.
+// Returns only endpoints with scores above the configured minimum threshold and not in cooldown.
 // Endpoints without a score (new endpoints) are assumed to have the initial score.
 func (p *Protocol) filterByReputation(
 	ctx context.Context,
@@ -48,7 +48,7 @@ func (p *Protocol) filterByReputation(
 		return endpoints
 	}
 
-	// Filter endpoints below threshold
+	// Filter endpoints below threshold or in cooldown
 	filtered := make(map[protocol.EndpointAddr]endpoint, len(endpoints))
 	for addr, ep := range endpoints {
 		key := keyBuilder.BuildKey(serviceID, addr, rpcType)
@@ -57,6 +57,16 @@ func (p *Protocol) filterByReputation(
 		// If score doesn't exist, the endpoint is new and gets initial score (which is above threshold)
 		if !exists {
 			filtered[addr] = ep
+			continue
+		}
+
+		// Check if endpoint is in cooldown from strike system
+		if score.IsInCooldown() {
+			logger.Debug().
+				Str("endpoint", string(addr)).
+				Int("strikes", score.CriticalStrikes).
+				Dur("cooldown_remaining", score.CooldownRemaining()).
+				Msg("Filtering out endpoint in cooldown (strike system)")
 			continue
 		}
 

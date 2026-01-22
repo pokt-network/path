@@ -98,9 +98,9 @@ func TestSignal_GetDefaultImpact(t *testing.T) {
 			expectedImpact: -50,
 		},
 		{
-			name:           "recovery success has boosted positive impact",
+			name:           "recovery success has moderate positive impact",
 			signalType:     SignalTypeRecoverySuccess,
-			expectedImpact: +15,
+			expectedImpact: +5, // Reduced from +15 to require sustained good behavior
 		},
 		{
 			name:           "unknown type has zero impact",

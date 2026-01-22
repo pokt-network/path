@@ -691,9 +691,10 @@ func (e *HealthCheckExecutor) recordCheckResult(
 
 	if checkErr == nil {
 		// Check passed - record recovery success signal with latency
-		// Health checks use RecoverySuccessSignal (+15) because their purpose is to help
-		// low-scoring endpoints recover. This provides stronger positive reinforcement
-		// than regular SuccessSignal (+1) used by client requests.
+		// Health checks use RecoverySuccessSignal (+5) because their purpose is to help
+		// low-scoring endpoints recover. This provides moderate positive reinforcement
+		// than regular SuccessSignal (+1) used by client requests, but requires
+		// sustained good behavior to fully recover from critical errors.
 		signal := reputation.NewRecoverySuccessSignal(latency)
 		if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
 			e.logger.Warn().

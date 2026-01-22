@@ -37,10 +37,12 @@ type RedisStorage struct {
 
 // Redis hash field names
 const (
-	fieldValue        = "value"
-	fieldLastUpdated  = "last_updated"
-	fieldSuccessCount = "success_count"
-	fieldErrorCount   = "error_count"
+	fieldValue           = "value"
+	fieldLastUpdated     = "last_updated"
+	fieldSuccessCount    = "success_count"
+	fieldErrorCount      = "error_count"
+	fieldCriticalStrikes = "critical_strikes"
+	fieldCooldownUntil   = "cooldown_until"
 )
 
 // NewRedisStorage creates a new Redis-backed storage.
@@ -158,10 +160,12 @@ func (r *RedisStorage) Set(ctx context.Context, key reputation.EndpointKey, scor
 	redisKey := r.buildKey(key)
 
 	fields := map[string]interface{}{
-		fieldValue:        strconv.FormatFloat(score.Value, 'f', -1, 64),
-		fieldLastUpdated:  strconv.FormatInt(score.LastUpdated.Unix(), 10),
-		fieldSuccessCount: strconv.FormatInt(score.SuccessCount, 10),
-		fieldErrorCount:   strconv.FormatInt(score.ErrorCount, 10),
+		fieldValue:           strconv.FormatFloat(score.Value, 'f', -1, 64),
+		fieldLastUpdated:     strconv.FormatInt(score.LastUpdated.Unix(), 10),
+		fieldSuccessCount:    strconv.FormatInt(score.SuccessCount, 10),
+		fieldErrorCount:      strconv.FormatInt(score.ErrorCount, 10),
+		fieldCriticalStrikes: strconv.Itoa(score.CriticalStrikes),
+		fieldCooldownUntil:   strconv.FormatInt(score.CooldownUntil.Unix(), 10),
 	}
 
 	pipe := r.client.Pipeline()
@@ -191,10 +195,12 @@ func (r *RedisStorage) SetMultiple(ctx context.Context, scores map[reputation.En
 		redisKey := r.buildKey(key)
 
 		fields := map[string]interface{}{
-			fieldValue:        strconv.FormatFloat(score.Value, 'f', -1, 64),
-			fieldLastUpdated:  strconv.FormatInt(score.LastUpdated.Unix(), 10),
-			fieldSuccessCount: strconv.FormatInt(score.SuccessCount, 10),
-			fieldErrorCount:   strconv.FormatInt(score.ErrorCount, 10),
+			fieldValue:           strconv.FormatFloat(score.Value, 'f', -1, 64),
+			fieldLastUpdated:     strconv.FormatInt(score.LastUpdated.Unix(), 10),
+			fieldSuccessCount:    strconv.FormatInt(score.SuccessCount, 10),
+			fieldErrorCount:      strconv.FormatInt(score.ErrorCount, 10),
+			fieldCriticalStrikes: strconv.Itoa(score.CriticalStrikes),
+			fieldCooldownUntil:   strconv.FormatInt(score.CooldownUntil.Unix(), 10),
 		}
 
 		pipe.HSet(ctx, redisKey, fields)
@@ -299,6 +305,26 @@ func (r *RedisStorage) parseScore(data map[string]string) (reputation.Score, err
 			return score, fmt.Errorf("invalid error_count: %w", err)
 		}
 		score.ErrorCount = count
+	}
+
+	// Parse strike system fields (for multi-instance coordination)
+	if v, ok := data[fieldCriticalStrikes]; ok {
+		strikes, err := strconv.Atoi(v)
+		if err != nil {
+			return score, fmt.Errorf("invalid critical_strikes: %w", err)
+		}
+		score.CriticalStrikes = strikes
+	}
+
+	if v, ok := data[fieldCooldownUntil]; ok {
+		ts, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return score, fmt.Errorf("invalid cooldown_until: %w", err)
+		}
+		// Unix timestamp 0 means no cooldown (zero time value)
+		if ts > 0 {
+			score.CooldownUntil = time.Unix(ts, 0)
+		}
 	}
 
 	return score, nil

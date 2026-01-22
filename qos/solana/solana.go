@@ -85,7 +85,7 @@ func (QoS) HydrateDisqualifiedEndpointsResponse(_ protocol.ServiceID, _ *devtool
 
 // UpdateFromExtractedData updates QoS state from extracted observation data.
 // Called by the observation pipeline after async parsing completes.
-// This updates the perceived block height without blocking user requests.
+// This updates the perceived block height and stores the endpoint's block height observation.
 //
 // Implements gateway.QoSService interface.
 func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *qostypes.ExtractedData) error {
@@ -98,11 +98,28 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 		return nil
 	}
 
+	blockHeight := uint64(data.BlockHeight)
+
+	// Lock the endpoint store to update the endpoint observation
+	q.EndpointStore.endpointsMu.Lock()
+	storedEndpoint := q.EndpointStore.endpoints[endpointAddr]
+
+	// Update the endpoint's block height observation (Solana uses block height from getEpochInfo)
+	// Create or update the SolanaGetEpochInfoResponse with just the block height
+	if storedEndpoint.SolanaGetEpochInfoResponse == nil {
+		storedEndpoint.SolanaGetEpochInfoResponse = &qosobservations.SolanaGetEpochInfoResponse{}
+	}
+	storedEndpoint.SolanaGetEpochInfoResponse.BlockHeight = blockHeight
+
+	// Store the updated endpoint back
+	q.EndpointStore.endpoints[endpointAddr] = storedEndpoint
+	q.EndpointStore.endpointsMu.Unlock()
+
+	// Lock service state to update perceived block height
 	q.serviceStateLock.Lock()
 	defer q.serviceStateLock.Unlock()
 
 	// Update perceived block height to maximum across all endpoints
-	blockHeight := uint64(data.BlockHeight)
 	if blockHeight > q.perceivedBlockHeight {
 		q.logger.Debug().
 			Str("endpoint", string(endpointAddr)).

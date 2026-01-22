@@ -80,6 +80,7 @@ func NewService(config Config, store Storage) ReputationService {
 
 // RecordSignal records a signal event for an endpoint.
 // Updates local cache immediately and queues async write to backend storage.
+// Also manages the strike system for persistently failing endpoints.
 func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Signal) error {
 	if !s.config.Enabled {
 		return nil
@@ -105,8 +106,35 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 
 	if signal.IsPositive() {
 		score.SuccessCount++
+		// Reset strikes on successful request - endpoint has proven it can work
+		score.CriticalStrikes = 0
 	} else if signal.IsNegative() {
 		score.ErrorCount++
+	}
+
+	// Strike system: track consecutive critical/fatal errors
+	if signal.Type == SignalTypeCriticalError || signal.Type == SignalTypeFatalError {
+		score.CriticalStrikes++
+
+		// Apply cooldown if strikes exceed threshold
+		if score.CriticalStrikes >= DefaultStrikeThreshold {
+			// Exponential backoff: base * 2^(strikes - threshold)
+			exponent := score.CriticalStrikes - DefaultStrikeThreshold
+			cooldownDuration := DefaultBaseCooldown * time.Duration(1<<exponent)
+			if cooldownDuration > DefaultMaxCooldown {
+				cooldownDuration = DefaultMaxCooldown
+			}
+			score.CooldownUntil = time.Now().Add(cooldownDuration)
+
+			if s.logger != nil {
+				s.logger.Warn().
+					Str("endpoint", key.String()).
+					Int("strikes", score.CriticalStrikes).
+					Dur("cooldown_duration", cooldownDuration).
+					Time("cooldown_until", score.CooldownUntil).
+					Msg("[STRIKE_SYSTEM] Endpoint entered cooldown due to repeated critical errors")
+			}
+		}
 	}
 
 	// Update latency metrics if signal includes latency data
