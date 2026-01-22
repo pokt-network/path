@@ -162,10 +162,10 @@ const (
 	MaxScore float64 = 100
 
 	// InitialScore is the starting score for new endpoints.
-	// Endpoints start at tier 2 level (60) requiring them to prove reliability
-	// before getting tier 1 treatment. Reduced from 80 to prevent unknown
-	// endpoints from immediately getting top-tier selection priority.
-	InitialScore float64 = 60
+	// Endpoints start at tier 1/2 boundary (80) giving new endpoints benefit of doubt.
+	// With buffer of 50 points above min threshold (30), endpoints can survive
+	// transient errors without being filtered out prematurely.
+	InitialScore float64 = 80
 
 	// DefaultMinThreshold is the minimum score required for endpoint selection.
 	// Endpoints below this threshold are excluded from selection.
@@ -175,8 +175,8 @@ const (
 // Strike system constants control extended cooldowns for persistently failing endpoints.
 const (
 	// DefaultStrikeThreshold is the number of consecutive critical/fatal errors
-	// before an extended cooldown is applied.
-	DefaultStrikeThreshold = 3
+	// before an extended cooldown is applied. Set to 5 for more tolerance.
+	DefaultStrikeThreshold = 5
 
 	// DefaultBaseCooldown is the initial cooldown duration after hitting the strike threshold.
 	// Each additional strike doubles this duration (exponential backoff).
