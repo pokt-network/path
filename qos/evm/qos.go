@@ -162,18 +162,21 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 	qos.endpointStore.endpoints[endpointAddr] = storedEndpoint
 	qos.endpointStore.endpointsMu.Unlock()
 
-	// Lock service state to update perceived block number
-	qos.serviceStateLock.Lock()
-	defer qos.serviceStateLock.Unlock()
-
-	// Update perceived block number to maximum across all endpoints
-	if blockNumber > qos.perceivedBlockNumber {
-		qos.logger.Debug().
-			Str("endpoint", string(endpointAddr)).
-			Uint64("old_block", qos.perceivedBlockNumber).
-			Uint64("new_block", blockNumber).
-			Msg("Updating perceived block number from observation pipeline")
-		qos.perceivedBlockNumber = blockNumber
+	// Atomically update perceived block number to maximum using compare-and-swap loop
+	for {
+		current := qos.perceivedBlockNumber.Load()
+		if blockNumber <= current {
+			break // Current value is already >= our block number
+		}
+		if qos.perceivedBlockNumber.CompareAndSwap(current, blockNumber) {
+			qos.logger.Debug().
+				Str("endpoint", string(endpointAddr)).
+				Uint64("old_block", current).
+				Uint64("new_block", blockNumber).
+				Msg("Updating perceived block number from observation pipeline")
+			break
+		}
+		// CAS failed, another goroutine updated it - retry
 	}
 
 	return nil
@@ -182,10 +185,9 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 // GetPerceivedBlockNumber returns the perceived current block number.
 // Used by health checks for block height validation.
 // Returns 0 if no block number has been observed yet.
+// Lock-free using atomic operations.
 //
 // Implements gateway.QoSService interface.
 func (qos *QoS) GetPerceivedBlockNumber() uint64 {
-	qos.serviceStateLock.RLock()
-	defer qos.serviceStateLock.RUnlock()
-	return qos.perceivedBlockNumber
+	return qos.perceivedBlockNumber.Load()
 }

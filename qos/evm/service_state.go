@@ -3,6 +3,7 @@ package evm
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -44,10 +45,11 @@ type serviceState struct {
 	// based on endpoints' responses to `eth_blockNumber` requests.
 	// It is calculated as the maximum of block height reported by
 	// any of the endpoints for the service.
+	// Uses atomic.Uint64 for lock-free reads to avoid contention on hot path.
 	//
 	// See the following link for more details:
 	// https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_blocknumber
-	perceivedBlockNumber uint64
+	perceivedBlockNumber atomic.Uint64
 
 	// archivalState contains the current state of the EVM archival check for the service.
 	archivalState archivalState
@@ -147,13 +149,14 @@ func (ss *serviceState) ApplyObservations(observations *qosobservations.Observat
 // - Only endpoints with received observations are considered.
 // - Estimations are derived from these updated endpoints.
 func (ss *serviceState) updateFromEndpoints(updatedEndpoints map[protocol.EndpointAddr]endpoint) error {
-	ss.serviceStateLock.Lock()
-	defer ss.serviceStateLock.Unlock()
+	// Track the maximum block number seen across all endpoints
+	var maxBlockNumber uint64
 
 	for endpointAddr, endpoint := range updatedEndpoints {
+		currentPerceived := ss.perceivedBlockNumber.Load()
 		logger := ss.logger.With(
 			"endpoint_addr", endpointAddr,
-			"perceived_block_number", ss.perceivedBlockNumber,
+			"perceived_block_number", currentPerceived,
 		)
 
 		// Do not update the perceived block number if the chain ID is invalid.
@@ -169,20 +172,35 @@ func (ss *serviceState) updateFromEndpoints(updatedEndpoints map[protocol.Endpoi
 			continue
 		}
 
-		// Update perceived block number to maximum instead of overwriting with last endpoint.
-		// Per perceivedBlockNumber field documentation, it should be "the maximum of block height reported by any endpoint"
-		// but code was incorrectly overwriting with each endpoint, causing validation failures.
-		if blockNumber > ss.perceivedBlockNumber {
-			logger.Debug().Msgf("Updating perceived block number from %d to %d", ss.perceivedBlockNumber, blockNumber)
-			ss.perceivedBlockNumber = blockNumber
+		if blockNumber > maxBlockNumber {
+			maxBlockNumber = blockNumber
+		}
+	}
+
+	// Atomically update perceived block number to maximum using compare-and-swap loop
+	if maxBlockNumber > 0 {
+		for {
+			current := ss.perceivedBlockNumber.Load()
+			if maxBlockNumber <= current {
+				break // Current value is already >= our max
+			}
+			if ss.perceivedBlockNumber.CompareAndSwap(current, maxBlockNumber) {
+				ss.logger.Debug().
+					Uint64("old_block", current).
+					Uint64("new_block", maxBlockNumber).
+					Msg("Updated perceived block number")
+				break
+			}
+			// CAS failed, another goroutine updated it - retry
 		}
 	}
 
 	// If archival checks are enabled for the service, update the archival state.
+	// This still needs the lock for archival state coordination.
 	if ss.archivalState.isEnabled() {
-		// Update the archival state based on the perceived block number.
-		// When the expected balance at the archival block number is known, this becomes a no-op.
-		ss.archivalState.updateArchivalState(ss.perceivedBlockNumber, updatedEndpoints)
+		ss.serviceStateLock.Lock()
+		ss.archivalState.updateArchivalState(ss.perceivedBlockNumber.Load(), updatedEndpoints)
+		ss.serviceStateLock.Unlock()
 	}
 
 	return nil

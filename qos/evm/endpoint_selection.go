@@ -119,10 +119,10 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 // - Failed endpoints are captured with specific failure reasons
 // - Successful endpoints are captured for metrics tracking
 // - Only valid endpoints are returned for potential selection
+//
+// Performance: Copies endpoint data under lock, then releases lock before validation loop
+// to minimize lock contention on the hot path.
 func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints protocol.EndpointAddrList) (protocol.EndpointAddrList, []*qosobservations.EndpointValidationResult, error) {
-	ss.endpointStore.endpointsMu.RLock()
-	defer ss.endpointStore.endpointsMu.RUnlock()
-
 	logger := ss.logger.With("method", "filterValidEndpointsWithDetails").With("qos_instance", "evm")
 
 	if len(availableEndpoints) == 0 {
@@ -131,17 +131,33 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 
 	logger.Debug().Msgf("About to filter through %d available endpoints", len(availableEndpoints))
 
+	// Copy endpoint data under lock to minimize lock hold time
+	// This prevents lock contention with UpdateFromExtractedData on the observation path
+	type endpointData struct {
+		addr     protocol.EndpointAddr
+		endpoint endpoint
+		found    bool
+	}
+	endpointsCopy := make([]endpointData, len(availableEndpoints))
+
+	ss.endpointStore.endpointsMu.RLock()
+	for i, addr := range availableEndpoints {
+		ep, found := ss.endpointStore.endpoints[addr]
+		endpointsCopy[i] = endpointData{addr: addr, endpoint: ep, found: found}
+	}
+	ss.endpointStore.endpointsMu.RUnlock()
+
+	// Now iterate without holding the lock
 	var filteredEndpointsAddr protocol.EndpointAddrList
 	var validationResults []*qosobservations.EndpointValidationResult
 
 	// TODO_FUTURE: use service-specific metrics to add an endpoint ranking method
 	// which can be used to assign a rank/score to a valid endpoint to guide endpoint selection.
-	for _, availableEndpointAddr := range availableEndpoints {
-		logger := logger.With("endpoint_addr", availableEndpointAddr)
+	for _, data := range endpointsCopy {
+		logger := logger.With("endpoint_addr", data.addr)
 		logger.Debug().Msg("processing endpoint")
 
-		endpoint, found := ss.endpointStore.endpoints[availableEndpointAddr]
-		if !found {
+		if !data.found {
 			// It is valid for an endpoint to not be in the store yet (e.g., first request,
 			// no observations collected). Treat it as a fresh endpoint and allow it.
 			// It will be added to the store once observations are collected.
@@ -152,22 +168,22 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 
 			// Create validation result for endpoint not in store (but still valid)
 			result := &qosobservations.EndpointValidationResult{
-				EndpointAddr: string(availableEndpointAddr),
+				EndpointAddr: string(data.addr),
 				Success:      true,
 			}
 			validationResults = append(validationResults, result)
-			filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
+			filteredEndpointsAddr = append(filteredEndpointsAddr, data.addr)
 			continue
 		}
 
-		if err := ss.basicEndpointValidation(endpoint); err != nil {
-			logger.Warn().Err(err).Msgf("⚠️ SKIPPING %s endpoint because it failed basic validation: %v", availableEndpointAddr, err)
+		if err := ss.basicEndpointValidation(data.endpoint); err != nil {
+			logger.Warn().Err(err).Msgf("⚠️ SKIPPING %s endpoint because it failed basic validation: %v", data.addr, err)
 
 			// Create validation result for validation failure
 			failureReason := ss.categorizeValidationFailure(err)
 			errorMsg := err.Error()
 			result := &qosobservations.EndpointValidationResult{
-				EndpointAddr:   string(availableEndpointAddr),
+				EndpointAddr:   string(data.addr),
 				Success:        false,
 				FailureReason:  &failureReason,
 				FailureDetails: &errorMsg,
@@ -178,13 +194,13 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 
 		// Endpoint passed validation - record success and add to valid list
 		result := &qosobservations.EndpointValidationResult{
-			EndpointAddr: string(availableEndpointAddr),
+			EndpointAddr: string(data.addr),
 			Success:      true,
 			// FailureReason and FailureDetails are nil for successful validations
 		}
 		validationResults = append(validationResults, result)
-		filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
-		logger.Debug().Msgf("endpoint passed validation: %s", availableEndpointAddr)
+		filteredEndpointsAddr = append(filteredEndpointsAddr, data.addr)
+		logger.Debug().Msgf("endpoint passed validation: %s", data.addr)
 	}
 
 	return filteredEndpointsAddr, validationResults, nil
@@ -230,10 +246,9 @@ func (ss *serviceState) categorizeValidationFailure(err error) qosobservations.E
 // - The endpoint's response to an `eth_chainId` request is not the expected chain ID.
 // - The endpoint's response to an `eth_blockNumber` request is greater than the perceived block number.
 // - The endpoint's archival check is invalid, if enabled.
+//
+// Note: This function is lock-free - perceivedBlockNumber uses atomic operations.
 func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
-	ss.serviceStateLock.RLock()
-	defer ss.serviceStateLock.RUnlock()
-
 	// Check if the endpoint has returned an empty response.
 	if endpoint.hasReturnedEmptyResponse {
 		return fmt.Errorf("empty response validation failed: %w", errEmptyResponseObs)
@@ -273,6 +288,8 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
 //   - sync_allowance is 0 (check disabled)
 //   - No perceived block number yet (no chain data to compare against)
 //   - Endpoint has no block number observation (no endpoint data to validate)
+//
+// Note: This function is lock-free - perceivedBlockNumber uses atomic operations.
 func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error {
 	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
 
@@ -284,8 +301,11 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 		return nil
 	}
 
+	// Load perceived block number atomically (lock-free)
+	perceivedBlock := ss.perceivedBlockNumber.Load()
+
 	// If we don't have a perceived block number yet, skip the check (no data to compare against)
-	if ss.perceivedBlockNumber == 0 {
+	if perceivedBlock == 0 {
 		ss.logger.Warn().
 			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 			Uint64("sync_allowance", syncAllowance).
@@ -297,7 +317,7 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 	if check.parsedBlockNumberResponse == nil {
 		ss.logger.Warn().
 			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-			Uint64("perceived_block", ss.perceivedBlockNumber).
+			Uint64("perceived_block", perceivedBlock).
 			Uint64("sync_allowance", syncAllowance).
 			Msg("🔍 Sync allowance check SKIPPED (endpoint has no block number observation)")
 		return nil
@@ -313,16 +333,16 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 
 	// If the endpoint's block height is less than the perceived block height minus the sync allowance,
 	// then the endpoint is behind the chain and should be filtered out.
-	minAllowedBlockNumber := ss.perceivedBlockNumber - syncAllowance
+	minAllowedBlockNumber := perceivedBlock - syncAllowance
 
 	// Log the sync allowance validation details
 	ss.logger.Warn().
 		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 		Uint64("endpoint_block", parsedBlockNumber).
-		Uint64("perceived_block", ss.perceivedBlockNumber).
+		Uint64("perceived_block", perceivedBlock).
 		Uint64("sync_allowance", syncAllowance).
 		Uint64("min_allowed_block", minAllowedBlockNumber).
-		Int64("blocks_behind", int64(ss.perceivedBlockNumber)-int64(parsedBlockNumber)).
+		Int64("blocks_behind", int64(perceivedBlock)-int64(parsedBlockNumber)).
 		Bool("within_allowance", parsedBlockNumber >= minAllowedBlockNumber).
 		Msg("🔍 Sync allowance validation")
 
