@@ -326,7 +326,7 @@ func (q *ObservationQueue) processObservation(obs *QueuedObservation) {
 	)
 
 	// Run all extractions (this is the heavy parsing work)
-	data.ExtractAll(extractor)
+	data.ExtractAll(extractor, obs.RequestBody)
 
 	// Call handler if set
 	if q.handler != nil {
