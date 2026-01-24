@@ -12,8 +12,129 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/metrics"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/heuristic"
+	"github.com/pokt-network/path/reputation"
 )
+
+// responseCheckResult contains the result of response success check.
+type responseCheckResult struct {
+	// Success indicates if the response should be treated as successful.
+	Success bool
+	// HeuristicResult contains the heuristic analysis result if payload was analyzed.
+	// This is nil if no heuristic analysis was performed.
+	HeuristicResult *heuristic.AnalysisResult
+}
+
+// checkResponseSuccess performs a comprehensive check to determine if a response
+// should be considered successful. It combines HTTP status code checks with
+// heuristic payload analysis to catch errors that might slip through with
+// only HTTP status validation.
+//
+// This catches cases where the endpoint returns HTTP 200 but the payload
+// contains a JSON-RPC error or other error indicators.
+//
+// Parameters:
+//   - err: Any error returned from the protocol layer
+//   - statusCode: HTTP status code from the endpoint
+//   - responseBytes: Response payload bytes
+//   - rpcType: RPC type for protocol-specific heuristic analysis
+//   - logger: Logger for debugging
+//
+// Returns responseCheckResult with success status and optional heuristic result.
+func checkResponseSuccess(
+	err error,
+	statusCode int,
+	responseBytes []byte,
+	rpcType sharedtypes.RPCType,
+	logger polylog.Logger,
+) responseCheckResult {
+	// Protocol error - definitely not successful
+	if err != nil {
+		return responseCheckResult{Success: false}
+	}
+
+	// HTTP status code check (original logic)
+	httpSuccess := statusCode == 0 || (statusCode >= 200 && statusCode < 300)
+	if !httpSuccess {
+		return responseCheckResult{Success: false}
+	}
+
+	// Heuristic payload analysis - catch errors that slip through HTTP status
+	// This detects JSON-RPC errors, malformed responses, HTML error pages, empty responses, etc.
+	result := heuristic.Analyze(responseBytes, statusCode, rpcType)
+	if result.ShouldRetry {
+		logger.Debug().
+			Str("heuristic_reason", result.Reason).
+			Float64("heuristic_confidence", result.Confidence).
+			Str("heuristic_details", result.Details).
+			Int("response_size", len(responseBytes)).
+			Msg("Heuristic analysis detected error in response payload despite HTTP success status")
+		return responseCheckResult{Success: false, HeuristicResult: &result}
+	}
+
+	return responseCheckResult{Success: true}
+}
+
+// recordHeuristicErrorToReputation records a correcting error signal to reputation
+// when heuristic analysis detects an error that the protocol layer missed.
+//
+// This is needed because the protocol layer records a success signal based on HTTP 200,
+// but the payload may contain a JSON-RPC error or other error indicators. This function
+// records a correcting negative signal to offset the incorrect success signal.
+func recordHeuristicErrorToReputation(
+	ctx context.Context,
+	reputationSvc reputation.ReputationService,
+	serviceID protocol.ServiceID,
+	endpointAddr protocol.EndpointAddr,
+	rpcType sharedtypes.RPCType,
+	heuristicResult *heuristic.AnalysisResult,
+	logger polylog.Logger,
+) {
+	if reputationSvc == nil || heuristicResult == nil {
+		return
+	}
+
+	keyBuilder := reputationSvc.KeyBuilderForService(serviceID)
+	endpointKey := keyBuilder.BuildKey(serviceID, endpointAddr, rpcType)
+
+	// Determine signal severity based on heuristic confidence and reason
+	var signal reputation.Signal
+	var metricSignal string
+
+	// High confidence heuristic errors (JSON-RPC errors, HTML pages) are more severe
+	// Note: latency=0 for heuristic errors since this is a payload analysis, not timing
+	if heuristicResult.Confidence >= 0.95 {
+		signal = reputation.NewMajorErrorSignal("heuristic_"+heuristicResult.Reason, 0)
+		metricSignal = metrics.SignalMajorError
+	} else {
+		signal = reputation.NewMinorErrorSignal("heuristic_" + heuristicResult.Reason)
+		metricSignal = metrics.SignalMinorError
+	}
+
+	// Fire-and-forget: don't block request on reputation recording
+	if err := reputationSvc.RecordSignal(ctx, endpointKey, signal); err != nil {
+		logger.Warn().Err(err).Msg("Failed to record heuristic error signal to reputation")
+	}
+
+	// Record metric for heuristic-detected errors
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(endpointAddr))
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	rpcTypeStr := metrics.NormalizeRPCType(rpcType.String())
+	// Use "heuristic_error" as status code category since HTTP was 200
+	metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), "heuristic_error", metricSignal, metrics.RelayTypeNormal, 0)
+
+	logger.Debug().
+		Str("endpoint", string(endpointAddr)).
+		Str("service_id", string(serviceID)).
+		Str("heuristic_reason", heuristicResult.Reason).
+		Float64("heuristic_confidence", heuristicResult.Confidence).
+		Str("reputation_signal", metricSignal).
+		Msg("Recorded heuristic error signal to reputation")
+}
 
 // TODO_TECHDEBT(@adshmh): A single protocol context should handle both single/parallel calls to one or more endpoints.
 // Including:
@@ -74,7 +195,7 @@ func (rc *requestContext) HandleRelayRequest() error {
 }
 
 // handleSingleRelayRequest handles a single relay request (original behavior)
-// handleSingleRelayRequest handles a single relay request (original behavior)
+// handleSingleRelayRequest handles a single relay request with optional hedge racing.
 func (rc *requestContext) handleSingleRelayRequest() error {
 	logger := rc.logger.With("method", "handleSingleRelayRequest")
 
@@ -95,6 +216,35 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		if retryConfig.MaxRetries != nil && *retryConfig.MaxRetries > 0 {
 			maxAttempts = *retryConfig.MaxRetries + 1 // +1 for the initial attempt
 		}
+	}
+
+	// Check if hedge racing is enabled
+	var hedgeDelay time.Duration
+	var connectTimeout time.Duration
+	if retryConfig != nil && retryConfig.HedgeDelay != nil && *retryConfig.HedgeDelay > 0 {
+		hedgeDelay = *retryConfig.HedgeDelay
+		if retryConfig.ConnectTimeout != nil {
+			connectTimeout = *retryConfig.ConnectTimeout
+		} else {
+			connectTimeout = 500 * time.Millisecond // Default
+		}
+		logger.Info().
+			Dur("hedge_delay", hedgeDelay).
+			Dur("connect_timeout", connectTimeout).
+			Msg("🏁 Hedge racing enabled for this service")
+	} else {
+		// Debug why hedging is not enabled
+		hasRetryConfig := retryConfig != nil
+		hasHedgeDelay := retryConfig != nil && retryConfig.HedgeDelay != nil
+		hedgeDelayValue := time.Duration(0)
+		if hasHedgeDelay {
+			hedgeDelayValue = *retryConfig.HedgeDelay
+		}
+		logger.Debug().
+			Bool("has_retry_config", hasRetryConfig).
+			Bool("has_hedge_delay", hasHedgeDelay).
+			Dur("hedge_delay_value", hedgeDelayValue).
+			Msg("Hedge racing NOT enabled - checking why")
 	}
 
 	var lastErr error
@@ -123,6 +273,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 		// Log retry attempt before timing to exclude logging overhead from latency measurement
 		if attempt > 1 {
+			// Track retry count for response headers
+			rc.retryCount++
+
 			logger.Debug().
 				Int("attempt", attempt).
 				Int("max_attempts", maxAttempts).
@@ -174,15 +327,13 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				triedEndpoints = make(map[protocol.EndpointAddr]bool)
 			}
 
-			// Select new endpoint using QoS rules (reputation-based selection)
-			selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultiple(filteredEndpoints, 1)
-			if err != nil {
-				logger.Error().Err(err).Msg("Failed to select new endpoint for retry")
-				lastErr = err
+			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
+			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType)
+			if newEndpointAddr == "" {
+				logger.Error().Msg("Failed to select endpoint for retry - no endpoints available")
+				lastErr = fmt.Errorf("no endpoints available for retry")
 				break
 			}
-
-			newEndpointAddr := selectedEndpoints[0]
 			currentEndpointAddr = newEndpointAddr
 
 			// Build new protocol context for the selected endpoint
@@ -213,6 +364,111 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			}
 		}
 
+		// ========================================================================
+		// HEDGE RACING: For the first attempt with hedge_delay > 0, use hedge racing
+		// ========================================================================
+		if attempt == 1 && hedgeDelay > 0 {
+			// Get available endpoints for hedge racing
+			availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
+				rc.context, rc.serviceID, rpcType, rc.originalHTTPRequest)
+			if err != nil {
+				logger.Warn().Err(err).Msg("Failed to get endpoints for hedge racing, falling back to normal request")
+				// Fall through to normal request
+			} else if len(availableEndpoints) > 0 {
+				// Select primary endpoint (first one, which is already reputation-sorted)
+				primaryEndpoint := availableEndpoints[0]
+
+				// Create hedge racer and run the race
+				racer := newHedgeRacer(rc, logger, rpcType, hedgeDelay, connectTimeout)
+				hedgeResponses, hedgeErr := racer.race(rc.context, currentProtocolCtx, primaryEndpoint, availableEndpoints)
+
+				// Copy hedge result to request context for response headers
+				rc.hedgeResult = racer.raceResult
+
+				// Process hedge race result
+				if hedgeErr == nil && len(hedgeResponses) > 0 {
+					// Hedge race succeeded - process the winning response
+					statusCode := hedgeResponses[0].HTTPStatusCode
+					endpointAddr := hedgeResponses[0].EndpointAddr
+					responseBytesForHeuristic := hedgeResponses[0].Bytes
+
+					// Check if response is actually successful (HTTP status + heuristic)
+					checkResult := checkResponseSuccess(hedgeErr, statusCode, responseBytesForHeuristic, rpcType, logger)
+					if checkResult.Success {
+						// Success! Process the response
+						for _, endpointResponse := range hedgeResponses {
+							rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+							rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+							if len(rc.relayMetadata) < 10 {
+								rc.relayMetadata = append(rc.relayMetadata, endpointResponse.Metadata)
+							}
+						}
+
+						// Record batch size metric
+						totalLatency := time.Since(retryLoopStartTime).Seconds()
+						metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), batchCount, totalLatency)
+
+						logger.Info().
+							Str("endpoint", string(endpointAddr)).
+							Int("status_code", statusCode).
+							Str("hedge_result", rc.hedgeResult).
+							Dur("total_latency", time.Since(retryLoopStartTime)).
+							Msg("✅ Hedge race completed successfully")
+
+						return nil
+					}
+
+					// Heuristic detected error - record and continue to retry
+					if checkResult.HeuristicResult != nil && endpointAddr != "" {
+						recordHeuristicErrorToReputation(
+							rc.context,
+							rc.protocol.GetReputationService(),
+							rc.serviceID,
+							endpointAddr,
+							rpcType,
+							checkResult.HeuristicResult,
+							logger,
+						)
+					}
+
+					lastErr = fmt.Errorf("hedge race response failed heuristic check")
+					lastStatusCode = statusCode
+					lastEndpointAddr = endpointAddr
+					currentEndpointAddr = endpointAddr
+
+					logger.Warn().
+						Str("endpoint", string(endpointAddr)).
+						Int("status_code", statusCode).
+						Msg("Hedge race response failed heuristic check, will retry")
+				} else {
+					// Hedge race failed - store error and continue to retry
+					lastErr = hedgeErr
+					if len(hedgeResponses) > 0 {
+						lastStatusCode = hedgeResponses[0].HTTPStatusCode
+						lastEndpointAddr = hedgeResponses[0].EndpointAddr
+						currentEndpointAddr = hedgeResponses[0].EndpointAddr
+					}
+
+					logger.Warn().Err(hedgeErr).
+						Str("hedge_result", rc.hedgeResult).
+						Msg("Hedge race failed, will retry with normal path")
+				}
+
+				// Mark endpoints tried by hedge racer
+				triedEndpoints[primaryEndpoint] = true
+				if racer.hedgeEndpoint != "" {
+					triedEndpoints[racer.hedgeEndpoint] = true
+				}
+
+				// Continue to next attempt (retry)
+				continue
+			}
+		}
+
+		// ========================================================================
+		// NORMAL REQUEST PATH (non-hedge or retry attempts)
+		// ========================================================================
+
 		// Track the start time AFTER logging to measure actual request duration
 		attemptStartTime := time.Now()
 
@@ -226,6 +482,8 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		// Extract status code and endpoint address from responses (if any)
 		statusCode := 0
 		var endpointAddr protocol.EndpointAddr
+		var supplierForTracking string
+
 		if len(endpointResponses) == 0 {
 			// No response from endpoint - likely protocol or network error
 			logger.Warn().
@@ -233,6 +491,8 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				Int("attempt", attempt).
 				Msg("HandleServiceRequest returned empty response - protocol or network error")
 			// statusCode remains 0, endpointAddr remains empty
+			// Use currentEndpointAddr for supplier tracking (extract supplier from endpoint format)
+			supplierForTracking = extractSupplierFromEndpoint(currentEndpointAddr)
 		} else {
 			statusCode = endpointResponses[0].HTTPStatusCode
 			endpointAddr = endpointResponses[0].EndpointAddr
@@ -240,16 +500,40 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			if attempt == 1 {
 				currentEndpointAddr = endpointAddr
 			}
+			// Get supplier from response metadata (preferred) or extract from endpoint
+			supplierForTracking = endpointResponses[0].Metadata.SupplierAddress
+			if supplierForTracking == "" {
+				supplierForTracking = extractSupplierFromEndpoint(endpointAddr)
+			}
 		}
 
-		// Check if the request was successful
-		if err == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
+		// Track supplier tried for response headers (up to 10) - track ALL attempts including failures
+		if supplierForTracking != "" && len(rc.suppliersTried) < 10 {
+			// Only add if not already tracked (avoid duplicates on retry to same supplier)
+			alreadyTracked := false
+			for _, s := range rc.suppliersTried {
+				if s == supplierForTracking {
+					alreadyTracked = true
+					break
+				}
+			}
+			if !alreadyTracked {
+				rc.suppliersTried = append(rc.suppliersTried, supplierForTracking)
+			}
+		}
+
+		// Extract response bytes for heuristic analysis
+		var responseBytesForHeuristic []byte
+		if len(endpointResponses) > 0 {
+			responseBytesForHeuristic = endpointResponses[0].Bytes
+		}
+
+		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, rpcType, logger)
+		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
-				responseBytes := 0
-				if len(endpointResponses) > 0 {
-					responseBytes = len(endpointResponses[0].Bytes)
-				}
+				responseBytes := len(responseBytesForHeuristic)
 				logger.Warn().
 					Str("endpoint", string(endpointAddr)).
 					Int("response_count", len(endpointResponses)).
@@ -269,6 +553,11 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 				// Queue observation for async parsing (sampled, non-blocking)
 				rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+
+				// Capture relay metadata for response headers (sample up to 10 for batched relays)
+				if len(rc.relayMetadata) < 10 {
+					rc.relayMetadata = append(rc.relayMetadata, endpointResponse.Metadata)
+				}
 			}
 
 			if attempt > 1 {
@@ -286,6 +575,21 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), batchCount, totalLatency)
 
 			return nil
+		}
+
+		// If heuristic detected an error, record a correcting signal to reputation.
+		// This is needed because the protocol layer recorded a success signal (HTTP 200),
+		// but the payload contains an error.
+		if checkResult.HeuristicResult != nil && endpointAddr != "" {
+			recordHeuristicErrorToReputation(
+				rc.context,
+				rc.protocol.GetReputationService(),
+				rc.serviceID,
+				endpointAddr,
+				rpcType,
+				checkResult.HeuristicResult,
+				logger,
+			)
 		}
 
 		// Store the last error, status code, and endpoint for potential retry decision
@@ -315,15 +619,13 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 		// Check if we should retry
 		if attempt < maxAttempts {
-			// Only check shouldRetry if we have endpoint info
-			if endpointAddr == "" {
-				logger.Debug().
-					Int("attempt", attempt).
-					Msg("Skipping retry check - no endpoint address available")
-				break
+			// Use currentEndpointAddr for metrics if endpointAddr is empty (protocol error with no response)
+			endpointForMetrics := string(endpointAddr)
+			if endpointForMetrics == "" {
+				endpointForMetrics = string(currentEndpointAddr)
 			}
 
-			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, string(endpointAddr)) {
+			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, endpointForMetrics, checkResult.HeuristicResult) {
 				logger.Debug().
 					Int("attempt", attempt).
 					Int("status_code", statusCode).
@@ -358,6 +660,8 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		logger.Error().Err(lastErr).
 			Int("max_attempts", maxAttempts).
 			Msg("Failed to send relay request after all retry attempts")
+		// Set the protocol error on QoS context for more informative client error messages
+		rc.qosCtx.SetProtocolError(lastErr)
 		return lastErr
 	}
 
@@ -366,7 +670,10 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		Int("status_code", lastStatusCode).
 		Int("max_attempts", maxAttempts).
 		Msg("Relay request failed with non-success status code after all retry attempts")
-	return fmt.Errorf("relay request failed with status code %d after %d attempts", lastStatusCode, maxAttempts)
+	statusErr := fmt.Errorf("relay request failed with status code %d after %d attempts", lastStatusCode, maxAttempts)
+	// Set the protocol error on QoS context for more informative client error messages
+	rc.qosCtx.SetProtocolError(statusErr)
+	return statusErr
 }
 
 // TODO_TECHDEBT(@adshmh): Remove this method:
@@ -402,7 +709,7 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 	}()
 
 	// TODO_TECHDEBT: Make sure timed out parallel requests are also sanctioned.
-	ctx, cancel := context.WithTimeout(rc.context, RelayRequestTimeout)
+	ctx, cancel := context.WithTimeout(rc.context, DefaultRelayRequestTimeout)
 	defer cancel()
 
 	resultChan, qosContextMutex := rc.launchParallelRequests(ctx, logger, rpcType)
@@ -533,15 +840,13 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				triedEndpoints = make(map[protocol.EndpointAddr]bool)
 			}
 
-			// Select new endpoint using QoS rules (reputation-based selection)
-			selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultiple(filteredEndpoints, 1)
-			if err != nil {
-				logger.Error().Err(err).Int("endpoint_index", index).
-					Msg("Failed to select new endpoint for retry in parallel path")
+			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
+			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType)
+			if newEndpointAddr == "" {
+				logger.Error().Int("endpoint_index", index).
+					Msg("Failed to select endpoint for retry in parallel path - no endpoints available")
 				return
 			}
-
-			newEndpointAddr := selectedEndpoints[0]
 			currentEndpointAddr = newEndpointAddr
 
 			// Build new protocol context for the selected endpoint
@@ -597,14 +902,18 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			}
 		}
 
-		// Check if the request was successful
-		if err == nil && (statusCode == 0 || (statusCode >= 200 && statusCode < 300)) {
+		// Extract response bytes for heuristic analysis
+		var responseBytesForHeuristic []byte
+		if len(responses) > 0 {
+			responseBytesForHeuristic = responses[0].Bytes
+		}
+
+		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, rpcType, logger)
+		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
-				responseBytes := 0
-				if len(responses) > 0 {
-					responseBytes = len(responses[0].Bytes)
-				}
+				responseBytes := len(responseBytesForHeuristic)
 				logger.Warn().
 					Str("endpoint", string(endpointAddr)).
 					Int("endpoint_index", index).
@@ -637,6 +946,21 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				logger.Debug().Msgf("Request to endpoint %d canceled after success on attempt %d", index, attempt)
 			}
 			return
+		}
+
+		// If heuristic detected an error, record a correcting signal to reputation.
+		// This is needed because the protocol layer recorded a success signal (HTTP 200),
+		// but the payload contains an error.
+		if checkResult.HeuristicResult != nil && endpointAddr != "" {
+			recordHeuristicErrorToReputation(
+				ctx,
+				rc.protocol.GetReputationService(),
+				rc.serviceID,
+				endpointAddr,
+				rpcType,
+				checkResult.HeuristicResult,
+				logger,
+			)
 		}
 
 		// Store the last error, responses, and endpoint for potential retry decision
@@ -679,7 +1003,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				break
 			}
 
-			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, string(endpointAddr)) {
+			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, string(endpointAddr), checkResult.HeuristicResult) {
 				logger.Debug().
 					Int("endpoint_index", index).
 					Int("attempt", attempt).
@@ -786,6 +1110,29 @@ func (rc *requestContext) handleSuccessfulResponse(
 
 		// Queue observation for async parsing (sampled, non-blocking)
 		rc.tryQueueObservation(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+
+		// Capture relay metadata for response headers (sample up to 10 for batched relays)
+		if len(rc.relayMetadata) < 10 {
+			rc.relayMetadata = append(rc.relayMetadata, response.Metadata)
+		}
+
+		// Track supplier tried for response headers (up to 10)
+		if len(rc.suppliersTried) < 10 {
+			supplierAddr := response.Metadata.SupplierAddress
+			if supplierAddr != "" {
+				// Only add if not already tracked (avoid duplicates)
+				alreadyTracked := false
+				for _, s := range rc.suppliersTried {
+					if s == supplierAddr {
+						alreadyTracked = true
+						break
+					}
+				}
+				if !alreadyTracked {
+					rc.suppliersTried = append(rc.suppliersTried, supplierAddr)
+				}
+			}
+		}
 	}
 
 	return nil
@@ -820,16 +1167,20 @@ func (rc *requestContext) handleContextDone(
 			Int64("duration_ms", totalDuration).
 			Int("completed_requests", metrics.numCompletedSuccessfully).
 			Msg("Parallel requests timed out (DeadlineExceeded)")
-		return fmt.Errorf("parallel relay requests timed out after %dms and %d completed requests, last error: %w",
+		err := fmt.Errorf("parallel relay requests timed out after %dms and %d completed requests, last error: %w",
 			totalDuration, metrics.numCompletedSuccessfully, lastErr)
+		rc.qosCtx.SetProtocolError(err)
+		return err
 	} else if ctx.Err() == context.Canceled {
 		logger.Debug().
 			Str("cancellation_reason", "client_canceled").
 			Int64("duration_ms", totalDuration).
 			Int("completed_requests", metrics.numCompletedSuccessfully).
 			Msg("Parallel requests canceled by client (context.Canceled)")
-		return fmt.Errorf("parallel relay requests canceled by client after %dms and %d completed requests, last error: %w",
+		err := fmt.Errorf("parallel relay requests canceled by client after %dms and %d completed requests, last error: %w",
 			totalDuration, metrics.numCompletedSuccessfully, lastErr)
+		rc.qosCtx.SetProtocolError(err)
+		return err
 	}
 
 	// Unknown cancellation reason
@@ -839,8 +1190,10 @@ func (rc *requestContext) handleContextDone(
 		Int64("duration_ms", totalDuration).
 		Int("completed_requests", metrics.numCompletedSuccessfully).
 		Msg("Parallel requests canceled with unknown reason")
-	return fmt.Errorf("parallel relay requests canceled (unknown) after %dms and %d completed requests, last error: %w",
+	err := fmt.Errorf("parallel relay requests canceled (unknown) after %dms and %d completed requests, last error: %w",
 		totalDuration, metrics.numCompletedSuccessfully, lastErr)
+	rc.qosCtx.SetProtocolError(err)
+	return err
 }
 
 // handleAllRequestsFailed processes the case where all requests failed
@@ -856,7 +1209,10 @@ func (rc *requestContext) handleAllRequestsFailed(
 	logger.Error().Msgf("All %d parallel requests failed after %dms with individual request durations: %s",
 		metrics.numRequestsToAttempt, totalDuration, timingsStr)
 
-	return fmt.Errorf("all parallel relay requests failed, last error: %w", lastErr)
+	err := fmt.Errorf("all parallel relay requests failed, last error: %w", lastErr)
+	// Set the protocol error on QoS context for more informative client error messages
+	rc.qosCtx.SetProtocolError(err)
+	return err
 }
 
 // formatTimingLog creates a timing log string for a relay result
@@ -889,4 +1245,81 @@ func calculateRetryBackoff(attempt int) time.Duration {
 	default:
 		return 400 * time.Millisecond
 	}
+}
+
+// selectTopRankedEndpoint selects the highest-reputation endpoint for retry.
+// This maximizes the chance of getting a successful response on retry by
+// prioritizing the best-performing endpoints based on their reputation scores.
+//
+// Falls back to the first endpoint in the list if reputation service is unavailable.
+func (rc *requestContext) selectTopRankedEndpoint(
+	endpoints protocol.EndpointAddrList,
+	rpcType sharedtypes.RPCType,
+) protocol.EndpointAddr {
+	if len(endpoints) == 0 {
+		return ""
+	}
+
+	// If only one endpoint, return it directly
+	if len(endpoints) == 1 {
+		return endpoints[0]
+	}
+
+	// Get reputation service
+	reputationSvc := rc.protocol.GetReputationService()
+	if reputationSvc == nil {
+		// No reputation service - fall back to first endpoint
+		return endpoints[0]
+	}
+
+	// Build endpoint keys for ranking
+	keys := make([]reputation.EndpointKey, len(endpoints))
+	keyBuilder := reputationSvc.KeyBuilderForService(rc.serviceID)
+	for i, ep := range endpoints {
+		keys[i] = keyBuilder.BuildKey(rc.serviceID, ep, rpcType)
+	}
+
+	// Rank endpoints by score (highest first)
+	rankedKeys, err := reputationSvc.RankEndpointsByScore(rc.context, keys)
+	if err != nil || len(rankedKeys) == 0 {
+		// Error ranking - fall back to first endpoint
+		return endpoints[0]
+	}
+
+	// Return the top-ranked endpoint address
+	topKey := rankedKeys[0]
+
+	rc.logger.Debug().
+		Str("top_endpoint", string(topKey.EndpointAddr)).
+		Int("num_candidates", len(endpoints)).
+		Msg("🏆 Selected TOP-RANKED endpoint for retry (highest reputation)")
+
+	return topKey.EndpointAddr
+}
+
+// extractSupplierFromEndpoint extracts the supplier address from an endpoint address.
+// Endpoint format is typically: "<supplier_address>-<url>"
+// e.g., "pokt1abc123-https://node.example.com" -> "pokt1abc123"
+// Returns empty string if the format is unexpected.
+func extractSupplierFromEndpoint(endpoint protocol.EndpointAddr) string {
+	if endpoint == "" {
+		return ""
+	}
+
+	endpointStr := string(endpoint)
+
+	// Find the first dash that separates supplier from URL
+	// The supplier address starts with "pokt1" and the URL typically starts with "http"
+	dashIdx := strings.Index(endpointStr, "-http")
+	if dashIdx > 0 {
+		return endpointStr[:dashIdx]
+	}
+
+	// Fallback: try to find any dash and take the first part
+	dashIdx = strings.Index(endpointStr, "-")
+	if dashIdx > 0 {
+		return endpointStr[:dashIdx]
+	}
+
+	return ""
 }

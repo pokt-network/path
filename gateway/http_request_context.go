@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/heuristic"
 )
 
 var (
@@ -39,10 +41,12 @@ const (
 	// - ✅ DONE: Made configurable via concurrency_config.max_parallel_endpoints in YAML
 	// - Enable parallel requests for gateways that maintain their own backend nodes as a special config
 
-	// RelayRequestTimeout is the timeout for relay requests
+	// DefaultRelayRequestTimeout is the default timeout for relay requests to backend endpoints.
+	// This controls how long PATH waits for a response from a single endpoint.
+	// Per-service timeout can be configured via services[].timeout_config.relay_timeout in YAML.
 	// TODO_TECHDEBT: Look into whether we can remove this variable altogether and consolidate
 	// it with HTTP level timeouts.
-	RelayRequestTimeout = 60 * time.Second
+	DefaultRelayRequestTimeout = 10 * time.Second
 )
 
 // requestContext is responsible for performing the steps necessary to complete a service request.
@@ -127,6 +131,22 @@ type requestContext struct {
 	// requestID is a unique identifier for this request, used for log correlation.
 	// It is either extracted from the X-Request-ID header or generated as a new UUID.
 	requestID string
+
+	// relayMetadata stores metadata about the relay(s) for response headers.
+	// For single relays, contains one entry. For batched relays, contains up to 10 samples.
+	relayMetadata []protocol.RelayMetadata
+
+	// retryCount tracks the number of retry attempts made for this request.
+	// 0 means no retries (first attempt succeeded), 1+ means retries were needed.
+	retryCount int
+
+	// suppliersTried tracks all supplier addresses that were attempted during the request.
+	// Includes the initial attempt and all retry attempts (up to 10 for header size limits).
+	suppliersTried []string
+
+	// hedgeResult tracks the outcome of hedge racing, if hedging was used.
+	// Values: "primary_only", "primary_won", "hedge_won", "both_failed", "no_hedge", or empty if not used.
+	hedgeResult string
 }
 
 // InitFromHTTPRequest builds the required context for serving an HTTP request.
@@ -353,6 +373,8 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	if err != nil {
 		// error encountered: use the supplied observations as protocol observations.
 		rc.updateProtocolObservations(&endpointLookupObs)
+		// Set the protocol error on QoS context for more informative client error messages
+		rc.qosCtx.SetProtocolError(err)
 		// log and return the error
 		rc.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).
 			Str("method", "BuildProtocolContextsFromHTTPRequest").
@@ -371,6 +393,12 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	if err != nil || len(selectedEndpoints) == 0 {
 		// no protocol context will be built: use the endpointLookup observation.
 		rc.updateProtocolObservations(&endpointLookupObs)
+		// Set the protocol error on QoS context for more informative client error messages
+		if err != nil {
+			rc.qosCtx.SetProtocolError(err)
+		} else {
+			rc.qosCtx.SetProtocolError(fmt.Errorf("no endpoints could be selected from %d available endpoints", len(availableEndpoints)))
+		}
 		// log and return the error
 		rc.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).
 			Str("method", "BuildProtocolContextsFromHTTPRequest").
@@ -415,6 +443,8 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 			Msgf("Zero protocol contexts were built for the request with %d selected endpoints", numSelectedEndpoints)
 		// error encountered: use the supplied observations as protocol observations.
 		rc.updateProtocolObservations(lastProtocolCtxSetupErrObs)
+		// Set the protocol error on QoS context for more informative client error messages
+		rc.qosCtx.SetProtocolError(fmt.Errorf("failed to build protocol context for any of the %d selected endpoints", numSelectedEndpoints))
 		rc.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).
 			Str("method", "BuildProtocolContextsFromHTTPRequest").
 			Msg(errHTTPRequestRejectedByProtocol.Error())
@@ -455,6 +485,10 @@ func (rc *requestContext) writeHTTPResponse(response pathhttp.HTTPResponse, w ht
 		w.Header().Set(key, value)
 	}
 
+	// Add relay metadata headers for debugging and transparency.
+	// For batched relays, we sample up to 10 entries.
+	rc.addRelayMetadataHeaders(w)
+
 	statusCode := response.GetHTTPStatusCode()
 	// TODO_IMPROVE: introduce handling for cases where the status code is not set.
 	if statusCode == 0 {
@@ -484,6 +518,77 @@ func (rc *requestContext) writeHTTPResponse(response pathhttp.HTTPResponse, w ht
 	}
 
 	logger.Debug().Msg("Completed processing the HTTP request and returned an HTTP response.")
+}
+
+// addRelayMetadataHeaders adds relay metadata headers to the HTTP response.
+// Headers include:
+//   - X-App-Address: The application address used for the relay
+//   - X-Supplier-Address: The supplier address of the endpoint (comma-separated for batched relays)
+//   - X-Session-ID: The session ID (comma-separated for batched relays if different)
+//   - X-Environment: The environment from PATH_ENVIRONMENT env variable
+//
+// For batched relays, up to 10 samples are included.
+func (rc *requestContext) addRelayMetadataHeaders(w http.ResponseWriter) {
+	// ALWAYS add retry count header (even on errors, even if 0)
+	w.Header().Set("X-Retry-Count", fmt.Sprintf("%d", rc.retryCount))
+
+	// ALWAYS add suppliers tried header if any were attempted (even on errors)
+	if len(rc.suppliersTried) > 0 {
+		w.Header().Set("X-Suppliers-Tried", strings.Join(rc.suppliersTried, ","))
+	}
+
+	// Add hedge result header if hedging was used
+	// Values: "primary_only" (fast, no hedge needed), "primary_won", "hedge_won", "both_failed", "no_hedge"
+	if rc.hedgeResult != "" {
+		w.Header().Set("X-Hedge-Result", rc.hedgeResult)
+	}
+
+	// Add environment header from env variable
+	if env := os.Getenv("PATH_ENVIRONMENT"); env != "" {
+		w.Header().Set("X-Environment", env)
+	}
+
+	// Only add relay metadata headers if we have successful relay data
+	if len(rc.relayMetadata) == 0 {
+		return
+	}
+
+	// Collect unique values for each header type
+	appAddresses := make([]string, 0, len(rc.relayMetadata))
+	supplierAddresses := make([]string, 0, len(rc.relayMetadata))
+	sessionIDs := make([]string, 0, len(rc.relayMetadata))
+	seenApps := make(map[string]bool)
+	seenSuppliers := make(map[string]bool)
+	seenSessions := make(map[string]bool)
+
+	for _, metadata := range rc.relayMetadata {
+		// Collect unique app addresses
+		if metadata.AppAddress != "" && !seenApps[metadata.AppAddress] {
+			appAddresses = append(appAddresses, metadata.AppAddress)
+			seenApps[metadata.AppAddress] = true
+		}
+		// Collect unique supplier addresses
+		if metadata.SupplierAddress != "" && !seenSuppliers[metadata.SupplierAddress] {
+			supplierAddresses = append(supplierAddresses, metadata.SupplierAddress)
+			seenSuppliers[metadata.SupplierAddress] = true
+		}
+		// Collect unique session IDs
+		if metadata.SessionID != "" && !seenSessions[metadata.SessionID] {
+			sessionIDs = append(sessionIDs, metadata.SessionID)
+			seenSessions[metadata.SessionID] = true
+		}
+	}
+
+	// Set headers (comma-separated for multiple values)
+	if len(appAddresses) > 0 {
+		w.Header().Set("X-App-Address", strings.Join(appAddresses, ","))
+	}
+	if len(supplierAddresses) > 0 {
+		w.Header().Set("X-Supplier-Address", strings.Join(supplierAddresses, ","))
+	}
+	if len(sessionIDs) > 0 {
+		w.Header().Set("X-Session-ID", strings.Join(sessionIDs, ","))
+	}
 }
 
 // observationBroadcastTimeout is the maximum time allowed for broadcasting observations.
@@ -808,7 +913,8 @@ func (rc *requestContext) getConcurrencyConfigForService() *ServiceConcurrencyCo
 // Returns true if the request should be retried.
 // The requestDuration parameter is the time the failed request took - if it exceeds MaxRetryLatency, no retry is attempted.
 // The endpointDomain parameter is used for metrics recording when retries are skipped due to budget exceeded.
-func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration time.Duration, retryConfig *ServiceRetryConfig, endpointDomain string) bool {
+// The heuristicResult parameter contains the result of heuristic response analysis (can be nil).
+func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration time.Duration, retryConfig *ServiceRetryConfig, endpointDomain string, heuristicResult *heuristic.AnalysisResult) bool {
 	// No retry config or retry disabled
 	if retryConfig == nil || retryConfig.Enabled == nil || !*retryConfig.Enabled {
 		if rc.logger != nil {
@@ -861,6 +967,26 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration
 		return true
 	}
 
+	// Check for heuristic-detected errors (JSON-RPC errors, empty responses, HTML pages, etc.)
+	// This catches cases where HTTP 200 was returned but the payload indicates a failure
+	if heuristicResult != nil && heuristicResult.ShouldRetry {
+		// Record retry metric
+		domain, _ := shannonmetrics.ExtractDomainOrHost(endpointDomain)
+		metrics.RecordRetryDistribution(domain, string(rc.detectedRPCType), string(rc.serviceID), metrics.RetryReasonHeuristic)
+
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Int("status_code", statusCode).
+				Dur("request_duration_ms", requestDuration).
+				Str("heuristic_reason", heuristicResult.Reason).
+				Float64("heuristic_confidence", heuristicResult.Confidence).
+				Str("retry_reason", "heuristic_error").
+				Msg("[RETRY] Will retry due to heuristic-detected error in response payload")
+		}
+		return true
+	}
+
 	// If no error, nothing more to check
 	if err == nil {
 		if rc.logger != nil {
@@ -895,8 +1021,11 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration
 	// Check for connection errors if configured
 	if retryConfig.RetryOnConnection != nil && *retryConfig.RetryOnConnection {
 		// Check if error is a connection error (contains "connection" or "dial")
+		// Also check for protocol-level failures like "no response", "empty response", "failed to receive"
 		errMsg := strings.ToLower(err.Error())
-		if strings.Contains(errMsg, "connection") || strings.Contains(errMsg, "dial") || strings.Contains(errMsg, "network") {
+		if strings.Contains(errMsg, "connection") || strings.Contains(errMsg, "dial") || strings.Contains(errMsg, "network") ||
+			strings.Contains(errMsg, "no response") || strings.Contains(errMsg, "empty response") ||
+			strings.Contains(errMsg, "failed to receive") || strings.Contains(errMsg, "no endpoints") {
 			// Record retry metric
 			domain, _ := shannonmetrics.ExtractDomainOrHost(endpointDomain)
 			metrics.RecordRetryDistribution(domain, string(rc.detectedRPCType), string(rc.serviceID), metrics.RetryReasonConnection)
@@ -911,6 +1040,23 @@ func (rc *requestContext) shouldRetry(err error, statusCode int, requestDuration
 			}
 			return true
 		}
+	}
+
+	// Fallback: if statusCode is 0 and we have an error, the protocol layer failed completely
+	// (no response received at all). This is a retriable condition if connection retries are enabled.
+	if statusCode == 0 && err != nil && retryConfig.RetryOnConnection != nil && *retryConfig.RetryOnConnection {
+		domain, _ := shannonmetrics.ExtractDomainOrHost(endpointDomain)
+		metrics.RecordRetryDistribution(domain, string(rc.detectedRPCType), string(rc.serviceID), metrics.RetryReasonConnection)
+
+		if rc.logger != nil {
+			rc.logger.Debug().
+				Str("service_id", string(rc.serviceID)).
+				Err(err).
+				Dur("request_duration_ms", requestDuration).
+				Str("retry_reason", "protocol_error").
+				Msg("[RETRY] Will retry due to protocol-level failure (no response received)")
+		}
+		return true
 	}
 
 	if rc.logger != nil {

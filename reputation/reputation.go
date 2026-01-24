@@ -230,6 +230,12 @@ type ReputationService interface {
 	// Returns a map of endpoint keys to scores. Missing endpoints are omitted.
 	GetScores(ctx context.Context, keys []EndpointKey) (map[EndpointKey]Score, error)
 
+	// RankEndpointsByScore ranks endpoints by their reputation score (highest first).
+	// Returns endpoints sorted by score in descending order.
+	// Endpoints not in the cache receive the initial score for comparison.
+	// This is useful for retry logic to prioritize the best-performing endpoints.
+	RankEndpointsByScore(ctx context.Context, keys []EndpointKey) ([]EndpointKey, error)
+
 	// FilterByScore filters endpoints that meet the minimum score threshold.
 	// Always reads from local cache for minimal latency.
 	// Returns only endpoints with scores >= minThreshold.

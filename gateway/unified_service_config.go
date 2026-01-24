@@ -138,6 +138,17 @@ type ServiceRetryConfig struct {
 	RetryOnTimeout    *bool          `yaml:"retry_on_timeout,omitempty"`
 	RetryOnConnection *bool          `yaml:"retry_on_connection,omitempty"`
 	MaxRetryLatency   *time.Duration `yaml:"max_retry_latency,omitempty"` // Only retry if failed request took less than this duration
+
+	// ConnectTimeout is the maximum time to establish a TCP connection.
+	// If connection fails within this time, retry immediately with a different endpoint.
+	// Default: 500ms. This is separate from read timeout to enable fast failure on unreachable endpoints.
+	ConnectTimeout *time.Duration `yaml:"connect_timeout,omitempty"`
+
+	// HedgeDelay is the time to wait before starting a hedge (parallel) request.
+	// If no response is received within this duration after connecting, a second request
+	// is sent to a different endpoint. The first response wins.
+	// Default: 500ms. Set to 0 to disable hedging.
+	HedgeDelay *time.Duration `yaml:"hedge_delay,omitempty"`
 }
 
 // ServiceObservationConfig holds per-service observation pipeline configuration.
@@ -154,6 +165,16 @@ type ServiceObservationConfig struct {
 type ServiceConcurrencyConfig struct {
 	MaxParallelEndpoints *int `yaml:"max_parallel_endpoints,omitempty"`
 	MaxBatchPayloads     *int `yaml:"max_batch_payloads,omitempty"`
+}
+
+// ServiceTimeoutConfig holds per-service timeout configuration.
+// Different services may require different timeouts based on their payload sizes and response times.
+// For example, LLM services may need 60s+ while fast EVM chains may only need 5s.
+type ServiceTimeoutConfig struct {
+	// RelayTimeout is the maximum time to wait for a response from a backend endpoint.
+	// This timeout applies to each individual relay attempt (before retries).
+	// Default: 10s (from DefaultRelayRequestTimeout)
+	RelayTimeout *time.Duration `yaml:"relay_timeout,omitempty"`
 }
 
 // ServiceHealthCheckOverride holds per-service health check configuration overrides.
@@ -184,6 +205,7 @@ type ServiceDefaults struct {
 	RetryConfig         ServiceRetryConfig           `yaml:"retry_config,omitempty"`
 	ObservationPipeline ServiceObservationConfig     `yaml:"observation_pipeline,omitempty"`
 	ConcurrencyConfig   ServiceConcurrencyConfig     `yaml:"concurrency_config,omitempty"`
+	TimeoutConfig       ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
 	ActiveHealthChecks  ServiceHealthCheckOverride   `yaml:"active_health_checks,omitempty"`
 }
 
@@ -201,6 +223,7 @@ type ServiceConfig struct {
 	RetryConfig         *ServiceRetryConfig           `yaml:"retry_config,omitempty"`
 	ObservationPipeline *ServiceObservationConfig     `yaml:"observation_pipeline,omitempty"`
 	ConcurrencyConfig   *ServiceConcurrencyConfig     `yaml:"concurrency_config,omitempty"`
+	TimeoutConfig       *ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
 	Fallback            *ServiceFallbackConfig        `yaml:"fallback,omitempty"`
 	HealthChecks        *ServiceHealthCheckOverride   `yaml:"health_checks,omitempty"`
 }
@@ -372,6 +395,14 @@ func (c *UnifiedServicesConfig) HydrateDefaults() {
 		maxRetryLatency := 500 * time.Millisecond
 		c.Defaults.RetryConfig.MaxRetryLatency = &maxRetryLatency
 	}
+	if c.Defaults.RetryConfig.ConnectTimeout == nil {
+		connectTimeout := 500 * time.Millisecond
+		c.Defaults.RetryConfig.ConnectTimeout = &connectTimeout
+	}
+	if c.Defaults.RetryConfig.HedgeDelay == nil {
+		hedgeDelay := 500 * time.Millisecond
+		c.Defaults.RetryConfig.HedgeDelay = &hedgeDelay
+	}
 
 	// Hydrate default observation pipeline
 	if c.Defaults.ObservationPipeline.Enabled == nil {
@@ -384,6 +415,12 @@ func (c *UnifiedServicesConfig) HydrateDefaults() {
 	}
 	// Note: worker_count and queue_size are GLOBAL only (gateway_config.observation_pipeline)
 	// Per-service config only supports sample_rate override
+
+	// Hydrate default timeout config
+	if c.Defaults.TimeoutConfig.RelayTimeout == nil {
+		defaultTimeout := DefaultRelayRequestTimeout
+		c.Defaults.TimeoutConfig.RelayTimeout = &defaultTimeout
+	}
 
 	// Hydrate default health check config
 	if c.Defaults.ActiveHealthChecks.Enabled == nil {
@@ -625,6 +662,12 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 		if merged.RetryConfig.MaxRetryLatency == nil {
 			merged.RetryConfig.MaxRetryLatency = c.Defaults.RetryConfig.MaxRetryLatency
 		}
+		if merged.RetryConfig.ConnectTimeout == nil {
+			merged.RetryConfig.ConnectTimeout = c.Defaults.RetryConfig.ConnectTimeout
+		}
+		if merged.RetryConfig.HedgeDelay == nil {
+			merged.RetryConfig.HedgeDelay = c.Defaults.RetryConfig.HedgeDelay
+		}
 	}
 
 	// Merge observation pipeline config
@@ -653,6 +696,16 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 			merged.ConcurrencyConfig.MaxBatchPayloads = c.Defaults.ConcurrencyConfig.MaxBatchPayloads
 		}
 		// Note: max_concurrent_relays is GLOBAL only, not per-service
+	}
+
+	// Merge timeout config
+	if merged.TimeoutConfig == nil {
+		timeoutCopy := c.Defaults.TimeoutConfig
+		merged.TimeoutConfig = &timeoutCopy
+	} else {
+		if merged.TimeoutConfig.RelayTimeout == nil {
+			merged.TimeoutConfig.RelayTimeout = c.Defaults.TimeoutConfig.RelayTimeout
+		}
 	}
 
 	// Merge health checks config (per-service HealthChecks inherits from defaults.ActiveHealthChecks)
@@ -705,6 +758,47 @@ func (c *UnifiedServicesConfig) GetSyncAllowanceForService(serviceID protocol.Se
 	return DefaultSyncAllowance
 }
 
+// SetServiceSyncAllowance sets the sync allowance for a specific service.
+// This is called when external health check rules are loaded to propagate
+// the sync_allowance to the unified config for use by the QoS layer.
+func (c *UnifiedServicesConfig) SetServiceSyncAllowance(serviceID protocol.ServiceID, syncAllowance int) {
+	for i := range c.Services {
+		if c.Services[i].ID == serviceID {
+			if c.Services[i].HealthChecks == nil {
+				c.Services[i].HealthChecks = &ServiceHealthCheckOverride{}
+			}
+			c.Services[i].HealthChecks.SyncAllowance = &syncAllowance
+			return
+		}
+	}
+	// Service not found in existing config, add a new service entry
+	c.Services = append(c.Services, ServiceConfig{
+		ID: serviceID,
+		HealthChecks: &ServiceHealthCheckOverride{
+			SyncAllowance: &syncAllowance,
+		},
+	})
+}
+
+// GetRelayTimeoutForService returns the relay timeout for a service.
+// It checks per-service config first, then falls back to global defaults.
+// Returns DefaultRelayRequestTimeout (10s) if not configured.
+func (c *UnifiedServicesConfig) GetRelayTimeoutForService(serviceID protocol.ServiceID) time.Duration {
+	// Check per-service config
+	svc := c.GetServiceConfig(serviceID)
+	if svc != nil && svc.TimeoutConfig != nil && svc.TimeoutConfig.RelayTimeout != nil {
+		return *svc.TimeoutConfig.RelayTimeout
+	}
+
+	// Check global defaults
+	if c.Defaults.TimeoutConfig.RelayTimeout != nil {
+		return *c.Defaults.TimeoutConfig.RelayTimeout
+	}
+
+	// Return default
+	return DefaultRelayRequestTimeout
+}
+
 // ParentConfigDefaults contains values from the parent config that serve as defaults.
 // This struct is used to pass values from gateway_config to UnifiedServicesConfig,
 // eliminating the need for a separate "defaults" section in YAML.
@@ -735,6 +829,10 @@ type ParentConfigDefaults struct {
 	RetryOnConnection bool
 	// MaxRetryLatency from retry_config.max_retry_latency
 	MaxRetryLatency time.Duration
+	// ConnectTimeout from retry_config.connect_timeout
+	ConnectTimeout *time.Duration
+	// HedgeDelay from retry_config.hedge_delay
+	HedgeDelay *time.Duration
 	// ObservationPipelineEnabled from observation_pipeline.enabled
 	ObservationPipelineEnabled bool
 	// SampleRate from observation_pipeline.sample_rate
@@ -745,6 +843,9 @@ type ParentConfigDefaults struct {
 	HealthCheckInterval time.Duration
 	// SyncAllowance from active_health_checks.sync_allowance
 	SyncAllowance int
+	// LocalHealthChecks from active_health_checks.local
+	// Used to propagate per-service sync_allowance before QoS instances are created
+	LocalHealthChecks []ServiceHealthCheckConfig
 }
 
 // SetDefaultsFromParent populates the internal Defaults field from parent config values.
@@ -790,6 +891,12 @@ func (c *UnifiedServicesConfig) SetDefaultsFromParent(parent ParentConfigDefault
 	if parent.MaxRetryLatency > 0 {
 		c.Defaults.RetryConfig.MaxRetryLatency = &parent.MaxRetryLatency
 	}
+	if parent.ConnectTimeout != nil && *parent.ConnectTimeout > 0 {
+		c.Defaults.RetryConfig.ConnectTimeout = parent.ConnectTimeout
+	}
+	if parent.HedgeDelay != nil && *parent.HedgeDelay > 0 {
+		c.Defaults.RetryConfig.HedgeDelay = parent.HedgeDelay
+	}
 
 	// Set observation pipeline defaults
 	c.Defaults.ObservationPipeline.Enabled = &parent.ObservationPipelineEnabled
@@ -804,5 +911,13 @@ func (c *UnifiedServicesConfig) SetDefaultsFromParent(parent ParentConfigDefault
 	}
 	if parent.SyncAllowance > 0 {
 		c.Defaults.ActiveHealthChecks.SyncAllowance = &parent.SyncAllowance
+	}
+
+	// Propagate per-service sync_allowance from local health check configs
+	// This ensures QoS instances are created with the correct sync_allowance
+	for _, localConfig := range parent.LocalHealthChecks {
+		if localConfig.SyncAllowance != nil && *localConfig.SyncAllowance > 0 {
+			c.SetServiceSyncAllowance(localConfig.ServiceID, *localConfig.SyncAllowance)
+		}
 	}
 }

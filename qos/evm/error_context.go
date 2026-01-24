@@ -104,7 +104,14 @@ func (ec *errorContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, e
 	).Warn().Msg("SHOULD NEVER HAPPEN: errorContext.UpdateWithResponse() should never be called.")
 }
 
-// UpdateWithResponse should never be called.
+// SetProtocolError is a no-op for errorContext since this context
+// already has an error stored from its construction.
+// Implements the gateway.RequestQoSContext interface.
+func (ec *errorContext) SetProtocolError(err error) {
+	// No-op: errorContext already has an error response set.
+}
+
+// GetEndpointSelector should never be called.
 // It logs a warning and returns a failing selector that logs a warning on all selection attempts.
 // Implements the gateway.RequestQoSContext interface.
 func (ec *errorContext) GetEndpointSelector() protocol.EndpointSelector {

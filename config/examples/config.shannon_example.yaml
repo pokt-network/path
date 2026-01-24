@@ -167,6 +167,22 @@ gateway_config:
     retry_on_timeout: true
     retry_on_connection: true
 
+    # Hedge Request Configuration
+    # ===========================
+    # Hedging starts a second (parallel) request to a different endpoint if
+    # the primary request is too slow. This reduces tail latency.
+    #
+    # Flow:
+    # 1. Primary request starts to the initial endpoint
+    # 2. If no response after hedge_delay, start hedge request to TOP-ranked endpoint
+    # 3. Return whichever responds first (the winner)
+    # 4. Both endpoints have reputation tracked (winner and loser)
+    #
+    # Response headers when hedging is used:
+    # - X-Hedge-Result: "primary_only" (fast), "primary_won", "hedge_won", "both_failed"
+    connect_timeout: 500ms  # TCP connect timeout for fast failure detection
+    hedge_delay: 500ms      # Start hedge request after this delay (0 to disable)
+
   # ===========================================================================
   # GLOBAL OBSERVATION PIPELINE (optional)
   # ===========================================================================
@@ -304,6 +320,7 @@ gateway_config:
   # - probation: Per-service probation settings
   # - retry_config: Per-service retry settings
   # - concurrency_config: Per-service concurrency overrides (max_parallel_endpoints, max_batch_payloads)
+  # - timeout_config: Per-service timeout settings (relay_timeout)
   # - observation_pipeline: Per-service sample rate
   # - fallback: Fallback endpoints (no defaults - must be explicitly configured)
   # - health_checks: Per-service health check rules
@@ -316,6 +333,11 @@ gateway_config:
       type: "evm"
       rpc_types: ["json_rpc", "websocket"]
       latency_profile: "fast"
+
+      # Per-service timeout configuration
+      # Fast EVM chains can use shorter timeouts (default: 10s)
+      timeout_config:
+        relay_timeout: 10s
 
       # Override reputation settings for a high-value chain
       reputation_config:
@@ -334,9 +356,11 @@ gateway_config:
         traffic_percent: 5
         recovery_multiplier: 5.0
 
-      # More retries for ETH
+      # Retry and hedge configuration for ETH
+      # Fast chain with aggressive hedging
       retry_config:
         max_retries: 2
+        hedge_delay: 300ms    # Start hedge earlier for fast chain
 
       # Higher sample rate for ETH traffic
       observation_pipeline:
@@ -477,6 +501,10 @@ gateway_config:
     - id: deepseek
       type: "passthrough"
       latency_profile: "llm"
+
+      # LLM services need much longer timeouts (60s+)
+      timeout_config:
+        relay_timeout: 60s
 
       # Higher initial score for curated LLM endpoints
       reputation_config:

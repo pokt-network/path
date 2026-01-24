@@ -54,6 +54,10 @@ type batchJSONRPCRequestContext struct {
 	// endpointResponses is the set of responses received from one or
 	// more endpoints as part of handling this service request.
 	endpointJSONRPCResponses []endpointJSONRPCResponse
+
+	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
+	// Used to provide more specific error messages to clients.
+	protocolError error
 }
 
 // TODO_NEXT(@commoddity): handle batch requests for Solana
@@ -98,6 +102,12 @@ func (brc *batchJSONRPCRequestContext) UpdateWithResponse(endpointAddr protocol.
 	})
 }
 
+// SetProtocolError stores a protocol-level error for more specific client error messages.
+// Implements the gateway.RequestQoSContext interface.
+func (brc *batchJSONRPCRequestContext) SetProtocolError(err error) {
+	brc.protocolError = err
+}
+
 // TODO_MVP(@adshmh): add `Content-Type: application/json` header.
 // GetHTTPResponse builds the HTTP response that should be returned for
 // a Solana blockchain service request.
@@ -107,8 +117,14 @@ func (brc batchJSONRPCRequestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 	// No responses received: this is an internal error:
 	// e.g. protocol-level errors like endpoint timing out.
 	if len(brc.endpointJSONRPCResponses) == 0 {
-		// Build the JSONRPC response indicating a protocol-level error.
-		jsonrpcErrorResponse := jsonrpc.NewErrResponseInternalErr(jsonrpc.ID{}, errors.New("protocol-level error: no endpoint responses received"))
+		// Use the specific protocol error if available, otherwise use a generic message.
+		var errToReport error
+		if brc.protocolError != nil {
+			errToReport = brc.protocolError
+		} else {
+			errToReport = errors.New("protocol-level error: no endpoint responses received")
+		}
+		jsonrpcErrorResponse := jsonrpc.NewErrResponseInternalErr(jsonrpc.ID{}, errToReport)
 		return qos.BuildHTTPResponseFromJSONRPCResponse(brc.logger, jsonrpcErrorResponse)
 	}
 

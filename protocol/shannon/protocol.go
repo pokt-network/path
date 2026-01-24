@@ -203,11 +203,14 @@ func NewProtocol(
 			}
 			return 0
 		}(),
+		ConnectTimeout:             config.RetryConfig.ConnectTimeout,
+		HedgeDelay:                 config.RetryConfig.HedgeDelay,
 		ObservationPipelineEnabled: config.ObservationPipelineConfig.Enabled,
 		SampleRate:                 config.ObservationPipelineConfig.SampleRate,
 		HealthChecksEnabled:        config.ActiveHealthChecksConfig.Enabled,
 		HealthCheckInterval:        config.ActiveHealthChecksConfig.Coordination.RenewInterval,
 		SyncAllowance:              config.ActiveHealthChecksConfig.SyncAllowance,
+		LocalHealthChecks:          config.ActiveHealthChecksConfig.Local,
 	})
 
 	// Apply defaults to concurrency config if not set.

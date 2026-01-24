@@ -18,10 +18,10 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/ory/dockertest/v3 v3.11.0
 	github.com/pokt-network/poktroll v0.1.30-0.20250926212324-1588b0a53acb
+	github.com/pokt-network/ring-go v0.1.1-0.20251219190013-b576b71e4648
 	github.com/pokt-network/shannon-sdk v0.0.0-20251219193856-1fca8457fb61
 	github.com/prometheus/client_golang v1.22.0
 	github.com/redis/go-redis/v9 v9.17.2
-	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.40.0
 	github.com/tsenart/vegeta v12.7.0+incompatible
@@ -219,7 +219,6 @@ require (
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/pokt-network/go-dleq v0.0.0-20250925202155-488f42ad642a // indirect
-	github.com/pokt-network/ring-go v0.1.1-0.20251219190013-b576b71e4648 // indirect
 	github.com/pokt-network/smt v0.14.1 // indirect
 	github.com/pokt-network/smt/kvstore/pebble v0.0.0-20240822175047-21ea8639c188 // indirect
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
@@ -230,6 +229,7 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/rs/cors v1.11.1 // indirect
+	github.com/rs/zerolog v1.34.0 // indirect
 	github.com/sagikazarmark/locafero v0.7.0 // indirect
 	github.com/sasha-s/go-deadlock v0.3.5 // indirect
 	github.com/shirou/gopsutil/v4 v4.25.6 // indirect

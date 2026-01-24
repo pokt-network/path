@@ -148,6 +148,13 @@ func (hc *HealthCheckQoSContext) UpdateWithResponse(
 		Msg("✅ Health check validation passed")
 }
 
+// SetProtocolError is a no-op for health checks since they don't generate user-facing error responses.
+// Implements the RequestQoSContext interface.
+func (hc *HealthCheckQoSContext) SetProtocolError(err error) {
+	// Health checks don't generate user-facing error responses.
+	// Protocol errors are handled via the IsSuccess/GetError methods instead.
+}
+
 // GetHTTPResponse returns a minimal HTTP response for health checks.
 // This method is required by the RequestQoSContext interface but is not used for health checks.
 func (hc *HealthCheckQoSContext) GetHTTPResponse() pathhttp.HTTPResponse {
