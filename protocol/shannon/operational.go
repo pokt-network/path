@@ -32,7 +32,7 @@ func (p *Protocol) GetServiceReadiness(serviceID protocol.ServiceID) (endpointCo
 	// We use getSessionsUniqueEndpoints to get the actual available endpoints
 	// after filtering low-reputation endpoints
 	// Note: We don't support Target-Suppliers header here since httpReq may be nil
-	endpoints, _, err := p.getUniqueEndpoints(ctx, serviceID, sessions, true, 0, nil) // 0 = UNKNOWN_RPC, gets all types, nil = no supplier filtering
+	endpoints, _, err := p.getUniqueEndpoints(ctx, serviceID, sessions, true, 0, nil, "") // 0 = UNKNOWN_RPC, gets all types, nil = no supplier filtering
 	if err != nil {
 		// Not having endpoints isn't necessarily an error - might just be all filtered
 		return 0, hasSession, nil

@@ -97,7 +97,7 @@ func (p *Protocol) GetEndpointLeaderboardData(ctx context.Context) ([]metrics.En
 		for _, rpcType := range rpcTypesToQuery {
 			// Get endpoints for this RPC type, bypassing reputation filtering
 			// actualRPCType may differ from rpcType if fallback occurred
-			endpoints, actualRPCType, uniqueEndpointsErr := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil)
+			endpoints, actualRPCType, uniqueEndpointsErr := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil, "")
 			if uniqueEndpointsErr != nil {
 				// No endpoints for this RPC type is normal - suppliers may not support all types
 				continue
@@ -253,7 +253,7 @@ func (p *Protocol) GetMeanScoreData(ctx context.Context) ([]metrics.MeanScoreEnt
 		for _, rpcType := range rpcTypesToQuery {
 			// Get endpoints for this RPC type, bypassing reputation filtering
 			// actualRPCType may differ from rpcType if fallback occurred
-			endpoints, actualRPCType, uniqueEndpointsErr := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil)
+			endpoints, actualRPCType, uniqueEndpointsErr := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil, "")
 			if uniqueEndpointsErr != nil {
 				continue
 			}

@@ -173,11 +173,15 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 			}
 			validationResults = append(validationResults, result)
 			filteredEndpointsAddr = append(filteredEndpointsAddr, data.addr)
+			logger.Debug().Msg("endpoint not in store - allowing as fresh endpoint")
 			continue
 		}
 
 		if err := ss.basicEndpointValidation(data.endpoint); err != nil {
-			logger.Warn().Err(err).Msgf("⚠️ SKIPPING %s endpoint because it failed basic validation: %v", data.addr, err)
+			logger.Warn().
+				Err(err).
+				Str("endpoint_addr", string(data.addr)).
+				Msg("⚠️ SKIPPING endpoint because it failed basic validation")
 
 			// Create validation result for validation failure
 			failureReason := ss.categorizeValidationFailure(err)
@@ -335,17 +339,6 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 	// then the endpoint is behind the chain and should be filtered out.
 	minAllowedBlockNumber := perceivedBlock - syncAllowance
 
-	// Log the sync allowance validation details
-	ss.logger.Warn().
-		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-		Uint64("endpoint_block", parsedBlockNumber).
-		Uint64("perceived_block", perceivedBlock).
-		Uint64("sync_allowance", syncAllowance).
-		Uint64("min_allowed_block", minAllowedBlockNumber).
-		Int64("blocks_behind", int64(perceivedBlock)-int64(parsedBlockNumber)).
-		Bool("within_allowance", parsedBlockNumber >= minAllowedBlockNumber).
-		Msg("🔍 Sync allowance validation")
-
 	if parsedBlockNumber < minAllowedBlockNumber {
 		blocksBehind := int64(perceivedBlock) - int64(parsedBlockNumber)
 		ss.logger.Warn().
@@ -359,6 +352,17 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 		return fmt.Errorf("%w: block number %d is outside the sync allowance relative to min allowed block number %d and sync allowance %d",
 			errOutsideSyncAllowanceBlockNumberObs, parsedBlockNumber, minAllowedBlockNumber, syncAllowance)
 	}
+
+	// Log the sync allowance validation details only if it passes (to reduce noise)
+	ss.logger.Debug().
+		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+		Uint64("endpoint_block", parsedBlockNumber).
+		Uint64("perceived_block", perceivedBlock).
+		Uint64("sync_allowance", syncAllowance).
+		Uint64("min_allowed_block", minAllowedBlockNumber).
+		Int64("blocks_behind", int64(perceivedBlock)-int64(parsedBlockNumber)).
+		Bool("within_allowance", parsedBlockNumber >= minAllowedBlockNumber).
+		Msg("🔍 Sync allowance validation")
 
 	return nil
 }
