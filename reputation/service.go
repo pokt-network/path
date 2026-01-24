@@ -262,6 +262,52 @@ func (s *service) GetScores(ctx context.Context, keys []EndpointKey) (map[Endpoi
 	return result, nil
 }
 
+// RankEndpointsByScore ranks endpoints by their reputation score (highest first).
+// Returns endpoints sorted by score in descending order.
+// Endpoints not in the cache receive the initial score for comparison.
+// This is useful for retry logic to prioritize the best-performing endpoints.
+func (s *service) RankEndpointsByScore(ctx context.Context, keys []EndpointKey) ([]EndpointKey, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	// Build score map for sorting
+	type scoredEndpoint struct {
+		key   EndpointKey
+		score float64
+	}
+
+	scored := make([]scoredEndpoint, len(keys))
+
+	s.mu.RLock()
+	for i, key := range keys {
+		if cachedScore, exists := s.cache[key.String()]; exists {
+			scored[i] = scoredEndpoint{key: key, score: cachedScore.Value}
+		} else {
+			// Endpoints not in cache get initial score (benefit of the doubt)
+			scored[i] = scoredEndpoint{key: key, score: s.GetInitialScoreForService(key.ServiceID)}
+		}
+	}
+	s.mu.RUnlock()
+
+	// Sort by score descending (highest first)
+	for i := 0; i < len(scored)-1; i++ {
+		for j := i + 1; j < len(scored); j++ {
+			if scored[j].score > scored[i].score {
+				scored[i], scored[j] = scored[j], scored[i]
+			}
+		}
+	}
+
+	// Extract sorted keys
+	result := make([]EndpointKey, len(scored))
+	for i, se := range scored {
+		result[i] = se.key
+	}
+
+	return result, nil
+}
+
 // FilterByScore filters endpoints that meet the minimum score threshold.
 // Always reads from local cache for minimal latency.
 // Endpoints eligible for recovery are automatically reset before filtering.

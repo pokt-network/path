@@ -234,9 +234,14 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
 	ss.serviceStateLock.RLock()
 	defer ss.serviceStateLock.RUnlock()
 
-	// Check if the endpoint has returned an empty response.
-	if endpoint.hasReturnedEmptyResponse {
-		return fmt.Errorf("empty response validation failed: %w", errEmptyResponseObs)
+	// Check if the endpoint has returned an empty response within the timeout period.
+	// Empty responses use the same 5-minute timeout as invalid responses to allow recovery.
+	if endpoint.hasReturnedEmptyResponse && endpoint.invalidResponseLastObserved != nil {
+		timeSinceEmptyResponse := time.Since(*endpoint.invalidResponseLastObserved)
+		if timeSinceEmptyResponse < invalidResponseTimeout {
+			return fmt.Errorf("recent empty response validation failed (%.0f minutes ago): %w",
+				timeSinceEmptyResponse.Minutes(), errEmptyResponseObs)
+		}
 	}
 
 	// Check if the endpoint has returned an invalid response within the invalid response timeout period.
@@ -276,37 +281,20 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
 func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error {
 	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
 
-	// If sync allowance is 0, the check is disabled
+	// If sync allowance is 0, the check is disabled (only log at debug level)
 	if syncAllowance == 0 {
-		ss.logger.Warn().
-			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-			Msg("🔍 Sync allowance check DISABLED (sync_allowance=0)")
 		return nil
 	}
 
 	// If we don't have a perceived block number yet, skip the check (no data to compare against)
 	if ss.perceivedBlockNumber == 0 {
-		ss.logger.Warn().
-			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-			Uint64("sync_allowance", syncAllowance).
-			Msg("🔍 Sync allowance check SKIPPED (no perceived block number yet)")
 		return nil
 	}
 
 	// If endpoint has no block number observation, skip the check (no endpoint data to validate)
 	if check.parsedBlockNumberResponse == nil {
-		ss.logger.Warn().
-			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-			Uint64("perceived_block", ss.perceivedBlockNumber).
-			Uint64("sync_allowance", syncAllowance).
-			Msg("🔍 Sync allowance check SKIPPED (endpoint has no block number observation)")
 		return nil
 	}
-
-	ss.logger.Warn().
-		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-		Uint64("sync_allowance", syncAllowance).
-		Msg("🔍 Sync allowance check ENABLED")
 
 	// Dereference pointer to show actual block number instead of memory address in error logs
 	parsedBlockNumber := *check.parsedBlockNumberResponse
@@ -315,24 +303,16 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 	// then the endpoint is behind the chain and should be filtered out.
 	minAllowedBlockNumber := ss.perceivedBlockNumber - syncAllowance
 
-	// Log the sync allowance validation details
-	ss.logger.Warn().
-		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-		Uint64("endpoint_block", parsedBlockNumber).
-		Uint64("perceived_block", ss.perceivedBlockNumber).
-		Uint64("sync_allowance", syncAllowance).
-		Uint64("min_allowed_block", minAllowedBlockNumber).
-		Int64("blocks_behind", int64(ss.perceivedBlockNumber)-int64(parsedBlockNumber)).
-		Bool("within_allowance", parsedBlockNumber >= minAllowedBlockNumber).
-		Msg("🔍 Sync allowance validation")
-
 	if parsedBlockNumber < minAllowedBlockNumber {
+		blocksBehind := int64(ss.perceivedBlockNumber) - int64(parsedBlockNumber)
 		ss.logger.Warn().
 			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 			Uint64("endpoint_block", parsedBlockNumber).
-			Uint64("min_allowed_block", minAllowedBlockNumber).
+			Uint64("perceived_block", ss.perceivedBlockNumber).
 			Uint64("sync_allowance", syncAllowance).
-			Msg("❌ Endpoint failed sync allowance check - too far behind")
+			Uint64("min_allowed_block", minAllowedBlockNumber).
+			Int64("blocks_behind", blocksBehind).
+			Msg("⛔ Endpoint filtered: block height outside sync allowance")
 		return fmt.Errorf("%w: block number %d is outside the sync allowance relative to min allowed block number %d and sync allowance %d",
 			errOutsideSyncAllowanceBlockNumberObs, parsedBlockNumber, minAllowedBlockNumber, syncAllowance)
 	}

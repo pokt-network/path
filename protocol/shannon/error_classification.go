@@ -13,6 +13,7 @@ import (
 	"github.com/pokt-network/path/metrics"
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
+	"github.com/pokt-network/path/qos/heuristic"
 	"github.com/pokt-network/path/reputation"
 )
 
@@ -263,6 +264,20 @@ func classifyNon2XXStatusCode(err error, latency time.Duration) (protocolobserva
 // See ERROR_CLASSIFICATION.md sections 1-2 and 4-6 for payload error categories.
 func classifyMalformedPayloadAsSignal(logger polylog.Logger, payloadContent string, latency time.Duration) (protocolobservations.ShannonEndpointErrorType, reputation.Signal) {
 	logger = logger.With("payload_content_preview", payloadContent[:min(len(payloadContent), 200)])
+
+	// Use heuristic indicator analysis to detect HTTP error patterns (bad gateway, 502, 503, etc.)
+	// This uses the same patterns as the gateway layer heuristic detection for consistency.
+	indicatorResult := heuristic.IndicatorAnalysis([]byte(payloadContent), false)
+	if indicatorResult.Found && indicatorResult.Category == heuristic.CategoryHTTPError {
+		// HTTP error patterns (bad gateway, service unavailable, etc.) are server-side failures
+		// Category: Supplier Service Errors (CRITICAL -25)
+		logger.Debug().
+			Str("pattern", indicatorResult.Pattern).
+			Float64("confidence", indicatorResult.Confidence).
+			Msg("Detected HTTP error pattern in malformed payload using heuristic analysis")
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_BACKEND_SERVICE,
+			reputation.NewCriticalErrorSignal("backend_http_error", latency)
+	}
 
 	// Connection refused errors - most common pattern (~52% of errors)
 	// Category: Supplier Infrastructure Issues - Connection (MAJOR -10)

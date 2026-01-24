@@ -117,6 +117,10 @@ type requestContext struct {
 	// rawResponses stores raw endpoint responses in passthrough mode.
 	// Used by GetHTTPResponse to return raw bytes without parsing.
 	rawResponses []rawEndpointResponse
+
+	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
+	// Used to provide more specific error messages to clients (e.g., "no valid endpoints available").
+	protocolError error
 }
 
 // GetServicePayloads returns the service payloads for the JSON-RPC requests in the request context.
@@ -175,6 +179,12 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 	})
 }
 
+// SetProtocolError stores a protocol-level error for more specific client error messages.
+// Implements the gateway.RequestQoSContext interface.
+func (rc *requestContext) SetProtocolError(err error) {
+	rc.protocolError = err
+}
+
 // TODO_TECHDEBT(@adshmh): Drop the responseNone struct:
 // - Not having received a response from protocol layer is a protocol error
 // - Use a RequestError, consistent with qos/cosmos and qos/solana packages.
@@ -200,12 +210,13 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 // getPassthroughHTTPResponse returns raw bytes as-is without parsing.
 // Used in passthrough mode for low-latency client responses.
 func (rc requestContext) getPassthroughHTTPResponse() pathhttp.HTTPResponse {
-	// No raw responses received - return error response
+	// No raw responses received - return error response with protocol error context if available
 	if len(rc.rawResponses) == 0 {
 		rc.logger.Warn().Msg("No responses received from any endpoints in passthrough mode. Returning generic non-response.")
 		responseNoneObj := responseNone{
 			logger:          rc.logger,
 			servicePayloads: rc.servicePayloads,
+			protocolError:   rc.protocolError,
 		}
 		return responseNoneObj.GetHTTPResponse()
 	}
@@ -233,6 +244,7 @@ func (rc requestContext) getLegacyHTTPResponse() pathhttp.HTTPResponse {
 		responseNoneObj := responseNone{
 			logger:          rc.logger,
 			servicePayloads: rc.servicePayloads,
+			protocolError:   rc.protocolError,
 		}
 		return responseNoneObj.GetHTTPResponse()
 	}

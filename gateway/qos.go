@@ -36,6 +36,13 @@ type RequestQoSContext interface {
 	// - httpStatusCode is the original HTTP status code from the backend endpoint.
 	UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int)
 
+	// SetProtocolError:
+	// - Sets a protocol-level error that occurred before any endpoint could respond.
+	// - Used to provide more specific error messages to clients.
+	// - Examples: "no valid endpoints available", "RPC type not supported", etc.
+	// - If set, GetHTTPResponse should use this error for a more informative response.
+	SetProtocolError(err error)
+
 	// GetHTTPResponse:
 	// - Returns the user-facing HTTP response.
 	// - Response depends on the current state of the service request context.

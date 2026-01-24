@@ -3,9 +3,6 @@ package shannon
 import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/pokt-network/poktroll/x/session/types"
-
-	"github.com/pokt-network/path/log"
-	"github.com/pokt-network/path/protocol"
 )
 
 // hydrateLoggerWithSession enhances a logger with full session details.
@@ -45,31 +42,4 @@ func hydrateLoggerWithSession(
 	}
 
 	return hydratedLogger
-}
-
-// hydrateLoggerWithPayload enhances a logger with payload details.
-// Creates contextually rich logs with payload information.
-//
-// Parameters:
-//   - logger: The base logger to enhance
-//   - payload: The payload object containing request data
-//
-// Returns:
-//   - An enhanced logger with all relevant payload fields attached
-func hydrateLoggerWithPayload(
-	logger polylog.Logger,
-	payload *protocol.Payload,
-) polylog.Logger {
-	// Handle nil payload
-	if payload == nil {
-		return logger
-	}
-
-	// Add payload fields, using data length instead of full data content
-	return logger.With(
-		"payload_data_length", len(payload.Data),
-		"payload_method", payload.Method,
-		"payload_path", payload.Path,
-		"payload_data_preview", log.Preview(payload.Data),
-	)
 }
