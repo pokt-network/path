@@ -43,4 +43,3 @@ func hydrateLoggerWithSession(
 
 	return hydratedLogger
 }
-

@@ -56,6 +56,10 @@ type requestContext struct {
 
 	// Endpoint response tracking
 	endpointResponses []endpointResponse
+
+	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
+	// Used to provide more specific error messages to clients.
+	protocolError error
 }
 
 // endpointResponse tracks a response from a specific endpoint
@@ -101,12 +105,22 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 	})
 }
 
+// SetProtocolError stores a protocol-level error for more specific client error messages.
+// Implements the gateway.RequestQoSContext interface.
+func (rc *requestContext) SetProtocolError(err error) {
+	rc.protocolError = err
+}
+
 // GetHTTPResponse builds the HTTP response that should be returned for
 // an EVM blockchain service request.
 // Implements the gateway.RequestQoSContext interface.
 func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 	// Use a noResponses struct if no responses were reported by the protocol from any endpoints.
 	if len(rc.endpointResponses) == 0 {
+		// If a specific protocol error is available, use it for a more informative response
+		if rc.protocolError != nil {
+			return rc.buildProtocolErrorResponse()
+		}
 		return rc.protocolErrorResponseBuilder(rc.logger)
 	}
 
@@ -240,4 +254,26 @@ func (rc *requestContext) Select(allEndpoints protocol.EndpointAddrList) (protoc
 func (rc *requestContext) SelectMultiple(allEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
 	// Select multiple endpoints from the available endpoints using the service state.
 	return rc.serviceState.SelectMultiple(allEndpoints, numEndpoints)
+}
+
+// buildProtocolErrorResponse builds an HTTP response using the stored protocol error.
+// This provides more specific error messages to clients than the generic error builders.
+func (rc requestContext) buildProtocolErrorResponse() pathhttp.HTTPResponse {
+	// Get an appropriate request ID for the error response
+	var requestID jsonrpc.ID
+	for id := range rc.servicePayloads {
+		requestID = id
+		break
+	}
+
+	errorResp := jsonrpc.NewErrResponseInternalErr(requestID, rc.protocolError)
+	bz, err := json.Marshal(errorResp)
+	if err != nil {
+		rc.logger.Warn().Err(err).Msg("buildProtocolErrorResponse: Marshaling JSONRPC response failed.")
+	}
+
+	return jsonrpc.HTTPResponse{
+		ResponsePayload: bz,
+		HTTPStatusCode:  http.StatusInternalServerError,
+	}
 }

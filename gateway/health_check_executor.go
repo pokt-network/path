@@ -34,6 +34,7 @@ import (
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/heuristic"
 	"github.com/pokt-network/path/reputation"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
@@ -218,6 +219,14 @@ func (e *HealthCheckExecutor) getUnifiedServicesHealthChecks() []ServiceHealthCh
 		return nil
 	}
 
+	// Build a map of local configs for quick lookup of per-service check_interval
+	localConfigMap := make(map[protocol.ServiceID]*ServiceHealthCheckConfig)
+	if e.config != nil {
+		for i := range e.config.Local {
+			localConfigMap[e.config.Local[i].ServiceID] = &e.config.Local[i]
+		}
+	}
+
 	var configs []ServiceHealthCheckConfig
 	for _, svc := range e.unifiedServicesConfig.Services {
 		// Get merged config (with defaults applied)
@@ -252,9 +261,15 @@ func (e *HealthCheckExecutor) getUnifiedServicesHealthChecks() []ServiceHealthCh
 
 		// Only add if we have checks
 		if len(finalChecks) > 0 {
+			// Determine check interval: local config takes precedence over unified config default
+			checkInterval := merged.HealthChecks.Interval
+			if localCfg, exists := localConfigMap[svc.ID]; exists && localCfg.CheckInterval > 0 {
+				checkInterval = localCfg.CheckInterval
+			}
+
 			cfg := ServiceHealthCheckConfig{
 				ServiceID:     svc.ID,
-				CheckInterval: merged.HealthChecks.Interval,
+				CheckInterval: checkInterval,
 				SyncAllowance: merged.HealthChecks.SyncAllowance,
 				Checks:        finalChecks,
 			}
@@ -434,10 +449,27 @@ func (e *HealthCheckExecutor) refreshExternalConfig(ctx context.Context) {
 	e.externalConfigError = nil
 	e.externalConfigMu.Unlock()
 
+	// Propagate sync_allowance from external configs to unified services config
+	// This ensures the QoS layer uses the correct sync_allowance for endpoint selection
+	syncAllowanceCount := 0
+	if e.unifiedServicesConfig != nil {
+		for _, cfg := range configs {
+			if cfg.SyncAllowance != nil && *cfg.SyncAllowance > 0 {
+				e.unifiedServicesConfig.SetServiceSyncAllowance(cfg.ServiceID, *cfg.SyncAllowance)
+				syncAllowanceCount++
+				e.logger.Info().
+					Str("service_id", string(cfg.ServiceID)).
+					Int("sync_allowance", *cfg.SyncAllowance).
+					Msg("📏 Loaded sync_allowance from external health check rules")
+			}
+		}
+	}
+
 	e.logger.Info().
 		Str("url", externalURL).
 		Int("service_count", len(configs)).
-		Msg("Successfully loaded external health check config")
+		Int("sync_allowance_count", syncAllowanceCount).
+		Msg("✅ Loaded external health check config")
 }
 
 // setExternalConfigError stores an error from external config loading.
@@ -682,11 +714,12 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	keyBuilder := e.reputationSvc.KeyBuilderForService(serviceID)
 	key := keyBuilder.BuildKey(serviceID, endpointAddr, rpcType)
 
-	// Extract domain from endpoint address for metrics
+	// Extract domain and supplier from endpoint address for metrics
 	domain, err := shannonmetrics.ExtractDomainOrHost(string(endpointAddr))
 	if err != nil {
 		domain = shannonmetrics.ErrDomain
 	}
+	supplier := extractSupplierFromEndpoint(endpointAddr)
 	rpcTypeStr := metrics.NormalizeRPCType(rpcType.String())
 
 	if checkErr == nil {
@@ -705,8 +738,8 @@ func (e *HealthCheckExecutor) recordCheckResult(
 				Msg("Failed to record recovery success signal")
 		}
 
-		// Record health check metric for success
-		metrics.RecordHealthCheck(domain, rpcTypeStr, string(serviceID), check.Name, metrics.SignalOK)
+		// Record health check metric for success (per supplier)
+		metrics.RecordHealthCheck(domain, supplier, rpcTypeStr, string(serviceID), check.Name, metrics.SignalOK)
 		return
 	}
 
@@ -721,9 +754,9 @@ func (e *HealthCheckExecutor) recordCheckResult(
 			Msg("Failed to record error signal")
 	}
 
-	// Record health check metric for failure
+	// Record health check metric for failure (per supplier)
 	metricSignal := mapReputationSignalToMetricSignal(check.ReputationSignal)
-	metrics.RecordHealthCheck(domain, rpcTypeStr, string(serviceID), check.Name, metricSignal)
+	metrics.RecordHealthCheck(domain, supplier, rpcTypeStr, string(serviceID), check.Name, metricSignal)
 
 	e.logger.Debug().
 		Str("service_id", string(serviceID)).
@@ -839,7 +872,8 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	startTime := time.Now()
 
 	// Create timeout context for the health check
-	timeout := 30 * time.Second
+	// Use configured timeout or default (5s for faster detection of unhealthy endpoints)
+	timeout := DefaultHealthCheckTimeout
 	if check.Timeout > 0 {
 		timeout = check.Timeout
 	}
@@ -929,6 +963,35 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Int("response_size", len(response.Bytes)).
 			Dur("latency", latency).
 			Msg("Health check relay response received from supplier")
+	}
+
+	// Heuristic analysis - detect bad gateway, empty responses, and other error patterns
+	// This runs BEFORE QoS validation to catch issues the basic validation might miss
+	heuristicResult := heuristic.Analyze(responseBody, httpStatusCode, servicePayload.RPCType)
+	if heuristicResult.ShouldRetry {
+		heuristicErr := fmt.Errorf("heuristic detected error: %s - %s", heuristicResult.Reason, heuristicResult.Details)
+		e.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Str("check", check.Name).
+			Str("heuristic_reason", heuristicResult.Reason).
+			Float64("heuristic_confidence", heuristicResult.Confidence).
+			Str("heuristic_details", heuristicResult.Details).
+			Int("response_size", len(responseBody)).
+			Dur("latency", latency).
+			Msg("Health check failed heuristic analysis - bad gateway, empty response, or error pattern detected")
+
+		// Record relay metric with appropriate signal based on heuristic confidence
+		statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
+		signalType := metrics.SignalMinorError
+		if heuristicResult.Confidence >= 0.95 {
+			signalType = metrics.SignalMajorError
+		}
+		metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, signalType, metrics.RelayTypeHealthCheck, latency.Seconds())
+
+		// Publish observations even for heuristic failures
+		e.publishHealthCheckObservations(serviceID, endpointAddr, startTime, protocolCtx, &protocolObs)
+		return latency, heuristicErr
 	}
 
 	// Process observation SYNCHRONOUSLY for block height extraction
@@ -1188,7 +1251,8 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 		Msg("Executing WebSocket health check via protocol")
 
 	// Create timeout context for the health check
-	timeout := 30 * time.Second
+	// Use configured timeout or default (5s for faster detection of unhealthy endpoints)
+	timeout := DefaultHealthCheckTimeout
 	if check.Timeout > 0 {
 		timeout = check.Timeout
 	}

@@ -24,6 +24,7 @@ import (
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/heuristic"
 	"github.com/pokt-network/path/reputation"
 )
 
@@ -606,6 +607,16 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// Hydrate the response with the endpoint address
 	deserializedResponse.EndpointAddr = selectedEndpoint.Addr()
 
+	// Hydrate the response with relay metadata for response headers
+	endpointSession := selectedEndpoint.Session()
+	deserializedResponse.Metadata = protocol.RelayMetadata{
+		SupplierAddress: selectedEndpoint.Supplier(),
+		SessionID:       endpointSession.SessionId,
+	}
+	if endpointSession.Application != nil {
+		deserializedResponse.Metadata.AppAddress = endpointSession.Application.Address
+	}
+
 	// Log non-2xx HTTP status codes for visibility, but passthrough the response
 	// to preserve the backend's original HTTP status code for the client.
 	responseHTTPStatusCode := deserializedResponse.HTTPStatusCode
@@ -613,6 +624,26 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		rc.logger.Debug().
 			Int("http_status_code", responseHTTPStatusCode).
 			Msg("Backend returned non-2xx HTTP status - passing through to client")
+	}
+
+	// Heuristic analysis of response content - detect bad gateway, empty responses, etc.
+	// This runs BEFORE returning to gateway to allow protocol-level retry decisions.
+	// Only analyze on HTTP 2xx status to avoid double-checking non-2xx responses.
+	if responseHTTPStatusCode >= 200 && responseHTTPStatusCode < 300 {
+		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.currentRPCType)
+		if heuristicResult.ShouldRetry {
+			rc.logger.Debug().
+				Str("heuristic_reason", heuristicResult.Reason).
+				Float64("heuristic_confidence", heuristicResult.Confidence).
+				Str("heuristic_details", heuristicResult.Details).
+				Int("response_size", len(deserializedResponse.Bytes)).
+				Int("http_status_code", responseHTTPStatusCode).
+				Msg("Heuristic analysis detected error in backend response - triggering retry")
+
+			// Return an error to trigger retry at protocol level
+			return defaultResponse, fmt.Errorf("%w: heuristic detected %s: %s",
+				errMalformedEndpointPayload, heuristicResult.Reason, heuristicResult.Details)
+		}
 	}
 
 	return deserializedResponse, nil
@@ -1249,10 +1280,17 @@ func (rc *requestContext) sendHTTPRequest(
 	url string,
 	requestData []byte,
 ) ([]byte, int, error) {
+	// Get per-service relay timeout, falling back to global default if not configured.
+	// This allows different services to have different timeouts based on their payload sizes
+	// and expected response times (e.g., LLM services may need 60s+ while EVM chains need 5-10s).
+	relayTimeout := gateway.DefaultRelayRequestTimeout
+	if rc.unifiedServicesConfig != nil {
+		relayTimeout = rc.unifiedServicesConfig.GetRelayTimeoutForService(rc.serviceID)
+	}
+
 	// Prepare a timeout context for the request.
 	// Use rc.context as parent to respect request-level cancellation signals.
-	timeout := time.Duration(gateway.RelayRequestTimeout) * time.Millisecond
-	ctxWithTimeout, cancelFn := context.WithTimeout(rc.context, timeout)
+	ctxWithTimeout, cancelFn := context.WithTimeout(rc.context, relayTimeout)
 	defer cancelFn()
 
 	// Build headers including RPCType header
@@ -1294,4 +1332,3 @@ func prepareURLFromPayload(endpointURL string, payload protocol.Payload) string 
 	}
 	return url
 }
-

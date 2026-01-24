@@ -357,6 +357,13 @@ type (
 		RetryOnTimeout bool `yaml:"retry_on_timeout,omitempty"`
 		// RetryOnConnection enables retrying on connection errors.
 		RetryOnConnection bool `yaml:"retry_on_connection,omitempty"`
+		// ConnectTimeout is the maximum time to establish a TCP connection.
+		// Used for hedge racing to detect slow connections quickly.
+		ConnectTimeout *time.Duration `yaml:"connect_timeout,omitempty"`
+		// HedgeDelay is the time to wait before starting a hedge (parallel) request.
+		// If the primary request hasn't completed within this duration, a second request
+		// is started to a different endpoint and the first response wins.
+		HedgeDelay *time.Duration `yaml:"hedge_delay,omitempty"`
 	}
 
 	// ObservationPipelineConfig configures the observation processing pipeline.

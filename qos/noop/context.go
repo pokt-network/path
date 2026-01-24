@@ -38,6 +38,10 @@ type requestContext struct {
 	// presetFailureResponse, if set, is used to return a preconstructed response to the user.
 	// This is used by the conductor of the requestContext instance, e.g. if reading the HTTP request's body fails.
 	presetFailureResponse pathhttp.HTTPResponse
+
+	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
+	// Used to provide more specific error messages to clients.
+	protocolError error
 }
 
 // GetServicePayload returns the payload to be sent to a service endpoint.
@@ -67,6 +71,12 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 	})
 }
 
+// SetProtocolError stores a protocol-level error for more specific client error messages.
+// Implements the gateway.RequestQoSContext interface.
+func (rc *requestContext) SetProtocolError(err error) {
+	rc.protocolError = err
+}
+
 // GetHTTPResponse returns a user-facing response that fulfills the pathhttp.HTTPResponse interface.
 // Any preset failure responses, e.g. set during the construction of the requestContext instance, take priority.
 // After that, this method simply returns an HTTP response based on the most recently reported endpoint response.
@@ -77,6 +87,10 @@ func (rc *requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 	}
 
 	if len(rc.receivedResponses) == 0 {
+		// Use the specific protocol error if available, otherwise use a generic message.
+		if rc.protocolError != nil {
+			return getNoEndpointResponseWithError(rc.protocolError)
+		}
 		return getNoEndpointResponse()
 	}
 
