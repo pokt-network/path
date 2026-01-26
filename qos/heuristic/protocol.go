@@ -76,7 +76,7 @@ func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType
 // analyzeJSONRPC checks JSON-RPC response structure.
 // Per JSON-RPC 2.0 spec, a valid response MUST have either:
 //   - "result" field (success)
-//   - "error" field (error)
+//   - "error" field (error - but still a VALID response)
 //
 // Having neither or both indicates a malformed response.
 func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
@@ -84,7 +84,7 @@ func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
 	hasError := bytes.Contains(prefix, jsonrpcErrorField)
 	hasVersion := bytes.Contains(prefix, jsonrpcVersionField)
 
-	// Has "result" without "error" - definitely success
+	// Case 1: Has "result" without "error" - definitely success
 	if hasResult && !hasError {
 		return AnalysisResult{
 			ShouldRetry: false,
@@ -95,27 +95,50 @@ func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
 		}
 	}
 
-	// Has "error" field - definitely an error response
-	if hasError {
+	// Case 2: Has "error" without "result" AND has proper structure
+	// This is a VALID JSON-RPC error response - should NOT retry
+	// Examples: smart contract errors, middleware errors, method not found, etc.
+	if hasError && !hasResult && hasVersion {
 		return AnalysisResult{
-			ShouldRetry: true,
-			Confidence:  0.90,
-			Reason:      "jsonrpc_error_field",
+			ShouldRetry: false, // FIXED: Don't retry valid error responses
+			Confidence:  0.0,
+			Reason:      "jsonrpc_valid_error",
 			Structure:   StructureValid,
-			Details:     "JSON-RPC response contains error field",
+			Details:     "JSON-RPC response contains valid error field",
 		}
 	}
 
-	// Has neither "result" nor "error"
-	// For small responses, this is suspicious
-	// For large responses, "result" might be beyond our prefix
+	// Case 3: Has BOTH "result" and "error" - malformed (violates JSON-RPC spec)
+	if hasResult && hasError {
+		return AnalysisResult{
+			ShouldRetry: true,
+			Confidence:  0.95,
+			Reason:      "jsonrpc_both_result_and_error",
+			Structure:   StructureValid,
+			Details:     "JSON-RPC response has both result and error (malformed)",
+		}
+	}
+
+	// Case 4: Has "error" but no "jsonrpc" version field - suspicious
+	// Might be a non-JSON-RPC error like {"error":"Bad Gateway"} from proxy
+	if hasError && !hasVersion {
+		return AnalysisResult{
+			ShouldRetry: true,
+			Confidence:  0.80,
+			Reason:      "error_without_jsonrpc_version",
+			Structure:   StructureValid,
+			Details:     "Response has error field but missing jsonrpc version",
+		}
+	}
+
+	// Case 5: Has neither "result" nor "error"
 	if !hasResult && !hasError {
 		// If it looks like JSON-RPC (has version) but no result/error
 		if hasVersion && fullLength < 500 {
 			return AnalysisResult{
 				ShouldRetry: true,
 				Confidence:  0.85,
-				Reason:      "jsonrpc_missing_result",
+				Reason:      "jsonrpc_missing_result_and_error",
 				Structure:   StructureValid,
 				Details:     "JSON-RPC response missing both result and error fields",
 			}
@@ -132,7 +155,7 @@ func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
 			}
 		}
 
-		// Larger response - result might be beyond prefix, lower confidence
+		// Larger response - result might be beyond prefix
 		return AnalysisResult{
 			ShouldRetry: false,
 			Confidence:  0.3,

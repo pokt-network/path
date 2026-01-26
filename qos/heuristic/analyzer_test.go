@@ -146,24 +146,34 @@ func TestProtocolAnalysis_JSONRPC(t *testing.T) {
 			expectedReason: "jsonrpc_success",
 		},
 		{
-			name:           "JSON-RPC error response",
+			name:           "JSON-RPC valid error response - should NOT retry",
 			response:       []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"server error"}}`),
-			expectedRetry:  true,
-			expectedReason: "jsonrpc_error_field",
-			minConfidence:  0.85,
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_valid_error",
 		},
 		{
-			name:           "JSON-RPC error with details",
-			response:       []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-31002,"message":"invalid response","data":{"endpoint_response":"Bad Gateway"}}}`),
+			name:           "Middleware custom error - valid response",
+			response:       []byte(`{"jsonrpc":"2.0","error":{"code":3200,"message":"ho ho ho merry christmas"},"id":1}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_valid_error",
+		},
+		{
+			name:           "JSON-RPC with both result and error - malformed",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":"0x123","error":{"code":-32000,"message":"error"}}`),
 			expectedRetry:  true,
-			expectedReason: "jsonrpc_error_field",
-			minConfidence:  0.85,
+			expectedReason: "jsonrpc_both_result_and_error",
+		},
+		{
+			name:           "Error without jsonrpc version - suspicious",
+			response:       []byte(`{"error":"Bad Gateway"}`),
+			expectedRetry:  true,
+			expectedReason: "error_without_jsonrpc_version",
 		},
 		{
 			name:           "JSON-RPC missing both result and error (small)",
 			response:       []byte(`{"jsonrpc":"2.0","id":1}`),
 			expectedRetry:  true,
-			expectedReason: "jsonrpc_missing_result",
+			expectedReason: "jsonrpc_missing_result_and_error",
 			minConfidence:  0.80,
 		},
 		{
@@ -386,8 +396,24 @@ func TestFullAnalyzer(t *testing.T) {
 			response:       []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"server error"}}`),
 			httpStatus:     200,
 			rpcType:        sharedtypes.RPCType_JSON_RPC,
+			expectedRetry:  false,
+			expectedReason: "likely_valid",
+		},
+		{
+			name:           "JSON-RPC with both result and error - malformed",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":"0x123","error":{"code":-32000,"message":"error"}}`),
+			httpStatus:     200,
+			rpcType:        sharedtypes.RPCType_JSON_RPC,
 			expectedRetry:  true,
-			expectedReason: "jsonrpc_error_field",
+			expectedReason: "jsonrpc_both_result_and_error",
+		},
+		{
+			name:           "Error without jsonrpc version - suspicious",
+			response:       []byte(`{"error":"Bad Gateway"}`),
+			httpStatus:     200,
+			rpcType:        sharedtypes.RPCType_JSON_RPC,
+			expectedRetry:  true,
+			expectedReason: "error_without_jsonrpc_version",
 		},
 
 		// Error indicator checks
@@ -397,7 +423,7 @@ func TestFullAnalyzer(t *testing.T) {
 			httpStatus:     200,
 			rpcType:        sharedtypes.RPCType_JSON_RPC,
 			expectedRetry:  true,
-			expectedReason: "jsonrpc_error_field",
+			expectedReason: "error_without_jsonrpc_version",
 		},
 
 		// Edge cases
