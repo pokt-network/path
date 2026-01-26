@@ -81,9 +81,6 @@ var errorPatterns = []errorPattern{
 	{[]byte("503 service unavailable"), CategoryHTTPError, 0.98},
 	{[]byte("504 gateway timeout"), CategoryHTTPError, 0.98},
 	{[]byte("500 internal server error"), CategoryHTTPError, 0.98},
-	{[]byte("502"), CategoryHTTPError, 0.70}, // Just the code
-	{[]byte("503"), CategoryHTTPError, 0.70},
-	{[]byte("504"), CategoryHTTPError, 0.70},
 	{[]byte("internal server error"), CategoryHTTPError, 0.90},
 	{[]byte("service unavailable"), CategoryHTTPError, 0.90},
 	{[]byte("gateway timeout"), CategoryHTTPError, 0.90},
@@ -108,15 +105,12 @@ var errorPatterns = []errorPattern{
 	{[]byte("rate-limit"), CategoryRateLimit, 0.95},
 	{[]byte("ratelimit"), CategoryRateLimit, 0.95},
 	{[]byte("too many request"), CategoryRateLimit, 0.95},
-	{[]byte("429"), CategoryRateLimit, 0.80},
 	{[]byte("quota exceeded"), CategoryRateLimit, 0.90},
 	{[]byte("throttl"), CategoryRateLimit, 0.85}, // throttle, throttled, throttling
 
 	// Authentication/Authorization Errors
 	{[]byte("unauthorized"), CategoryAuthError, 0.90},
-	{[]byte("401"), CategoryAuthError, 0.75},
 	{[]byte("forbidden"), CategoryAuthError, 0.90},
-	{[]byte("403"), CategoryAuthError, 0.75},
 	{[]byte("access denied"), CategoryAuthError, 0.90},
 	{[]byte("invalid api key"), CategoryAuthError, 0.95},
 	{[]byte("authentication failed"), CategoryAuthError, 0.95},

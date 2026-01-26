@@ -640,9 +640,10 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 				Int("http_status_code", responseHTTPStatusCode).
 				Msg("Heuristic analysis detected error in backend response - triggering retry")
 
-			// Return an error to trigger retry at protocol level
-			return defaultResponse, fmt.Errorf("%w: heuristic detected %s: %s",
-				errMalformedEndpointPayload, heuristicResult.Reason, heuristicResult.Details)
+			// Return an error to trigger retry at protocol level.
+			// Wrap in raw_payload: format to allow proper error classification and reputation penalty.
+			return defaultResponse, fmt.Errorf("raw_payload: %s: heuristic detected %s: %w",
+				string(deserializedResponse.Bytes), heuristicResult.Reason, errMalformedEndpointPayload)
 		}
 	}
 

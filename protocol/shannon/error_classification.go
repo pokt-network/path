@@ -260,9 +260,81 @@ func classifyNon2XXStatusCode(err error, latency time.Duration) (protocolobserva
 	}
 }
 
+// classifyHeuristicErrorAsSignal maps heuristic reasons to Shannon error types and signals.
+func classifyHeuristicErrorAsSignal(
+	logger polylog.Logger,
+	reason string,
+	payloadContent string,
+	latency time.Duration,
+) (protocolobservations.ShannonEndpointErrorType, reputation.Signal) {
+	switch {
+	// Category: Supplier Service Errors (CRITICAL -25)
+	case strings.HasPrefix(reason, "error_indicator_http_error"),
+		reason == "html_error_page",
+		reason == "bad_gateway",
+		reason == "rest_error_field",
+		reason == "rest_code_message_error":
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_BACKEND_SERVICE,
+			reputation.NewCriticalErrorSignal("service_error", latency)
+
+	// Category: Supplier Infrastructure Issues - Connection (MAJOR -10)
+	case strings.HasPrefix(reason, "error_indicator_connection_error"):
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_CONNECTION_REFUSED,
+			reputation.NewMajorErrorSignal("connection_error", latency)
+
+	// Category: Rate Limiting (MAJOR -10)
+	case strings.HasPrefix(reason, "error_indicator_rate_limit"):
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_BACKEND_SERVICE,
+			reputation.NewMajorErrorSignal("rate_limit", latency)
+
+	// Category: Authentication/Authorization (MINOR -3)
+	// Usually client-side but recorded as minor to track supplier health
+	case strings.HasPrefix(reason, "error_indicator_auth_error"):
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RELAY_MINER_HTTP_4XX,
+			reputation.NewMinorErrorSignal("auth_error")
+
+	// Category: Blockchain Errors (MINOR -3)
+	// Could be node syncing, pruned data, etc.
+	case strings.HasPrefix(reason, "error_indicator_blockchain_error"):
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_BACKEND_SERVICE,
+			reputation.NewMinorErrorSignal("blockchain_error")
+
+	// Category: Protocol Errors (CRITICAL -25)
+	case strings.HasPrefix(reason, "error_indicator_protocol_error"),
+		reason == "jsonrpc_both_result_and_error",
+		reason == "jsonrpc_missing_result_and_error",
+		reason == "malformed_json":
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_PROTOCOL_WIRE_TYPE,
+			reputation.NewCriticalErrorSignal("protocol_error", latency)
+
+	// Category: Empty Response (MINOR -3)
+	case reason == "empty_response", reason == "small_no_result":
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_UNEXPECTED_EOF,
+			reputation.NewMinorErrorSignal("empty_response")
+
+	// Default: Treat as unknown malformed payload
+	default:
+		return classifyMalformedPayloadAsSignal(logger, payloadContent, latency)
+	}
+}
+
 // classifyMalformedPayloadAsSignal classifies errors found in malformed endpoint response payloads.
 // See ERROR_CLASSIFICATION.md sections 1-2 and 4-6 for payload error categories.
 func classifyMalformedPayloadAsSignal(logger polylog.Logger, payloadContent string, latency time.Duration) (protocolobservations.ShannonEndpointErrorType, reputation.Signal) {
+	// If this was a heuristic detected error, handle it using the detected reason
+	if idx := strings.LastIndex(payloadContent, ": heuristic detected "); idx != -1 {
+		heuristicReason := payloadContent[idx+len(": heuristic detected "):]
+		// Clean up body for logging and further analysis
+		payloadContent = payloadContent[:idx]
+
+		logger = logger.With(
+			"payload_content_preview", payloadContent[:min(len(payloadContent), 200)],
+			"heuristic_reason", heuristicReason,
+		)
+
+		return classifyHeuristicErrorAsSignal(logger, heuristicReason, payloadContent, latency)
+	}
+
 	logger = logger.With("payload_content_preview", payloadContent[:min(len(payloadContent), 200)])
 
 	// Use heuristic indicator analysis to detect HTTP error patterns (bad gateway, 502, 503, etc.)

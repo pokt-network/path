@@ -435,6 +435,14 @@ func TestFullAnalyzer(t *testing.T) {
 			expectedRetry:  false,
 			expectedReason: "likely_valid",
 		},
+		{
+			name:           "JSON-RPC with 403 in result - should NOT retry",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":"address contains 403 somewhere"}`),
+			httpStatus:     200,
+			rpcType:        sharedtypes.RPCType_JSON_RPC,
+			expectedRetry:  false,
+			expectedReason: "likely_valid",
+		},
 	}
 
 	for _, tt := range tests {
