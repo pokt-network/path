@@ -114,8 +114,10 @@ func (hr *hedgeRacer) race(
 		hr.logger.Info().
 			Str("service_id", hr.serviceID).
 			Str("supplier", result.supplierAddr).
+			Str("primary_supplier", primarySupplier).
 			Dur("latency", result.duration).
 			Bool("success", result.err == nil).
+			Int("suppliers_tracked_before", len(hr.rc.suppliersTried)).
 			Msg("⚡ Primary responded before hedge delay (no hedge needed)")
 
 		// Record metric: primary_only (no hedge was started)
@@ -419,6 +421,12 @@ func (hr *hedgeRacer) handleResult(result hedgeResult) ([]protocol.Response, err
 		}
 		if !alreadyTracked {
 			hr.rc.suppliersTried = append(hr.rc.suppliersTried, result.supplierAddr)
+			hr.logger.Debug().
+				Str("supplier", result.supplierAddr).
+				Bool("is_hedge", result.isHedge).
+				Str("source", "handleResult").
+				Int("total_suppliers_tried", len(hr.rc.suppliersTried)).
+				Msg("🔍 TRACKED supplier in suppliersTried (winner)")
 		}
 	}
 
@@ -456,6 +464,12 @@ func (hr *hedgeRacer) recordLoser(result hedgeResult) {
 		}
 		if !alreadyTracked {
 			hr.rc.suppliersTried = append(hr.rc.suppliersTried, result.supplierAddr)
+			hr.logger.Debug().
+				Str("supplier", result.supplierAddr).
+				Bool("is_hedge", result.isHedge).
+				Str("source", "recordLoser").
+				Int("total_suppliers_tried", len(hr.rc.suppliersTried)).
+				Msg("🔍 TRACKED supplier in suppliersTried (loser)")
 		}
 	}
 

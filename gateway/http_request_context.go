@@ -535,6 +535,11 @@ func (rc *requestContext) addRelayMetadataHeaders(w http.ResponseWriter) {
 	// ALWAYS add suppliers tried header if any were attempted (even on errors)
 	if len(rc.suppliersTried) > 0 {
 		w.Header().Set("X-Suppliers-Tried", strings.Join(rc.suppliersTried, ","))
+		rc.logger.Debug().
+			Str("suppliers_tried", strings.Join(rc.suppliersTried, ",")).
+			Int("retry_count", rc.retryCount).
+			Str("hedge_result", rc.hedgeResult).
+			Msg("🔍 FINAL X-Suppliers-Tried header set")
 	}
 
 	// Add hedge result header if hedging was used

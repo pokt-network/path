@@ -385,6 +385,15 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				// Copy hedge result to request context for response headers
 				rc.hedgeResult = racer.raceResult
 
+				logger.Debug().
+					Str("hedge_result", rc.hedgeResult).
+					Bool("hedge_started", racer.hedgeStarted).
+					Str("primary_endpoint", string(primaryEndpoint)).
+					Str("hedge_endpoint", string(racer.hedgeEndpoint)).
+					Int("suppliers_tracked", len(rc.suppliersTried)).
+					Err(hedgeErr).
+					Msg("🔍 Hedge race completed")
+
 				// Process hedge race result
 				if hedgeErr == nil && len(hedgeResponses) > 0 {
 					// Hedge race succeeded - process the winning response
@@ -439,7 +448,10 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					logger.Warn().
 						Str("endpoint", string(endpointAddr)).
 						Int("status_code", statusCode).
-						Msg("Hedge race response failed heuristic check, will retry")
+						Str("hedge_result", rc.hedgeResult).
+						Int("suppliers_tracked", len(rc.suppliersTried)).
+						Int("retry_count", rc.retryCount).
+						Msg("🔍 Hedge race response failed heuristic check, will retry")
 				} else {
 					// Hedge race failed - store error and continue to retry
 					lastErr = hedgeErr
@@ -519,6 +531,14 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			}
 			if !alreadyTracked {
 				rc.suppliersTried = append(rc.suppliersTried, supplierForTracking)
+				logger.Debug().
+					Str("supplier", supplierForTracking).
+					Int("attempt", attempt).
+					Int("retry_count", rc.retryCount).
+					Int("status_code", statusCode).
+					Str("source", "handleSingleRelayRequest").
+					Int("total_suppliers_tried", len(rc.suppliersTried)).
+					Msg("🔍 TRACKED supplier in suppliersTried (normal/retry path)")
 			}
 		}
 
@@ -1130,6 +1150,12 @@ func (rc *requestContext) handleSuccessfulResponse(
 				}
 				if !alreadyTracked {
 					rc.suppliersTried = append(rc.suppliersTried, supplierAddr)
+					logger.Debug().
+						Str("supplier", supplierAddr).
+						Int("result_index", result.index).
+						Str("source", "handleSuccessfulResponse-parallel").
+						Int("total_suppliers_tried", len(rc.suppliersTried)).
+						Msg("🔍 TRACKED supplier in suppliersTried (parallel path)")
 				}
 			}
 		}

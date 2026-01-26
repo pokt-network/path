@@ -134,29 +134,31 @@ var errorPatterns = []errorPattern{
 	{[]byte("syntax error"), CategoryProtocolError, 0.85},
 
 	// Blockchain-Specific Errors (EVM)
-	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},
-	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95},
-	{[]byte("state not available"), CategoryBlockchainError, 0.90},
-	{[]byte("block not found"), CategoryBlockchainError, 0.85},
-	{[]byte("transaction not found"), CategoryBlockchainError, 0.80},
-	{[]byte("header not found"), CategoryBlockchainError, 0.85},
-	{[]byte("nonce too low"), CategoryBlockchainError, 0.80},
-	{[]byte("nonce too high"), CategoryBlockchainError, 0.80},
-	{[]byte("insufficient funds"), CategoryBlockchainError, 0.85},
-	{[]byte("gas too low"), CategoryBlockchainError, 0.85},
-	{[]byte("execution reverted"), CategoryBlockchainError, 0.80},
+	// ONLY include errors that indicate supplier/node problems, NOT application-level errors
+	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},     // Data corruption/sync issue
+	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95}, // Archival data not available
+	{[]byte("state not available"), CategoryBlockchainError, 0.90},   // Node sync issue
 
 	// Blockchain-Specific Errors (Solana)
-	{[]byte("slot skipped"), CategoryBlockchainError, 0.85},
-	{[]byte("slot too old"), CategoryBlockchainError, 0.85},
-	{[]byte("block not available"), CategoryBlockchainError, 0.85},
-	{[]byte("node is behind"), CategoryBlockchainError, 0.90},
-	{[]byte("node is unhealthy"), CategoryBlockchainError, 0.95},
+	{[]byte("node is behind"), CategoryBlockchainError, 0.90},    // Sync issue
+	{[]byte("node is unhealthy"), CategoryBlockchainError, 0.95}, // Health issue
 
 	// Blockchain-Specific Errors (Cosmos)
-	{[]byte("block has been pruned"), CategoryBlockchainError, 0.95},
-	{[]byte("height is not available"), CategoryBlockchainError, 0.90},
-	{[]byte("validator set is nil"), CategoryBlockchainError, 0.85},
+	{[]byte("block has been pruned"), CategoryBlockchainError, 0.95},   // Archival issue
+	{[]byte("height is not available"), CategoryBlockchainError, 0.90}, // Sync issue
+
+	// REMOVED APPLICATION-LEVEL ERRORS (valid JSON-RPC errors that should be returned to client):
+	// - "block not found" - Often a valid response (block doesn't exist, future block, or user error)
+	// - "transaction not found" - Often a valid response (transaction doesn't exist)
+	// - "header not found" - Often a valid response
+	// - "nonce too low/high" - Client error, not supplier error
+	// - "insufficient funds" - Client error, not supplier error
+	// - "gas too low" - Client error, not supplier error
+	// - "execution reverted" - Smart contract rejection, not supplier error
+	// - "slot skipped" - Normal Solana behavior, not an error
+	// - "slot too old" - Often a valid response
+	// - "block not available" - Similar to "block not found"
+	// - "validator set is nil" - Often a valid response for certain queries
 }
 
 // IndicatorResult contains the result of error indicator analysis.
