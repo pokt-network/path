@@ -125,13 +125,22 @@ var errorPatterns = []errorPattern{
 	{[]byte("supplier"), CategoryServiceError, 0.60}, // May indicate supplier issue
 
 	// Protocol Errors
+	// NOTE: Protocol-level errors from Shannon/gRPC, NOT JSON-RPC error messages
 	{[]byte("proto: illegal wiretype"), CategoryProtocolError, 0.95},
 	{[]byte("proto: relayrequest"), CategoryProtocolError, 0.95},
-	{[]byte("malformed"), CategoryProtocolError, 0.80},
-	{[]byte("invalid request"), CategoryProtocolError, 0.75},
-	{[]byte("parse error"), CategoryProtocolError, 0.80},
-	{[]byte("invalid json"), CategoryProtocolError, 0.85},
-	{[]byte("syntax error"), CategoryProtocolError, 0.85},
+
+	// REMOVED GENERIC ERROR PATTERNS that appear in valid JSON-RPC error responses:
+	// - "invalid request" - Appears in JSON-RPC -32600 errors (valid client error)
+	// - "parse error" - Appears in JSON-RPC -32700 errors
+	// - "invalid json" - Too generic, matches both errors and valid responses
+	// - "syntax error" - Too generic
+	// - "malformed" - Too generic
+	//
+	// These patterns were causing false positives where valid JSON-RPC error responses
+	// (e.g., {"jsonrpc":"2.0","error":{"code":-32600,"message":"invalid request"}})
+	// were being classified as supplier errors and triggering unnecessary retries.
+	//
+	// The protocol analyzer now properly handles JSON-RPC error detection.
 
 	// Blockchain-Specific Errors (EVM)
 	// ONLY include errors that indicate supplier/node problems, NOT application-level errors

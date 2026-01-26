@@ -37,8 +37,12 @@ func NewDefaultAnalyzer() *ResponseAnalyzer {
 // Returns an AnalysisResult with retry recommendation and confidence.
 func (ra *ResponseAnalyzer) Analyze(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType) AnalysisResult {
 	// Level 0: HTTP Status Code (free - no payload inspection)
-	if result := ra.analyzeHTTPStatus(httpStatusCode); result.ShouldRetry {
-		return result
+	// Only return early for definitive server errors (5xx) and rate limits (429)
+	// For other 4xx codes (400, 401, 403), we need to check if it's a valid JSON-RPC error
+	statusResult := ra.analyzeHTTPStatus(httpStatusCode)
+	if statusResult.ShouldRetry && (httpStatusCode >= 500 || httpStatusCode == 429) {
+		// 5xx server errors and 429 rate limits are definitive - retry immediately
+		return statusResult
 	}
 
 	// Level 1: Structural Analysis
@@ -58,11 +62,32 @@ func (ra *ResponseAnalyzer) Analyze(responseBytes []byte, httpStatusCode int, rp
 
 	// Level 2: Protocol-Specific Analysis
 	protocolResult := ProtocolAnalysis(prefix, len(responseBytes), rpcType)
-	if protocolResult.ShouldRetry && protocolResult.Confidence >= ra.config.ConfidenceThreshold {
+
+	// Special handling for HTTP 4xx: If protocol detects valid JSON-RPC response, trust it
+	// This prevents retrying valid error responses like {"jsonrpc":"2.0","error":{"code":-32600,"message":"invalid request"}}
+	if httpStatusCode >= 400 && httpStatusCode < 500 && httpStatusCode != 429 {
+		if protocolResult.Reason == "jsonrpc_valid_error" || protocolResult.Reason == "jsonrpc_success" {
+			// Valid JSON-RPC response despite 4xx status - return to client (don't retry)
+			return protocolResult
+		}
+		// If not a valid JSON-RPC response, trust the HTTP status (malformed/invalid request)
+		return statusResult
+	}
+
+	// CRITICAL: If protocol analysis has high confidence (positive or negative), trust it
+	// This prevents indicator analysis from overriding valid JSON-RPC error detection
+	if protocolResult.Confidence >= ra.config.ConfidenceThreshold {
+		return protocolResult
+	}
+
+	// If protocol says it's a valid JSON-RPC error (confidence=0 but reason="jsonrpc_valid_error"),
+	// trust it and don't run indicator analysis which might incorrectly flag error messages
+	if protocolResult.Reason == "jsonrpc_valid_error" || protocolResult.Reason == "jsonrpc_success" {
 		return protocolResult
 	}
 
 	// Level 3: Error Indicator Analysis (if enabled)
+	// Only run this if protocol analysis was inconclusive
 	if ra.config.EnableTier3 {
 		prefixLower := bytes.ToLower(prefix)
 		indicatorResult := IndicatorAnalysis(prefixLower, true)
