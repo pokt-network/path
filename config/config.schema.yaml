@@ -1017,6 +1017,10 @@ definitions:
             archival:
               description: "Is this an archival check."
               type: boolean
+            sync_check:
+              description: "Enable sync check validation. When true, extracts block height from response and validates against the service's sync_allowance. Requires sync_allowance > 0."
+              type: boolean
+              default: false
             reputation_signal:
               description: "Signal type on failure."
               type: string

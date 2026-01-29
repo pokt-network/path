@@ -201,7 +201,7 @@ gateway_config:
   # Per-service health check rules can be defined in services[].health_checks
 
   active_health_checks:
-    enabled: true
+    enabled: false
 
     # Leader election for multi-instance deployments
     # Only the leader runs health checks to avoid duplicate traffic
@@ -213,47 +213,19 @@ gateway_config:
 
     # External health check rules URL
     # --------------------------------
-    # PATH can fetch health check rules from a remote URL, enabling centralized
-    # management of health checks across multiple PATH instances. This is useful for:
-    #   - Sharing health check rules across a fleet of gateways
-    #   - Updating health checks without redeploying PATH
-    #   - Maintaining a single source of truth for health check definitions
+    # PATH fetches health check rules from a remote URL for centralized management.
+    # Rules include sync_allowance (blocks behind threshold) and sync_check validation.
     #
-    # The URL should return a YAML file with this structure:
+    # PNF maintains official rules at:
+    # https://raw.githubusercontent.com/pokt-network/pocket-network-resources/refs/heads/main/pocket-health-checks.yaml
     #
-    #   rules:
-    #     - service_id: "eth"           # Which service this check applies to
-    #       name: "eth_blockNumber"     # Unique name for this check
-    #       type: "json_rpc"             # RPC type: json_rpc, rest, comet_bft, websocket, grpc
-    #       method: "POST"              # HTTP method
-    #       path: "/"                   # Request path
-    #       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'
-    #       expected_status_code: 200   # Expected HTTP status
-    #       expected_response_contains: "result"  # Optional: response must contain
-    #       timeout: "5s"               # Check timeout
-    #       reputation_signal: "minor_error"  # Signal on failure: minor_error, major_error, critical_error, fatal_error
-    #       archival: false             # If true, only run on archival endpoints
-    #
-    # Rules are fetched at startup and refreshed at `refresh_interval`.
     # Local rules (below or in services[].health_checks.local) override
     # external rules with the same service_id + name combination.
     external:
-      url: "https://raw.githubusercontent.com/pokt-network/path/main/config/health_checks.yaml"
-      refresh_interval: "1h"   # How often to re-fetch external rules
+      url: "https://raw.githubusercontent.com/pokt-network/pocket-network-resources/refs/heads/main/pocket-health-checks.yaml"
+      refresh_interval: "5m"   # How often to re-fetch external rules
       timeout: "30s"           # HTTP timeout for fetching the URL
 
-    # Local health check rules (override external rules with same service_id + name)
-    # Uncomment and customize as needed:
-    # local:
-    #   - service_id: "eth"
-    #     name: "eth_blockNumber"
-    #     type: "json_rpc"
-    #     method: "POST"
-    #     path: "/"
-    #     body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'
-    #     expected_status_code: 200
-    #     timeout: "5s"
-    #     reputation_signal: "minor_error"
     local: []
 
   # ===========================================================================
@@ -329,110 +301,61 @@ gateway_config:
     # -------------------------------------------------------------------------
     # EVM Services
     # -------------------------------------------------------------------------
+    # Health check rules are fetched from external URL (active_health_checks.external)
+    # Each service inherits sync_allowance from external rules (e.g., eth: 25 blocks)
+
     - id: eth
       type: "evm"
       rpc_types: ["json_rpc", "websocket"]
       latency_profile: "fast"
-
-      # Per-service timeout configuration
-      # Fast EVM chains can use shorter timeouts (default: 10s)
       timeout_config:
         relay_timeout: 10s
-
-      # Override reputation settings for a high-value chain
-      reputation_config:
-        initial_score: 80
-        min_threshold: 30
-        recovery_timeout: 10m
-
-      # Stricter tier thresholds for ETH
-      tiered_selection:
-        tier1_threshold: 80
-        tier2_threshold: 40
-
-      # Aggressive probation for ETH
-      probation:
-        threshold: 5
-        traffic_percent: 5
-        recovery_multiplier: 5.0
-
-      # Retry and hedge configuration for ETH
-      # Fast chain with aggressive hedging
+      # More retries and hedging for high-value chain
       retry_config:
         max_retries: 2
-        hedge_delay: 300ms    # Start hedge earlier for fast chain
+        hedge_delay: 300ms
 
-      # Higher sample rate for ETH traffic
-      observation_pipeline:
-        sample_rate: 0.2
-
-      # Fallback endpoints (no defaults - must be explicitly configured)
-      fallback:
-        enabled: true
-        send_all_traffic: false  # Only use if session endpoints unavailable
-        endpoints:
-          - default_url: "https://eth.api.pocket.network"
-
-      # Per-service health checks
-      health_checks:
-        interval: 10s
-        sync_allowance: 50
-        local:
-          # Basic block number check
-          - name: "eth_blockNumber"
-            type: "json_rpc"
-            method: "POST"
-            path: "/"
-            body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'
-            expected_status_code: 200
-            timeout: "5s"
-            reputation_signal: "minor_error"
-
-          # Chain ID validation
-          - name: "eth_chainId"
-            type: "json_rpc"
-            method: "POST"
-            path: "/"
-            body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}'
-            expected_status_code: 200
-            expected_response_contains: "0x1"
-            timeout: "5s"
-            reputation_signal: "critical_error"
-
-          # Archival check (historical data)
-          - name: "eth_archival"
-            type: "json_rpc"
-            method: "POST"
-            path: "/"
-            body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x28C6c06298d514Db089934071355E5743bf21d60","0xe4e1c0"]}'
-            expected_status_code: 200
-            expected_response_contains: "0x314214a541a8e719f516"
-            timeout: "10s"
-            reputation_signal: "critical_error"
-            archival: true
+    - id: poly
+      type: "evm"
+      rpc_types: ["json_rpc", "websocket"]
+      latency_profile: "fast"
+      timeout_config:
+        relay_timeout: 10s
 
     - id: base
       type: "evm"
       rpc_types: ["json_rpc", "websocket"]
       latency_profile: "fast"
-      # Uses all other defaults
-
-    - id: poly
-      type: "evm"
-      latency_profile: "fast"
-      # Uses all other defaults
+      timeout_config:
+        relay_timeout: 10s
 
     - id: op
       type: "evm"
+      rpc_types: ["json_rpc", "websocket"]
       latency_profile: "fast"
-      # Uses all other defaults
+      timeout_config:
+        relay_timeout: 10s
 
-    - id: arb
+    - id: arb-one
       type: "evm"
+      rpc_types: ["json_rpc", "websocket"]
       latency_profile: "fast"
-      # Per-service health checks with sync allowance
-      health_checks:
-        sync_allowance: 50  # Filter out nodes more than 50 blocks behind
+      timeout_config:
+        relay_timeout: 10s
+
+    - id: bsc
+      type: "evm"
+      rpc_types: ["json_rpc"]
+      latency_profile: "fast"
+      timeout_config:
+        relay_timeout: 10s
+
+    - id: avax
+      type: "evm"
+      rpc_types: ["json_rpc"]
+      latency_profile: "fast"
+      timeout_config:
+        relay_timeout: 10s
 
     # -------------------------------------------------------------------------
     # Solana Service
@@ -441,59 +364,61 @@ gateway_config:
       type: "solana"
       rpc_types: ["json_rpc"]
       latency_profile: "standard"
-      # Uses all other defaults
+      timeout_config:
+        relay_timeout: 15s
 
     # -------------------------------------------------------------------------
     # Cosmos SDK Services
     # -------------------------------------------------------------------------
-    - id: cosmoshub
+    # RPC type fallback: Workaround for suppliers with incorrect RPC type stakes
+    # Remove once suppliers update their stakes
+
+    - id: pocket
       type: "cosmos"
       rpc_types: ["json_rpc", "rest", "comet_bft"]
       latency_profile: "slow"
-
-      # RPC type fallback configuration
-      # Temporary workaround for suppliers that stake with incorrect RPC types.
-      # When no endpoints are found for the requested RPC type, PATH will
-      # automatically retry with the fallback type.
-      # Remove this once suppliers update their stakes to correct RPC types.
+      timeout_config:
+        relay_timeout: 15s
       rpc_type_fallbacks:
-        comet_bft: json_rpc  # Fall back to json_rpc if no comet_bft endpoints
-        rest: json_rpc       # Fall back to json_rpc if no rest endpoints
+        comet_bft: json_rpc
+        rest: json_rpc
 
     - id: osmosis
       type: "cosmos"
       rpc_types: ["json_rpc", "rest", "comet_bft"]
       latency_profile: "slow"
-
-      # Example: only fallback comet_bft
-      rpc_type_fallbacks:
-        comet_bft: json_rpc
-
-    # Cosmos chain with EVM support (like XRPL EVM)
-    - id: xrplevm
-      type: "cosmos"  # Cosmos SDK chain with EVM support
-      rpc_types: ["json_rpc", "comet_bft", "websocket"]  # Suppliers don't support REST
-      latency_profile: "standard"
-      rpc_type_fallbacks:
-        comet_bft: json_rpc
-
-#      fallback:
-#        enabled: true
-#        send_all_traffic: false
-#        endpoints:
-#          - default_url: "http://fallback.xrplevm.io"
-#            json_rpc: "http://fallback.xrplevm.io:8545"
-#            rest: "http://fallback.xrplevm.io:1317"
-#            comet_bft: "http://fallback.xrplevm.io:26657"
-#            websocket: "ws://fallback.xrplevm.io:8546"
-
-    - id: pocket
-      type: "cosmos"
-      rpc_types: [ "json_rpc", "rest", "comet_bft" ]
-      latency_profile: "standard"
+      timeout_config:
+        relay_timeout: 15s
       rpc_type_fallbacks:
         comet_bft: json_rpc
         rest: json_rpc
+
+    # Cosmos chain with EVM support
+    - id: xrplevm
+      type: "cosmos"
+      rpc_types: ["json_rpc", "comet_bft", "websocket"]
+      latency_profile: "standard"
+      timeout_config:
+        relay_timeout: 15s
+      rpc_type_fallbacks:
+        comet_bft: json_rpc
+
+    # -------------------------------------------------------------------------
+    # Non-EVM Services
+    # -------------------------------------------------------------------------
+    - id: near
+      type: "generic"
+      rpc_types: ["json_rpc"]
+      latency_profile: "standard"
+      timeout_config:
+        relay_timeout: 15s
+
+    - id: sui
+      type: "generic"
+      rpc_types: ["json_rpc"]
+      latency_profile: "standard"
+      timeout_config:
+        relay_timeout: 15s
 
     # -------------------------------------------------------------------------
     # LLM / AI Services
@@ -501,22 +426,10 @@ gateway_config:
     - id: deepseek
       type: "passthrough"
       latency_profile: "llm"
-
-      # LLM services need much longer timeouts (60s+)
+      # LLM services need much longer timeouts
       timeout_config:
         relay_timeout: 60s
-
-      # Higher initial score for curated LLM endpoints
-      reputation_config:
-        initial_score: 90
-
-      # Override latency profile with inline config
-      # This takes precedence over latency_profile
-      latency:
-        target_ms: 5000      # 5 second target
-        penalty_weight: 0.1  # Reduced penalty weight for LLMs
-
-      # Don't retry LLM requests (they're expensive)
+      # Don't retry LLM requests (expensive)
       retry_config:
         enabled: false
 
@@ -525,18 +438,6 @@ gateway_config:
     # -------------------------------------------------------------------------
     - id: custom-api
       type: "generic"
-      latency_profile: "slow"
+      latency_profile: "standard"
       retry_config:
         max_retries: 2
-
-      # Per-service concurrency overrides (optional)
-      # Use these to override global concurrency_config for specific services
-      # concurrency_config:
-      #   # max_parallel_endpoints: Race multiple endpoints in parallel (1-10)
-      #   # Use >1 for unreliable services to get faster responses
-      #   # ⚠️ WARNING: Values >1 multiply token burn (e.g., 3 endpoints = 3x cost)
-      #   max_parallel_endpoints: 3
-      #
-      #   # max_batch_payloads: Limit batch size for this service (1-10000)
-      #   # Useful for heavy services that process large batches
-      #   max_batch_payloads: 100
