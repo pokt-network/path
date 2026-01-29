@@ -102,6 +102,14 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 
 	// Lock the endpoint store to update the endpoint observation
 	q.endpointsMu.Lock()
+	defer q.endpointsMu.Unlock()
+
+	// Initialize the map if nil (can happen if UpdateFromExtractedData is called
+	// before any UpdateEndpointsFromObservations calls)
+	if q.endpoints == nil {
+		q.endpoints = make(map[protocol.EndpointAddr]endpoint)
+	}
+
 	storedEndpoint := q.endpoints[endpointAddr]
 
 	// Update the endpoint's block height observation (Solana uses block height from getEpochInfo)
@@ -113,7 +121,6 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 
 	// Store the updated endpoint back
 	q.endpoints[endpointAddr] = storedEndpoint
-	q.endpointsMu.Unlock()
 
 	// Lock service state to update perceived block height
 	q.serviceStateLock.Lock()
