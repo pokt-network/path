@@ -1298,11 +1298,20 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		return endpoints[0]
 	}
 
-	// Build endpoint keys for ranking
+	// Build endpoint keys for ranking and map keys back to original endpoints
+	// This is needed because with per-supplier or per-domain granularity,
+	// the key's EndpointAddr may differ from the original endpoint address.
 	keys := make([]reputation.EndpointKey, len(endpoints))
+	keyToOriginalEndpoint := make(map[protocol.EndpointAddr]protocol.EndpointAddr)
 	keyBuilder := reputationSvc.KeyBuilderForService(rc.serviceID)
 	for i, ep := range endpoints {
-		keys[i] = keyBuilder.BuildKey(rc.serviceID, ep, rpcType)
+		key := keyBuilder.BuildKey(rc.serviceID, ep, rpcType)
+		keys[i] = key
+		// Map the key's EndpointAddr to the original endpoint
+		// If multiple endpoints map to the same key, keep the first one
+		if _, exists := keyToOriginalEndpoint[key.EndpointAddr]; !exists {
+			keyToOriginalEndpoint[key.EndpointAddr] = ep
+		}
 	}
 
 	// Rank endpoints by score (highest first)
@@ -1312,15 +1321,24 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		return endpoints[0]
 	}
 
-	// Return the top-ranked endpoint address
+	// Return the original endpoint address corresponding to the top-ranked key
 	topKey := rankedKeys[0]
+	originalEndpoint, ok := keyToOriginalEndpoint[topKey.EndpointAddr]
+	if !ok {
+		// Shouldn't happen, but fall back to first endpoint if mapping fails
+		rc.logger.Warn().
+			Str("top_key", string(topKey.EndpointAddr)).
+			Msg("Failed to map top-ranked key back to original endpoint, falling back")
+		return endpoints[0]
+	}
 
 	rc.logger.Debug().
-		Str("top_endpoint", string(topKey.EndpointAddr)).
+		Str("top_endpoint", string(originalEndpoint)).
+		Str("reputation_key", string(topKey.EndpointAddr)).
 		Int("num_candidates", len(endpoints)).
 		Msg("🏆 Selected TOP-RANKED endpoint for retry (highest reputation)")
 
-	return topKey.EndpointAddr
+	return originalEndpoint
 }
 
 // extractSupplierFromEndpoint extracts the supplier address from an endpoint address.
