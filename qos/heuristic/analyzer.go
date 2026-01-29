@@ -80,9 +80,23 @@ func (ra *ResponseAnalyzer) Analyze(responseBytes []byte, httpStatusCode int, rp
 		return protocolResult
 	}
 
-	// If protocol says it's a valid JSON-RPC error (confidence=0 but reason="jsonrpc_valid_error"),
-	// trust it and don't run indicator analysis which might incorrectly flag error messages
-	if protocolResult.Reason == "jsonrpc_valid_error" || protocolResult.Reason == "jsonrpc_success" {
+	// If protocol says it's a valid JSON-RPC error, we need to check if it contains
+	// blockchain-specific error patterns that indicate node/supplier issues.
+	// These errors (like "missing trie node", "node is unhealthy") SHOULD be retried
+	// on a different supplier, even though they're valid JSON-RPC error responses.
+	if protocolResult.Reason == "jsonrpc_valid_error" {
+		prefixLower := bytes.ToLower(prefix)
+		indicatorResult := IndicatorAnalysis(prefixLower, true)
+		// If we detect a blockchain-specific error, it's a supplier issue - retry
+		if indicatorResult.Found && indicatorResult.Category == CategoryBlockchainError {
+			return IndicatorAnalysisToResult(indicatorResult)
+		}
+		// Otherwise, trust the protocol analysis (valid error, don't retry)
+		return protocolResult
+	}
+
+	// For successful JSON-RPC responses, no need for indicator analysis
+	if protocolResult.Reason == "jsonrpc_success" {
 		return protocolResult
 	}
 

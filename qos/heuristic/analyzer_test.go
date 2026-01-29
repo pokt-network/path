@@ -389,7 +389,7 @@ func TestFullAnalyzer(t *testing.T) {
 			httpStatus:     200,
 			rpcType:        sharedtypes.RPCType_JSON_RPC,
 			expectedRetry:  false,
-			expectedReason: "likely_valid",
+			expectedReason: "jsonrpc_success",
 		},
 		{
 			name:           "JSON-RPC error in body with HTTP 200",
@@ -397,7 +397,7 @@ func TestFullAnalyzer(t *testing.T) {
 			httpStatus:     200,
 			rpcType:        sharedtypes.RPCType_JSON_RPC,
 			expectedRetry:  false,
-			expectedReason: "likely_valid",
+			expectedReason: "jsonrpc_valid_error",
 		},
 		{
 			name:           "JSON-RPC with both result and error - malformed",
@@ -433,7 +433,7 @@ func TestFullAnalyzer(t *testing.T) {
 			httpStatus:     200,
 			rpcType:        sharedtypes.RPCType_JSON_RPC,
 			expectedRetry:  false,
-			expectedReason: "likely_valid",
+			expectedReason: "jsonrpc_success",
 		},
 		{
 			name:           "JSON-RPC with 403 in result - should NOT retry",
@@ -441,7 +441,7 @@ func TestFullAnalyzer(t *testing.T) {
 			httpStatus:     200,
 			rpcType:        sharedtypes.RPCType_JSON_RPC,
 			expectedRetry:  false,
-			expectedReason: "likely_valid",
+			expectedReason: "jsonrpc_success",
 		},
 	}
 
