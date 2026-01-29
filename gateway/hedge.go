@@ -204,11 +204,18 @@ func (hr *hedgeRacer) executeRequest(
 	responses, err := protocolCtx.HandleServiceRequest(hr.rc.qosCtx.GetServicePayloads())
 	duration := time.Since(startTime)
 
+	// Use supplier from response metadata if available, otherwise fall back to extracted supplier.
+	// This ensures X-Suppliers-Tried matches X-Supplier-Address when both come from the same response.
+	supplierFromResponse := supplier
+	if len(responses) > 0 && responses[0].Metadata.SupplierAddress != "" {
+		supplierFromResponse = responses[0].Metadata.SupplierAddress
+	}
+
 	result := hedgeResult{
 		responses:     responses,
 		err:           err,
 		endpointAddr:  endpoint,
-		supplierAddr:  supplier,
+		supplierAddr:  supplierFromResponse,
 		duration:      duration,
 		isHedge:       isHedge,
 		attemptNumber: attemptNum,
