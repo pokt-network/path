@@ -146,6 +146,10 @@ func (hr *hedgeRacer) race(
 				Str("hedge_supplier", hedgeSupplier).
 				Msg("🏃 Hedge request started - racing primary and hedge")
 
+			// Pre-register both suppliers for X-Suppliers-Tried header
+			// This ensures both are tracked even if one is cancelled before responding
+			hr.rc.suppliersTried = append(hr.rc.suppliersTried, primarySupplier, hedgeSupplier)
+
 			// Build protocol context for hedge endpoint
 			hedgeCtx, _, err := hr.rc.protocol.BuildHTTPRequestContextForEndpoint(
 				ctx, hr.rc.serviceID, hedgeEndpoint, hr.rpcType, hr.rc.originalHTTPRequest, true)
@@ -292,8 +296,9 @@ func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, e
 			metrics.RecordHedgeRequest(rpcTypeStr, hr.serviceID, metrics.HedgeResultNoHedge, winningLatency)
 		}
 
-		// Wait briefly for second result to record its status
-		go hr.collectLoser()
+		// Wait briefly for second result to record its status (for X-Suppliers-Tried header)
+		// Must be synchronous so loser is recorded before response headers are sent
+		hr.collectLoserSync()
 
 		return hr.handleResult(*firstResult)
 	}
@@ -493,13 +498,15 @@ func (hr *hedgeRacer) recordLoser(result hedgeResult) {
 		Msg("Race loser recorded")
 }
 
-// collectLoser waits briefly for the second result to record it.
-func (hr *hedgeRacer) collectLoser() {
+// collectLoserSync waits synchronously for the loser to record it in suppliersTried.
+// Uses a short timeout to avoid adding latency when loser is slow.
+func (hr *hedgeRacer) collectLoserSync() {
 	select {
 	case result := <-hr.resultChan:
 		hr.recordLoser(result)
-	case <-time.After(5 * time.Second):
-		// Second request never completed
+	case <-time.After(100 * time.Millisecond):
+		// Loser didn't arrive in time - that's ok, we already have the winner
+		hr.logger.Debug().Msg("Loser did not arrive within 100ms for X-Suppliers-Tried")
 	}
 }
 
