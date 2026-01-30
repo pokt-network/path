@@ -72,14 +72,6 @@ type requestContext struct {
 	protocolError error
 }
 
-// response interface defines what endpoint response validators must return.
-// NOTE: This interface is kept for compatibility with synthetic checks (hydrator).
-// For organic requests on the hot path, raw bytes are stored without parsing.
-type response interface {
-	GetHTTPResponse() pathhttp.HTTPResponse
-	GetObservation() qosobservations.CosmosEndpointObservation
-}
-
 // TODO_NEXT(@commoddity): handle batch requests for Cosmos SDK
 // GetServicePayload builds the payload to send to blockchain endpoints
 func (rc requestContext) GetServicePayloads() []protocol.Payload {

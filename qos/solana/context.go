@@ -17,6 +17,15 @@ import (
 	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
+const (
+	// errCodeUnmarshaling is set as the JSON-RPC response's error code if the endpoint returns a malformed response.
+	// `jsonrpc.ResponseCodeBackendServerErr`, i.e. code -31002, will result in returning a 500 HTTP Status Code to the client.
+	errCodeUnmarshaling = jsonrpc.ResponseCodeBackendServerErr
+
+	// errMsgUnmarshaling is the generic message returned to the user if the endpoint returns a malformed response.
+	errMsgUnmarshaling = "the response returned by the endpoint is not a valid JSON-RPC response"
+)
+
 // requestContext provides the support required by the gateway
 // package for handling service requests.
 var _ gateway.RequestQoSContext = &requestContext{}
@@ -28,20 +37,6 @@ type rawEndpointResponse struct {
 	EndpointAddr   protocol.EndpointAddr
 	ResponseBytes  []byte
 	HTTPStatusCode int
-}
-
-// TODO_TECHDEBT: Need a Validate() method here to allow
-// the caller, e.g. gateway, determine whether the endpoint's
-// response was valid, and whether a retry makes sense.
-//
-// response defines the functionality required from a parsed endpoint response.
-// NOTE: This interface is kept for compatibility with synthetic checks (hydrator).
-// For organic requests on the hot path, raw bytes are stored without parsing.
-type response interface {
-	GetObservation() qosobservations.SolanaEndpointObservation
-	GetJSONRPCResponse() jsonrpc.Response
-
-	// TODO_TECHDEBT: add method(s) to support retrying a request, e.g. IsUserError(), IsEndpointError().
 }
 
 // requestContext provides the functionality required
