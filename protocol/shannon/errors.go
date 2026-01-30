@@ -60,9 +60,15 @@ var (
 	// Error initializing a signer for the current gateway mode.
 	errRequestContextSetupErrSignerSetup = errors.New("error getting the permitted signer: relay request will fail")
 
-	// The endpoint returned a malformed payload.
+	// The endpoint returned a malformed payload (failed to parse/unmarshal).
 	// Helps track more fine-grained metrics on endpoint errors.
 	errMalformedEndpointPayload = errors.New("endpoint returned malformed payload")
+
+	// The endpoint returned a valid response that heuristic analysis determined
+	// indicates a backend error (e.g., pruned state, node behind, etc.).
+	// The response itself is valid JSON-RPC but indicates the endpoint cannot
+	// serve this request properly. Used to trigger retry on another endpoint.
+	errHeuristicDetectedBackendError = errors.New("backend returned error response")
 
 	// The endpoint returned a non-2XX response.
 	errEndpointNon2XXHTTPStatusCode = errors.New("endpoint returned non-2xx HTTP status code")

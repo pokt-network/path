@@ -75,6 +75,9 @@ type HealthCheckExecutor struct {
 	// pool is the worker pool for concurrent health check execution.
 	pool pond.Pool
 
+	// maxWorkers is the configured/calculated worker pool size for logging.
+	maxWorkers int
+
 	// External config caching (global)
 	externalConfigMu    sync.RWMutex
 	externalConfigs     []ServiceHealthCheckConfig
@@ -108,20 +111,34 @@ type HealthCheckExecutorConfig struct {
 // NewHealthCheckExecutor creates a new HealthCheckExecutor.
 func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor {
 	maxWorkers := cfg.MaxWorkers
+
+	// Calculate optimal worker count if not explicitly configured
+	serviceCount, checksPerService := countServicesAndChecks(cfg.Config)
+	estimatedTotalJobs := serviceCount * DefaultEndpointsPerServiceEstimate * checksPerService
+
 	if maxWorkers <= 0 {
-		maxWorkers = 10 // Default number of concurrent workers
+		// Workers = max(DefaultMinHealthCheckWorkers, estimatedJobs * HealthCheckWorkerMultiplier)
+		// This ensures all health checks can run in parallel with headroom.
+		// Example: 5 services × 50 endpoints × 3 checks = 750 jobs → 1500 workers
+		calculatedWorkers := estimatedTotalJobs * HealthCheckWorkerMultiplier
+		if calculatedWorkers > DefaultMinHealthCheckWorkers {
+			maxWorkers = calculatedWorkers
+		} else {
+			maxWorkers = DefaultMinHealthCheckWorkers
+		}
 	}
 
 	// Create worker pool for concurrent health check execution
 	pool := pond.NewPool(maxWorkers)
 
-	return &HealthCheckExecutor{
+	executor := &HealthCheckExecutor{
 		config:          cfg.Config,
 		reputationSvc:   cfg.ReputationSvc,
 		logger:          cfg.Logger,
 		protocol:        cfg.Protocol,
 		metricsReporter: cfg.MetricsReporter,
 		pool:            pool,
+		maxWorkers:      maxWorkers,
 		// HTTP client for external config fetching only
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -137,6 +154,39 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 		unifiedServicesConfig:     cfg.UnifiedServicesConfig,
 		perServiceExternalConfigs: make(map[protocol.ServiceID][]HealthCheckConfig),
 	}
+
+	if cfg.Logger != nil {
+		cfg.Logger.Info().
+			Int("max_workers", maxWorkers).
+			Int("service_count", serviceCount).
+			Int("checks_per_service", checksPerService).
+			Int("endpoints_per_service_estimate", DefaultEndpointsPerServiceEstimate).
+			Int("estimated_total_jobs", estimatedTotalJobs).
+			Int("worker_multiplier", HealthCheckWorkerMultiplier).
+			Msg("🏊 Health check worker pool initialized")
+	}
+
+	return executor
+}
+
+// countServicesAndChecks counts the number of services and average checks per service from config.
+// Returns (serviceCount, avgChecksPerService) used to estimate total jobs.
+func countServicesAndChecks(config *ActiveHealthChecksConfig) (int, int) {
+	if config == nil || len(config.Local) == 0 {
+		return 0, 0
+	}
+
+	totalChecks := 0
+	for _, svcConfig := range config.Local {
+		totalChecks += len(svcConfig.Checks)
+	}
+
+	serviceCount := len(config.Local)
+	avgChecks := totalChecks / serviceCount
+	if avgChecks == 0 && totalChecks > 0 {
+		avgChecks = 1
+	}
+	return serviceCount, avgChecks
 }
 
 // IsEnabled returns true if the health check executor is enabled.
@@ -1493,8 +1543,9 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 	e.logger.Info().
 		Int("service_count", len(serviceConfigs)).
 		Int("total_jobs", totalJobs).
-		Int("pool_running", int(e.pool.RunningWorkers())).
-		Msg("Starting health checks via protocol with pond pool")
+		Int("max_workers", e.maxWorkers).
+		Int("pool_running_workers", int(e.pool.RunningWorkers())).
+		Msg("🏊 Starting health check cycle")
 
 	// Wait for all jobs to complete
 	// group.Wait() returns an error only if context is canceled

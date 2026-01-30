@@ -46,6 +46,17 @@ func classifyErrorAsSignal(logger polylog.Logger, err error, latency time.Durati
 		}
 		return classifyMalformedPayloadAsSignal(logger, payloadContent, latency)
 
+	// Heuristic detected a backend error in a valid JSON-RPC response
+	// (e.g., "state at block #X is pruned", "node is behind", etc.)
+	case errors.Is(err, errHeuristicDetectedBackendError):
+		// Extract the payload content from the error message
+		errorStr := err.Error()
+		payloadContent := strings.TrimPrefix(errorStr, "raw_payload: ")
+		if idx := strings.LastIndex(payloadContent, ": backend returned error response"); idx != -1 {
+			payloadContent = payloadContent[:idx]
+		}
+		return classifyMalformedPayloadAsSignal(logger, payloadContent, latency)
+
 	// Endpoint payload failed to unmarshal into a RelayResponse struct
 	// Category: Supplier Protocol Violations (CRITICAL -25)
 	case errors.Is(err, sdk.ErrRelayResponseValidationUnmarshal):
