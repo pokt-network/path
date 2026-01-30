@@ -6,12 +6,14 @@
 //   - Cluster (chain) info from getClusterNodes or getVersion responses
 //
 // Solana uses JSON-RPC 2.0 for all RPC calls, similar to EVM chains.
+// Uses gjson for efficient field extraction without full unmarshalling.
 package solana
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/tidwall/gjson"
 
 	"github.com/pokt-network/path/qos/jsonrpc"
 	qostypes "github.com/pokt-network/path/qos/types"
@@ -21,6 +23,7 @@ import (
 var _ qostypes.DataExtractor = (*SolanaDataExtractor)(nil)
 
 // SolanaDataExtractor extracts quality data from Solana JSON-RPC responses.
+// Uses gjson for efficient field extraction without full unmarshalling.
 type SolanaDataExtractor struct{}
 
 // NewSolanaDataExtractor creates a new Solana data extractor.
@@ -39,31 +42,34 @@ func NewSolanaDataExtractor() *SolanaDataExtractor {
 //   - Block height as int64
 //   - Error if extraction fails or response doesn't contain block height
 func (e *SolanaDataExtractor) ExtractBlockHeight(request []byte, response []byte) (int64, error) {
-	jsonrpcResp, err := e.parseJSONRPCResponse(response)
-	if err != nil {
-		return 0, fmt.Errorf("parse block height response: %w", err)
+	// Check for error first
+	errorResult := gjson.GetBytes(response, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		code := gjson.GetBytes(response, "error.code").Int()
+		msg := gjson.GetBytes(response, "error.message").String()
+		return 0, fmt.Errorf("getEpochInfo returned error: code=%d, message=%s", code, msg)
 	}
 
-	if jsonrpcResp.Error != nil {
-		return 0, fmt.Errorf("getEpochInfo returned error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
-	}
-
-	if jsonrpcResp.Result == nil {
+	// Check for result field
+	resultField := gjson.GetBytes(response, "result")
+	if !resultField.Exists() || resultField.Type == gjson.Null {
 		return 0, fmt.Errorf("response missing result field")
 	}
 
-	resultBytes, err := jsonrpcResp.GetResultAsBytes()
-	if err != nil {
-		return 0, fmt.Errorf("get result bytes: %w", err)
+	// Get blockHeight from result
+	// Note: Solana returns blockHeight as a number, or we might also check absoluteSlot
+	blockHeight := gjson.GetBytes(response, "result.blockHeight")
+	if blockHeight.Exists() && blockHeight.Type == gjson.Number {
+		return blockHeight.Int(), nil
 	}
 
-	var epochInfoResult epochInfo
-	if err := json.Unmarshal(resultBytes, &epochInfoResult); err != nil {
-		return 0, fmt.Errorf("parse epoch info: %w", err)
+	// Try absoluteSlot as fallback (some responses use this)
+	absoluteSlot := gjson.GetBytes(response, "result.absoluteSlot")
+	if absoluteSlot.Exists() && absoluteSlot.Type == gjson.Number {
+		return absoluteSlot.Int(), nil
 	}
 
-	return int64(epochInfoResult.BlockHeight), nil
+	return 0, fmt.Errorf("could not extract block height from response")
 }
 
 // ExtractChainID extracts the cluster identifier from a Solana response.
@@ -78,35 +84,27 @@ func (e *SolanaDataExtractor) ExtractBlockHeight(request []byte, response []byte
 // for responses that don't contain cluster information.
 //
 // Returns:
-//   - Cluster identifier as string (e.g., feature set version)
+//   - Cluster identifier as string (e.g., solana-core version)
 //   - Error if extraction fails
 func (e *SolanaDataExtractor) ExtractChainID(request []byte, response []byte) (string, error) {
-	jsonrpcResp, err := e.parseJSONRPCResponse(response)
-	if err != nil {
-		return "", fmt.Errorf("parse chain ID response: %w", err)
+	// Check for error first
+	errorResult := gjson.GetBytes(response, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		code := gjson.GetBytes(response, "error.code").Int()
+		msg := gjson.GetBytes(response, "error.message").String()
+		return "", fmt.Errorf("response returned error: code=%d, message=%s", code, msg)
 	}
 
-	if jsonrpcResp.Error != nil {
-		return "", fmt.Errorf("response returned error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
-	}
-
-	if jsonrpcResp.Result == nil {
+	// Check for result field
+	resultField := gjson.GetBytes(response, "result")
+	if !resultField.Exists() || resultField.Type == gjson.Null {
 		return "", fmt.Errorf("response missing result field")
 	}
 
-	resultBytes, err := jsonrpcResp.GetResultAsBytes()
-	if err != nil {
-		return "", fmt.Errorf("get result bytes: %w", err)
-	}
-
-	// Try to extract version info (from getVersion)
-	var versionResult struct {
-		SolanaCore string `json:"solana-core"`
-		FeatureSet uint32 `json:"feature-set"`
-	}
-	if err := json.Unmarshal(resultBytes, &versionResult); err == nil && versionResult.SolanaCore != "" {
-		return versionResult.SolanaCore, nil
+	// Try to extract version info (from getVersion) - solana-core field
+	solanaCore := gjson.GetBytes(response, "result.solana-core")
+	if solanaCore.Exists() && solanaCore.String() != "" {
+		return solanaCore.String(), nil
 	}
 
 	// For Solana, chain ID extraction is not straightforward like EVM
@@ -134,36 +132,27 @@ func (e *SolanaDataExtractor) ExtractChainID(request []byte, response []byte) (s
 //   - false if endpoint is healthy (not syncing)
 //   - Error if sync status cannot be determined
 func (e *SolanaDataExtractor) IsSyncing(request []byte, response []byte) (bool, error) {
-	jsonrpcResp, err := e.parseJSONRPCResponse(response)
-	if err != nil {
-		return false, fmt.Errorf("parse syncing response: %w", err)
-	}
-
 	// If getHealth returns an error, the node is unhealthy (possibly syncing)
-	if jsonrpcResp.Error != nil {
+	errorResult := gjson.GetBytes(response, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
 		// Check if it's a "behind" error which indicates syncing
-		errMsg := strings.ToLower(jsonrpcResp.Error.Message)
+		errMsg := strings.ToLower(gjson.GetBytes(response, "error.message").String())
 		if strings.Contains(errMsg, "behind") || strings.Contains(errMsg, "unhealthy") {
 			return true, nil // Node is syncing/behind
 		}
 		// Other errors - return error to caller
-		return false, fmt.Errorf("getHealth returned error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
+		code := gjson.GetBytes(response, "error.code").Int()
+		return false, fmt.Errorf("getHealth returned error: code=%d, message=%s", code, errMsg)
 	}
 
-	if jsonrpcResp.Result == nil {
+	// Check for result field
+	resultField := gjson.GetBytes(response, "result")
+	if !resultField.Exists() || resultField.Type == gjson.Null {
 		return false, fmt.Errorf("response missing result field")
 	}
 
-	resultBytes, err := jsonrpcResp.GetResultAsBytes()
-	if err != nil {
-		return false, fmt.Errorf("get result bytes: %w", err)
-	}
-
-	var healthResult string
-	if err := json.Unmarshal(resultBytes, &healthResult); err != nil {
-		return false, fmt.Errorf("parse health result: %w", err)
-	}
+	// Result should be "ok" for healthy node
+	healthResult := resultField.String()
 
 	// "ok" means healthy (not syncing)
 	// Anything else means unhealthy/syncing
@@ -182,14 +171,10 @@ func (e *SolanaDataExtractor) IsSyncing(request []byte, response []byte) (bool, 
 //   - false if endpoint is not archival (historical query failed)
 //   - Error if archival status cannot be determined
 func (e *SolanaDataExtractor) IsArchival(request []byte, response []byte) (bool, error) {
-	jsonrpcResp, err := e.parseJSONRPCResponse(response)
-	if err != nil {
-		return false, fmt.Errorf("parse archival response: %w", err)
-	}
-
-	// If there's an error, check if it's a slot-too-old error
-	if jsonrpcResp.Error != nil {
-		errMsg := strings.ToLower(jsonrpcResp.Error.Message)
+	// Check for error in the response
+	errorResult := gjson.GetBytes(response, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		errMsg := strings.ToLower(gjson.GetBytes(response, "error.message").String())
 		archivalErrorIndicators := []string{
 			"slot was skipped",
 			"block not available",
@@ -206,12 +191,13 @@ func (e *SolanaDataExtractor) IsArchival(request []byte, response []byte) (bool,
 		}
 
 		// Some other error - can't determine archival status
-		return false, fmt.Errorf("archival check returned error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
+		code := gjson.GetBytes(response, "error.code").Int()
+		return false, fmt.Errorf("archival check returned error: code=%d, message=%s", code, errMsg)
 	}
 
 	// No error and has result - this is an archival node
-	if jsonrpcResp.Result != nil {
+	resultField := gjson.GetBytes(response, "result")
+	if resultField.Exists() && resultField.Type != gjson.Null {
 		return true, nil
 	}
 
@@ -230,19 +216,23 @@ func (e *SolanaDataExtractor) IsValidResponse(request []byte, response []byte) (
 		return false, nil
 	}
 
-	jsonrpcResp, err := e.parseJSONRPCResponse(response)
-	if err != nil {
+	// Validate JSON
+	if !gjson.ValidBytes(response) {
 		return false, nil // Invalid JSON or structure
 	}
 
 	// Check JSON-RPC version
-	if jsonrpcResp.Version != jsonrpc.Version2 {
+	version := gjson.GetBytes(response, "jsonrpc")
+	if !version.Exists() || version.String() != string(jsonrpc.Version2) {
 		return false, nil
 	}
 
 	// Check for valid result/error combination
-	hasResult := jsonrpcResp.Result != nil
-	hasError := jsonrpcResp.Error != nil
+	resultField := gjson.GetBytes(response, "result")
+	errorField := gjson.GetBytes(response, "error")
+
+	hasResult := resultField.Exists() && resultField.Type != gjson.Null
+	hasError := errorField.Exists() && errorField.Type != gjson.Null
 
 	// Must have exactly one of result or error
 	if !hasResult && !hasError {
@@ -258,17 +248,4 @@ func (e *SolanaDataExtractor) IsValidResponse(request []byte, response []byte) (
 	}
 
 	return true, nil
-}
-
-// parseJSONRPCResponse parses raw bytes into a JSON-RPC response struct.
-func (e *SolanaDataExtractor) parseJSONRPCResponse(response []byte) (*jsonrpc.Response, error) {
-	if len(response) == 0 {
-		return nil, fmt.Errorf("empty response")
-	}
-
-	var jsonrpcResp jsonrpc.Response
-	if err := json.Unmarshal(response, &jsonrpcResp); err != nil {
-		return nil, fmt.Errorf("unmarshal JSON-RPC response: %w", err)
-	}
-	return &jsonrpcResp, nil
 }
