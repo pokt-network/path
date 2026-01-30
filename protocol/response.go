@@ -28,4 +28,9 @@ type Response struct {
 	// Metadata contains relay-specific information for debugging/transparency.
 	// Used to populate response headers like X-Supplier-Address, X-App-Address, X-Session-ID.
 	Metadata RelayMetadata
+
+	// RequestID is the JSON-RPC request ID that this response corresponds to.
+	// Used for batch request processing to ensure error responses have the correct ID.
+	// For non-JSON-RPC requests or when ID extraction fails, this may be empty.
+	RequestID string
 }

@@ -2,6 +2,7 @@ package shannon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -170,6 +171,8 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 	// For single payload, handle directly without additional overhead.
 	if len(payloads) == 1 {
 		response, err := rc.sendSingleRelay(payloads[0])
+		// Set the request ID from the payload for proper error response handling
+		response.RequestID = extractJSONRPCRequestID(payloads[0].Data)
 		return []protocol.Response{response}, err
 	}
 
@@ -294,7 +297,7 @@ func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payloa
 	<-observationsCollected
 	rc.observationsChan = nil // Reset to nil so single relay mode works normally
 
-	return rc.convertResultsToResponses(results, rc.findFirstError(results))
+	return rc.convertResultsToResponses(results, payloads, rc.findFirstError(results))
 }
 
 // parallelRelayResult holds the result of a single relay request for parallel processing.
@@ -321,7 +324,8 @@ func (rc *requestContext) findFirstError(results []parallelRelayResult) error {
 //
 // convertResultsToResponses converts parallel relay results into an array of protocol responses.
 // Maintains the order of responses to match the order of input payloads.
-func (rc *requestContext) convertResultsToResponses(results []parallelRelayResult, firstErr error) ([]protocol.Response, error) {
+// The payloads parameter is used to extract request IDs for error responses.
+func (rc *requestContext) convertResultsToResponses(results []parallelRelayResult, payloads []protocol.Payload, firstErr error) ([]protocol.Response, error) {
 	if len(results) == 0 {
 		response, err := rc.handleInternalError(fmt.Errorf("convertResultsToResponses: no results to convert"))
 		return []protocol.Response{response}, err
@@ -330,9 +334,13 @@ func (rc *requestContext) convertResultsToResponses(results []parallelRelayResul
 	// Create response array in the same order as input payloads.
 	responses := make([]protocol.Response, len(results))
 
-	// Process results in order.
+	// Process results in order, setting request ID from corresponding payload.
 	for i, result := range results {
 		responses[i] = result.response
+		// Set the request ID from the payload so that error responses have the correct ID
+		if i < len(payloads) {
+			responses[i].RequestID = extractJSONRPCRequestID(payloads[i].Data)
+		}
 	}
 
 	rc.logger.Debug().
@@ -341,6 +349,43 @@ func (rc *requestContext) convertResultsToResponses(results []parallelRelayResul
 		Msg("Response conversion completed")
 
 	return responses, firstErr
+}
+
+// extractJSONRPCRequestID extracts the JSON-RPC request ID from a payload data string.
+// The payload data is expected to be a JSON-RPC request like:
+// {"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}
+// Returns the ID as a string (e.g., "1", "abc", etc.), or empty string if extraction fails.
+func extractJSONRPCRequestID(payloadData string) string {
+	if payloadData == "" {
+		return ""
+	}
+
+	// Parse the JSON to extract the ID
+	var req struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(payloadData), &req); err != nil {
+		return ""
+	}
+
+	// If no ID field or null ID
+	if len(req.ID) == 0 || string(req.ID) == "null" {
+		return ""
+	}
+
+	// Try to parse as integer
+	var intID int
+	if err := json.Unmarshal(req.ID, &intID); err == nil {
+		return fmt.Sprintf("%d", intID)
+	}
+
+	// Try to parse as string
+	var strID string
+	if err := json.Unmarshal(req.ID, &strID); err == nil {
+		return strID
+	}
+
+	return ""
 }
 
 // GetObservations:
