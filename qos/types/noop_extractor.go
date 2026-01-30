@@ -26,28 +26,28 @@ func NewNoOpDataExtractor() *NoOpDataExtractor {
 }
 
 // ExtractBlockHeight returns an error indicating extraction is not supported.
-func (e *NoOpDataExtractor) ExtractBlockHeight(_ []byte) (int64, error) {
+func (e *NoOpDataExtractor) ExtractBlockHeight(_, _ []byte) (int64, error) {
 	return 0, ErrNoOpExtractor
 }
 
 // ExtractChainID returns an error indicating extraction is not supported.
-func (e *NoOpDataExtractor) ExtractChainID(_ []byte) (string, error) {
+func (e *NoOpDataExtractor) ExtractChainID(_, _ []byte) (string, error) {
 	return "", ErrNoOpExtractor
 }
 
 // IsSyncing returns an error indicating extraction is not supported.
-func (e *NoOpDataExtractor) IsSyncing(_ []byte) (bool, error) {
+func (e *NoOpDataExtractor) IsSyncing(_, _ []byte) (bool, error) {
 	return false, ErrNoOpExtractor
 }
 
 // IsArchival returns an error indicating extraction is not supported.
-func (e *NoOpDataExtractor) IsArchival(_ []byte) (bool, error) {
+func (e *NoOpDataExtractor) IsArchival(_, _ []byte) (bool, error) {
 	return false, ErrNoOpExtractor
 }
 
 // IsValidResponse returns true for any non-empty response.
 // This is the only method that provides a meaningful result for NoOp.
 // A response is considered "valid" if it has content.
-func (e *NoOpDataExtractor) IsValidResponse(response []byte) (bool, error) {
+func (e *NoOpDataExtractor) IsValidResponse(_, response []byte) (bool, error) {
 	return len(response) > 0, nil
 }

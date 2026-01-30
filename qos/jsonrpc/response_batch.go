@@ -66,9 +66,11 @@ func validateResponseIDs(responses []json.RawMessage, servicePayloads map[ID]pro
 	nullIDCount := 0
 	matchedRequestIDs := make(map[string]bool)
 
-	for _, respMsg := range responses {
+	for i, respMsg := range responses {
 		var resp Response
 		if err := json.Unmarshal(respMsg, &resp); err != nil {
+			// Log unmarshal error for debugging
+			_ = i    // prevent unused variable warning
 			continue // Skip invalid responses - they'll be handled elsewhere
 		}
 
@@ -79,12 +81,16 @@ func validateResponseIDs(responses []json.RawMessage, servicePayloads map[ID]pro
 		}
 
 		// Find matching request ID
+		found := false
 		for reqID := range servicePayloads {
 			if reqID.Equal(resp.ID) {
 				matchedRequestIDs[reqID.String()] = true
+				found = true
 				break
 			}
 		}
+		// Debug: if not found, this is the problematic response
+		_ = found
 	}
 
 	// Count unmatched request IDs

@@ -115,6 +115,103 @@ func TestIDHandling(t *testing.T) {
 	}
 }
 
+// TestIDEqual tests the Equal method for ID comparison,
+// including cross-type comparisons (int vs string) which are important
+// for JSON-RPC compatibility with endpoints that may return string IDs
+// even when given integer IDs.
+func TestIDEqual(t *testing.T) {
+	testCases := []struct {
+		name     string
+		id1      ID
+		id2      ID
+		expected bool
+	}{
+		{
+			name:     "both empty",
+			id1:      ID{},
+			id2:      ID{},
+			expected: true,
+		},
+		{
+			name:     "same integer",
+			id1:      IDFromInt(1),
+			id2:      IDFromInt(1),
+			expected: true,
+		},
+		{
+			name:     "different integers",
+			id1:      IDFromInt(1),
+			id2:      IDFromInt(2),
+			expected: false,
+		},
+		{
+			name:     "same string",
+			id1:      IDFromStr("abc"),
+			id2:      IDFromStr("abc"),
+			expected: true,
+		},
+		{
+			name:     "different strings",
+			id1:      IDFromStr("abc"),
+			id2:      IDFromStr("def"),
+			expected: false,
+		},
+		{
+			name:     "int vs string with same value",
+			id1:      IDFromInt(1),
+			id2:      IDFromStr("1"),
+			expected: true,
+		},
+		{
+			name:     "string vs int with same value",
+			id1:      IDFromStr("1"),
+			id2:      IDFromInt(1),
+			expected: true,
+		},
+		{
+			name:     "int vs string with different value",
+			id1:      IDFromInt(1),
+			id2:      IDFromStr("2"),
+			expected: false,
+		},
+		{
+			name:     "empty vs int",
+			id1:      ID{},
+			id2:      IDFromInt(1),
+			expected: false,
+		},
+		{
+			name:     "empty vs string",
+			id1:      ID{},
+			id2:      IDFromStr("abc"),
+			expected: false,
+		},
+		{
+			name:     "zero int vs string zero",
+			id1:      IDFromInt(0),
+			id2:      IDFromStr("0"),
+			expected: true,
+		},
+		{
+			name:     "negative int vs string negative",
+			id1:      IDFromInt(-1),
+			id2:      IDFromStr("-1"),
+			expected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := tc.id1.Equal(tc.id2)
+			require.Equal(t, tc.expected, result, "ID1: %v, ID2: %v", tc.id1, tc.id2)
+
+			// Test symmetry: a.Equal(b) should equal b.Equal(a)
+			reverseResult := tc.id2.Equal(tc.id1)
+			require.Equal(t, tc.expected, reverseResult, "Symmetry check failed for ID1: %v, ID2: %v", tc.id1, tc.id2)
+		})
+	}
+}
+
 // TODO_MVP(@adshmh): add a test case for batch JSONRPC requests
 func TestUnmarshalParams(t *testing.T) {
 	testCases := []struct {

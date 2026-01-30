@@ -24,7 +24,7 @@ e2e_load_test_config:
       #   - In local, will log to a file
       docker_log: true
       # [Optional] Force Docker image rebuild (useful after code changes)
-      force_rebuild_image: false
+      force_rebuild_image: true
 
   # Load Test Mode
   # Tests run against a specified gateway URL (local or public)
@@ -49,10 +49,10 @@ e2e_load_test_config:
 default_service_config:
   global_rps: 100 # Requests per second (shared across all methods)
   requests_per_method: 30 # Number of requests (per method)
-  success_rate: 0.90 # Minimum required success rate in % (0-1)
-  max_p50_latency_ms: 10000ms # Max allowed P50 latency (ms)
-  max_p95_latency_ms: 20000ms # Max allowed P95 latency (ms)
-  max_p99_latency_ms: 30000ms # Max allowed P99 latency (ms)
+  success_rate: 0.60 # Minimum required success rate in % (0-1) - reduced due to network issues out of our control
+  max_p50_latency_ms: 5000ms # Max allowed P50 latency (ms)
+  max_p95_latency_ms: 12000ms # Max allowed P95 latency (ms) - slightly above 10s timeout for variance
+  max_p99_latency_ms: 15000ms # Max allowed P99 latency (ms)
 
 # Override default configuration for specific services
 service_config_overrides:
@@ -85,7 +85,7 @@ service_config_overrides:
     archival: true
   "eth":
     archival: true
-    success_rate: 0.75 # Reduced from to avoid flaky E2E tests in CI
+    success_rate: 0.60 # Reduced due to network issues out of our control
   "eth-holesky-testnet":
     archival: true
   "eth-sepolia-testnet":

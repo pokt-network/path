@@ -79,48 +79,6 @@ const (
 )
 
 type (
-	// BlockHeightReferenceType defines the source of the reference block height.
-	BlockHeightReferenceType string
-
-	// BlockHeightOperator defines the comparison operator for block height validation.
-	BlockHeightOperator string
-)
-
-const (
-	// BlockHeightReferenceTypeStatic uses a fixed block height value.
-	BlockHeightReferenceTypeStatic BlockHeightReferenceType = "static"
-
-	// BlockHeightReferenceTypeExternal queries an external endpoint for the reference height.
-	BlockHeightReferenceTypeExternal BlockHeightReferenceType = "external"
-
-	// BlockHeightReferenceTypePerceived uses the QoS perceived block number.
-	BlockHeightReferenceTypePerceived BlockHeightReferenceType = "perceived"
-)
-
-const (
-	// BlockHeightOperatorGreaterThanOrEqual checks if endpoint height >= reference - tolerance.
-	BlockHeightOperatorGreaterThanOrEqual BlockHeightOperator = ">="
-
-	// BlockHeightOperatorGreaterThan checks if endpoint height > reference - tolerance.
-	BlockHeightOperatorGreaterThan BlockHeightOperator = ">"
-
-	// BlockHeightOperatorLessThanOrEqual checks if endpoint height <= reference + tolerance.
-	BlockHeightOperatorLessThanOrEqual BlockHeightOperator = "<="
-
-	// BlockHeightOperatorLessThan checks if endpoint height < reference + tolerance.
-	BlockHeightOperatorLessThan BlockHeightOperator = "<"
-
-	// BlockHeightOperatorEqual checks if endpoint height == reference (within tolerance if set).
-	BlockHeightOperatorEqual BlockHeightOperator = "=="
-)
-
-// Default values for block height validation
-const (
-	DefaultExternalReferenceTimeout       = 5 * time.Second
-	DefaultExternalReferenceCacheDuration = 10 * time.Second
-)
-
-type (
 	// ErrorDetection configures error pattern matching in health check responses.
 	// This allows health checks to detect and penalize known error patterns like
 	// rate limits, bad gateways, quota errors, etc.
@@ -167,50 +125,6 @@ type (
 		ReputationSignal string `yaml:"reputation_signal"`
 	}
 
-	// BlockHeightValidation configures block height comparison checks.
-	// This allows health checks to validate that an endpoint's block height
-	// meets certain criteria (e.g., not too far behind a reference value).
-	BlockHeightValidation struct {
-		// Operator is the comparison operator: "<", ">", "<=", ">=", "=="
-		Operator BlockHeightOperator `yaml:"operator"`
-
-		// Reference specifies where to get the reference value for comparison.
-		Reference BlockHeightReference `yaml:"reference"`
-	}
-
-	// BlockHeightReference specifies the source of the reference block height.
-	BlockHeightReference struct {
-		// Type is the reference source: "static", "external", "perceived"
-		Type BlockHeightReferenceType `yaml:"type"`
-
-		// Value is the static block height (only for type="static")
-		Value int64 `yaml:"value,omitempty"`
-
-		// Endpoint is the external RPC endpoint to query (only for type="external")
-		// Example: "https://arb-mainnet.g.alchemy.com/v2/demo"
-		Endpoint string `yaml:"endpoint,omitempty"`
-
-		// Method is the RPC method to call on external endpoint (only for type="external")
-		// Example: "eth_blockNumber" for EVM chains
-		Method string `yaml:"method,omitempty"`
-
-		// Tolerance is the allowed difference (only for type="external" and type="perceived")
-		// For external: endpoint_height >= (external_height - tolerance)
-		// For perceived: endpoint_height >= (perceived_height - tolerance)
-		// Default: 0 (no tolerance)
-		Tolerance int64 `yaml:"tolerance,omitempty"`
-
-		// Headers for external endpoint authentication (only for type="external")
-		Headers map[string]string `yaml:"headers,omitempty"`
-
-		// Timeout for external endpoint query (default: 5s)
-		Timeout time.Duration `yaml:"timeout,omitempty"`
-
-		// CacheDuration how long to cache external endpoint response (default: 10s)
-		// Prevents hammering external endpoint on every health check
-		CacheDuration time.Duration `yaml:"cache_duration,omitempty"`
-	}
-
 	// HealthCheckConfig defines a single configurable health check.
 	// This replaces hardcoded QoS checks with YAML-configurable checks.
 	HealthCheckConfig struct {
@@ -254,12 +168,6 @@ type (
 		// For websocket with body: checked against any received message within timeout.
 		ExpectedResponseContains string `yaml:"expected_response_contains,omitempty"`
 
-		// BlockHeightValidation enables block height comparison checks.
-		// If specified, the health check will extract the block height from the response
-		// and compare it against a reference value using the specified operator.
-		// This is useful for detecting stuck or lagging nodes.
-		BlockHeightValidation *BlockHeightValidation `yaml:"block_height_validation,omitempty"`
-
 		// ErrorDetection enables error pattern detection in health check responses.
 		// If specified, the health check will detect known error patterns (rate limits,
 		// bad gateway errors, quota errors, etc.) and send appropriate reputation signals.
@@ -271,6 +179,13 @@ type (
 
 		// Archival indicates if this is an archival-specific check.
 		Archival bool `yaml:"archival,omitempty"`
+
+		// SyncCheck enables block height validation against the service's sync_allowance.
+		// When true, extracts block height from the response and compares against the
+		// perceived block number. If the endpoint is more than sync_allowance blocks behind,
+		// the health check fails and the configured reputation_signal is recorded.
+		// Requires sync_allowance > 0 to be configured on the service.
+		SyncCheck bool `yaml:"sync_check,omitempty"`
 
 		// ReputationSignal is the signal type to record on failure.
 		// Values: "minor_error", "major_error", "critical_error", "fatal_error"
@@ -357,6 +272,13 @@ type (
 		RetryOnTimeout bool `yaml:"retry_on_timeout,omitempty"`
 		// RetryOnConnection enables retrying on connection errors.
 		RetryOnConnection bool `yaml:"retry_on_connection,omitempty"`
+		// ConnectTimeout is the maximum time to establish a TCP connection.
+		// Used for hedge racing to detect slow connections quickly.
+		ConnectTimeout *time.Duration `yaml:"connect_timeout,omitempty"`
+		// HedgeDelay is the time to wait before starting a hedge (parallel) request.
+		// If the primary request hasn't completed within this duration, a second request
+		// is started to a different endpoint and the first response wins.
+		HedgeDelay *time.Duration `yaml:"hedge_delay,omitempty"`
 	}
 
 	// ObservationPipelineConfig configures the observation processing pipeline.
@@ -597,13 +519,6 @@ func (hcc *HealthCheckConfig) Validate() error {
 		return fmt.Errorf("invalid reputation_signal '%s' for check %s (must be minor_error, major_error, critical_error, or fatal_error)", hcc.ReputationSignal, hcc.Name)
 	}
 
-	// Validate block height validation if provided
-	if hcc.BlockHeightValidation != nil {
-		if err := hcc.BlockHeightValidation.Validate(hcc.Name); err != nil {
-			return err
-		}
-	}
-
 	// Validate error detection if provided
 	if hcc.ErrorDetection != nil {
 		if err := hcc.ErrorDetection.Validate(hcc.Name); err != nil {
@@ -663,79 +578,6 @@ func (rc *RetryConfig) Validate(logger polylog.Logger) error {
 	}
 
 	return nil
-}
-
-// Validate validates the BlockHeightValidation configuration.
-func (bhv *BlockHeightValidation) Validate(checkName string) error {
-	// Validate operator
-	validOperators := map[BlockHeightOperator]bool{
-		BlockHeightOperatorGreaterThanOrEqual: true,
-		BlockHeightOperatorGreaterThan:        true,
-		BlockHeightOperatorLessThanOrEqual:    true,
-		BlockHeightOperatorLessThan:           true,
-		BlockHeightOperatorEqual:              true,
-	}
-	if !validOperators[bhv.Operator] {
-		return fmt.Errorf("invalid block_height_validation.operator '%s' for check %s (must be >=, >, <=, <, or ==)", bhv.Operator, checkName)
-	}
-
-	// Validate reference
-	if err := bhv.Reference.Validate(checkName); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// Validate validates the BlockHeightReference configuration.
-func (bhr *BlockHeightReference) Validate(checkName string) error {
-	// Validate type
-	validTypes := map[BlockHeightReferenceType]bool{
-		BlockHeightReferenceTypeStatic:    true,
-		BlockHeightReferenceTypeExternal:  true,
-		BlockHeightReferenceTypePerceived: true,
-	}
-	if !validTypes[bhr.Type] {
-		return fmt.Errorf("invalid block_height_validation.reference.type '%s' for check %s (must be static, external, or perceived)", bhr.Type, checkName)
-	}
-
-	// Type-specific validation
-	switch bhr.Type {
-	case BlockHeightReferenceTypeStatic:
-		if bhr.Value <= 0 {
-			return fmt.Errorf("block_height_validation.reference.value must be positive for type 'static' in check %s, got %d", checkName, bhr.Value)
-		}
-
-	case BlockHeightReferenceTypeExternal:
-		if bhr.Endpoint == "" {
-			return fmt.Errorf("block_height_validation.reference.endpoint is required for type 'external' in check %s", checkName)
-		}
-		if bhr.Method == "" {
-			return fmt.Errorf("block_height_validation.reference.method is required for type 'external' in check %s", checkName)
-		}
-
-	case BlockHeightReferenceTypePerceived:
-		// No additional validation needed for perceived type
-	}
-
-	// Tolerance must be non-negative
-	if bhr.Tolerance < 0 {
-		return fmt.Errorf("block_height_validation.reference.tolerance must be non-negative for check %s, got %d", checkName, bhr.Tolerance)
-	}
-
-	return nil
-}
-
-// HydrateDefaults applies default values to BlockHeightReference.
-func (bhr *BlockHeightReference) HydrateDefaults() {
-	if bhr.Type == BlockHeightReferenceTypeExternal {
-		if bhr.Timeout == 0 {
-			bhr.Timeout = DefaultExternalReferenceTimeout
-		}
-		if bhr.CacheDuration == 0 {
-			bhr.CacheDuration = DefaultExternalReferenceCacheDuration
-		}
-	}
 }
 
 // Validate validates the ErrorDetection configuration.

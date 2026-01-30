@@ -40,7 +40,12 @@ func NewEVMDataExtractor() *EVMDataExtractor {
 // Returns:
 //   - Block height as int64
 //   - Error if response is invalid or doesn't contain block height
-func (e *EVMDataExtractor) ExtractBlockHeight(response []byte) (int64, error) {
+func (e *EVMDataExtractor) ExtractBlockHeight(request []byte, response []byte) (int64, error) {
+	// Only extract block height from eth_blockNumber requests
+	if !isMethod(request, "eth_blockNumber") {
+		return 0, fmt.Errorf("not an eth_blockNumber request")
+	}
+
 	result, err := e.extractStringResult(response)
 	if err != nil {
 		return 0, fmt.Errorf("extract block height: %w", err)
@@ -64,7 +69,12 @@ func (e *EVMDataExtractor) ExtractBlockHeight(response []byte) (int64, error) {
 // Returns:
 //   - Chain ID as hex string
 //   - Error if response is invalid or doesn't contain chain ID
-func (e *EVMDataExtractor) ExtractChainID(response []byte) (string, error) {
+func (e *EVMDataExtractor) ExtractChainID(request []byte, response []byte) (string, error) {
+	// Only extract chain ID from eth_chainId requests
+	if !isMethod(request, "eth_chainId") {
+		return "", fmt.Errorf("not an eth_chainId request")
+	}
+
 	result, err := e.extractStringResult(response)
 	if err != nil {
 		return "", fmt.Errorf("extract chain ID: %w", err)
@@ -88,7 +98,12 @@ func (e *EVMDataExtractor) ExtractChainID(response []byte) (string, error) {
 //   - true if endpoint is syncing
 //   - false if endpoint is synced
 //   - Error if sync status cannot be determined
-func (e *EVMDataExtractor) IsSyncing(response []byte) (bool, error) {
+func (e *EVMDataExtractor) IsSyncing(request []byte, response []byte) (bool, error) {
+	// Only check sync status from eth_syncing requests
+	if !isMethod(request, "eth_syncing") {
+		return false, fmt.Errorf("not an eth_syncing request")
+	}
+
 	jsonrpcResp, err := e.parseJSONRPCResponse(response)
 	if err != nil {
 		return false, fmt.Errorf("parse syncing response: %w", err)
@@ -141,7 +156,15 @@ func (e *EVMDataExtractor) IsSyncing(response []byte) (bool, error) {
 //   - true if endpoint is archival (query succeeded)
 //   - false if endpoint is not archival (query failed with specific error)
 //   - Error if archival status cannot be determined
-func (e *EVMDataExtractor) IsArchival(response []byte) (bool, error) {
+func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, error) {
+	// Historical queries typically use eth_getBalance, eth_getTransactionCount, etc.
+	// We don't strictly filter by method here because many methods can be used for archival checks,
+	// and we rely on the error message indicators below.
+	// However, we should at least check if it's a JSON-RPC request.
+	if len(request) == 0 {
+		return false, fmt.Errorf("empty request")
+	}
+
 	jsonrpcResp, err := e.parseJSONRPCResponse(response)
 	if err != nil {
 		return false, fmt.Errorf("parse archival response: %w", err)
@@ -192,7 +215,7 @@ func (e *EVMDataExtractor) IsArchival(response []byte) (bool, error) {
 //   - true if response is valid JSON-RPC
 //   - false if response is malformed or contains JSON-RPC error
 //   - Error if validation fails unexpectedly
-func (e *EVMDataExtractor) IsValidResponse(response []byte) (bool, error) {
+func (e *EVMDataExtractor) IsValidResponse(request []byte, response []byte) (bool, error) {
 	if len(response) == 0 {
 		return false, nil
 	}
@@ -225,6 +248,17 @@ func (e *EVMDataExtractor) IsValidResponse(response []byte) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// isMethod checks if the JSON-RPC request calls the specified method.
+func isMethod(request []byte, method string) bool {
+	var req struct {
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(request, &req); err != nil {
+		return false
+	}
+	return req.Method == method
 }
 
 // extractStringResult extracts the result field as a string from a JSON-RPC response.

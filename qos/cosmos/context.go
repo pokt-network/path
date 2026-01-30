@@ -49,13 +49,18 @@ type requestContext struct {
 	protocolErrorObservationBuilder func() *qosobservations.RequestError
 
 	// Validator to use to build user response/endpoint observations from the endpoint response.
-	endpointResponseValidator func(polylog.Logger, []byte) response
+	// The string parameter is the requestID for batch request error handling.
+	endpointResponseValidator func(polylog.Logger, []byte, string) response
 
 	// Service state for endpoint selection
 	serviceState protocol.EndpointSelector
 
 	// Endpoint response tracking
 	endpointResponses []endpointResponse
+
+	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
+	// Used to provide more specific error messages to clients.
+	protocolError error
 }
 
 // endpointResponse tracks a response from a specific endpoint
@@ -85,20 +90,42 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 // UpdateWithResponse processes a response from an endpoint
 // Uses the existing response unmarshaling system
 // NOT safe for concurrent use
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
+// The requestID parameter is used to ensure error responses have the correct JSON-RPC ID
+// when processing batch requests with independent flows per item.
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int, requestID string) {
 	logger := rc.logger.With(
 		"method", "UpdateWithResponse",
 		"endpoint_addr", endpointAddr,
+		"request_id", requestID,
 	)
 
+	// Debug: Log incoming response
+	logger.Debug().
+		Int("response_size", len(responseBz)).
+		Int("http_status", httpStatusCode).
+		Bool("is_batch", rc.isBatch).
+		Int("current_response_count", len(rc.endpointResponses)).
+		Msg("Processing endpoint response")
+
 	// Parse and validate the endpoint response.
-	parsedEndpointResponse := rc.endpointResponseValidator(logger, responseBz)
+	// Pass requestID for batch request error handling.
+	parsedEndpointResponse := rc.endpointResponseValidator(logger, responseBz, requestID)
 
 	rc.endpointResponses = append(rc.endpointResponses, endpointResponse{
 		endpointAddr:   endpointAddr,
 		response:       parsedEndpointResponse,
 		httpStatusCode: httpStatusCode,
 	})
+
+	logger.Debug().
+		Int("new_response_count", len(rc.endpointResponses)).
+		Msg("Added endpoint response")
+}
+
+// SetProtocolError stores a protocol-level error for more specific client error messages.
+// Implements the gateway.RequestQoSContext interface.
+func (rc *requestContext) SetProtocolError(err error) {
+	rc.protocolError = err
 }
 
 // GetHTTPResponse builds the HTTP response that should be returned for
@@ -107,6 +134,10 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 	// Use a noResponses struct if no responses were reported by the protocol from any endpoints.
 	if len(rc.endpointResponses) == 0 {
+		// If a specific protocol error is available, use it for a more informative response
+		if rc.protocolError != nil {
+			return rc.buildProtocolErrorResponse()
+		}
 		return rc.protocolErrorResponseBuilder(rc.logger)
 	}
 
@@ -150,13 +181,48 @@ func (r *httpResponseWithStatus) GetHTTPHeaders() map[string]string {
 // into an array according to the JSON-RPC 2.0 specification.
 // https://www.jsonrpc.org/specification#batch
 func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
+	logger := rc.logger.With("method", "getBatchHTTPResponse")
+
+	// Log request IDs for debugging
+	var reqIDsStr string
+	for id := range rc.servicePayloads {
+		if reqIDsStr != "" {
+			reqIDsStr += ","
+		}
+		reqIDsStr += id.String()
+	}
+	logger.Debug().
+		Str("request_ids", reqIDsStr).
+		Int("num_endpoint_responses", len(rc.endpointResponses)).
+		Msg("Building batch response")
+
 	// Collect individual response payloads
 	var individualResponses []json.RawMessage
-	for _, endpointResp := range rc.endpointResponses {
+	var responseIDsStr string
+	for i, endpointResp := range rc.endpointResponses {
 		// Extract the JSON payload from each response
 		payload := endpointResp.response.GetHTTPResponse().GetPayload()
 		if len(payload) > 0 {
 			individualResponses = append(individualResponses, json.RawMessage(payload))
+
+			// Debug: log each response ID
+			var respObj struct {
+				ID json.RawMessage `json:"id"`
+			}
+			if err := json.Unmarshal(payload, &respObj); err == nil {
+				if responseIDsStr != "" {
+					responseIDsStr += ","
+				}
+				responseIDsStr += string(respObj.ID)
+				logger.Debug().
+					Int("response_index", i).
+					Str("response_id_raw", string(respObj.ID)).
+					Msg("Collected response payload")
+			}
+		} else {
+			logger.Warn().
+				Int("response_index", i).
+				Msg("Empty payload in endpoint response - skipping")
 		}
 	}
 
@@ -170,6 +236,12 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 		return errorResponse.GetHTTPResponse()
 	}
 
+	logger.Debug().
+		Int("num_individual_responses", len(individualResponses)).
+		Int("num_service_payloads", len(rc.servicePayloads)).
+		Str("response_ids", responseIDsStr).
+		Msg("Validating batch response")
+
 	// Validate and construct batch response using jsonrpc package
 	batchResponse, err := jsonrpc.ValidateAndBuildBatchResponse(
 		rc.logger,
@@ -177,6 +249,14 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 		rc.servicePayloads,
 	)
 	if err != nil {
+		logger.Error().
+			Err(err).
+			Int("num_responses", len(individualResponses)).
+			Int("num_requests", len(rc.servicePayloads)).
+			Str("request_ids", reqIDsStr).
+			Str("response_ids", responseIDsStr).
+			Msg("Batch response validation failed")
+
 		// Create a responseGeneric for batch validation failure and return its HTTP response
 		errorResponse := getGenericJSONRPCErrResponseBatchMarshalFailure(rc.logger, err)
 		return errorResponse.GetHTTPResponse()
@@ -240,4 +320,26 @@ func (rc *requestContext) Select(allEndpoints protocol.EndpointAddrList) (protoc
 func (rc *requestContext) SelectMultiple(allEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
 	// Select multiple endpoints from the available endpoints using the service state.
 	return rc.serviceState.SelectMultiple(allEndpoints, numEndpoints)
+}
+
+// buildProtocolErrorResponse builds an HTTP response using the stored protocol error.
+// This provides more specific error messages to clients than the generic error builders.
+func (rc requestContext) buildProtocolErrorResponse() pathhttp.HTTPResponse {
+	// Get an appropriate request ID for the error response
+	var requestID jsonrpc.ID
+	for id := range rc.servicePayloads {
+		requestID = id
+		break
+	}
+
+	errorResp := jsonrpc.NewErrResponseInternalErr(requestID, rc.protocolError)
+	bz, err := json.Marshal(errorResp)
+	if err != nil {
+		rc.logger.Warn().Err(err).Msg("buildProtocolErrorResponse: Marshaling JSONRPC response failed.")
+	}
+
+	return jsonrpc.HTTPResponse{
+		ResponsePayload: bz,
+		HTTPStatusCode:  http.StatusInternalServerError,
+	}
 }

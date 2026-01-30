@@ -38,7 +38,7 @@ func NewSolanaDataExtractor() *SolanaDataExtractor {
 // Returns:
 //   - Block height as int64
 //   - Error if extraction fails or response doesn't contain block height
-func (e *SolanaDataExtractor) ExtractBlockHeight(response []byte) (int64, error) {
+func (e *SolanaDataExtractor) ExtractBlockHeight(request []byte, response []byte) (int64, error) {
 	jsonrpcResp, err := e.parseJSONRPCResponse(response)
 	if err != nil {
 		return 0, fmt.Errorf("parse block height response: %w", err)
@@ -80,7 +80,7 @@ func (e *SolanaDataExtractor) ExtractBlockHeight(response []byte) (int64, error)
 // Returns:
 //   - Cluster identifier as string (e.g., feature set version)
 //   - Error if extraction fails
-func (e *SolanaDataExtractor) ExtractChainID(response []byte) (string, error) {
+func (e *SolanaDataExtractor) ExtractChainID(request []byte, response []byte) (string, error) {
 	jsonrpcResp, err := e.parseJSONRPCResponse(response)
 	if err != nil {
 		return "", fmt.Errorf("parse chain ID response: %w", err)
@@ -133,7 +133,7 @@ func (e *SolanaDataExtractor) ExtractChainID(response []byte) (string, error) {
 //   - true if endpoint is syncing/unhealthy
 //   - false if endpoint is healthy (not syncing)
 //   - Error if sync status cannot be determined
-func (e *SolanaDataExtractor) IsSyncing(response []byte) (bool, error) {
+func (e *SolanaDataExtractor) IsSyncing(request []byte, response []byte) (bool, error) {
 	jsonrpcResp, err := e.parseJSONRPCResponse(response)
 	if err != nil {
 		return false, fmt.Errorf("parse syncing response: %w", err)
@@ -181,7 +181,7 @@ func (e *SolanaDataExtractor) IsSyncing(response []byte) (bool, error) {
 //   - true if endpoint is archival (historical query succeeded)
 //   - false if endpoint is not archival (historical query failed)
 //   - Error if archival status cannot be determined
-func (e *SolanaDataExtractor) IsArchival(response []byte) (bool, error) {
+func (e *SolanaDataExtractor) IsArchival(request []byte, response []byte) (bool, error) {
 	jsonrpcResp, err := e.parseJSONRPCResponse(response)
 	if err != nil {
 		return false, fmt.Errorf("parse archival response: %w", err)
@@ -225,7 +225,7 @@ func (e *SolanaDataExtractor) IsArchival(response []byte) (bool, error) {
 //   - true if response is valid JSON-RPC with result
 //   - false if response is malformed or contains error
 //   - Error if validation fails unexpectedly
-func (e *SolanaDataExtractor) IsValidResponse(response []byte) (bool, error) {
+func (e *SolanaDataExtractor) IsValidResponse(request []byte, response []byte) (bool, error) {
 	if len(response) == 0 {
 		return false, nil
 	}

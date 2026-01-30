@@ -101,19 +101,26 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 	blockHeight := uint64(data.BlockHeight)
 
 	// Lock the endpoint store to update the endpoint observation
-	q.EndpointStore.endpointsMu.Lock()
-	storedEndpoint := q.EndpointStore.endpoints[endpointAddr]
+	q.endpointsMu.Lock()
+	defer q.endpointsMu.Unlock()
+
+	// Initialize the map if nil (can happen if UpdateFromExtractedData is called
+	// before any UpdateEndpointsFromObservations calls)
+	if q.endpoints == nil {
+		q.endpoints = make(map[protocol.EndpointAddr]endpoint)
+	}
+
+	storedEndpoint := q.endpoints[endpointAddr]
 
 	// Update the endpoint's block height observation (Solana uses block height from getEpochInfo)
 	// Create or update the SolanaGetEpochInfoResponse with just the block height
 	if storedEndpoint.SolanaGetEpochInfoResponse == nil {
 		storedEndpoint.SolanaGetEpochInfoResponse = &qosobservations.SolanaGetEpochInfoResponse{}
 	}
-	storedEndpoint.SolanaGetEpochInfoResponse.BlockHeight = blockHeight
+	storedEndpoint.BlockHeight = blockHeight
 
 	// Store the updated endpoint back
-	q.EndpointStore.endpoints[endpointAddr] = storedEndpoint
-	q.EndpointStore.endpointsMu.Unlock()
+	q.endpoints[endpointAddr] = storedEndpoint
 
 	// Lock service state to update perceived block height
 	q.serviceStateLock.Lock()

@@ -28,6 +28,7 @@ func (p *Protocol) filterByReputation(
 	endpoints map[protocol.EndpointAddr]endpoint,
 	rpcType sharedtypes.RPCType,
 	logger polylog.Logger,
+	requestedEndpointAddr protocol.EndpointAddr,
 ) map[protocol.EndpointAddr]endpoint {
 	if p.reputationService == nil {
 		return endpoints
@@ -62,6 +63,19 @@ func (p *Protocol) filterByReputation(
 
 		// Check if endpoint is in cooldown from strike system
 		if score.IsInCooldown() {
+			// CRITICAL: If this is the pre-selected endpoint, we MUST include it to avoid
+			// the "Selected endpoint is not available" error. This handles the race condition
+			// where an endpoint was selected but then entered cooldown.
+			if addr == requestedEndpointAddr {
+				filtered[addr] = ep
+				logger.Debug().
+					Str("endpoint", string(addr)).
+					Int("strikes", score.CriticalStrikes).
+					Dur("cooldown_remaining", score.CooldownRemaining()).
+					Msg("Including requested endpoint even though it is in cooldown")
+				continue
+			}
+
 			logger.Debug().
 				Str("endpoint", string(addr)).
 				Int("strikes", score.CriticalStrikes).
@@ -72,8 +86,15 @@ func (p *Protocol) filterByReputation(
 
 		// Check if score is above the configured minimum threshold (use per-service threshold)
 		minThreshold := p.getMinThresholdForService(serviceID)
-		if score.Value >= minThreshold {
+		if score.Value >= minThreshold || addr == requestedEndpointAddr {
 			filtered[addr] = ep
+			if score.Value < minThreshold && addr == requestedEndpointAddr {
+				logger.Debug().
+					Str("endpoint", string(addr)).
+					Float64("score", score.Value).
+					Float64("threshold", minThreshold).
+					Msg("Including requested endpoint even though it is below threshold")
+			}
 		} else {
 			logger.Debug().
 				Str("endpoint", string(addr)).
@@ -175,6 +196,7 @@ func (p *Protocol) filterToHighestTier(
 	endpoints map[protocol.EndpointAddr]endpoint,
 	rpcType sharedtypes.RPCType,
 	logger polylog.Logger,
+	requestedEndpointAddr protocol.EndpointAddr,
 ) map[protocol.EndpointAddr]endpoint {
 	if len(endpoints) == 0 {
 		return endpoints
@@ -230,6 +252,20 @@ func (p *Protocol) filterToHighestTier(
 			}
 		}
 
+		// If a specific endpoint was requested and it's NOT in the result, but IS above threshold,
+		// include it anyway to avoid "Selected endpoint is not available" error.
+		if requestedEndpointAddr != "" {
+			if _, ok := result[requestedEndpointAddr]; !ok {
+				if ep, exists := endpoints[requestedEndpointAddr]; exists {
+					key := keyBuilder.BuildKey(serviceID, requestedEndpointAddr, rpcType)
+					if score, ok := endpointScores[key]; ok && score >= selector.MinThreshold() {
+						result[requestedEndpointAddr] = ep
+						logger.Debug().Str("endpoint", string(requestedEndpointAddr)).Msg("Including requested endpoint even though probation is active")
+					}
+				}
+			}
+		}
+
 		return result
 	}
 
@@ -279,6 +315,27 @@ func (p *Protocol) filterToHighestTier(
 		for _, fullAddr := range keyToEndpoints[key.EndpointAddr] {
 			if ep, exists := endpoints[fullAddr]; exists {
 				result[fullAddr] = ep
+			}
+		}
+	}
+
+	// CRITICAL: If a specific endpoint was requested and it's NOT in the highest tier,
+	// but it IS above the minimum threshold, we MUST include it.
+	// This prevents the "Selected endpoint is not available" error which occurs when:
+	// 1. AvailableHTTPEndpoints() returned the endpoint (it was in the highest tier then)
+	// 2. Gateway selected it
+	// 3. BuildHTTPRequestContextForEndpoint() is called, but now it's no longer in the highest tier
+	if requestedEndpointAddr != "" {
+		if _, ok := result[requestedEndpointAddr]; !ok {
+			if ep, exists := endpoints[requestedEndpointAddr]; exists {
+				key := keyBuilder.BuildKey(serviceID, requestedEndpointAddr, rpcType)
+				if score, ok := endpointScores[key]; ok && score >= selector.MinThreshold() {
+					result[requestedEndpointAddr] = ep
+					logger.Debug().
+						Str("endpoint", string(requestedEndpointAddr)).
+						Int("selected_tier", selectedTier).
+						Msg("Including requested endpoint even though it's not in the highest tier")
+				}
 			}
 		}
 	}

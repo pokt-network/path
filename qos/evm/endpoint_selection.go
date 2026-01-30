@@ -173,11 +173,15 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 			}
 			validationResults = append(validationResults, result)
 			filteredEndpointsAddr = append(filteredEndpointsAddr, data.addr)
+			logger.Debug().Msg("endpoint not in store - allowing as fresh endpoint")
 			continue
 		}
 
 		if err := ss.basicEndpointValidation(data.endpoint); err != nil {
-			logger.Warn().Err(err).Msgf("⚠️ SKIPPING %s endpoint because it failed basic validation: %v", data.addr, err)
+			logger.Warn().
+				Err(err).
+				Str("endpoint_addr", string(data.addr)).
+				Msg("⚠️ SKIPPING endpoint because it failed basic validation")
 
 			// Create validation result for validation failure
 			failureReason := ss.categorizeValidationFailure(err)
@@ -249,8 +253,16 @@ func (ss *serviceState) categorizeValidationFailure(err error) qosobservations.E
 //
 // Note: This function is lock-free - perceivedBlockNumber uses atomic operations.
 func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
-	// Check if the endpoint has returned an empty response.
-	if endpoint.hasReturnedEmptyResponse {
+	// Check if the endpoint has returned an empty response within the timeout period.
+	// Empty responses use the same 5-minute timeout as invalid responses to allow recovery.
+	if endpoint.hasReturnedEmptyResponse && endpoint.invalidResponseLastObserved != nil {
+		timeSinceEmptyResponse := time.Since(*endpoint.invalidResponseLastObserved)
+		if timeSinceEmptyResponse < invalidResponseTimeout {
+			return fmt.Errorf("recent empty response validation failed (%.0f minutes ago): %w",
+				timeSinceEmptyResponse.Minutes(), errEmptyResponseObs)
+		}
+	} else if endpoint.hasReturnedEmptyResponse {
+		// Fallback for cases where hasReturnedEmptyResponse is true but invalidResponseLastObserved is nil
 		return fmt.Errorf("empty response validation failed: %w", errEmptyResponseObs)
 	}
 
@@ -293,11 +305,8 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
 func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error {
 	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
 
-	// If sync allowance is 0, the check is disabled
+	// If sync allowance is 0, the check is disabled (only log at debug level)
 	if syncAllowance == 0 {
-		ss.logger.Warn().
-			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-			Msg("🔍 Sync allowance check DISABLED (sync_allowance=0)")
 		return nil
 	}
 
@@ -323,11 +332,6 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 		return nil
 	}
 
-	ss.logger.Warn().
-		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-		Uint64("sync_allowance", syncAllowance).
-		Msg("🔍 Sync allowance check ENABLED")
-
 	// Dereference pointer to show actual block number instead of memory address in error logs
 	parsedBlockNumber := *check.parsedBlockNumberResponse
 
@@ -335,8 +339,22 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 	// then the endpoint is behind the chain and should be filtered out.
 	minAllowedBlockNumber := perceivedBlock - syncAllowance
 
-	// Log the sync allowance validation details
-	ss.logger.Warn().
+	if parsedBlockNumber < minAllowedBlockNumber {
+		blocksBehind := int64(perceivedBlock) - int64(parsedBlockNumber)
+		ss.logger.Warn().
+			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+			Uint64("endpoint_block", parsedBlockNumber).
+			Uint64("perceived_block", perceivedBlock).
+			Uint64("sync_allowance", syncAllowance).
+			Uint64("min_allowed_block", minAllowedBlockNumber).
+			Int64("blocks_behind", blocksBehind).
+			Msg("⛔ Endpoint filtered: block height outside sync allowance")
+		return fmt.Errorf("%w: block number %d is outside the sync allowance relative to min allowed block number %d and sync allowance %d",
+			errOutsideSyncAllowanceBlockNumberObs, parsedBlockNumber, minAllowedBlockNumber, syncAllowance)
+	}
+
+	// Log the sync allowance validation details only if it passes (to reduce noise)
+	ss.logger.Debug().
 		Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 		Uint64("endpoint_block", parsedBlockNumber).
 		Uint64("perceived_block", perceivedBlock).
@@ -345,17 +363,6 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 		Int64("blocks_behind", int64(perceivedBlock)-int64(parsedBlockNumber)).
 		Bool("within_allowance", parsedBlockNumber >= minAllowedBlockNumber).
 		Msg("🔍 Sync allowance validation")
-
-	if parsedBlockNumber < minAllowedBlockNumber {
-		ss.logger.Warn().
-			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
-			Uint64("endpoint_block", parsedBlockNumber).
-			Uint64("min_allowed_block", minAllowedBlockNumber).
-			Uint64("sync_allowance", syncAllowance).
-			Msg("❌ Endpoint failed sync allowance check - too far behind")
-		return fmt.Errorf("%w: block number %d is outside the sync allowance relative to min allowed block number %d and sync allowance %d",
-			errOutsideSyncAllowanceBlockNumberObs, parsedBlockNumber, minAllowedBlockNumber, syncAllowance)
-	}
 
 	return nil
 }

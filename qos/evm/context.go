@@ -117,6 +117,10 @@ type requestContext struct {
 	// rawResponses stores raw endpoint responses in passthrough mode.
 	// Used by GetHTTPResponse to return raw bytes without parsing.
 	rawResponses []rawEndpointResponse
+
+	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
+	// Used to provide more specific error messages to clients (e.g., "no valid endpoints available").
+	protocolError error
 }
 
 // GetServicePayloads returns the service payloads for the JSON-RPC requests in the request context.
@@ -141,7 +145,11 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 //
 // In legacy mode (rc.passthroughMode == false):
 //   - Full JSON parsing is done synchronously (existing behavior)
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
+//
+// The requestID parameter is the JSON-RPC request ID that this response corresponds to.
+// For batch requests, this ensures error responses use the correct ID.
+// For single requests or when empty, the ID is extracted from the response bytes.
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int, requestID string) {
 	rc.logger = rc.logger.With(
 		"endpoint_addr", endpointAddr,
 		"endpoint_response_len", len(responseBz),
@@ -164,7 +172,7 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 	// indicating the validity of the request when calling on QoS instance's ParseHTTPRequest
 
 	response, err := unmarshalResponse(
-		rc.logger, rc.servicePayloads, responseBz, endpointAddr,
+		rc.logger, rc.servicePayloads, responseBz, endpointAddr, requestID,
 	)
 
 	rc.endpointResponses = append(rc.endpointResponses, endpointResponse{
@@ -173,6 +181,12 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 		unmarshalErr:   err,
 		httpStatusCode: httpStatusCode,
 	})
+}
+
+// SetProtocolError stores a protocol-level error for more specific client error messages.
+// Implements the gateway.RequestQoSContext interface.
+func (rc *requestContext) SetProtocolError(err error) {
+	rc.protocolError = err
 }
 
 // TODO_TECHDEBT(@adshmh): Drop the responseNone struct:
@@ -200,12 +214,13 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 // getPassthroughHTTPResponse returns raw bytes as-is without parsing.
 // Used in passthrough mode for low-latency client responses.
 func (rc requestContext) getPassthroughHTTPResponse() pathhttp.HTTPResponse {
-	// No raw responses received - return error response
+	// No raw responses received - return error response with protocol error context if available
 	if len(rc.rawResponses) == 0 {
 		rc.logger.Warn().Msg("No responses received from any endpoints in passthrough mode. Returning generic non-response.")
 		responseNoneObj := responseNone{
 			logger:          rc.logger,
 			servicePayloads: rc.servicePayloads,
+			protocolError:   rc.protocolError,
 		}
 		return responseNoneObj.GetHTTPResponse()
 	}
@@ -233,6 +248,7 @@ func (rc requestContext) getLegacyHTTPResponse() pathhttp.HTTPResponse {
 		responseNoneObj := responseNone{
 			logger:          rc.logger,
 			servicePayloads: rc.servicePayloads,
+			protocolError:   rc.protocolError,
 		}
 		return responseNoneObj.GetHTTPResponse()
 	}

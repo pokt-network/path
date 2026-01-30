@@ -34,7 +34,16 @@ type RequestQoSContext interface {
 	// - Informs the request QoS context of the payload returned by a specific endpoint.
 	// - Response is for the service payload produced by GetServicePayload.
 	// - httpStatusCode is the original HTTP status code from the backend endpoint.
-	UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int)
+	// - requestID is the JSON-RPC request ID that this response corresponds to (for batch processing).
+	//   For non-JSON-RPC or single requests, this can be empty and the ID will be extracted from the response.
+	UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int, requestID string)
+
+	// SetProtocolError:
+	// - Sets a protocol-level error that occurred before any endpoint could respond.
+	// - Used to provide more specific error messages to clients.
+	// - Examples: "no valid endpoints available", "RPC type not supported", etc.
+	// - If set, GetHTTPResponse should use this error for a more informative response.
+	SetProtocolError(err error)
 
 	// GetHTTPResponse:
 	// - Returns the user-facing HTTP response.

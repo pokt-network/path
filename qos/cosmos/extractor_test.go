@@ -54,7 +54,7 @@ func TestCosmosDataExtractor_ExtractBlockHeight(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			blockHeight, err := extractor.ExtractBlockHeight([]byte(tt.response))
+			blockHeight, err := extractor.ExtractBlockHeight(nil, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -114,7 +114,7 @@ func TestCosmosDataExtractor_ExtractChainID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			chainID, err := extractor.ExtractChainID([]byte(tt.response))
+			chainID, err := extractor.ExtractChainID(nil, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -169,7 +169,7 @@ func TestCosmosDataExtractor_IsSyncing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isSyncing, err := extractor.IsSyncing([]byte(tt.response))
+			isSyncing, err := extractor.IsSyncing(nil, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -221,7 +221,7 @@ func TestCosmosDataExtractor_IsArchival(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isArchival, err := extractor.IsArchival([]byte(tt.response))
+			isArchival, err := extractor.IsArchival(nil, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -278,7 +278,7 @@ func TestCosmosDataExtractor_IsValidResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isValid, err := extractor.IsValidResponse([]byte(tt.response))
+			isValid, err := extractor.IsValidResponse(nil, []byte(tt.response))
 			require.NoError(t, err)
 			assert.Equal(t, tt.expectedValid, isValid)
 		})

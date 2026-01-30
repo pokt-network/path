@@ -63,7 +63,8 @@ func TestEVMDataExtractor_ExtractBlockHeight(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			blockHeight, err := extractor.ExtractBlockHeight([]byte(tt.response))
+			request := []byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}`)
+			blockHeight, err := extractor.ExtractBlockHeight(request, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -110,7 +111,8 @@ func TestEVMDataExtractor_ExtractChainID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			chainID, err := extractor.ExtractChainID([]byte(tt.response))
+			request := []byte(`{"jsonrpc":"2.0","method":"eth_chainId","id":1}`)
+			chainID, err := extractor.ExtractChainID(request, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -156,7 +158,8 @@ func TestEVMDataExtractor_IsSyncing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isSyncing, err := extractor.IsSyncing([]byte(tt.response))
+			request := []byte(`{"jsonrpc":"2.0","method":"eth_syncing","id":1}`)
+			isSyncing, err := extractor.IsSyncing(request, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -215,7 +218,8 @@ func TestEVMDataExtractor_IsArchival(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isArchival, err := extractor.IsArchival([]byte(tt.response))
+			request := []byte(`{"jsonrpc":"2.0","method":"eth_getBalance","id":1}`)
+			isArchival, err := extractor.IsArchival(request, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -273,11 +277,54 @@ func TestEVMDataExtractor_IsValidResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isValid, err := extractor.IsValidResponse([]byte(tt.response))
+			request := []byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}`)
+			isValid, err := extractor.IsValidResponse(request, []byte(tt.response))
 			require.NoError(t, err)
 			assert.Equal(t, tt.expectedValid, isValid)
 		})
 	}
+}
+
+func TestEVMDataExtractor_RequestAwareness(t *testing.T) {
+	extractor := NewEVMDataExtractor()
+
+	t.Run("eth_getBalance should not update block height", func(t *testing.T) {
+		request := []byte(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123","latest"],"id":1}`)
+		response := []byte(`{"jsonrpc":"2.0","result":"0xde0b6b3a7640000","id":1}`) // 1 ETH in wei
+
+		blockHeight, err := extractor.ExtractBlockHeight(request, response)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not an eth_blockNumber request")
+		assert.Equal(t, int64(0), blockHeight)
+	})
+
+	t.Run("eth_blockNumber should update block height", func(t *testing.T) {
+		request := []byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}`)
+		response := []byte(`{"jsonrpc":"2.0","result":"0x12345","id":1}`)
+
+		blockHeight, err := extractor.ExtractBlockHeight(request, response)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(74565), blockHeight)
+	})
+
+	t.Run("eth_getBalance should not update chain ID", func(t *testing.T) {
+		request := []byte(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123","latest"],"id":1}`)
+		response := []byte(`{"jsonrpc":"2.0","result":"0x1","id":1}`)
+
+		chainID, err := extractor.ExtractChainID(request, response)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not an eth_chainId request")
+		assert.Equal(t, "", chainID)
+	})
+
+	t.Run("eth_chainId should update chain ID", func(t *testing.T) {
+		request := []byte(`{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}`)
+		response := []byte(`{"jsonrpc":"2.0","result":"0x1","id":1}`)
+
+		chainID, err := extractor.ExtractChainID(request, response)
+		assert.NoError(t, err)
+		assert.Equal(t, "0x1", chainID)
+	})
 }
 
 func TestParseHexToInt64(t *testing.T) {

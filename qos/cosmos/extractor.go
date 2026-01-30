@@ -45,7 +45,7 @@ func NewCosmosDataExtractor() *CosmosDataExtractor {
 // Returns:
 //   - Block height as int64
 //   - Error if extraction fails or response doesn't contain block height
-func (e *CosmosDataExtractor) ExtractBlockHeight(response []byte) (int64, error) {
+func (e *CosmosDataExtractor) ExtractBlockHeight(request []byte, response []byte) (int64, error) {
 	if len(response) == 0 {
 		return 0, fmt.Errorf("empty response")
 	}
@@ -73,7 +73,7 @@ func (e *CosmosDataExtractor) ExtractBlockHeight(response []byte) (int64, error)
 // Returns:
 //   - Chain ID as string (e.g., "cosmoshub-4", "osmosis-1")
 //   - Error if extraction fails or response doesn't contain chain ID
-func (e *CosmosDataExtractor) ExtractChainID(response []byte) (string, error) {
+func (e *CosmosDataExtractor) ExtractChainID(request []byte, response []byte) (string, error) {
 	if len(response) == 0 {
 		return "", fmt.Errorf("empty response")
 	}
@@ -107,7 +107,7 @@ func (e *CosmosDataExtractor) ExtractChainID(response []byte) (string, error) {
 //   - true if endpoint is syncing (catching_up = true)
 //   - false if endpoint is synced (catching_up = false)
 //   - Error if sync status cannot be determined
-func (e *CosmosDataExtractor) IsSyncing(response []byte) (bool, error) {
+func (e *CosmosDataExtractor) IsSyncing(request []byte, response []byte) (bool, error) {
 	if len(response) == 0 {
 		return false, fmt.Errorf("empty response")
 	}
@@ -149,7 +149,7 @@ func (e *CosmosDataExtractor) IsSyncing(response []byte) (bool, error) {
 //   - true if endpoint is archival (query succeeded)
 //   - false if endpoint is not archival (query failed with pruning error)
 //   - Error if archival status cannot be determined
-func (e *CosmosDataExtractor) IsArchival(response []byte) (bool, error) {
+func (e *CosmosDataExtractor) IsArchival(request []byte, response []byte) (bool, error) {
 	if len(response) == 0 {
 		return false, fmt.Errorf("empty response")
 	}
@@ -208,7 +208,7 @@ func (e *CosmosDataExtractor) IsArchival(response []byte) (bool, error) {
 //   - true if response is valid (correct format, no errors)
 //   - false if response is invalid (malformed, contains error)
 //   - Error if validation fails unexpectedly
-func (e *CosmosDataExtractor) IsValidResponse(response []byte) (bool, error) {
+func (e *CosmosDataExtractor) IsValidResponse(request []byte, response []byte) (bool, error) {
 	if len(response) == 0 {
 		return false, nil
 	}

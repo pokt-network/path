@@ -212,7 +212,7 @@ func (p *Protocol) getPreSelectedEndpoint(
 	// NOTE: WebSocket endpoints currently don't have dedicated health checks, so they may have
 	// low initial scores. We use filterByReputation=false for WebSocket until health checks are implemented.
 	filterByReputation := rpcType != sharedtypes.RPCType_WEBSOCKET
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers)
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers, selectedEndpointAddr)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, err

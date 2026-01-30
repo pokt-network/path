@@ -69,11 +69,13 @@ func (hc *HealthCheckQoSContext) GetServicePayloads() []protocol.Payload {
 
 // UpdateWithResponse processes the endpoint response for the health check.
 // It validates the response against expected criteria (status code, body content).
+// The requestID parameter is unused for health checks but required by the interface.
 // Implements RequestQoSContext interface.
 func (hc *HealthCheckQoSContext) UpdateWithResponse(
 	endpointAddr protocol.EndpointAddr,
 	endpointSerializedResponse []byte,
 	httpStatusCode int,
+	requestID string,
 ) {
 	hc.responseMu.Lock()
 	defer hc.responseMu.Unlock()
@@ -146,6 +148,13 @@ func (hc *HealthCheckQoSContext) UpdateWithResponse(
 		Str("check_name", hc.checkConfig.Name).
 		Int("status_code", httpStatusCode).
 		Msg("✅ Health check validation passed")
+}
+
+// SetProtocolError is a no-op for health checks since they don't generate user-facing error responses.
+// Implements the RequestQoSContext interface.
+func (hc *HealthCheckQoSContext) SetProtocolError(err error) {
+	// Health checks don't generate user-facing error responses.
+	// Protocol errors are handled via the IsSuccess/GetError methods instead.
 }
 
 // GetHTTPResponse returns a minimal HTTP response for health checks.

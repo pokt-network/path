@@ -2,6 +2,7 @@ package shannon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -24,6 +25,7 @@ import (
 	pathhttp "github.com/pokt-network/path/network/http"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/heuristic"
 	"github.com/pokt-network/path/reputation"
 )
 
@@ -169,6 +171,8 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 	// For single payload, handle directly without additional overhead.
 	if len(payloads) == 1 {
 		response, err := rc.sendSingleRelay(payloads[0])
+		// Set the request ID from the payload for proper error response handling
+		response.RequestID = extractJSONRPCRequestID(payloads[0].Data)
 		return []protocol.Response{response}, err
 	}
 
@@ -293,7 +297,7 @@ func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payloa
 	<-observationsCollected
 	rc.observationsChan = nil // Reset to nil so single relay mode works normally
 
-	return rc.convertResultsToResponses(results, rc.findFirstError(results))
+	return rc.convertResultsToResponses(results, payloads, rc.findFirstError(results))
 }
 
 // parallelRelayResult holds the result of a single relay request for parallel processing.
@@ -320,7 +324,8 @@ func (rc *requestContext) findFirstError(results []parallelRelayResult) error {
 //
 // convertResultsToResponses converts parallel relay results into an array of protocol responses.
 // Maintains the order of responses to match the order of input payloads.
-func (rc *requestContext) convertResultsToResponses(results []parallelRelayResult, firstErr error) ([]protocol.Response, error) {
+// The payloads parameter is used to extract request IDs for error responses.
+func (rc *requestContext) convertResultsToResponses(results []parallelRelayResult, payloads []protocol.Payload, firstErr error) ([]protocol.Response, error) {
 	if len(results) == 0 {
 		response, err := rc.handleInternalError(fmt.Errorf("convertResultsToResponses: no results to convert"))
 		return []protocol.Response{response}, err
@@ -329,9 +334,13 @@ func (rc *requestContext) convertResultsToResponses(results []parallelRelayResul
 	// Create response array in the same order as input payloads.
 	responses := make([]protocol.Response, len(results))
 
-	// Process results in order.
+	// Process results in order, setting request ID from corresponding payload.
 	for i, result := range results {
 		responses[i] = result.response
+		// Set the request ID from the payload so that error responses have the correct ID
+		if i < len(payloads) {
+			responses[i].RequestID = extractJSONRPCRequestID(payloads[i].Data)
+		}
 	}
 
 	rc.logger.Debug().
@@ -340,6 +349,43 @@ func (rc *requestContext) convertResultsToResponses(results []parallelRelayResul
 		Msg("Response conversion completed")
 
 	return responses, firstErr
+}
+
+// extractJSONRPCRequestID extracts the JSON-RPC request ID from a payload data string.
+// The payload data is expected to be a JSON-RPC request like:
+// {"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}
+// Returns the ID as a string (e.g., "1", "abc", etc.), or empty string if extraction fails.
+func extractJSONRPCRequestID(payloadData string) string {
+	if payloadData == "" {
+		return ""
+	}
+
+	// Parse the JSON to extract the ID
+	var req struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(payloadData), &req); err != nil {
+		return ""
+	}
+
+	// If no ID field or null ID
+	if len(req.ID) == 0 || string(req.ID) == "null" {
+		return ""
+	}
+
+	// Try to parse as integer
+	var intID int
+	if err := json.Unmarshal(req.ID, &intID); err == nil {
+		return fmt.Sprintf("%d", intID)
+	}
+
+	// Try to parse as string
+	var strID string
+	if err := json.Unmarshal(req.ID, &strID); err == nil {
+		return strID
+	}
+
+	return ""
 }
 
 // GetObservations:
@@ -606,6 +652,16 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// Hydrate the response with the endpoint address
 	deserializedResponse.EndpointAddr = selectedEndpoint.Addr()
 
+	// Hydrate the response with relay metadata for response headers
+	endpointSession := selectedEndpoint.Session()
+	deserializedResponse.Metadata = protocol.RelayMetadata{
+		SupplierAddress: selectedEndpoint.Supplier(),
+		SessionID:       endpointSession.SessionId,
+	}
+	if endpointSession.Application != nil {
+		deserializedResponse.Metadata.AppAddress = endpointSession.Application.Address
+	}
+
 	// Log non-2xx HTTP status codes for visibility, but passthrough the response
 	// to preserve the backend's original HTTP status code for the client.
 	responseHTTPStatusCode := deserializedResponse.HTTPStatusCode
@@ -613,6 +669,27 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		rc.logger.Debug().
 			Int("http_status_code", responseHTTPStatusCode).
 			Msg("Backend returned non-2xx HTTP status - passing through to client")
+	}
+
+	// Heuristic analysis of response content - detect bad gateway, empty responses, etc.
+	// This runs BEFORE returning to gateway to allow protocol-level retry decisions.
+	// Only analyze on HTTP 2xx status to avoid double-checking non-2xx responses.
+	if responseHTTPStatusCode >= 200 && responseHTTPStatusCode < 300 {
+		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.currentRPCType)
+		if heuristicResult.ShouldRetry {
+			rc.logger.Debug().
+				Str("heuristic_reason", heuristicResult.Reason).
+				Float64("heuristic_confidence", heuristicResult.Confidence).
+				Str("heuristic_details", heuristicResult.Details).
+				Int("response_size", len(deserializedResponse.Bytes)).
+				Int("http_status_code", responseHTTPStatusCode).
+				Msg("Heuristic analysis detected error in backend response - triggering retry")
+
+			// Return an error to trigger retry at protocol level.
+			// Wrap in raw_payload: format to allow proper error classification and reputation penalty.
+			return defaultResponse, fmt.Errorf("raw_payload: %s: heuristic detected %s: %w",
+				string(deserializedResponse.Bytes), heuristicResult.Reason, errMalformedEndpointPayload)
+		}
 	}
 
 	return deserializedResponse, nil
@@ -1099,14 +1176,30 @@ func (rc *requestContext) handleEndpointSuccess(
 	var reputationSignal string
 	var relayType string
 
+	// Check if backend returned a 5xx server error.
+	// 5xx errors are server-side failures and should penalize reputation.
+	// 4xx errors are NOT penalized as they're often client-side issues (bad request, auth, etc.).
+	backendHTTPStatus := endpointResponse.HTTPStatusCode
+	isBackend5xx := backendHTTPStatus >= 500
+
 	if rc.reputationService != nil {
 		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
 		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
 
-		// Check if endpoint is in probation - use RecoverySuccessSignal (+15) for probation,
-		// SuccessSignal (+1) for normal requests. This helps low-scoring endpoints recover faster.
 		var signal reputation.Signal
-		if rc.tieredSelector != nil && rc.tieredSelector.Config().Probation.Enabled && rc.tieredSelector.IsInProbation(endpointKey) {
+
+		// Backend returned 5xx server error - record error signal instead of success
+		if isBackend5xx {
+			signal = reputation.NewCriticalErrorSignal("backend_5xx", latency)
+			reputationSignal = metrics.SignalCriticalError
+			relayType = metrics.RelayTypeNormal
+
+			rc.logger.Debug().
+				Int("backend_http_status", backendHTTPStatus).
+				Str("endpoint", string(selectedEndpointAddr)).
+				Str("service_id", string(rc.serviceID)).
+				Msg("Backend returned 5xx error - recording critical error signal for reputation")
+		} else if rc.tieredSelector != nil && rc.tieredSelector.Config().Probation.Enabled && rc.tieredSelector.IsInProbation(endpointKey) {
 			// Probation endpoint succeeded - use recovery signal for stronger positive reinforcement
 			signal = reputation.NewRecoverySuccessSignal(latency)
 			reputationSignal = metrics.SignalOK
@@ -1136,12 +1229,17 @@ func (rc *requestContext) handleEndpointSuccess(
 			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for success")
 		}
 
-		// Record additional latency penalty signals if applicable
-		// This is done by checking the per-service latency config and determining
-		// if the response was slow enough to warrant an additional penalty signal
-		rc.recordLatencyPenaltySignalsIfNeeded(endpointKey, latency)
+		// Record additional latency penalty signals if applicable (only for actual successes)
+		if !isBackend5xx {
+			rc.recordLatencyPenaltySignalsIfNeeded(endpointKey, latency)
+		}
 	} else {
-		reputationSignal = metrics.SignalOK
+		// No reputation service - just set the signal for metrics
+		if isBackend5xx {
+			reputationSignal = metrics.SignalCriticalError
+		} else {
+			reputationSignal = metrics.SignalOK
+		}
 		relayType = metrics.RelayTypeNormal
 	}
 
@@ -1228,10 +1326,17 @@ func (rc *requestContext) sendHTTPRequest(
 	url string,
 	requestData []byte,
 ) ([]byte, int, error) {
+	// Get per-service relay timeout, falling back to global default if not configured.
+	// This allows different services to have different timeouts based on their payload sizes
+	// and expected response times (e.g., LLM services may need 60s+ while EVM chains need 5-10s).
+	relayTimeout := gateway.DefaultRelayRequestTimeout
+	if rc.unifiedServicesConfig != nil {
+		relayTimeout = rc.unifiedServicesConfig.GetRelayTimeoutForService(rc.serviceID)
+	}
+
 	// Prepare a timeout context for the request.
 	// Use rc.context as parent to respect request-level cancellation signals.
-	timeout := time.Duration(gateway.RelayRequestTimeout) * time.Millisecond
-	ctxWithTimeout, cancelFn := context.WithTimeout(rc.context, timeout)
+	ctxWithTimeout, cancelFn := context.WithTimeout(rc.context, relayTimeout)
 	defer cancelFn()
 
 	// Build headers including RPCType header
@@ -1272,44 +1377,4 @@ func prepareURLFromPayload(endpointURL string, payload protocol.Payload) string 
 		url = fmt.Sprintf("%s%s", url, payload.Path)
 	}
 	return url
-}
-
-// hydrateLogger:
-// - Enhances the base logger with information from the request context.
-// - Includes:
-//   - Method name
-//   - Service ID
-//   - Selected endpoint supplier
-//   - Selected endpoint URL
-func (rc *requestContext) hydrateLogger(methodName string) {
-	logger := rc.logger.With(
-		"request_type", "http",
-		"method", methodName,
-		"service_id", rc.serviceID,
-	)
-
-	defer func() {
-		rc.logger = logger
-	}()
-
-	// No endpoint specified on request context.
-	// - This should never happen.
-	selectedEndpoint := rc.getSelectedEndpoint()
-	if selectedEndpoint == nil {
-		return
-	}
-
-	logger = logger.With(
-		"selected_endpoint_supplier", selectedEndpoint.Supplier(),
-		"selected_endpoint_url", selectedEndpoint.PublicURL(),
-	)
-
-	sessionHeader := selectedEndpoint.Session().Header
-	if sessionHeader == nil {
-		return
-	}
-
-	logger = logger.With(
-		"selected_endpoint_app", sessionHeader.ApplicationAddress,
-	)
 }
