@@ -2,13 +2,19 @@
 # Pocket Network Health Check Configuration
 # ==========================================
 # Generated for all supported chains at api.pocket.network
-# Last updated: January 29, 2026,
+# Last updated: January 30, 2026
 #
 # Service IDs match the subdomain of each endpoint URL
 # Template format: gateway/health_check_config.go
 #
 # CHANGELOG:
-# - Reduce penalty for archival requests from critical to minor, once we have specific archival service we will move it to major
+# - Added archival checks for all EVM chains aligned with E2E config (services_shannon.yaml)
+#   Chains with archival checks: eth, poly, bsc, avax, bera, sonic, ink, moonbeam, gnosis,
+#   celo, fantom, oasys, kaia, xrplevm, arb-one, op, base, scroll, linea, blast, boba,
+#   metis, taiko, opbnb
+#   Chains pending archival verification: zksync-era, iotex, fuse
+# - Verified expected balances via DRPC and operator archival endpoints
+# - Reduce penalty for archival requests from critical to minor
 # - Updated BSC archival check with verified expected balance from https://bsc.drpc.org
 # - Added sync_check for all chains
 # - Added sync_allowance for all chains (5 minutes of blocks)
@@ -60,21 +66,21 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
-    # Archival check - queries balance at historical block 15,000,000 (early 2022)
+    # Archival check - queries balance at historical block 12,300,000 (mid-2021)
     # Non-archival nodes will fail with "missing trie node" error
-    # Address: 0x28C6c06298d514Db089934071355E5743bf21d60 (Binance hot wallet)
-    # Block: 0xe4e1c0 (15,000,000)
-    # Expected balance: 0x314214a541a8e719f516 (~14,700 ETH)
+    # Address: 0x28C6c06298d514Db089934071355E5743bf21d60 (Binance hot wallet from E2E tests)
+    # Block: 0xbbaee0 (12,300,000)
+    # Expected balance: 0xcab531a8ea39e00 (verified via DRPC archival)
     - name: eth_archival
       type: json_rpc
       method: POST
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x28C6c06298d514Db089934071355E5743bf21d60","0xe4e1c0"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x28C6c06298d514Db089934071355E5743bf21d60","0xbbaee0"]}'
       expected_status_code: 200
-      expected_response_contains: "0x314214a541a8e719f516"
+      expected_response_contains: "0xcab531a8ea39e00"
       timeout: 10s
       archival: true
-      reputation_signal: minor_error # lets penalty but not that hardest
+      reputation_signal: minor_error
 
 - service_id: poly
   # Block time: ~2s | Source: chainspect.app, polygonscan.com
@@ -108,6 +114,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 5,000,000
+    # Address: 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270 (WMATIC from E2E tests)
+    # Block: 0x4c4b40 (5,000,000)
+    - name: poly_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270","0x4c4b40"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x0"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: bsc
   # Block time: ~3s | Source: bscscan.com, bnbchain docs
@@ -181,6 +200,20 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - queries balance at historical block 5,000,000
+    # Address: 0x9f8c163cBA728e99993ABe7495F06c0A3c8Ac8b9 (from E2E tests)
+    # Block: 0x4c4b40 (5,000,000)
+    # Expected balance: 0xd1cd6895a4c6e6b221e0 (verified via DRPC archival)
+    - name: avax_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x9f8c163cBA728e99993ABe7495F06c0A3c8Ac8b9","0x4c4b40"]}'
+      expected_status_code: 200
+      expected_response_contains: "0xd1cd6895a4c6e6b221e0"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 # DEPRECATED from public portal but retained for operators
 - service_id: avax-dfk
@@ -232,6 +265,20 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - queries balance at historical block 2,000,000
+    # Address: 0x6969696969696969696969696969696969696969 (from E2E tests)
+    # Block: 0x1e8480 (2,000,000)
+    # Expected balance: 0x1006008cb3f7fd70df2ab5 (verified via public RPC)
+    - name: bera_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x6969696969696969696969696969696969696969","0x1e8480"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x1006008cb3f7fd70df2ab5"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: sonic
   # Block time: ~1s | Source: sonicscan.org, soniclabs.com docs
@@ -257,6 +304,20 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - queries balance at historical block 10,769,279
+    # Address: 0xfc00face00000000000000000000000000000000 (from E2E tests)
+    # Block: 0xa4537f (10,769,279)
+    # Expected balance: 0x3be6de067d592077ea6bc6b (verified via public RPC)
+    - name: sonic_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xfc00face00000000000000000000000000000000","0xa4537f"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x3be6de067d592077ea6bc6b"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: ink
   # Block time: ~2s | Source: OP Stack L2 (default 2s block time)
@@ -282,6 +343,20 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - queries balance at historical block 4,500,000
+    # Address: 0x4200000000000000000000000000000000000006 (from E2E tests)
+    # Block: 0x44aa20 (4,500,000)
+    # Expected balance: 0x2a4761dc71170c3eb0 (verified via public RPC)
+    - name: ink_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x4200000000000000000000000000000000000006","0x44aa20"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x2a4761dc71170c3eb0"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: moonbeam
   # Block time: ~6s | Source: chainspect.app, moonscan.io
@@ -307,6 +382,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 677,000
+    # Address: 0xf89d7b9c864f589bbf53a82105107622b35eaa40 (from E2E tests)
+    # Block: 0xa5488 (677,000)
+    - name: moonbeam_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xf89d7b9c864f589bbf53a82105107622b35eaa40","0xa5488"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x109855c3ae698000"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: moonriver
   # Block time: ~6s | Source: moonscan.io (same as Moonbeam)
@@ -357,6 +445,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 20,000,000
+    # Address: 0xe91d153e0b41518a2ce8dd3d7944fa863463a97d (from E2E tests)
+    # Block: 0x1312d00 (20,000,000)
+    - name: gnosis_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xe91d153e0b41518a2ce8dd3d7944fa863463a97d","0x1312d00"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x1faf6c098f2d065917389b"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: celo
   # Block time: ~5s | Source: celoscan.io, celo docs
@@ -382,6 +483,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 20,000,000
+    # Address: 0xf89d7b9c864f589bbF53a82105107622B35EaA40 (from E2E tests)
+    # Block: 0x1312d00 (20,000,000)
+    - name: celo_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xf89d7b9c864f589bbF53a82105107622B35EaA40","0x1312d00"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x9a1201de9ff1d6718714"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: fantom
   # Block time: ~1s | Source: ftmscan.com (legacy chain, migrating to Sonic)
@@ -407,6 +521,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 110,633,000
+    # Address: 0xaabf86ab3646a7064aa2f61e5959e39129ca46b6 (from E2E tests)
+    # Block: 0x6982028 (110,633,000)
+    - name: fantom_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xaabf86ab3646a7064aa2f61e5959e39129ca46b6","0x6982028"]}'
+      expected_status_code: 200
+      expected_response_contains: "0xe274153fc265324"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: harmony
   # Block time: ~2s | Source: explorer.harmony.one, harmony docs
@@ -507,6 +634,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 424,300
+    # Address: 0xf89d7b9c864f589bbF53a82105107622B35EaA40 (from E2E tests)
+    # Block: 0x6796c (424,300)
+    - name: oasys_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xf89d7b9c864f589bbF53a82105107622B35EaA40","0x6796c"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x26e0e4d5c53ea66fb93698"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: kaia
   # Block time: ~1s | Source: kaiascan.io, kaia.io docs (formerly Klaytn)
@@ -532,6 +672,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 170,000,000
+    # Address: 0x0051ef9259c7ec0644a80e866ab748a2f30841b3 (from E2E tests)
+    # Block: 0xa21fe80 (170,000,000)
+    - name: kaia_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x0051ef9259c7ec0644a80e866ab748a2f30841b3","0xa21fe80"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x9eac1a68d8e41eee7c327"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: xrplevm
   # Block time: ~4s | Source: evm-sidechain.xrpl.org explorer
@@ -557,6 +710,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 1,002,479
+    # Address: 0x7C21a90E3eCD3215d16c3BBe76a491f8f792d4Bf (from E2E tests)
+    # Block: 0xf4bef (1,002,479)
+    - name: xrplevm_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x7C21a90E3eCD3215d16c3BBe76a491f8f792d4Bf","0xf4bef"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x0"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 # Hyperliquid is an EVM chain (not Cosmos)
 # KNOWN ISSUE: eth_call ignores block number parameter - always returns latest block context
@@ -621,6 +787,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 3,100,000
+    # Address: 0xb38e8c17e38363af6ebdcb3dae12e0243582891d (from E2E tests)
+    # Block: 0x2f4d60 (3,100,000)
+    - name: arb_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xb38e8c17e38363af6ebdcb3dae12e0243582891d","0x2f4d60"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x133b76fbe5482070"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: op
   # Block time: ~2s | Source: chainspect.app, optimistic.etherscan.io
@@ -654,6 +833,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 8,121,800
+    # Address: 0xacD03D601e5bB1B275Bb94076fF46ED9D753435A (from E2E tests)
+    # Block: 0x7bedc8 (8,121,800)
+    - name: op_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xacD03D601e5bB1B275Bb94076fF46ED9D753435A","0x7bedc8"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x12e28e5ddc49828"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: base
   # Block time: ~2s | Source: chainspect.app, basescan.org
@@ -687,6 +879,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 4,504,400
+    # Address: 0x3304E22DDaa22bCdC5fCa2269b418046aE7b566A (from E2E tests)
+    # Block: 0x44bb50 (4,504,400)
+    - name: base_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x3304E22DDaa22bCdC5fCa2269b418046aE7b566A","0x44bb50"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x235d852383386"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: poly-zkevm
   # Block time: ~2s | Source: zkevm.polygonscan.com
@@ -787,6 +992,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 5,000,000
+    # Address: 0x5300000000000000000000000000000000000004 (from E2E tests)
+    # Block: 0x4c4b40 (5,000,000)
+    - name: scroll_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x5300000000000000000000000000000000000004","0x4c4b40"]}'
+      expected_status_code: 200
+      expected_response_contains: "0xbb0dede65b522e37cc"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: linea
   # Block time: ~2s | Source: lineascan.build
@@ -812,6 +1030,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 10,000,000
+    # Address: 0xf89d7b9c864f589bbf53a82105107622b35eaa40 (from E2E tests)
+    # Block: 0x989680 (10,000,000)
+    - name: linea_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xf89d7b9c864f589bbf53a82105107622b35eaa40","0x989680"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x131b06ed22b67549a58"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 # DEPRECATED from public portal but retained for operators
 - service_id: mantle
@@ -863,6 +1094,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 1,000,000
+    # Address: 0x4300000000000000000000000000000000000004 (from E2E tests)
+    # Block: 0xf4240 (1,000,000)
+    - name: blast_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x4300000000000000000000000000000000000004","0xf4240"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x24a55ab608f779ac0e68"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: boba
   # Block time: ~2s | Source: bobascan.com (OP Stack)
@@ -888,6 +1132,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 3,060,300
+    # Address: 0x3A92cA39476fF84Dc579C868D4D7dE125513B034 (from E2E tests)
+    # Block: 0x2eb24c (3,060,300)
+    - name: boba_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x3A92cA39476fF84Dc579C868D4D7dE125513B034","0x2eb24c"]}'
+      expected_status_code: 200
+      expected_response_contains: "0xa65e4b7ca14ea1c1e"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: metis
   # Block time: ~2s | Source: andromeda-explorer.metis.io
@@ -913,6 +1170,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 15,000,000
+    # Address: 0xfad31cd4d45Ac7C4B5aC6A0044AA05Ca7C017e62 (from E2E tests)
+    # Block: 0xe4e1c0 (15,000,000)
+    - name: metis_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xfad31cd4d45Ac7C4B5aC6A0044AA05Ca7C017e62","0xe4e1c0"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x115470844d1b8bc17"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: taiko
   # Block time: ~12s | Source: taikoscan.io (based-rollup inherits L1 timing)
@@ -938,6 +1208,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 170,163
+    # Address: 0x1670000000000000000000000000000000000001 (from E2E tests)
+    # Block: 0x298b3 (170,163)
+    - name: taiko_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x1670000000000000000000000000000000000001","0x298b3"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x33b2d17896ccc8bbcb6f73b"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: unichain
   # Block time: ~1s | Source: uniscan.xyz (OP Stack with 1s blocks)
@@ -988,6 +1271,19 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # Archival check - block 20,000,000
+    # Address: 0x001ceb373c83ae75b9f5cf78fc2aba3e185d09e2 (from E2E tests)
+    # Block: 0x1312d00 (20,000,000)
+    - name: opbnb_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x001ceb373c83ae75b9f5cf78fc2aba3e185d09e2","0x1312d00"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x2960f1d005cb35efb40"
+      timeout: 10s
+      archival: true
+      reputation_signal: minor_error
 
 - service_id: fraxtal
   # Block time: ~2s | Source: fraxscan.com (OP Stack)
