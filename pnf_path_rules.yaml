@@ -8,6 +8,7 @@
 # Template format: gateway/health_check_config.go
 #
 # CHANGELOG:
+# - Reduce penalty for archival requests from critical to minor, once we have specific archival service we will move it to major
 # - Updated BSC archival check with verified expected balance from https://bsc.drpc.org
 # - Added sync_check for all chains
 # - Added sync_allowance for all chains (5 minutes of blocks)
@@ -73,7 +74,7 @@
       expected_response_contains: "0x314214a541a8e719f516"
       timeout: 10s
       archival: true
-      reputation_signal: critical_error
+      reputation_signal: minor_error # lets penalty but not that hardest
 
 - service_id: poly
   # Block time: ~2s | Source: chainspect.app, polygonscan.com
@@ -154,7 +155,7 @@
       expected_response_contains: "0x231f41a5cec600"
       timeout: 10s
       archival: true
-      reputation_signal: critical_error
+      reputation_signal: minor_error # lets penalty but not that hardest
 
 - service_id: avax
   # Block time: ~2s | Source: chainspect.app, snowtrace.io
