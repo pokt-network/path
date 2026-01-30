@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -196,6 +197,7 @@ func (rc *requestContext) HandleRelayRequest() error {
 
 // handleSingleRelayRequest handles a single relay request (original behavior)
 // handleSingleRelayRequest handles a single relay request with optional hedge racing.
+// For batch requests (multiple payloads), delegates to handleBatchRelayRequest.
 func (rc *requestContext) handleSingleRelayRequest() error {
 	logger := rc.logger.With("method", "handleSingleRelayRequest")
 
@@ -204,6 +206,15 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	if len(payloads) == 0 {
 		return fmt.Errorf("no payloads available from QoS context")
 	}
+
+	// For batch requests, each item should go through full retry/hedge/heuristic flow independently
+	if len(payloads) > 1 {
+		logger.Debug().
+			Int("batch_size", len(payloads)).
+			Msg("Detected batch request - routing to batch handler")
+		return rc.handleBatchRelayRequest(payloads)
+	}
+
 	rpcType := payloads[0].RPCType
 	batchCount := len(payloads)
 
@@ -379,8 +390,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				primaryEndpoint := availableEndpoints[0]
 
 				// Create hedge racer and run the race
+				// Pass the single payload explicitly (payloads[0]) for proper hedge request handling
 				racer := newHedgeRacer(rc, logger, rpcType, hedgeDelay, connectTimeout)
-				hedgeResponses, hedgeErr := racer.race(rc.context, currentProtocolCtx, primaryEndpoint, availableEndpoints)
+				hedgeResponses, hedgeErr := racer.race(rc.context, currentProtocolCtx, primaryEndpoint, availableEndpoints, payloads[0])
 
 				// Copy hedge result to request context for response headers
 				rc.hedgeResult = racer.raceResult
@@ -406,7 +418,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					if checkResult.Success {
 						// Success! Process the response
 						for _, endpointResponse := range hedgeResponses {
-							rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+							rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode, endpointResponse.RequestID)
 							rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
 							if len(rc.relayMetadata) < 10 {
 								rc.relayMetadata = append(rc.relayMetadata, endpointResponse.Metadata)
@@ -569,7 +581,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			// - Remove the individual endpoint response handling from the gateway package.
 			//
 			for _, endpointResponse := range endpointResponses {
-				rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+				rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode, endpointResponse.RequestID)
 
 				// Queue observation for async parsing (sampled, non-blocking)
 				rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
@@ -633,7 +645,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 		// Update QoS context with the failed response (if we have responses)
 		for _, endpointResponse := range endpointResponses {
-			rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
+			rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode, endpointResponse.RequestID)
 			rc.tryQueueObservation(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode)
 		}
 
@@ -694,6 +706,292 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	// Set the protocol error on QoS context for more informative client error messages
 	rc.qosCtx.SetProtocolError(statusErr)
 	return statusErr
+}
+
+// batchPayloadResult holds the result of processing a single payload in a batch.
+type batchPayloadResult struct {
+	index    int
+	response protocol.Response
+	err      error
+}
+
+// handleBatchRelayRequest handles batch JSON-RPC requests by processing each payload
+// independently through the full retry/hedge/heuristic flow.
+// This ensures each batch item gets proper endpoint selection, retry, and error handling.
+func (rc *requestContext) handleBatchRelayRequest(payloads []protocol.Payload) error {
+	logger := rc.logger.With("method", "handleBatchRelayRequest").With("batch_size", len(payloads))
+	logger.Info().Msg("Processing batch request with independent flows per item")
+
+	startTime := time.Now()
+	rpcType := payloads[0].RPCType
+
+	// Process each payload in parallel
+	resultChan := make(chan batchPayloadResult, len(payloads))
+	var wg sync.WaitGroup
+
+	for i, payload := range payloads {
+		// Debug: Log each payload before processing
+		logger.Debug().
+			Int("payload_index", i).
+			Str("payload_data_preview", func() string {
+				if len(payload.Data) > 100 {
+					return payload.Data[:100] + "..."
+				}
+				return payload.Data
+			}()).
+			Msg("Processing batch payload")
+
+		wg.Add(1)
+		go func(index int, p protocol.Payload) {
+			defer wg.Done()
+			response, err := rc.processSinglePayloadWithRetry(p, index, rpcType, logger)
+			resultChan <- batchPayloadResult{
+				index:    index,
+				response: response,
+				err:      err,
+			}
+		}(i, payload)
+	}
+
+	// Wait for all goroutines to complete and close channel
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results in order
+	results := make([]batchPayloadResult, len(payloads))
+	var hasError bool
+	for result := range resultChan {
+		results[result.index] = result
+		if result.err != nil {
+			hasError = true
+		}
+	}
+
+	// Update QoS context with all responses
+	for _, result := range results {
+		if result.response.Bytes != nil || result.err != nil {
+			rc.qosCtx.UpdateWithResponse(
+				result.response.EndpointAddr,
+				result.response.Bytes,
+				result.response.HTTPStatusCode,
+				result.response.RequestID,
+			)
+		}
+	}
+
+	// Record batch metrics
+	totalLatency := time.Since(startTime).Seconds()
+	metrics.RecordBatchSize(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), len(payloads), totalLatency)
+
+	// Count successes and failures for logging
+	successCount := 0
+	for _, result := range results {
+		if result.err == nil && result.response.HTTPStatusCode >= 200 && result.response.HTTPStatusCode < 300 {
+			successCount++
+		}
+	}
+
+	logger.Info().
+		Int("batch_size", len(payloads)).
+		Int("successes", successCount).
+		Int("failures", len(payloads)-successCount).
+		Dur("total_duration", time.Since(startTime)).
+		Msg("Batch request processing completed")
+
+	// Return nil - individual errors are captured in responses
+	// The QoS layer will build appropriate error responses for failed items
+	if hasError {
+		logger.Warn().Msg("Some batch items failed - errors captured in individual responses")
+	}
+	return nil
+}
+
+// processSinglePayloadWithRetry handles a single payload with full retry/hedge/heuristic flow.
+// This is the core logic extracted for batch processing.
+func (rc *requestContext) processSinglePayloadWithRetry(
+	payload protocol.Payload,
+	index int,
+	rpcType sharedtypes.RPCType,
+	parentLogger polylog.Logger,
+) (protocol.Response, error) {
+	logger := parentLogger.With("payload_index", index)
+
+	// Get retry configuration
+	retryConfig := rc.getRetryConfigForService()
+	maxAttempts := 1
+	if retryConfig != nil && retryConfig.Enabled != nil && *retryConfig.Enabled {
+		if retryConfig.MaxRetries != nil && *retryConfig.MaxRetries > 0 {
+			maxAttempts = *retryConfig.MaxRetries + 1
+		}
+	}
+
+	// Check if hedge racing is enabled
+	var hedgeDelay time.Duration
+	var connectTimeout time.Duration
+	if retryConfig != nil && retryConfig.HedgeDelay != nil && *retryConfig.HedgeDelay > 0 {
+		hedgeDelay = *retryConfig.HedgeDelay
+		if retryConfig.ConnectTimeout != nil {
+			connectTimeout = *retryConfig.ConnectTimeout
+		} else {
+			connectTimeout = 500 * time.Millisecond
+		}
+	}
+
+	var lastErr error
+	var lastResponse protocol.Response
+	triedEndpoints := make(map[protocol.EndpointAddr]bool)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Get available endpoints
+		availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
+			rc.context, rc.serviceID, rpcType, rc.originalHTTPRequest)
+		if err != nil || len(availableEndpoints) == 0 {
+			lastErr = fmt.Errorf("no endpoints available for batch item %d", index)
+			logger.Warn().Err(err).Int("attempt", attempt).Msg("No endpoints available")
+			continue
+		}
+
+		// Filter out already tried endpoints for retries
+		var filteredEndpoints []protocol.EndpointAddr
+		for _, ep := range availableEndpoints {
+			if !triedEndpoints[ep] {
+				filteredEndpoints = append(filteredEndpoints, ep)
+			}
+		}
+		if len(filteredEndpoints) == 0 {
+			// All endpoints tried, use original list
+			filteredEndpoints = availableEndpoints
+		}
+
+		// Select endpoint
+		selectedEndpoint := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType)
+		if selectedEndpoint == "" {
+			selectedEndpoint = filteredEndpoints[0]
+		}
+		triedEndpoints[selectedEndpoint] = true
+
+		// Build protocol context for this endpoint
+		protocolCtx, _, err := rc.protocol.BuildHTTPRequestContextForEndpoint(
+			rc.context, rc.serviceID, selectedEndpoint, rpcType, rc.originalHTTPRequest, true)
+		if err != nil {
+			lastErr = err
+			logger.Warn().Err(err).Str("endpoint", string(selectedEndpoint)).Msg("Failed to build protocol context")
+			continue
+		}
+
+		// Hedge racing on first attempt if enabled
+		if attempt == 1 && hedgeDelay > 0 && len(filteredEndpoints) > 1 {
+			racer := newHedgeRacer(rc, logger, rpcType, hedgeDelay, connectTimeout)
+			hedgeResponses, hedgeErr := racer.race(rc.context, protocolCtx, selectedEndpoint, filteredEndpoints, payload)
+
+			if hedgeErr == nil && len(hedgeResponses) > 0 {
+				resp := hedgeResponses[0]
+				checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, rpcType, logger)
+				if checkResult.Success {
+					// Extract request ID from payload
+					resp.RequestID = extractRequestIDFromPayload(payload)
+					logger.Debug().
+						Str("endpoint", string(resp.EndpointAddr)).
+						Int("status", resp.HTTPStatusCode).
+						Msg("Batch item succeeded via hedge racing")
+					return resp, nil
+				}
+				// Hedge failed heuristic check, continue to retry
+				lastResponse = resp
+				lastErr = fmt.Errorf("hedge response failed heuristic check")
+				if checkResult.HeuristicResult != nil {
+					recordHeuristicErrorToReputation(rc.context, rc.protocol.GetReputationService(),
+						rc.serviceID, resp.EndpointAddr, rpcType, checkResult.HeuristicResult, logger)
+				}
+				// Mark hedge endpoint as tried
+				if racer.hedgeEndpoint != "" {
+					triedEndpoints[racer.hedgeEndpoint] = true
+				}
+				continue
+			}
+			// Hedge failed, fall through to normal request
+		}
+
+		// Normal request path - send single payload
+		responses, err := protocolCtx.HandleServiceRequest([]protocol.Payload{payload})
+		if err != nil || len(responses) == 0 {
+			lastErr = err
+			if lastErr == nil {
+				lastErr = fmt.Errorf("empty response for batch item %d", index)
+			}
+			// Capture the failed response to ensure RequestID is available for error handling
+			if len(responses) > 0 {
+				lastResponse = responses[0]
+				lastResponse.RequestID = extractRequestIDFromPayload(payload)
+			}
+			logger.Warn().Err(lastErr).Int("attempt", attempt).Msg("Request failed")
+			continue
+		}
+
+		resp := responses[0]
+		resp.RequestID = extractRequestIDFromPayload(payload)
+
+		// Check response success with heuristic
+		checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, rpcType, logger)
+		if checkResult.Success {
+			logger.Debug().
+				Str("endpoint", string(resp.EndpointAddr)).
+				Int("status", resp.HTTPStatusCode).
+				Int("attempt", attempt).
+				Msg("Batch item succeeded")
+			return resp, nil
+		}
+
+		// Failed heuristic check
+		lastResponse = resp
+		lastErr = fmt.Errorf("response failed heuristic check")
+		if checkResult.HeuristicResult != nil {
+			recordHeuristicErrorToReputation(rc.context, rc.protocol.GetReputationService(),
+				rc.serviceID, resp.EndpointAddr, rpcType, checkResult.HeuristicResult, logger)
+		}
+	}
+
+	// All attempts failed - return last response with error info
+	logger.Warn().
+		Err(lastErr).
+		Int("max_attempts", maxAttempts).
+		Msg("Batch item failed after all retry attempts")
+
+	// Ensure we have a response with the request ID even on failure
+	if lastResponse.RequestID == "" {
+		lastResponse.RequestID = extractRequestIDFromPayload(payload)
+	}
+
+	return lastResponse, lastErr
+}
+
+// extractRequestIDFromPayload extracts the JSON-RPC request ID from a payload.
+func extractRequestIDFromPayload(payload protocol.Payload) string {
+	if payload.Data == "" {
+		return ""
+	}
+	var req struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(payload.Data), &req); err != nil {
+		return ""
+	}
+	if len(req.ID) == 0 || string(req.ID) == "null" {
+		return ""
+	}
+	// Try integer
+	var intID int
+	if err := json.Unmarshal(req.ID, &intID); err == nil {
+		return strconv.Itoa(intID)
+	}
+	// Try string
+	var strID string
+	if err := json.Unmarshal(req.ID, &strID); err == nil {
+		return strID
+	}
+	return ""
 }
 
 // TODO_TECHDEBT(@adshmh): Remove this method:
@@ -1007,7 +1305,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		// Update QoS context with the failed response (if we have responses)
 		qosContextMutex.Lock()
 		for _, response := range responses {
-			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode, response.RequestID)
 			rc.tryQueueObservation(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
 		}
 		qosContextMutex.Unlock()
@@ -1061,7 +1359,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	if lastErr != nil {
 		qosContextMutex.Lock()
 		for _, response := range lastResponses {
-			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+			rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode, response.RequestID)
 
 			// Queue observation for async parsing (sampled, non-blocking)
 			rc.tryQueueObservation(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
@@ -1126,7 +1424,7 @@ func (rc *requestContext) handleSuccessfulResponse(
 			Msgf("Parallel request success: endpoint %d/%d responded in %dms",
 				result.index+1, metrics.numRequestsToAttempt, overallDuration.Milliseconds())
 
-		rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+		rc.qosCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode, response.RequestID)
 
 		// Queue observation for async parsing (sampled, non-blocking)
 		rc.tryQueueObservation(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)

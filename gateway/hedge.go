@@ -49,6 +49,10 @@ type hedgeRacer struct {
 
 	// raceResult stores the outcome for headers (primary_only, primary_won, hedge_won, etc.)
 	raceResult string
+
+	// payload is the single payload to send for this hedge race.
+	// For batch requests, this is the individual batch item being processed.
+	payload protocol.Payload
 }
 
 // newHedgeRacer creates a new hedge racer for a request.
@@ -79,13 +83,18 @@ func newHedgeRacer(
 // 3. If no response yet, start hedge request to TOP-ranked different endpoint
 // 4. Return first successful response (or first error if both fail)
 // 5. Track reputation for both endpoints (winner gets reward, loser gets recorded)
+//
+// The payload parameter specifies the single payload to send. For batch requests,
+// this should be the individual batch item being processed, not all batch items.
 func (hr *hedgeRacer) race(
 	ctx context.Context,
 	primaryCtx ProtocolRequestContext,
 	primaryEndpoint protocol.EndpointAddr,
 	availableEndpoints protocol.EndpointAddrList,
+	payload protocol.Payload,
 ) ([]protocol.Response, error) {
 	hr.primaryEndpoint = primaryEndpoint
+	hr.payload = payload
 	hr.raceStartTime = time.Now()
 	rpcTypeStr := metrics.NormalizeRPCType(hr.rpcType.String())
 
@@ -205,7 +214,9 @@ func (hr *hedgeRacer) executeRequest(
 		Str("request_type", requestType).
 		Msg("Starting request")
 
-	responses, err := protocolCtx.HandleServiceRequest(hr.rc.qosCtx.GetServicePayloads())
+	// Use the single payload stored in the racer, not all payloads from QoS context.
+	// This is critical for batch requests where each item must be processed independently.
+	responses, err := protocolCtx.HandleServiceRequest([]protocol.Payload{hr.payload})
 	duration := time.Since(startTime)
 
 	// Use supplier from response metadata if available, otherwise fall back to extracted supplier.
