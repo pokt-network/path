@@ -53,6 +53,10 @@ type serviceState struct {
 
 	// archivalState contains the current state of the EVM archival check for the service.
 	archivalState archivalState
+
+	// archivalHeuristic provides archival request detection for routing decisions.
+	// Cached instance to avoid allocations on the hot path.
+	archivalHeuristic *ArchivalHeuristic
 }
 
 /* -------------------- QoS Endpoint Check Generator -------------------- */
@@ -215,8 +219,9 @@ func (ss *serviceState) getDisqualifiedEndpointsResponse(serviceID protocol.Serv
 	}
 
 	// Populate the data response object using the endpoints in the endpoint store.
+	// Use requiresArchival=true to check full validation including archival (most conservative)
 	for endpointAddr, endpoint := range ss.endpointStore.endpoints {
-		if err := ss.basicEndpointValidation(endpoint); err != nil {
+		if err := ss.basicEndpointValidation(endpoint, true); err != nil {
 			qosLevelDataResponse.DisqualifiedEndpoints[endpointAddr] = devtools.QoSDisqualifiedEndpoint{
 				EndpointAddr: endpointAddr,
 				Reason:       err.Error(),

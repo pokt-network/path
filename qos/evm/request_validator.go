@@ -39,6 +39,9 @@ type evmRequestValidator struct {
 // If validation fails, an errorContext is returned along with false.
 // If validation succeeds, a fully initialized requestContext is returned along with true.
 //
+// Archival detection runs on the hot path using gjson (~350ns, 40B alloc) to determine
+// if the request requires archival data for routing decisions.
+//
 // EVM only supports JSON-RPC, so detectedRPCType is logged but not used for routing.
 func (erv *evmRequestValidator) validateHTTPRequest(req *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
 	logger := erv.logger.With(
@@ -71,6 +74,21 @@ func (erv *evmRequestValidator) validateHTTPRequest(req *http.Request, detectedR
 
 	servicePayloads := erv.buildServicePayloads(jsonrpcReqs)
 
+	// Run archival heuristic detection (gjson-based, ~350ns, lock-free)
+	// This determines if the request needs archival data for endpoint routing.
+	var archivalResult ArchivalHeuristicResult
+	if erv.serviceState.archivalHeuristic != nil && !isBatch {
+		// Get perceived block from serviceState (atomic, lock-free read)
+		perceivedBlock := erv.serviceState.perceivedBlockNumber.Load()
+		archivalResult = erv.serviceState.archivalHeuristic.IsArchivalRequest(body, perceivedBlock)
+
+		logger.Debug().
+			Bool("requires_archival", archivalResult.RequiresArchival).
+			Str("archival_reason", archivalResult.Reason).
+			Str("method", archivalResult.Method).
+			Msg("Archival detection completed")
+	}
+
 	// Request is valid, return a fully initialized requestContext
 	return &requestContext{
 		logger:               erv.logger,
@@ -80,6 +98,7 @@ func (erv *evmRequestValidator) validateHTTPRequest(req *http.Request, detectedR
 		servicePayloads:      servicePayloads,
 		isBatch:              isBatch,
 		serviceState:         erv.serviceState,
+		archivalResult:       archivalResult,
 		// Set the origin of the request as ORGANIC (i.e. from a user).
 		requestOrigin: qosobservations.RequestOrigin_REQUEST_ORIGIN_ORGANIC,
 	}, true

@@ -42,6 +42,7 @@ type EndpointSelectionMetadata struct {
 // Available endpoints are filtered based on their validity first.
 // Endpoints are selected with TLD diversity preference when possible.
 // If numEndpoints is 0, it defaults to 1. If numEndpoints is greater than available endpoints, it returns all valid endpoints.
+// Note: SelectMultiple does not support archival filtering - it's used for hedge racing where we want all valid endpoints.
 func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
 	logger := ss.logger.With("method", "SelectMultiple").
 		With("chain_id", ss.serviceQoSConfig.getEVMChainID()).
@@ -49,8 +50,8 @@ func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrL
 		With("num_endpoints", numEndpoints)
 	logger.Debug().Msgf("filtering %d available endpoints to select up to %d.", len(availableEndpoints), numEndpoints)
 
-	// Filter valid endpoints
-	filteredEndpointsAddr, _, err := ss.filterValidEndpointsWithDetails(availableEndpoints)
+	// Filter valid endpoints (no archival filtering for SelectMultiple)
+	filteredEndpointsAddr, _, err := ss.filterValidEndpointsWithDetails(availableEndpoints, false)
 	if err != nil {
 		logger.Error().Err(err).Msg("error filtering endpoints")
 		return nil, err
@@ -70,15 +71,19 @@ func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrL
 // SelectWithMetadata returns endpoint address and selection metadata.
 // Filters endpoints by validity and captures detailed validation failure information.
 // Selects random endpoint if all fail validation.
-func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointAddrList) (EndpointSelectionResult, error) {
+//
+// When requiresArchival is true, only endpoints that have passed the archival check are considered.
+// When requiresArchival is false, the archival check is skipped, allowing all valid endpoints.
+func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointAddrList, requiresArchival bool) (EndpointSelectionResult, error) {
 	logger := ss.logger.With("method", "SelectWithMetadata").
 		With("chain_id", ss.serviceQoSConfig.getEVMChainID()).
-		With("service_id", ss.serviceQoSConfig.GetServiceID())
+		With("service_id", ss.serviceQoSConfig.GetServiceID()).
+		With("requires_archival", requiresArchival)
 
 	availableCount := len(availableEndpoints)
 	logger.Debug().Msgf("filtering %d available endpoints.", availableCount)
 
-	filteredEndpointsAddr, validationResults, err := ss.filterValidEndpointsWithDetails(availableEndpoints)
+	filteredEndpointsAddr, validationResults, err := ss.filterValidEndpointsWithDetails(availableEndpoints, requiresArchival)
 	if err != nil {
 		logger.Error().Err(err).Msg("error filtering endpoints")
 		return EndpointSelectionResult{}, err
@@ -120,10 +125,15 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 // - Successful endpoints are captured for metrics tracking
 // - Only valid endpoints are returned for potential selection
 //
+// When requiresArchival is true, only endpoints that have passed the archival check are considered.
+// When requiresArchival is false, the archival check is skipped, allowing all valid endpoints.
+//
 // Performance: Copies endpoint data under lock, then releases lock before validation loop
 // to minimize lock contention on the hot path.
-func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints protocol.EndpointAddrList) (protocol.EndpointAddrList, []*qosobservations.EndpointValidationResult, error) {
-	logger := ss.logger.With("method", "filterValidEndpointsWithDetails").With("qos_instance", "evm")
+func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints protocol.EndpointAddrList, requiresArchival bool) (protocol.EndpointAddrList, []*qosobservations.EndpointValidationResult, error) {
+	logger := ss.logger.With("method", "filterValidEndpointsWithDetails").
+		With("qos_instance", "evm").
+		With("requires_archival", requiresArchival)
 
 	if len(availableEndpoints) == 0 {
 		return nil, nil, errEmptyEndpointListObs
@@ -177,7 +187,7 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 			continue
 		}
 
-		if err := ss.basicEndpointValidation(data.endpoint); err != nil {
+		if err := ss.basicEndpointValidation(data.endpoint, requiresArchival); err != nil {
 			logger.Warn().
 				Err(err).
 				Str("endpoint_addr", string(data.addr)).
@@ -249,10 +259,13 @@ func (ss *serviceState) categorizeValidationFailure(err error) qosobservations.E
 // - The endpoint has returned an invalid response within the last 30 minutes.
 // - The endpoint's response to an `eth_chainId` request is not the expected chain ID.
 // - The endpoint's response to an `eth_blockNumber` request is greater than the perceived block number.
-// - The endpoint's archival check is invalid, if enabled.
+// - The endpoint's archival check is invalid, if requiresArchival is true and archival checks are enabled.
+//
+// When requiresArchival is true, only endpoints that have passed the archival check are considered valid.
+// When requiresArchival is false, the archival check is skipped, allowing all otherwise valid endpoints.
 //
 // Note: This function is lock-free - perceivedBlockNumber uses atomic operations.
-func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
+func (ss *serviceState) basicEndpointValidation(endpoint endpoint, requiresArchival bool) error {
 	// Check if the endpoint has returned an empty response within the timeout period.
 	// Empty responses use the same 5-minute timeout as invalid responses to allow recovery.
 	if endpoint.hasReturnedEmptyResponse && endpoint.invalidResponseLastObserved != nil {
@@ -285,9 +298,13 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint) error {
 		return fmt.Errorf("chain ID validation failed: %w", err)
 	}
 
-	// Check if the endpoint has returned an archival balance for the perceived block number.
-	if err := ss.archivalState.isArchivalBalanceValid(endpoint.checkArchival); err != nil {
-		return fmt.Errorf("archival balance validation failed: %w", err)
+	// CONDITIONAL: Only apply archival check if request requires archival data.
+	// This allows non-archival requests to use all valid endpoints (larger pool).
+	// Archival requests will only be routed to archival-capable endpoints.
+	if requiresArchival {
+		if err := ss.archivalState.isArchivalBalanceValid(endpoint.checkArchival); err != nil {
+			return fmt.Errorf("archival balance validation failed: %w", err)
+		}
 	}
 
 	return nil

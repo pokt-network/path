@@ -61,9 +61,10 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 	}
 
 	serviceState := &serviceState{
-		logger:           logger,
-		serviceQoSConfig: minimalConfig,
-		endpointStore:    store,
+		logger:            logger,
+		serviceQoSConfig:  minimalConfig,
+		endpointStore:     store,
+		archivalHeuristic: NewArchivalHeuristic(0), // Use default threshold
 	}
 
 	evmRequestValidator := &evmRequestValidator{

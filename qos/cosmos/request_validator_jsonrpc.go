@@ -110,7 +110,6 @@ func (rv *requestValidator) buildJSONRPCRequestContext(
 		servicePayloads:              servicePayloads,
 		isBatch:                      isBatch,
 		observations:                 requestObservation,
-		endpointResponseValidator:    getJSONRPCRequestEndpointResponseValidator(jsonrpcReqs),
 		protocolErrorResponseBuilder: buildJSONRPCProtocolErrorResponse(getJsonRpcIDForErrorResponse(jsonrpcReqs)),
 		// Protocol-level request error observation is the same for JSONRPC and REST.
 		protocolErrorObservationBuilder: buildProtocolErrorObservation,
