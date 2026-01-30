@@ -161,27 +161,14 @@ gateway_config:
 
   retry_config:
     enabled: true
-    max_retries: 1
-    max_retry_latency: 500ms  # Only retry if failed request took < 500ms
+    max_retries: 3
+    max_retry_latency: 5000ms  # Retry even if request took up to 5s
     retry_on_5xx: true
     retry_on_timeout: true
     retry_on_connection: true
-
     # Hedge Request Configuration
-    # ===========================
-    # Hedging starts a second (parallel) request to a different endpoint if
-    # the primary request is too slow. This reduces tail latency.
-    #
-    # Flow:
-    # 1. Primary request starts to the initial endpoint
-    # 2. If no response after hedge_delay, start hedge request to TOP-ranked endpoint
-    # 3. Return whichever responds first (the winner)
-    # 4. Both endpoints have reputation tracked (winner and loser)
-    #
-    # Response headers when hedging is used:
-    # - X-Hedge-Result: "primary_only" (fast), "primary_won", "hedge_won", "both_failed"
     connect_timeout: 500ms  # TCP connect timeout for fast failure detection
-    hedge_delay: 500ms      # Start hedge request after this delay (0 to disable)
+    hedge_delay: 200ms      # Start hedge request after this delay (0 to disable)
 
   # ===========================================================================
   # GLOBAL OBSERVATION PIPELINE (optional)
@@ -197,36 +184,11 @@ gateway_config:
   # ===========================================================================
   # GLOBAL ACTIVE HEALTH CHECKS
   # ===========================================================================
-  # Proactive endpoint monitoring - runs health checks on all endpoints
-  # Per-service health check rules can be defined in services[].health_checks
+  # Disabled by default. Enable in production with external rules from:
+  # https://raw.githubusercontent.com/pokt-network/pocket-network-resources/refs/heads/main/pocket-health-checks.yaml
 
   active_health_checks:
     enabled: false
-
-    # Leader election for multi-instance deployments
-    # Only the leader runs health checks to avoid duplicate traffic
-    coordination:
-      type: "leader_election"  # "none" or "leader_election"
-      lease_duration: "15s"
-      renew_interval: "5s"
-      key: "path:health:leader"
-
-    # External health check rules URL
-    # --------------------------------
-    # PATH fetches health check rules from a remote URL for centralized management.
-    # Rules include sync_allowance (blocks behind threshold) and sync_check validation.
-    #
-    # PNF maintains official rules at:
-    # https://raw.githubusercontent.com/pokt-network/pocket-network-resources/refs/heads/main/pocket-health-checks.yaml
-    #
-    # Local rules (below or in services[].health_checks.local) override
-    # external rules with the same service_id + name combination.
-    external:
-      url: "https://raw.githubusercontent.com/pokt-network/pocket-network-resources/refs/heads/main/pocket-health-checks.yaml"
-      refresh_interval: "5m"   # How often to re-fetch external rules
-      timeout: "30s"           # HTTP timeout for fetching the URL
-
-    local: []
 
   # ===========================================================================
   # LATENCY PROFILES
