@@ -52,16 +52,20 @@ var (
 
 // unmarshalJSONRPCRequestEndpointResponse parses the supplied raw byte slice from an endpoint.
 // The raw byte is returned by an endpoint in response to a JSONRPC request.
+// The requestID parameter is used to ensure error responses have the correct JSON-RPC ID
+// when processing batch requests with independent flows per item.
 func unmarshalJSONRPCRequestEndpointResponse(
 	logger polylog.Logger,
 	jsonrpcReqs map[jsonrpc.ID]jsonrpc.Request,
 	data []byte,
+	requestID string,
 ) response {
 	// Parse and validate the raw payload as a JSONRPC response.
 	jsonrpcResponse, jsonrpcReq, responseValidationErr := unmarshalAsJSONRPCResponse(
 		logger,
 		jsonrpcReqs,
 		data,
+		requestID,
 	)
 
 	// Log JSONRPC responses indicating an error.
@@ -101,10 +105,13 @@ func unmarshalJSONRPCRequestEndpointResponse(
 
 // unmarshalAsJSONRPCResponse converts raw endpoint bytes into a JSONRPC response struct.
 // The second return value contains the validation failure, if any.
+// The requestID parameter is used to ensure error responses have the correct JSON-RPC ID
+// when processing batch requests with independent flows per item.
 func unmarshalAsJSONRPCResponse(
 	logger polylog.Logger,
 	jsonrpcReqs map[jsonrpc.ID]jsonrpc.Request,
 	data []byte,
+	requestID string,
 ) (jsonrpc.Response, jsonrpc.Request, *qosobservations.CosmosResponseValidationError) {
 	// Empty payload is invalid.
 	if len(data) == 0 {
@@ -115,10 +122,16 @@ func unmarshalAsJSONRPCResponse(
 		).Debug().Msg(errEmptyPayload.Error())
 
 		// Create a generic JSONRPC response for the user.
+		// Use the provided requestID if available (batch request case),
+		// otherwise fall back to extracting from jsonrpcReqs (single request case).
+		errorID := getJsonRpcIDForErrorResponse(jsonrpcReqs)
+		if requestID != "" {
+			errorID = jsonrpc.IDFromString(requestID)
+		}
 		validationErr := qosobservations.CosmosResponseValidationError_COSMOS_RESPONSE_VALIDATION_ERROR_EMPTY
 		return getGenericJSONRPCErrResponse(
 			logger,
-			getJsonRpcIDForErrorResponse(jsonrpcReqs),
+			errorID,
 			errCodeEmptyResponse,
 			errMsgJSONRPCEmptyResponse,
 		), jsonrpc.Request{}, &validationErr
@@ -138,10 +151,16 @@ func unmarshalAsJSONRPCResponse(
 		).Debug().Msg("Failed to unmarshal endpoint payload as JSONRPC.")
 
 		// Create a generic JSONRPC response for the user.
+		// Use the provided requestID if available (batch request case),
+		// otherwise fall back to extracting from jsonrpcReqs (single request case).
+		errorID := getJsonRpcIDForErrorResponse(jsonrpcReqs)
+		if requestID != "" {
+			errorID = jsonrpc.IDFromString(requestID)
+		}
 		validationErr := qosobservations.CosmosResponseValidationError_COSMOS_RESPONSE_VALIDATION_ERROR_UNMARSHAL
 		return getGenericJSONRPCErrResponse(
 			logger,
-			getJsonRpcIDForErrorResponse(jsonrpcReqs),
+			errorID,
 			errCodeUnmarshaling,
 			errMsgJSONRPCUnmarshaling,
 		), jsonrpc.Request{}, &validationErr
@@ -151,10 +170,16 @@ func unmarshalAsJSONRPCResponse(
 	//
 	jsonrpcReq, ok := findJsonRpcRequestByID(jsonrpcReqs, jsonrpcResponse.ID)
 	if !ok {
+		// Use the provided requestID if available (batch request case),
+		// otherwise fall back to extracting from jsonrpcReqs (single request case).
+		errorID := getJsonRpcIDForErrorResponse(jsonrpcReqs)
+		if requestID != "" {
+			errorID = jsonrpc.IDFromString(requestID)
+		}
 		validationErr := qosobservations.CosmosResponseValidationError_COSMOS_RESPONSE_VALIDATION_ERROR_FORMAT_MISMATCH
 		return getGenericJSONRPCErrResponse(
 			logger,
-			getJsonRpcIDForErrorResponse(jsonrpcReqs),
+			errorID,
 			errCodeUnmarshaling,
 			errMsgJSONRPCUnmarshaling,
 		), jsonrpc.Request{}, &validationErr

@@ -145,7 +145,11 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 //
 // In legacy mode (rc.passthroughMode == false):
 //   - Full JSON parsing is done synchronously (existing behavior)
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
+//
+// The requestID parameter is the JSON-RPC request ID that this response corresponds to.
+// For batch requests, this ensures error responses use the correct ID.
+// For single requests or when empty, the ID is extracted from the response bytes.
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int, requestID string) {
 	rc.logger = rc.logger.With(
 		"endpoint_addr", endpointAddr,
 		"endpoint_response_len", len(responseBz),
@@ -168,7 +172,7 @@ func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr,
 	// indicating the validity of the request when calling on QoS instance's ParseHTTPRequest
 
 	response, err := unmarshalResponse(
-		rc.logger, rc.servicePayloads, responseBz, endpointAddr,
+		rc.logger, rc.servicePayloads, responseBz, endpointAddr, requestID,
 	)
 
 	rc.endpointResponses = append(rc.endpointResponses, endpointResponse{

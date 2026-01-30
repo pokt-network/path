@@ -43,17 +43,23 @@ var (
 //   - eth_blockNumber
 //   - eth_getBalance
 //   - any empty response, regardless of method
+//
+// The requestID parameter is the JSON-RPC request ID that this response corresponds to.
+// For batch requests, this ensures error responses use the correct ID.
+// For single requests or when empty, the ID is extracted from the response bytes.
 func unmarshalResponse(
 	logger polylog.Logger,
 	servicePayloads map[jsonrpc.ID]protocol.Payload,
 	data []byte,
 	endpointAddr protocol.EndpointAddr,
+	requestID string,
 ) (response, error) {
 	// Create a specialized response for empty endpoint response.
 	if len(data) == 0 {
 		return responseEmpty{
 			logger:          logger,
 			servicePayloads: servicePayloads,
+			requestID:       requestID,
 		}, nil
 	}
 
@@ -74,7 +80,13 @@ func unmarshalResponse(
 			"endpoint_addr", endpointAddr,
 		).Error().Msg("❌ Failed to unmarshal response payload as JSON-RPC")
 
-		return getGenericJSONRPCErrResponse(logger, getJsonRpcIDForErrorResponse(servicePayloads), data, err), err
+		// Use the provided requestID if available (batch request case),
+		// otherwise fall back to extracting from servicePayloads (single request case).
+		errorID := getJsonRpcIDForErrorResponse(servicePayloads)
+		if requestID != "" {
+			errorID = jsonrpc.IDFromString(requestID)
+		}
+		return getGenericJSONRPCErrResponse(logger, errorID, data, err), err
 	}
 
 	// Get the corresponding service payload for the response.
@@ -83,14 +95,26 @@ func unmarshalResponse(
 		// TODO_TECHDEBT(@commoddity): Add QoS check for if endpoint fails to return the correct ID in the response.
 		logger.Error().Msg("SHOULD NEVER HAPPEN: JSON-RPC ID not found in the response")
 		err := fmt.Errorf("JSON-RPC ID not found in the response")
-		return getGenericJSONRPCErrResponse(logger, getJsonRpcIDForErrorResponse(servicePayloads), data, err), err
+		// Use the provided requestID if available (batch request case),
+		// otherwise fall back to extracting from servicePayloads (single request case).
+		errorID := getJsonRpcIDForErrorResponse(servicePayloads)
+		if requestID != "" {
+			errorID = jsonrpc.IDFromString(requestID)
+		}
+		return getGenericJSONRPCErrResponse(logger, errorID, data, err), err
 	}
 
 	// Get the JSON-RPC request from the service payload.
 	jsonrpcReq, err := jsonrpc.GetJsonRpcReqFromServicePayload(servicePayload)
 	if err != nil {
 		logger.Error().Err(err).Msg("SHOULD NEVER HAPPEN: Failed to get JSONRPC request from service payload")
-		return getGenericJSONRPCErrResponse(logger, getJsonRpcIDForErrorResponse(servicePayloads), data, err), err
+		// Use the provided requestID if available (batch request case),
+		// otherwise fall back to extracting from servicePayloads (single request case).
+		errorID := getJsonRpcIDForErrorResponse(servicePayloads)
+		if requestID != "" {
+			errorID = jsonrpc.IDFromString(requestID)
+		}
+		return getGenericJSONRPCErrResponse(logger, errorID, data, err), err
 	}
 
 	// Validate the JSONRPC response.

@@ -138,11 +138,12 @@ func buildJSONRPCServicePayload(rpcType sharedtypes.RPCType, jsonrpcReq jsonrpc.
 
 func getJSONRPCRequestEndpointResponseValidator(
 	jsonrpcReqs map[jsonrpc.ID]jsonrpc.Request,
-) func(polylog.Logger, []byte) response {
+) func(polylog.Logger, []byte, string) response {
 
 	// Delegate the unmarshaling/validation of endpoint response to the specialized JSONRPC unmarshaler.
-	return func(logger polylog.Logger, endpointResponseBz []byte) response {
-		return unmarshalJSONRPCRequestEndpointResponse(logger, jsonrpcReqs, endpointResponseBz)
+	// The requestID parameter is used for batch request error handling.
+	return func(logger polylog.Logger, endpointResponseBz []byte, requestID string) response {
+		return unmarshalJSONRPCRequestEndpointResponse(logger, jsonrpcReqs, endpointResponseBz, requestID)
 	}
 }
 

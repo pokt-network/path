@@ -139,9 +139,10 @@ func buildRESTServicePayload(
 	}
 }
 
-func getRESTRequestEndpointResponseValidator(requestPath string) func(polylog.Logger, []byte) response {
+func getRESTRequestEndpointResponseValidator(requestPath string) func(polylog.Logger, []byte, string) response {
 	// Delegate the unmarshaling/validation of endpoint response to the specialized REST unmarshaler.
-	return func(logger polylog.Logger, endpointResponseBz []byte) response {
+	// The requestID parameter is unused for REST but required by the interface for batch request support.
+	return func(logger polylog.Logger, endpointResponseBz []byte, requestID string) response {
 		return unmarshalRESTRequestEndpointResponse(logger, requestPath, endpointResponseBz)
 	}
 }

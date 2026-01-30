@@ -946,7 +946,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	var httpStatusCode int
 	var responseBody []byte
 	for _, response := range responses {
-		hcQoSCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode)
+		hcQoSCtx.UpdateWithResponse(response.EndpointAddr, response.Bytes, response.HTTPStatusCode, response.RequestID)
 		httpStatusCode = response.HTTPStatusCode
 		responseBody = response.Bytes
 

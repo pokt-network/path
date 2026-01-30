@@ -81,7 +81,8 @@ func (brc batchJSONRPCRequestContext) GetServicePayloads() []protocol.Payload {
 
 // TODO_TECHDEBT(@adshmh): Refactor once the QoS context interface is updated to receive an array of responses.
 // UpdateWithResponse is NOT safe for concurrent use
-func (brc *batchJSONRPCRequestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
+// The requestID parameter is used for batch requests to ensure error responses have the correct ID.
+func (brc *batchJSONRPCRequestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int, requestID string) {
 	// TODO_TECHDEBT(@adshmh): Refactor this once the QoS context interface is updated to accept all endpoint responses at once.
 	// This would make it possible to map each JSONRPC request of a batch to its corresponding endpoint response.
 	// This is required to enable request method-specific esponse validation: e.g. format of result field in response to a `getHealth` request.
@@ -91,8 +92,9 @@ func (brc *batchJSONRPCRequestContext) UpdateWithResponse(endpointAddr protocol.
 	if err := json.Unmarshal(responseBz, &jsonrpcResponse); err != nil {
 		// TODO_UPNEXT(@adshmh): Include a preview of malformed payload in the response.
 		//
-		// Parsing failed, store a generic error JSONRPC response
-		jsonrpcResponse = jsonrpc.GetErrorResponse(jsonrpc.ID{}, errCodeUnmarshaling, errMsgUnmarshaling, nil)
+		// Parsing failed, store a generic error JSONRPC response with the correct request ID
+		responseID := jsonrpc.IDFromString(requestID)
+		jsonrpcResponse = jsonrpc.GetErrorResponse(responseID, errCodeUnmarshaling, errMsgUnmarshaling, nil)
 	}
 
 	// Store the response: will be processed later by the JSONRPC batch request struct.
