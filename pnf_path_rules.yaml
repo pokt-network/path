@@ -8,6 +8,7 @@
 # Template format: gateway/health_check_config.go
 #
 # CHANGELOG:
+# - Updated BSC archival check with verified expected balance from https://bsc.drpc.org
 # - Added sync_check for all chains
 # - Added sync_allowance for all chains (5 minutes of blocks)
 # - Formula: sync_allowance = ceil(300 seconds / block_time)
@@ -131,6 +132,29 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    - name: eth_syncing
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}'
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: major_error
+    # Archival check - queries balance at historical block 33,049,200 (mid-2023)
+    # Non-archival nodes will fail with "state at block X is pruned" error
+    # Address: 0xfb50526f49894b78541b776f5aaefe43e3bd8590 (active contract from E2E tests)
+    # Block: 0x1F86B10 (33,049,200)
+    # Expected balance: 0x231f41a5cec600 (verified via https://bsc.drpc.org)
+    - name: bsc_archival
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xfb50526f49894b78541b776f5aaefe43e3bd8590","0x1f86b10"]}'
+      expected_status_code: 200
+      expected_response_contains: "0x231f41a5cec600"
+      timeout: 10s
+      archival: true
+      reputation_signal: critical_error
 
 - service_id: avax
   # Block time: ~2s | Source: chainspect.app, snowtrace.io

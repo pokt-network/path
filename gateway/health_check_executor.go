@@ -36,6 +36,7 @@ import (
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/heuristic"
+	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
@@ -1081,10 +1082,18 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Msg("Supplier unblacklisted after successful health check")
 	}
 
+	// If this was an archival health check that passed all validations (including error_detection),
+	// mark the endpoint as archival-capable. This is done explicitly AFTER all checks pass to avoid
+	// marking endpoints that returned "false success" responses (like "0x0" for archival queries).
+	if check.Archival {
+		e.markEndpointArchival(serviceID, endpointAddr)
+	}
+
 	e.logger.Debug().
 		Str("service_id", string(serviceID)).
 		Str("endpoint", string(endpointAddr)).
 		Str("check", check.Name).
+		Bool("archival_check", check.Archival).
 		Dur("latency", latency).
 		Msg("Health check passed via protocol relay")
 
@@ -1165,6 +1174,7 @@ func (e *HealthCheckExecutor) processObservationSync(
 		ServiceID:          serviceID,
 		EndpointAddr:       endpointAddr,
 		Source:             SourceHealthCheck,
+		IsArchivalCheck:    check.Archival,
 		Timestamp:          startTime,
 		Latency:            latency,
 		RequestPath:        payload.Path,
@@ -1182,6 +1192,39 @@ func (e *HealthCheckExecutor) processObservationSync(
 		Str("endpoint", string(endpointAddr)).
 		Str("check", check.Name).
 		Msg("Health check observation processed synchronously for block height extraction")
+}
+
+// markEndpointArchival marks an endpoint as archival-capable via the QoS instance.
+// This is called ONLY after an archival health check passes ALL validations including error_detection.
+// This ensures we don't mark endpoints that returned "false success" responses (e.g., "0x0").
+func (e *HealthCheckExecutor) markEndpointArchival(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr) {
+	qosInstance, exists := e.qosInstances[serviceID]
+	if !exists || qosInstance == nil {
+		e.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Msg("No QoS instance found for archival marking")
+		return
+	}
+
+	// Create extracted data with only IsArchival set
+	data := &qostypes.ExtractedData{
+		IsArchival: true,
+	}
+
+	if err := qosInstance.UpdateFromExtractedData(endpointAddr, data); err != nil {
+		e.logger.Warn().
+			Err(err).
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Msg("Failed to mark endpoint as archival-capable")
+		return
+	}
+
+	e.logger.Info().
+		Str("service_id", string(serviceID)).
+		Str("endpoint", string(endpointAddr)).
+		Msg("📜 Endpoint marked as archival-capable from health check")
 }
 
 // buildServicePayload creates a protocol.Payload from the health check configuration.

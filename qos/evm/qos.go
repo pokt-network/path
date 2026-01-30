@@ -3,6 +3,7 @@ package evm
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
@@ -96,10 +97,6 @@ func (c *simpleServiceConfig) getSyncAllowance() uint64 {
 	}
 	return c.syncAllowance
 }
-func (c *simpleServiceConfig) getEVMArchivalCheckConfig() evmArchivalCheckConfig {
-	return evmArchivalCheckConfig{}
-}
-func (c *simpleServiceConfig) archivalCheckEnabled() bool { return false }
 func (c *simpleServiceConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
 	return map[sharedtypes.RPCType]struct{}{sharedtypes.RPCType_JSON_RPC: {}}
 }
@@ -135,7 +132,7 @@ func (qos *QoS) HydrateDisqualifiedEndpointsResponse(serviceID protocol.ServiceI
 
 // UpdateFromExtractedData updates QoS state from extracted observation data.
 // Called by the observation pipeline after async parsing completes.
-// This updates the perceived block number and stores the endpoint's block number observation.
+// This updates the perceived block number, archival status, and stores endpoint observations.
 //
 // Implements gateway.QoSService interface.
 func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *qostypes.ExtractedData) error {
@@ -143,20 +140,31 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 		return nil
 	}
 
-	// Only update if we extracted a valid block height
-	if data.BlockHeight <= 0 {
-		return nil
-	}
-
-	blockNumber := uint64(data.BlockHeight)
-
-	// Lock the endpoint store to update the endpoint observation
+	// Lock the endpoint store to update the endpoint observations
 	qos.endpointStore.endpointsMu.Lock()
 	storedEndpoint := qos.endpointStore.endpoints[endpointAddr]
 
-	// Update the endpoint's block number observation
-	storedEndpoint.checkBlockNumber = endpointCheckBlockNumber{
-		parsedBlockNumberResponse: &blockNumber,
+	// Update block number if extracted
+	var blockNumber uint64
+	if data.BlockHeight > 0 {
+		blockNumber = uint64(data.BlockHeight)
+		storedEndpoint.checkBlockNumber = endpointCheckBlockNumber{
+			parsedBlockNumberResponse: &blockNumber,
+		}
+	}
+
+	// Update archival status from health check.
+	// If IsArchival is true, mark the endpoint as archival-capable.
+	// This status is used by endpoint selection to filter archival-capable endpoints
+	// when a request requires historical blockchain data.
+	if data.IsArchival {
+		storedEndpoint.checkArchival = endpointCheckArchival{
+			isArchival: true,
+			expiresAt:  time.Now().Add(checkArchivalTTL),
+		}
+		qos.logger.Debug().
+			Str("endpoint", string(endpointAddr)).
+			Msg("Marked endpoint as archival-capable from health check")
 	}
 
 	// Store the updated endpoint back

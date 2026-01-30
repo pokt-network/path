@@ -443,7 +443,7 @@ func (rc requestContext) createEndpointObservationFromRawBytes(rawResp rawEndpoi
 
 	// Create an unrecognized response observation (since we're not doing method-specific parsing on hot path)
 	return &qosobservations.EVMEndpointObservation{
-		EndpointAddr:           string(rawResp.EndpointAddr),
+		EndpointAddr:          string(rawResp.EndpointAddr),
 		ParsedJsonrpcResponse: parsedResp,
 		ResponseObservation: &qosobservations.EVMEndpointObservation_UnrecognizedResponse{
 			UnrecognizedResponse: &qosobservations.EVMUnrecognizedResponse{

@@ -2,7 +2,6 @@ package evm
 
 import (
 	"errors"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,9 +31,6 @@ var (
 type serviceState struct {
 	logger polylog.Logger
 
-	// serviceStateLock is a read-write mutex used to synchronize access to this struct
-	serviceStateLock sync.RWMutex
-
 	// serviceQoSConfig maintains the QoS configs for this service
 	serviceQoSConfig EVMServiceQoSConfig
 
@@ -50,9 +46,6 @@ type serviceState struct {
 	// See the following link for more details:
 	// https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_blocknumber
 	perceivedBlockNumber atomic.Uint64
-
-	// archivalState contains the current state of the EVM archival check for the service.
-	archivalState archivalState
 
 	// archivalHeuristic provides archival request detection for routing decisions.
 	// Cached instance to avoid allocations on the hot path.
@@ -74,6 +67,10 @@ func (ss *serviceState) CheckWebsocketConnection() bool {
 
 // GetRequiredQualityChecks returns the list of quality checks required for an endpoint.
 // It is called in the `gateway/hydrator.go` file on each run of the hydrator.
+//
+// Note: Archival capability is determined by external health checks, not by synthetic
+// QoS requests. The health check system marks endpoints as archival-capable via
+// UpdateFromExtractedData when health checks pass.
 func (ss *serviceState) GetRequiredQualityChecks(endpointAddr protocol.EndpointAddr) []gateway.RequestQoSContext {
 	ss.endpointStore.endpointsMu.RLock()
 	defer ss.endpointStore.endpointsMu.RUnlock()
@@ -88,15 +85,6 @@ func (ss *serviceState) GetRequiredQualityChecks(endpointAddr protocol.EndpointA
 	// Chain ID check runs infrequently as an endpoint's EVM chain ID is very unlikely to change regularly.
 	if ss.shouldChainIDCheckRun(endpoint.checkChainID) {
 		checks = append(checks, ss.getEndpointCheck(endpoint.checkChainID.getRequestID(), endpoint.checkChainID.getServicePayload()))
-	}
-
-	// Archival check runs infrequently as the result of a request for an archival block is not expected to change regularly.
-	// Additionally, this check will only run if the service is configured to perform archival checks.
-	if ss.archivalState.shouldArchivalCheckRun(endpoint.checkArchival) {
-		checks = append(
-			checks,
-			ss.getEndpointCheck(endpoint.checkArchival.getRequestID(), endpoint.checkArchival.getServicePayload(&ss.archivalState)),
-		)
 	}
 
 	return checks
@@ -141,10 +129,7 @@ func (ss *serviceState) ApplyObservations(observations *qosobservations.Observat
 		return errNilApplyEVMObservations
 	}
 
-	updatedEndpoints := ss.endpointStore.updateEndpointsFromObservations(
-		evmObservations,
-		ss.archivalState.blockNumberHex,
-	)
+	updatedEndpoints := ss.endpointStore.updateEndpointsFromObservations(evmObservations)
 
 	return ss.updateFromEndpoints(updatedEndpoints)
 }
@@ -199,14 +184,6 @@ func (ss *serviceState) updateFromEndpoints(updatedEndpoints map[protocol.Endpoi
 		}
 	}
 
-	// If archival checks are enabled for the service, update the archival state.
-	// This still needs the lock for archival state coordination.
-	if ss.archivalState.isEnabled() {
-		ss.serviceStateLock.Lock()
-		ss.archivalState.updateArchivalState(ss.perceivedBlockNumber.Load(), updatedEndpoints)
-		ss.serviceStateLock.Unlock()
-	}
-
 	return nil
 }
 
@@ -244,9 +221,8 @@ func (ss *serviceState) getDisqualifiedEndpointsResponse(serviceID protocol.Serv
 				errors.Is(err, errInvalidChainIDObs):
 				qosLevelDataResponse.ChainIDCheckErrorsCount++
 
-			// Endpoint is disqualified due to a missing or invalid archival balance.
-			case errors.Is(err, errNoArchivalBalanceObs),
-				errors.Is(err, errInvalidArchivalBalanceObs):
+			// Endpoint is disqualified due to not being archival-capable.
+			case errors.Is(err, errEndpointNotArchival):
 				qosLevelDataResponse.ArchivalCheckErrorsCount++
 
 			default:

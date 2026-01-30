@@ -144,9 +144,13 @@ var errorPatterns = []errorPattern{
 
 	// Blockchain-Specific Errors (EVM)
 	// ONLY include errors that indicate supplier/node problems, NOT application-level errors
-	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},     // Data corruption/sync issue
-	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95}, // Archival data not available
-	{[]byte("state not available"), CategoryBlockchainError, 0.90},   // Node sync issue
+	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},          // Data corruption/sync issue
+	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95},      // Archival data not available
+	{[]byte("is pruned"), CategoryBlockchainError, 0.95},                  // Generic pruned error (e.g., "state at block #X is pruned")
+	{[]byte("state not available"), CategoryBlockchainError, 0.90},        // Node sync issue
+	{[]byte("haven't been fully indexed"), CategoryBlockchainError, 0.95}, // Archival indexing not complete (BSC)
+	{[]byte("not been fully indexed"), CategoryBlockchainError, 0.95},     // Archival indexing not complete (variant)
+	{[]byte("historical state"), CategoryBlockchainError, 0.85},           // Historical state not available
 
 	// Blockchain-Specific Errors (Solana)
 	{[]byte("node is behind"), CategoryBlockchainError, 0.90},    // Sync issue

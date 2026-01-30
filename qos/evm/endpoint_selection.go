@@ -301,9 +301,10 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint, requiresArchi
 	// CONDITIONAL: Only apply archival check if request requires archival data.
 	// This allows non-archival requests to use all valid endpoints (larger pool).
 	// Archival requests will only be routed to archival-capable endpoints.
+	// Archival capability is determined by external health checks, not by QoS observations.
 	if requiresArchival {
-		if err := ss.archivalState.isArchivalBalanceValid(endpoint.checkArchival); err != nil {
-			return fmt.Errorf("archival balance validation failed: %w", err)
+		if err := isArchivalCapable(endpoint.checkArchival); err != nil {
+			return fmt.Errorf("archival capability check failed: %w", err)
 		}
 	}
 

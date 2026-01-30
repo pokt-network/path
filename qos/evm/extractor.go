@@ -157,9 +157,35 @@ func (e *EVMDataExtractor) IsSyncing(request []byte, response []byte) (bool, err
 //   - false if endpoint is not archival (query failed with specific error)
 //   - Error if archival status cannot be determined
 func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, error) {
-	// Historical queries typically use eth_getBalance, eth_getTransactionCount, etc.
+	// This method should ONLY return true/false when the request is an archival-related query.
+	// For non-archival queries (eth_blockNumber, eth_chainId, etc.), return an error to indicate
+	// that archival status cannot be determined from this request.
+	//
+	// Archival-related queries are those that access historical state:
+	// - eth_getBalance with a block parameter (not "latest")
+	// - eth_getStorageAt with a historical block
+	// - eth_call with a historical block
+	// - etc.
+
 	if len(request) == 0 {
 		return false, fmt.Errorf("empty request")
+	}
+
+	// Check if this is an archival-related request by examining the method
+	method := gjson.GetBytes(request, "method").String()
+
+	// Only these methods with historical block parameters can determine archival status
+	archivalMethods := map[string]bool{
+		"eth_getBalance":          true,
+		"eth_getStorageAt":        true,
+		"eth_getTransactionCount": true,
+		"eth_getCode":             true,
+		"eth_call":                true,
+	}
+
+	if !archivalMethods[method] {
+		// This request cannot determine archival status
+		return false, fmt.Errorf("not an archival-related request (method: %s)", method)
 	}
 
 	// Check for error in the response
@@ -191,6 +217,7 @@ func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, er
 	// Check for result field
 	resultField := gjson.GetBytes(response, "result")
 	if resultField.Exists() && resultField.Type != gjson.Null {
+		// The archival query succeeded - endpoint is archival-capable
 		return true, nil
 	}
 
