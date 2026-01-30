@@ -430,6 +430,10 @@ func (m *mockProtocolForRetry) Name() string {
 	return "mockProtocolForRetry"
 }
 
+func (m *mockProtocolForRetry) SetQoSServiceRegistry(registry QoSServiceRegistry) {
+	// No-op for testing
+}
+
 // TestShouldRetryErrorMessageMatching tests that error message matching is case-insensitive
 func TestShouldRetryErrorMessageMatching(t *testing.T) {
 	tests := []struct {

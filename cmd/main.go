@@ -198,6 +198,10 @@ func main() {
 		QoSServices: qosInstances,
 	}
 
+	// Wire up the QoS service registry to the protocol for endpoint details reporting.
+	// This enables /ready/<service>?detailed=true to include archival status information.
+	protocol.SetQoSServiceRegistry(requestParser)
+
 	// NOTE: the gateway uses the requestParser to get the correct QoS instance for any incoming request.
 	gtw := &gateway.Gateway{
 		Logger:                     logger,

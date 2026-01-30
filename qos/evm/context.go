@@ -183,9 +183,28 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 	// Return the most recent raw response as-is for single requests
 	latestResponse := rc.rawResponses[len(rc.rawResponses)-1]
 
+	// Check for empty response bytes - endpoint returned no data
+	if len(latestResponse.ResponseBytes) == 0 {
+		rc.logger.Warn().
+			Str("endpoint_addr", string(latestResponse.EndpointAddr)).
+			Msg("Endpoint returned empty response bytes. Returning error response.")
+		responseNoneObj := responseNone{
+			logger:          rc.logger,
+			servicePayloads: rc.servicePayloads,
+			protocolError:   rc.protocolError,
+		}
+		return responseNoneObj.GetHTTPResponse()
+	}
+
+	// Strip trailing newline if present (suppliers may use json.Encoder which adds \n)
+	payload := latestResponse.ResponseBytes
+	if payload[len(payload)-1] == '\n' {
+		payload = payload[:len(payload)-1]
+	}
+
 	return &rawHTTPResponse{
 		httpStatusCode: latestResponse.HTTPStatusCode,
-		payload:        latestResponse.ResponseBytes,
+		payload:        payload,
 		headers:        rc.buildResponseHeaders(),
 	}
 }
@@ -231,7 +250,12 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 	for _, rawResp := range rc.rawResponses {
 		// Use raw bytes directly - no parsing needed
 		if len(rawResp.ResponseBytes) > 0 {
-			individualResponses = append(individualResponses, json.RawMessage(rawResp.ResponseBytes))
+			// Strip trailing newline if present (suppliers may use json.Encoder which adds \n)
+			respBytes := rawResp.ResponseBytes
+			if respBytes[len(respBytes)-1] == '\n' {
+				respBytes = respBytes[:len(respBytes)-1]
+			}
+			individualResponses = append(individualResponses, json.RawMessage(respBytes))
 		}
 	}
 

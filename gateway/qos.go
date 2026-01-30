@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"time"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
@@ -157,4 +158,22 @@ type QoSService interface {
 	// HydrateDisqualifiedEndpointsResponse:
 	// - Fills the disqualified endpoint response with QoS-specific data.
 	HydrateDisqualifiedEndpointsResponse(protocol.ServiceID, *devtools.DisqualifiedEndpointResponse)
+}
+
+// QoSArchivalReporter is an optional interface that QoS services can implement
+// to report archival capability status for endpoints.
+// Used by the /ready endpoint to include archival information in endpoint details.
+type QoSArchivalReporter interface {
+	// GetEndpointArchivalStatus returns the archival status for a specific endpoint.
+	// Returns (isArchival, expiresAt) if the endpoint has been checked for archival capability.
+	// Returns (false, zero time) if the endpoint has not been checked or is not archival-capable.
+	GetEndpointArchivalStatus(endpointAddr protocol.EndpointAddr) (isArchival bool, expiresAt time.Time)
+}
+
+// QoSServiceRegistry provides access to QoS services by service ID.
+// Used by the protocol to query endpoint-specific QoS data like archival status.
+type QoSServiceRegistry interface {
+	// GetQoSServiceForServiceID returns the QoS service for a given service ID.
+	// Returns nil if no QoS service is registered for the service ID.
+	GetQoSServiceForServiceID(serviceID protocol.ServiceID) QoSService
 }

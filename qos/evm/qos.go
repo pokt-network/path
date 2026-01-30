@@ -200,3 +200,18 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 func (qos *QoS) GetPerceivedBlockNumber() uint64 {
 	return qos.perceivedBlockNumber.Load()
 }
+
+// GetEndpointArchivalStatus returns the archival status for a specific endpoint.
+// Returns (isArchival, expiresAt) if the endpoint has been checked for archival capability.
+// Returns (false, zero time) if the endpoint has not been checked or is not archival-capable.
+func (qos *QoS) GetEndpointArchivalStatus(endpointAddr protocol.EndpointAddr) (isArchival bool, expiresAt time.Time) {
+	qos.endpointStore.endpointsMu.RLock()
+	defer qos.endpointStore.endpointsMu.RUnlock()
+
+	endpoint, ok := qos.endpointStore.endpoints[endpointAddr]
+	if !ok {
+		return false, time.Time{}
+	}
+
+	return endpoint.checkArchival.isValid(), endpoint.checkArchival.expiresAt
+}

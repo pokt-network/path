@@ -57,11 +57,6 @@ var (
 	// - Supplier blacklisted (validation/signature errors)
 	// - No fallback endpoints configured
 	errProtocolContextSetupNoEndpoints = errors.New("no valid endpoints available for service")
-	// Selected endpoint is no longer available.
-	// Can happen due to:
-	// - Bug in endpoint selection logic.
-	// - Endpoint filtered out (low reputation) due to an observation while selection logic was running.
-	errRequestContextSetupInvalidEndpointSelected = errors.New("selected endpoint is not available: relay request will fail")
 	// Error initializing a signer for the current gateway mode.
 	errRequestContextSetupErrSignerSetup = errors.New("error getting the permitted signer: relay request will fail")
 

@@ -2,8 +2,15 @@ package shannon
 
 import (
 	"context"
+	"sort"
+	"strings"
+	"time"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+
+	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 )
 
 // GetServiceReadiness returns readiness information for a specific service.
@@ -215,4 +222,176 @@ func (p *Protocol) GetSanitizedConfig() map[string]interface{} {
 	}
 
 	return config
+}
+
+// GetServiceEndpointDetails returns detailed endpoint information for a specific service.
+// Includes reputation scores, archival status, latency metrics, tier information, and more.
+func (p *Protocol) GetServiceEndpointDetails(serviceID protocol.ServiceID) ([]protocol.EndpointDetails, error) {
+	ctx := context.Background()
+
+	// Get active sessions for this service
+	sessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(sessions) == 0 {
+		return []protocol.EndpointDetails{}, nil
+	}
+
+	// Get all endpoints (without reputation filtering to show all)
+	endpoints, _, err := p.getUniqueEndpoints(ctx, serviceID, sessions, false, 0, nil, "")
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the tiered selector for this service to determine tier thresholds
+	selector := p.getTieredSelectorForService(serviceID)
+
+	// Build endpoint details list
+	details := make([]protocol.EndpointDetails, 0, len(endpoints))
+
+	for addr, ep := range endpoints {
+		detail := protocol.EndpointDetails{
+			Address:         string(addr),
+			SupplierAddress: ep.Supplier(),
+			URL:             ep.PublicURL(),
+			IsFallback:      ep.IsFallback(),
+		}
+
+		// Get URL from address if PublicURL() is empty
+		if detail.URL == "" {
+			if url, urlErr := addr.GetURL(); urlErr == nil {
+				detail.URL = url
+			}
+		}
+
+		// Collect supported RPC types
+		rpcTypes := p.getEndpointRPCTypes(ep)
+		detail.RPCTypes = rpcTypes
+
+		// Get reputation score if reputation service is available
+		if p.reputationService != nil {
+			// Use JSON_RPC as the default RPC type for reputation lookup
+			rpcType := sharedtypes.RPCType_JSON_RPC
+			keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+			key := keyBuilder.BuildKey(serviceID, addr, rpcType)
+
+			score, scoreErr := p.reputationService.GetScore(ctx, key)
+			if scoreErr == nil {
+				detail.Reputation = &protocol.EndpointReputation{
+					Score:           score.Value,
+					SuccessCount:    score.SuccessCount,
+					ErrorCount:      score.ErrorCount,
+					CriticalStrikes: score.CriticalStrikes,
+				}
+
+				if !score.LastUpdated.IsZero() {
+					detail.Reputation.LastUpdated = score.LastUpdated.Format(time.RFC3339)
+				}
+
+				// Add latency metrics if available
+				if score.LatencyMetrics.SampleCount > 0 {
+					detail.Reputation.Latency = &protocol.EndpointLatency{
+						AvgLatencyMs:  float64(score.LatencyMetrics.AvgLatency.Milliseconds()),
+						MinLatencyMs:  float64(score.LatencyMetrics.MinLatency.Milliseconds()),
+						MaxLatencyMs:  float64(score.LatencyMetrics.MaxLatency.Milliseconds()),
+						LastLatencyMs: float64(score.LatencyMetrics.LastLatency.Milliseconds()),
+						SampleCount:   score.LatencyMetrics.SampleCount,
+					}
+				}
+
+				// Check cooldown status
+				if score.IsInCooldown() {
+					detail.InCooldown = true
+					detail.CooldownRemaining = score.CooldownRemaining().Round(time.Second).String()
+				}
+
+				// Determine tier based on score
+				if selector != nil {
+					detail.Tier = p.determineTier(score.Value, selector)
+				}
+			} else {
+				// New endpoint with no score yet - use initial score
+				initialScore := p.reputationService.GetInitialScoreForService(serviceID)
+				detail.Reputation = &protocol.EndpointReputation{
+					Score: initialScore,
+				}
+				if selector != nil {
+					detail.Tier = p.determineTier(initialScore, selector)
+				}
+			}
+		}
+
+		// Get archival status from QoS service if available.
+		// Always include archival field for services that support archival detection,
+		// showing is_archival: false if the endpoint hasn't been checked yet.
+		if p.qosServiceRegistry != nil {
+			if qosSvc := p.qosServiceRegistry.GetQoSServiceForServiceID(serviceID); qosSvc != nil {
+				if archivalReporter, ok := qosSvc.(gateway.QoSArchivalReporter); ok {
+					isArchival, expiresAt := archivalReporter.GetEndpointArchivalStatus(addr)
+					detail.Archival = &protocol.EndpointArchival{
+						IsArchival: isArchival,
+					}
+					if !expiresAt.IsZero() {
+						detail.Archival.ExpiresAt = expiresAt.Format(time.RFC3339)
+					}
+				}
+			}
+		}
+
+		details = append(details, detail)
+	}
+
+	// Sort by score (descending) then by address for consistent ordering
+	sort.Slice(details, func(i, j int) bool {
+		scoreI := float64(0)
+		scoreJ := float64(0)
+		if details[i].Reputation != nil {
+			scoreI = details[i].Reputation.Score
+		}
+		if details[j].Reputation != nil {
+			scoreJ = details[j].Reputation.Score
+		}
+		if scoreI != scoreJ {
+			return scoreI > scoreJ
+		}
+		return details[i].Address < details[j].Address
+	})
+
+	return details, nil
+}
+
+// getEndpointRPCTypes returns the list of RPC types supported by an endpoint.
+func (p *Protocol) getEndpointRPCTypes(ep endpoint) []string {
+	// For protocol endpoints, we can check the rpcTypeURLs map
+	// For fallback endpoints, check configured RPC types
+	rpcTypes := make([]string, 0)
+
+	// Try to get RPC types from the endpoint's URLs
+	for _, rpcType := range []sharedtypes.RPCType{
+		sharedtypes.RPCType_JSON_RPC,
+		sharedtypes.RPCType_REST,
+		sharedtypes.RPCType_WEBSOCKET,
+		sharedtypes.RPCType_GRPC,
+	} {
+		url := ep.GetURL(rpcType)
+		if url != "" {
+			rpcTypes = append(rpcTypes, strings.ToLower(rpcType.String()))
+		}
+	}
+
+	return rpcTypes
+}
+
+// determineTier returns the tier (1, 2, or 3) for a given score based on selector thresholds.
+func (p *Protocol) determineTier(score float64, selector *reputation.TieredSelector) int {
+	config := selector.Config()
+	if score >= config.Tier1Threshold {
+		return 1
+	}
+	if score >= config.Tier2Threshold {
+		return 2
+	}
+	return 3
 }
