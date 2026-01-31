@@ -1059,6 +1059,12 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Dur("latency", latency).
 			Msg("Health check response validation failed")
 
+		// If this was an archival check that failed validation (expected_response_contains didn't match),
+		// clear the archival status. This ensures endpoints that return errors are not marked as archival.
+		if check.Archival {
+			e.clearEndpointArchival(serviceID, endpointAddr, check)
+		}
+
 		// Record relay metric for validation failure (relay succeeded but validation failed)
 		statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
 		metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, metrics.SignalMinorError, metrics.RelayTypeHealthCheck, latency.Seconds())
@@ -1295,6 +1301,47 @@ func (e *HealthCheckExecutor) markEndpointArchival(serviceID protocol.ServiceID,
 		Str("endpoint", string(endpointAddr)).
 		Str("rpc_type", rpcType.String()).
 		Msg("📜 Endpoint marked as archival-capable (synced to Redis)")
+}
+
+// clearEndpointArchival clears the archival status for an endpoint.
+// This is called when an archival health check FAILS validation (expected_response_contains didn't match).
+// This ensures endpoints that return errors are not marked as archival-capable.
+func (e *HealthCheckExecutor) clearEndpointArchival(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, check HealthCheckConfig) {
+	// Convert check type to RPC type for the reputation key
+	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(string(check.Type))])
+	if rpcType == sharedtypes.RPCType_UNKNOWN_RPC {
+		rpcType = sharedtypes.RPCType_JSON_RPC // Default to JSON_RPC
+	}
+
+	// Clear archival status via reputation service (synced to Redis)
+	if e.reputationSvc != nil {
+		key := reputation.NewEndpointKey(serviceID, endpointAddr, rpcType)
+		ctx := context.Background()
+		// Set archival to false with 0 TTL (immediate expiration)
+		if err := e.reputationSvc.SetArchivalStatus(ctx, key, false, 0); err != nil {
+			e.logger.Warn().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Str("endpoint", string(endpointAddr)).
+				Msg("Failed to clear archival status in reputation service")
+		}
+	}
+
+	// Also update the local QoS instance for immediate effect on this replica
+	qosInstance, exists := e.qosInstances[serviceID]
+	if exists && qosInstance != nil {
+		data := &qostypes.ExtractedData{
+			ArchivalCheckPerformed: true,
+			IsArchival:             false,
+		}
+		_ = qosInstance.UpdateFromExtractedData(endpointAddr, data)
+	}
+
+	e.logger.Warn().
+		Str("service_id", string(serviceID)).
+		Str("endpoint", string(endpointAddr)).
+		Str("rpc_type", rpcType.String()).
+		Msg("🚫 Endpoint archival status CLEARED - health check validation failed")
 }
 
 // buildServicePayload creates a protocol.Payload from the health check configuration.

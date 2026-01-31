@@ -98,7 +98,13 @@ type ExtractedData struct {
 	IsSyncing bool
 
 	// IsArchival indicates if the endpoint supports archival queries.
+	// Only meaningful when ArchivalCheckPerformed is true.
 	IsArchival bool
+
+	// ArchivalCheckPerformed indicates whether an archival check was actually performed.
+	// When true, IsArchival contains a definitive result (true or false).
+	// When false, IsArchival should be ignored (request wasn't an archival query).
+	ArchivalCheckPerformed bool
 
 	// IsValidResponse indicates if the response was valid.
 	IsValidResponse bool
@@ -159,6 +165,7 @@ func (ed *ExtractedData) ExtractAll(extractor DataExtractor, request []byte) {
 	// Check archival status
 	if isArchival, err := extractor.IsArchival(request, ed.RawResponse); err == nil {
 		ed.IsArchival = isArchival
+		ed.ArchivalCheckPerformed = true // Mark that we got a definitive result
 	} else {
 		ed.ExtractionErrors["is_archival"] = err.Error()
 	}
@@ -235,6 +242,7 @@ func (ed *ExtractedData) ExtractWithConfig(extractor DataExtractor, request []by
 	if config.CheckArchival {
 		if isArchival, err := extractor.IsArchival(request, ed.RawResponse); err == nil {
 			ed.IsArchival = isArchival
+			ed.ArchivalCheckPerformed = true // Mark that we got a definitive result
 		} else {
 			ed.ExtractionErrors["is_archival"] = err.Error()
 		}

@@ -158,18 +158,21 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 		}
 	}
 
-	// Update archival status from health check.
-	// If IsArchival is true, mark the endpoint as archival-capable.
-	// This status is used by endpoint selection to filter archival-capable endpoints
-	// when a request requires historical blockchain data.
-	if data.IsArchival {
+	// Update archival status: ONLY clear (set false), never set true.
+	// Setting archival=true is done ONLY by health checks via markEndpointArchival()
+	// which validates the response contains the expected value.
+	//
+	// User requests can clear archival status when they fail, catching false positives
+	// where health check passed but actual requests fail.
+	if data.ArchivalCheckPerformed && !data.IsArchival {
+		// Archival query failed - clear archival status immediately
 		storedEndpoint.checkArchival = endpointCheckArchival{
-			isArchival: true,
-			expiresAt:  time.Now().Add(checkArchivalTTL),
+			isArchival: false,
+			expiresAt:  time.Time{}, // Zero time = invalid
 		}
-		qos.logger.Debug().
+		qos.logger.Warn().
 			Str("endpoint", string(endpointAddr)).
-			Msg("Marked endpoint as archival-capable from health check")
+			Msg("Cleared archival status - endpoint failed archival query")
 	}
 
 	// Store the updated endpoint back

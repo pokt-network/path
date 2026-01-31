@@ -200,6 +200,9 @@ func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, er
 			"block not found",
 			"header not found",
 			"state not available",
+			"state histories",      // "state histories haven't been fully indexed yet"
+			"not fully indexed",    // catch variations
+			"historical data",      // "historical data not available"
 		}
 
 		for _, indicator := range archivalErrorIndicators {
