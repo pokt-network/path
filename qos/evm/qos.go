@@ -12,6 +12,7 @@ import (
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
 	qostypes "github.com/pokt-network/path/qos/types"
+	"github.com/pokt-network/path/reputation"
 )
 
 // QoS implements gateway.QoSService by providing:
@@ -61,11 +62,15 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 		syncAllowance: syncAllowance,
 	}
 
+	// Create block consensus calculator for robust perceived block height
+	blockConsensus := NewBlockHeightConsensus(logger, minimalConfig.getSyncAllowance())
+
 	serviceState := &serviceState{
 		logger:            logger,
 		serviceQoSConfig:  minimalConfig,
 		endpointStore:     store,
 		archivalHeuristic: NewArchivalHeuristic(0), // Use default threshold
+		blockConsensus:    blockConsensus,
 	}
 
 	evmRequestValidator := &evmRequestValidator{
@@ -171,21 +176,32 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 	qos.endpointStore.endpoints[endpointAddr] = storedEndpoint
 	qos.endpointStore.endpointsMu.Unlock()
 
-	// Atomically update perceived block number to maximum using compare-and-swap loop
-	for {
-		current := qos.perceivedBlockNumber.Load()
-		if blockNumber <= current {
-			break // Current value is already >= our block number
-		}
-		if qos.perceivedBlockNumber.CompareAndSwap(current, blockNumber) {
+	// Update perceived block using consensus mechanism
+	// This protects against malicious endpoints reporting extreme block heights
+	if blockNumber > 0 && qos.serviceState.blockConsensus != nil {
+		oldBlock := qos.perceivedBlockNumber.Load()
+		newPerceived := qos.serviceState.blockConsensus.AddObservation(endpointAddr, blockNumber)
+
+		// Update the atomic for fast reads
+		qos.perceivedBlockNumber.Store(newPerceived)
+
+		if newPerceived != oldBlock {
 			qos.logger.Debug().
 				Str("endpoint", string(endpointAddr)).
-				Uint64("old_block", current).
-				Uint64("new_block", blockNumber).
-				Msg("Updating perceived block number from observation pipeline")
-			break
+				Uint64("reported_block", blockNumber).
+				Uint64("old_perceived", oldBlock).
+				Uint64("new_perceived", newPerceived).
+				Msg("Updated perceived block number via consensus")
+
+			// Also update Redis for cross-replica sync (async, non-blocking)
+			if qos.serviceState.reputationSvc != nil {
+				go func(bn uint64) {
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+					_ = qos.serviceState.reputationSvc.SetPerceivedBlockNumber(ctx, qos.serviceState.serviceQoSConfig.GetServiceID(), bn)
+				}(newPerceived)
+			}
 		}
-		// CAS failed, another goroutine updated it - retry
 	}
 
 	return nil
@@ -201,17 +217,141 @@ func (qos *QoS) GetPerceivedBlockNumber() uint64 {
 	return qos.perceivedBlockNumber.Load()
 }
 
+// GetBlockConsensusStats returns the median block and observation count.
+// Used for observability to understand how block consensus is calculated.
+//
+// Implements gateway.QoSBlockConsensusReporter interface.
+func (qos *QoS) GetBlockConsensusStats() (medianBlock uint64, observationCount int) {
+	if qos.serviceState.blockConsensus == nil {
+		return 0, 0
+	}
+	return qos.serviceState.blockConsensus.GetMedianBlock(), qos.serviceState.blockConsensus.GetObservationCount()
+}
+
 // GetEndpointArchivalStatus returns the archival status for a specific endpoint.
 // Returns (isArchival, expiresAt) if the endpoint has been checked for archival capability.
 // Returns (false, zero time) if the endpoint has not been checked or is not archival-capable.
+//
+// Checks both local endpointStore AND reputation service (Redis) for archival status.
+// This ensures non-leader replicas see archival status set by health checks on the leader.
 func (qos *QoS) GetEndpointArchivalStatus(endpointAddr protocol.EndpointAddr) (isArchival bool, expiresAt time.Time) {
+	// Check local store first (fast path)
 	qos.endpointStore.endpointsMu.RLock()
-	defer qos.endpointStore.endpointsMu.RUnlock()
-
 	endpoint, ok := qos.endpointStore.endpoints[endpointAddr]
-	if !ok {
-		return false, time.Time{}
+	qos.endpointStore.endpointsMu.RUnlock()
+
+	if ok && endpoint.checkArchival.isValid() {
+		return true, endpoint.checkArchival.expiresAt
 	}
 
-	return endpoint.checkArchival.isValid(), endpoint.checkArchival.expiresAt
+	// Check reputation service (Redis) for shared archival status
+	if qos.serviceState.reputationSvc != nil {
+		key := reputation.NewEndpointKey(
+			qos.serviceState.serviceQoSConfig.GetServiceID(),
+			endpointAddr,
+			sharedtypes.RPCType_JSON_RPC,
+		)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		if qos.serviceState.reputationSvc.IsArchivalCapable(ctx, key) {
+			// Get the score to retrieve expiration time
+			score, err := qos.serviceState.reputationSvc.GetScore(ctx, key)
+			if err == nil && score.IsArchivalCapable() {
+				return true, score.ArchivalExpiresAt
+			}
+			return true, time.Time{} // Archival but no expiry info
+		}
+	}
+
+	return false, time.Time{}
+}
+
+// SetReputationService sets the reputation service for shared state across replicas.
+// The reputation service provides archival status via Redis, enabling non-leader replicas
+// to access archival endpoint information set by health checks running on the leader.
+func (qos *QoS) SetReputationService(svc reputation.ReputationService) {
+	qos.serviceState.reputationSvc = svc
+}
+
+// StartBackgroundSync starts a background goroutine that periodically syncs
+// perceived block number from Redis. This ensures all replicas converge to
+// the same max block number for sync_allowance validation.
+//
+// The syncInterval determines how often to check Redis (e.g., 5 seconds).
+// Call this after SetReputationService to enable cross-replica sync.
+//
+// IMPORTANT: This performs an immediate sync on startup to ensure the replica
+// has the latest perceived block number before serving requests.
+func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Duration) {
+	if qos.serviceState.reputationSvc == nil {
+		qos.logger.Warn().Msg("Cannot start background sync: reputation service not set")
+		return
+	}
+
+	serviceID := qos.serviceState.serviceQoSConfig.GetServiceID()
+
+	// syncFromRedis fetches perceived block number from Redis and adds it to local consensus.
+	// The Redis value represents consensus from other replicas, so we treat it as another
+	// observation and let the local consensus mechanism decide the actual perceived block.
+	syncFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		redisBlockNumber := qos.serviceState.reputationSvc.GetPerceivedBlockNumber(fetchCtx, serviceID)
+		cancel()
+
+		if redisBlockNumber == 0 {
+			return // No data in Redis yet
+		}
+
+		// Add Redis value as an observation to local consensus
+		// Use a synthetic endpoint address to identify Redis-sourced observations
+		if qos.serviceState.blockConsensus != nil {
+			oldBlock := qos.perceivedBlockNumber.Load()
+			newPerceived := qos.serviceState.blockConsensus.AddObservation(
+				protocol.EndpointAddr("redis-sync"),
+				redisBlockNumber,
+			)
+
+			// Update the atomic for fast reads
+			qos.perceivedBlockNumber.Store(newPerceived)
+
+			if newPerceived != oldBlock {
+				qos.logger.Debug().
+					Str("service_id", string(serviceID)).
+					Uint64("redis_block", redisBlockNumber).
+					Uint64("old_perceived", oldBlock).
+					Uint64("new_perceived", newPerceived).
+					Msg("Updated perceived block number from Redis sync via consensus")
+			}
+		}
+	}
+
+	// Perform immediate sync on startup to have latest data before serving requests
+	syncFromRedis()
+	qos.logger.Info().
+		Str("service_id", string(serviceID)).
+		Uint64("perceived_block", qos.perceivedBlockNumber.Load()).
+		Msg("Completed initial perceived block number sync from Redis")
+
+	go func() {
+		ticker := time.NewTicker(syncInterval)
+		defer ticker.Stop()
+
+		qos.logger.Info().
+			Str("service_id", string(serviceID)).
+			Dur("sync_interval", syncInterval).
+			Msg("Started background sync for perceived block number")
+
+		for {
+			select {
+			case <-ctx.Done():
+				qos.logger.Debug().
+					Str("service_id", string(serviceID)).
+					Msg("Stopping background sync for perceived block number")
+				return
+			case <-ticker.C:
+				syncFromRedis()
+			}
+		}
+	}()
 }

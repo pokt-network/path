@@ -3,6 +3,8 @@ package reputation
 import (
 	"context"
 	"errors"
+
+	"github.com/pokt-network/path/protocol"
 )
 
 // Common errors returned by storage implementations.
@@ -39,6 +41,15 @@ type Storage interface {
 	// List returns all stored endpoint keys for a service.
 	// If serviceID is empty, returns all endpoint keys.
 	List(ctx context.Context, serviceID string) ([]EndpointKey, error)
+
+	// SetPerceivedBlockNumber stores the perceived block number for a service.
+	// Uses atomic max semantics: only updates if new value > stored value.
+	// This enables sharing chain state across replicas.
+	SetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID, blockNumber uint64) error
+
+	// GetPerceivedBlockNumber retrieves the perceived block number for a service.
+	// Returns 0 if no block number has been stored yet.
+	GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) (uint64, error)
 
 	// Close releases any resources held by the storage.
 	Close() error

@@ -395,3 +395,40 @@ func (p *Protocol) determineTier(score float64, selector *reputation.TieredSelec
 	}
 	return 3
 }
+
+// GetServicePerceivedBlockHeight returns the perceived block height for a service.
+// This is the highest block number observed across all endpoints for the service.
+// Returns 0 if no block number has been observed yet or if the service doesn't support it.
+func (p *Protocol) GetServicePerceivedBlockHeight(serviceID protocol.ServiceID) uint64 {
+	if p.qosServiceRegistry == nil {
+		return 0
+	}
+
+	qosSvc := p.qosServiceRegistry.GetQoSServiceForServiceID(serviceID)
+	if qosSvc == nil {
+		return 0
+	}
+
+	return qosSvc.GetPerceivedBlockNumber()
+}
+
+// GetServiceBlockConsensusStats returns block consensus statistics for a service.
+// Returns (medianBlock, observationCount) for observability.
+// Returns (0, 0) if the service doesn't support block consensus stats.
+func (p *Protocol) GetServiceBlockConsensusStats(serviceID protocol.ServiceID) (medianBlock uint64, observationCount int) {
+	if p.qosServiceRegistry == nil {
+		return 0, 0
+	}
+
+	qosSvc := p.qosServiceRegistry.GetQoSServiceForServiceID(serviceID)
+	if qosSvc == nil {
+		return 0, 0
+	}
+
+	// Check if the QoS service implements block consensus reporting
+	if consensusReporter, ok := qosSvc.(gateway.QoSBlockConsensusReporter); ok {
+		return consensusReporter.GetBlockConsensusStats()
+	}
+
+	return 0, 0
+}

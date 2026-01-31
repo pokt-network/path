@@ -1,15 +1,19 @@
 package evm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
 	"time"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/selector"
+	"github.com/pokt-network/path/reputation"
 )
 
 var (
@@ -187,7 +191,7 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 			continue
 		}
 
-		if err := ss.basicEndpointValidation(data.endpoint, requiresArchival); err != nil {
+		if err := ss.basicEndpointValidation(data.addr, data.endpoint, requiresArchival); err != nil {
 			logger.Warn().
 				Err(err).
 				Str("endpoint_addr", string(data.addr)).
@@ -265,7 +269,7 @@ func (ss *serviceState) categorizeValidationFailure(err error) qosobservations.E
 // When requiresArchival is false, the archival check is skipped, allowing all otherwise valid endpoints.
 //
 // Note: This function is lock-free - perceivedBlockNumber uses atomic operations.
-func (ss *serviceState) basicEndpointValidation(endpoint endpoint, requiresArchival bool) error {
+func (ss *serviceState) basicEndpointValidation(endpointAddr protocol.EndpointAddr, endpoint endpoint, requiresArchival bool) error {
 	// Check if the endpoint has returned an empty response within the timeout period.
 	// Empty responses use the same 5-minute timeout as invalid responses to allow recovery.
 	if endpoint.hasReturnedEmptyResponse && endpoint.invalidResponseLastObserved != nil {
@@ -303,9 +307,26 @@ func (ss *serviceState) basicEndpointValidation(endpoint endpoint, requiresArchi
 	// Archival requests will only be routed to archival-capable endpoints.
 	// Archival capability is determined by external health checks, not by QoS observations.
 	if requiresArchival {
-		if err := isArchivalCapable(endpoint.checkArchival); err != nil {
-			return fmt.Errorf("archival capability check failed: %w", err)
+		// Check archival from local endpointStore first (fast path for leader replica)
+		if isArchivalCapable(endpoint.checkArchival) == nil {
+			return nil // Local check passed
 		}
+
+		// Local check failed - try reputation service (shared across replicas via Redis)
+		// This is the key fix: non-leader replicas will get archival status from Redis
+		if ss.reputationSvc != nil {
+			// Build reputation key - use JSON_RPC as default RPC type for archival checks
+			key := reputation.NewEndpointKey(
+				ss.serviceQoSConfig.GetServiceID(),
+				endpointAddr,
+				sharedtypes.RPCType_JSON_RPC,
+			)
+			if ss.reputationSvc.IsArchivalCapable(context.Background(), key) {
+				return nil // Redis check passed
+			}
+		}
+
+		return fmt.Errorf("archival capability check failed: %w", errEndpointNotArchival)
 	}
 
 	return nil

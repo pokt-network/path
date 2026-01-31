@@ -1136,7 +1136,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	// mark the endpoint as archival-capable. This is done explicitly AFTER all checks pass to avoid
 	// marking endpoints that returned "false success" responses (like "0x0" for archival queries).
 	if check.Archival {
-		e.markEndpointArchival(serviceID, endpointAddr)
+		e.markEndpointArchival(serviceID, endpointAddr, check)
 	}
 
 	e.logger.Debug().
@@ -1244,37 +1244,57 @@ func (e *HealthCheckExecutor) processObservationSync(
 		Msg("Health check observation processed synchronously for block height extraction")
 }
 
-// markEndpointArchival marks an endpoint as archival-capable via the QoS instance.
+// archivalTTL is how long an archival status from health checks remains valid.
+// Health checks run periodically, so this should be longer than the health check interval.
+const archivalTTL = 30 * time.Minute
+
+// markEndpointArchival marks an endpoint as archival-capable via the reputation service.
 // This is called ONLY after an archival health check passes ALL validations including error_detection.
 // This ensures we don't mark endpoints that returned "false success" responses (e.g., "0x0").
-func (e *HealthCheckExecutor) markEndpointArchival(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr) {
-	qosInstance, exists := e.qosInstances[serviceID]
-	if !exists || qosInstance == nil {
+// The archival status is shared across all replicas via Redis storage.
+func (e *HealthCheckExecutor) markEndpointArchival(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, check HealthCheckConfig) {
+	if e.reputationSvc == nil {
 		e.logger.Debug().
 			Str("service_id", string(serviceID)).
 			Str("endpoint", string(endpointAddr)).
-			Msg("No QoS instance found for archival marking")
+			Msg("No reputation service available for archival marking")
 		return
 	}
 
-	// Create extracted data with only IsArchival set
-	data := &qostypes.ExtractedData{
-		IsArchival: true,
+	// Convert check type to RPC type for the reputation key
+	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(string(check.Type))])
+	if rpcType == sharedtypes.RPCType_UNKNOWN_RPC {
+		rpcType = sharedtypes.RPCType_JSON_RPC // Default to JSON_RPC
 	}
 
-	if err := qosInstance.UpdateFromExtractedData(endpointAddr, data); err != nil {
+	// Build reputation key
+	key := reputation.NewEndpointKey(serviceID, endpointAddr, rpcType)
+
+	// Set archival status via reputation service (synced to Redis)
+	ctx := context.Background()
+	if err := e.reputationSvc.SetArchivalStatus(ctx, key, true, archivalTTL); err != nil {
 		e.logger.Warn().
 			Err(err).
 			Str("service_id", string(serviceID)).
 			Str("endpoint", string(endpointAddr)).
-			Msg("Failed to mark endpoint as archival-capable")
+			Msg("Failed to mark endpoint as archival-capable in reputation service")
 		return
+	}
+
+	// Also update the local QoS instance for immediate effect on this replica
+	qosInstance, exists := e.qosInstances[serviceID]
+	if exists && qosInstance != nil {
+		data := &qostypes.ExtractedData{
+			IsArchival: true,
+		}
+		_ = qosInstance.UpdateFromExtractedData(endpointAddr, data)
 	}
 
 	e.logger.Info().
 		Str("service_id", string(serviceID)).
 		Str("endpoint", string(endpointAddr)).
-		Msg("📜 Endpoint marked as archival-capable from health check")
+		Str("rpc_type", rpcType.String()).
+		Msg("📜 Endpoint marked as archival-capable (synced to Redis)")
 }
 
 // buildServicePayload creates a protocol.Payload from the health check configuration.

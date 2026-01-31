@@ -19,6 +19,15 @@ type ServiceReadinessReporter interface {
 	// Includes reputation scores, archival status, latency metrics, and more.
 	GetServiceEndpointDetails(serviceID protocol.ServiceID) ([]protocol.EndpointDetails, error)
 
+	// GetServicePerceivedBlockHeight returns the perceived block height for a service.
+	// This is the highest block number observed across all endpoints for the service.
+	// Returns 0 if no block number has been observed yet.
+	GetServicePerceivedBlockHeight(serviceID protocol.ServiceID) uint64
+
+	// GetServiceBlockConsensusStats returns block consensus statistics for a service.
+	// Returns (medianBlock, observationCount) for observability.
+	GetServiceBlockConsensusStats(serviceID protocol.ServiceID) (medianBlock uint64, observationCount int)
+
 	// ConfiguredServiceIDs returns all configured service IDs.
 	ConfiguredServiceIDs() map[protocol.ServiceID]struct{}
 }
@@ -40,11 +49,14 @@ type ServiceReadinessResponse struct {
 
 // ServiceReadyInfo contains readiness info for a single service.
 type ServiceReadyInfo struct {
-	Ready         bool                       `json:"ready"`
-	EndpointCount int                        `json:"endpoint_count"`
-	HasSession    bool                       `json:"has_session"`
-	Error         string                     `json:"error,omitempty"`
-	Endpoints     []protocol.EndpointDetails `json:"endpoints,omitempty"`
+	Ready                bool                       `json:"ready"`
+	EndpointCount        int                        `json:"endpoint_count"`
+	HasSession           bool                       `json:"has_session"`
+	PerceivedBlockHeight uint64                     `json:"perceived_block_height,omitempty"`
+	MedianBlockHeight    uint64                     `json:"median_block_height,omitempty"`
+	BlockObservations    int                        `json:"block_observations,omitempty"`
+	Error                string                     `json:"error,omitempty"`
+	Endpoints            []protocol.EndpointDetails `json:"endpoints,omitempty"`
 }
 
 // handleHealth is a minimal liveness probe endpoint.
@@ -103,7 +115,7 @@ func (r *router) handleServiceReadiness(w http.ResponseWriter, reporter ServiceR
 		info.Ready = endpointCount > 0 && hasSession
 	}
 
-	// Include endpoint details if requested
+	// Include endpoint details and block consensus stats if requested
 	if includeDetails {
 		details, detailsErr := reporter.GetServiceEndpointDetails(serviceID)
 		if detailsErr != nil {
@@ -111,6 +123,10 @@ func (r *router) handleServiceReadiness(w http.ResponseWriter, reporter ServiceR
 		} else {
 			info.Endpoints = details
 		}
+
+		// Include block consensus stats
+		info.PerceivedBlockHeight = reporter.GetServicePerceivedBlockHeight(serviceID)
+		info.MedianBlockHeight, info.BlockObservations = reporter.GetServiceBlockConsensusStats(serviceID)
 	}
 
 	response := ServiceReadinessResponse{
@@ -161,7 +177,7 @@ func (r *router) handleAllServicesReadiness(w http.ResponseWriter, reporter Serv
 			}
 		}
 
-		// Include endpoint details if requested
+		// Include endpoint details and block consensus stats if requested
 		if includeDetails {
 			details, detailsErr := reporter.GetServiceEndpointDetails(serviceID)
 			if detailsErr != nil {
@@ -169,6 +185,10 @@ func (r *router) handleAllServicesReadiness(w http.ResponseWriter, reporter Serv
 			} else {
 				info.Endpoints = details
 			}
+
+			// Include block consensus stats
+			info.PerceivedBlockHeight = reporter.GetServicePerceivedBlockHeight(serviceID)
+			info.MedianBlockHeight, info.BlockObservations = reporter.GetServiceBlockConsensusStats(serviceID)
 		}
 
 		services[string(serviceID)] = info

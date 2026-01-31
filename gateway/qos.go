@@ -170,6 +170,15 @@ type QoSArchivalReporter interface {
 	GetEndpointArchivalStatus(endpointAddr protocol.EndpointAddr) (isArchival bool, expiresAt time.Time)
 }
 
+// QoSBlockConsensusReporter is an optional interface that QoS services can implement
+// to report block consensus statistics for observability.
+// Used by the /ready endpoint to include block consensus info.
+type QoSBlockConsensusReporter interface {
+	// GetBlockConsensusStats returns the median block and observation count.
+	// Used for observability to understand how block consensus is calculated.
+	GetBlockConsensusStats() (medianBlock uint64, observationCount int)
+}
+
 // QoSServiceRegistry provides access to QoS services by service ID.
 // Used by the protocol to query endpoint-specific QoS data like archival status.
 type QoSServiceRegistry interface {
