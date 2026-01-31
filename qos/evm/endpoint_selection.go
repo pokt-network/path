@@ -48,14 +48,23 @@ type EndpointSelectionMetadata struct {
 // If numEndpoints is 0, it defaults to 1. If numEndpoints is greater than available endpoints, it returns all valid endpoints.
 // Note: SelectMultiple does not support archival filtering - it's used for hedge racing where we want all valid endpoints.
 func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
-	logger := ss.logger.With("method", "SelectMultiple").
+	return ss.SelectMultipleWithArchival(availableEndpoints, numEndpoints, false)
+}
+
+// SelectMultipleWithArchival returns multiple endpoint addresses with optional archival filtering.
+// When requiresArchival is true, only endpoints that have passed archival capability checks are considered.
+// When requiresArchival is false, all valid endpoints are considered (same behavior as SelectMultiple).
+// This enables archival requests to be routed only to archival-capable endpoints.
+func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.EndpointAddrList, numEndpoints uint, requiresArchival bool) (protocol.EndpointAddrList, error) {
+	logger := ss.logger.With("method", "SelectMultipleWithArchival").
 		With("chain_id", ss.serviceQoSConfig.getEVMChainID()).
 		With("service_id", ss.serviceQoSConfig.GetServiceID()).
-		With("num_endpoints", numEndpoints)
+		With("num_endpoints", numEndpoints).
+		With("requires_archival", requiresArchival)
 	logger.Debug().Msgf("filtering %d available endpoints to select up to %d.", len(availableEndpoints), numEndpoints)
 
-	// Filter valid endpoints (no archival filtering for SelectMultiple)
-	filteredEndpointsAddr, _, err := ss.filterValidEndpointsWithDetails(availableEndpoints, false)
+	// Filter valid endpoints with archival filtering when required
+	filteredEndpointsAddr, _, err := ss.filterValidEndpointsWithDetails(availableEndpoints, requiresArchival)
 	if err != nil {
 		logger.Error().Err(err).Msg("error filtering endpoints")
 		return nil, err
@@ -63,6 +72,18 @@ func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrL
 
 	// Select random endpoints as fallback
 	if len(filteredEndpointsAddr) == 0 {
+		// When requiresArchival is true, we must respect archival filtering even in fallback.
+		// Filter to only archival-capable endpoints before random selection.
+		if requiresArchival {
+			archivalEndpoints := ss.filterArchivalEndpointsForFallback(availableEndpoints)
+			if len(archivalEndpoints) > 0 {
+				logger.Warn().Msgf("SELECTING RANDOM ARCHIVAL ENDPOINTS (fallback) from %d archival-capable endpoints", len(archivalEndpoints))
+				return selector.RandomSelectMultiple(archivalEndpoints, numEndpoints), nil
+			}
+			// No archival endpoints available - log and fail gracefully
+			logger.Error().Msgf("NO ARCHIVAL ENDPOINTS available for archival request from %d total endpoints", len(availableEndpoints))
+			return nil, fmt.Errorf("no archival-capable endpoints available for archival request")
+		}
 		logger.Warn().Msgf("SELECTING RANDOM ENDPOINTS because all endpoints failed validation from: %s", availableEndpoints.String())
 		return selector.RandomSelectMultiple(availableEndpoints, numEndpoints), nil
 	}
@@ -440,4 +461,38 @@ func (ss *serviceState) isChainIDValid(check endpointCheckChainID) error {
 			errInvalidChainIDObs, chainID, expectedChainID)
 	}
 	return nil
+}
+
+// filterArchivalEndpointsForFallback returns endpoints known to be archival-capable.
+// Used when normal validation fails but we need to respect archival requirements.
+// Checks both local endpointStore and Redis/reputation service for archival status.
+func (ss *serviceState) filterArchivalEndpointsForFallback(availableEndpoints protocol.EndpointAddrList) protocol.EndpointAddrList {
+	var archivalEndpoints protocol.EndpointAddrList
+
+	// Check each endpoint for archival capability
+	ss.endpointStore.endpointsMu.RLock()
+	for _, addr := range availableEndpoints {
+		endpoint, found := ss.endpointStore.endpoints[addr]
+
+		// Check local store first
+		if found && endpoint.checkArchival.isValid() {
+			archivalEndpoints = append(archivalEndpoints, addr)
+			continue
+		}
+
+		// Check reputation service (Redis) for shared archival status
+		if ss.reputationSvc != nil {
+			key := reputation.NewEndpointKey(
+				ss.serviceQoSConfig.GetServiceID(),
+				addr,
+				sharedtypes.RPCType_JSON_RPC,
+			)
+			if ss.reputationSvc.IsArchivalCapable(context.Background(), key) {
+				archivalEndpoints = append(archivalEndpoints, addr)
+			}
+		}
+	}
+	ss.endpointStore.endpointsMu.RUnlock()
+
+	return archivalEndpoints
 }

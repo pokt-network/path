@@ -557,6 +557,19 @@ func (rc *requestContext) SelectMultiple(allEndpoints protocol.EndpointAddrList,
 	return rc.serviceState.SelectMultiple(allEndpoints, numEndpoints)
 }
 
+// SelectMultipleWithArchival returns multiple endpoint addresses with optional archival filtering.
+// When requiresArchival is true, only endpoints that have passed archival capability checks are considered.
+// Implements the protocol.EndpointSelector interface.
+func (rc *requestContext) SelectMultipleWithArchival(allEndpoints protocol.EndpointAddrList, numEndpoints uint, requiresArchival bool) (protocol.EndpointAddrList, error) {
+	return rc.serviceState.SelectMultipleWithArchival(allEndpoints, numEndpoints, requiresArchival)
+}
+
+// RequiresArchival returns true if the current request requires archival data.
+// This is determined by analyzing the request payload for archival data patterns.
+func (rc *requestContext) RequiresArchival() bool {
+	return rc.archivalResult.RequiresArchival
+}
+
 // findServicePayload finds a service payload by ID using value-based comparison.
 // This handles the case where JSON unmarshaling creates new ID structs with different
 // pointer addresses but equivalent values.

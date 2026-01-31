@@ -57,7 +57,14 @@ func (ss *serviceState) Select(availableEndpoints protocol.EndpointAddrList) (pr
 // Valid endpoints are determined by filtering the available endpoints based on their
 // validity criteria. If numEndpoints is 0, it defaults to 1.
 func (ss *serviceState) SelectMultiple(allAvailableEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
-	logger := ss.logger.With("method", "SelectMultiple").With("num_endpoints", numEndpoints)
+	return ss.SelectMultipleWithArchival(allAvailableEndpoints, numEndpoints, false)
+}
+
+// SelectMultipleWithArchival returns multiple endpoint addresses with optional archival filtering.
+// CosmosSDK does not have an archival concept, so the requiresArchival parameter is ignored
+// and this method delegates to the standard endpoint selection logic.
+func (ss *serviceState) SelectMultipleWithArchival(allAvailableEndpoints protocol.EndpointAddrList, numEndpoints uint, _ bool) (protocol.EndpointAddrList, error) {
+	logger := ss.logger.With("method", "SelectMultipleWithArchival").With("num_endpoints", numEndpoints)
 	logger.Debug().Msgf("filtering %d available endpoints to select up to %d.", len(allAvailableEndpoints), numEndpoints)
 
 	filteredEndpointsAddr, err := ss.filterValidEndpoints(allAvailableEndpoints)

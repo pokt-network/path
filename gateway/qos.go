@@ -179,6 +179,15 @@ type QoSBlockConsensusReporter interface {
 	GetBlockConsensusStats() (medianBlock uint64, observationCount int)
 }
 
+// ArchivalRequirementChecker is an optional interface that RequestQoSContext can implement
+// to indicate whether the current request requires archival data.
+// Used by endpoint selection to filter for archival-capable endpoints.
+type ArchivalRequirementChecker interface {
+	// RequiresArchival returns true if the request requires archival data
+	// (e.g., querying historical blockchain state).
+	RequiresArchival() bool
+}
+
 // QoSServiceRegistry provides access to QoS services by service ID.
 // Used by the protocol to query endpoint-specific QoS data like archival status.
 type QoSServiceRegistry interface {

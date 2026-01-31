@@ -389,7 +389,16 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	if concurrencyConfig := rc.getConcurrencyConfigForService(); concurrencyConfig != nil && concurrencyConfig.MaxParallelEndpoints != nil {
 		maxParallelEndpoints = *concurrencyConfig.MaxParallelEndpoints // Per-service override
 	}
-	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultiple(availableEndpoints, uint(maxParallelEndpoints))
+
+	// Check if the request requires archival data (EVM-specific)
+	// Use type assertion to check for RequiresArchival method
+	requiresArchival := false
+	if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+		requiresArchival = archivalChecker.RequiresArchival()
+	}
+
+	// Use archival-aware endpoint selection to filter endpoints appropriately
+	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(availableEndpoints, uint(maxParallelEndpoints), requiresArchival)
 	if err != nil || len(selectedEndpoints) == 0 {
 		// no protocol context will be built: use the endpointLookup observation.
 		rc.updateProtocolObservations(&endpointLookupObs)

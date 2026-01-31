@@ -312,6 +312,26 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				lastErr = fmt.Errorf("no endpoints available for retry")
 				break
 			}
+
+			// Check if the request requires archival data and filter endpoints accordingly
+			// This ensures retries also respect archival requirements
+			requiresArchival := false
+			if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+				requiresArchival = archivalChecker.RequiresArchival()
+			}
+			if requiresArchival {
+				// Filter available endpoints using archival-aware selection
+				// This returns only archival-capable endpoints
+				archivalEndpoints, archivalErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+					availableEndpoints, uint(len(availableEndpoints)), true)
+				if archivalErr == nil && len(archivalEndpoints) > 0 {
+					availableEndpoints = archivalEndpoints
+					logger.Debug().
+						Int("archival_endpoints", len(archivalEndpoints)).
+						Msg("Filtered to archival-capable endpoints for retry")
+				}
+			}
+
 			// Filter out endpoints we've already tried
 			filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints)
 
@@ -386,6 +406,22 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				logger.Warn().Err(err).Msg("Failed to get endpoints for hedge racing, falling back to normal request")
 				// Fall through to normal request
 			} else if len(availableEndpoints) > 0 {
+				// Filter for archival endpoints if request requires archival data
+				// This ensures hedge requests also go to archival-capable endpoints
+				requiresArchival := false
+				if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+					requiresArchival = archivalChecker.RequiresArchival()
+				}
+				if requiresArchival {
+					archivalEndpoints, archivalErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+						availableEndpoints, uint(len(availableEndpoints)), true)
+					if archivalErr == nil && len(archivalEndpoints) > 0 {
+						availableEndpoints = archivalEndpoints
+						logger.Debug().
+							Int("archival_endpoints", len(archivalEndpoints)).
+							Msg("Filtered to archival-capable endpoints for hedge racing")
+					}
+				}
 				// Select primary endpoint (first one, which is already reputation-sorted)
 				primaryEndpoint := availableEndpoints[0]
 
@@ -853,6 +889,22 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			continue
 		}
 
+		// Filter for archival endpoints if request requires archival data
+		requiresArchival := false
+		if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+			requiresArchival = archivalChecker.RequiresArchival()
+		}
+		if requiresArchival {
+			archivalEndpoints, archivalErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+				availableEndpoints, uint(len(availableEndpoints)), true)
+			if archivalErr == nil && len(archivalEndpoints) > 0 {
+				availableEndpoints = archivalEndpoints
+				logger.Debug().
+					Int("archival_endpoints", len(archivalEndpoints)).
+					Msg("Filtered to archival-capable endpoints for batch item")
+			}
+		}
+
 		// Filter out already tried endpoints for retries
 		var filteredEndpoints []protocol.EndpointAddr
 		for _, ep := range availableEndpoints {
@@ -1129,6 +1181,25 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				logger.Error().Int("endpoint_index", index).
 					Msg("No endpoints available for retry in parallel path")
 				return
+			}
+
+			// Check if the request requires archival data and filter endpoints accordingly
+			// This ensures retries also respect archival requirements
+			requiresArchival := false
+			if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+				requiresArchival = archivalChecker.RequiresArchival()
+			}
+			if requiresArchival {
+				// Filter available endpoints using archival-aware selection
+				archivalEndpoints, archivalErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+					availableEndpoints, uint(len(availableEndpoints)), true)
+				if archivalErr == nil && len(archivalEndpoints) > 0 {
+					availableEndpoints = archivalEndpoints
+					logger.Debug().
+						Int("endpoint_index", index).
+						Int("archival_endpoints", len(archivalEndpoints)).
+						Msg("Filtered to archival-capable endpoints for parallel retry")
+				}
 			}
 
 			// Filter out endpoints we've already tried
