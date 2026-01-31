@@ -204,9 +204,9 @@ func (rc *requestContext) sendSingleRelay(payload protocol.Payload) (protocol.Re
 	// Execute relay request using the appropriate strategy based on endpoint type and network conditions
 	relayResponse, err := rc.executeRelayRequestStrategy(payload)
 
-	// Failure: Pass the response (which may contain RelayMinerError data) to error handler.
+	// Failure: Pass the response (which may contain response bytes for fallback) to error handler.
 	if err != nil {
-		return rc.handleEndpointError(endpointQueryTime, err)
+		return rc.handleEndpointError(endpointQueryTime, relayResponse, err)
 	}
 
 	// Success:
@@ -685,10 +685,18 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 				Int("http_status_code", responseHTTPStatusCode).
 				Msg("Heuristic analysis detected error in backend response - triggering retry")
 
+			// Include the actual response bytes in the returned response.
+			// This ensures if all retries fail, the actual backend error (e.g., "state is pruned")
+			// can be returned to the user instead of a generic error wrapper.
+			defaultResponse.Bytes = deserializedResponse.Bytes
+			defaultResponse.HTTPStatusCode = responseHTTPStatusCode
+
 			// Return an error to trigger retry at protocol level.
 			// Wrap in raw_payload: format to allow proper error classification and reputation penalty.
+			// Use errHeuristicDetectedBackendError instead of errMalformedEndpointPayload because
+			// the response is valid JSON-RPC, it just indicates a backend issue (pruned state, etc.).
 			return defaultResponse, fmt.Errorf("raw_payload: %s: heuristic detected %s: %w",
-				string(deserializedResponse.Bytes), heuristicResult.Reason, errMalformedEndpointPayload)
+				string(deserializedResponse.Bytes), heuristicResult.Reason, errHeuristicDetectedBackendError)
 		}
 	}
 
@@ -1043,8 +1051,11 @@ func (rc *requestContext) handleInternalError(internalErr error) (protocol.Respo
 //   - Records endpoint error observation with enhanced classification and returns the response.
 //   - Tracks endpoint error in observations with detailed categorization for metrics.
 //   - Includes any RelayMinerError data that was captured via trackRelayMinerError.
+//   - Preserves response bytes from the original response so they can be returned to the user
+//     if all retries fail (e.g., "state is pruned" error should be returned as-is).
 func (rc *requestContext) handleEndpointError(
 	endpointQueryTime time.Time,
+	originalResponse protocol.Response,
 	endpointErr error,
 ) (protocol.Response, error) {
 	// PERF: Removed hydrateLogger() call to avoid logger allocation
@@ -1127,8 +1138,11 @@ func (rc *requestContext) handleEndpointError(
 	relayType := metrics.RelayTypeNormal
 	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
-	// Return error.
-	return protocol.Response{EndpointAddr: selectedEndpointAddr},
+	// Return the original response (preserving any response bytes) with the error.
+	// This allows the gateway to return the actual backend response to the user
+	// if all retries fail (e.g., "state is pruned" should be returned as-is).
+	originalResponse.EndpointAddr = selectedEndpointAddr
+	return originalResponse,
 		fmt.Errorf("relay: error sending relay for service %s endpoint %s: %w",
 			rc.serviceID, selectedEndpointAddr, endpointErr,
 		)

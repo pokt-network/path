@@ -7,6 +7,7 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+	"github.com/tidwall/gjson"
 
 	"github.com/pokt-network/path/gateway"
 	pathhttp "github.com/pokt-network/path/network/http"
@@ -16,31 +17,31 @@ import (
 	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
+const (
+	// errCodeUnmarshaling is set as the JSON-RPC response's error code if the endpoint returns a malformed response.
+	// `jsonrpc.ResponseCodeBackendServerErr`, i.e. code -31002, will result in returning a 500 HTTP Status Code to the client.
+	errCodeUnmarshaling = jsonrpc.ResponseCodeBackendServerErr
+
+	// errMsgUnmarshaling is the generic message returned to the user if the endpoint returns a malformed response.
+	errMsgUnmarshaling = "the response returned by the endpoint is not a valid JSON-RPC response"
+)
+
 // requestContext provides the support required by the gateway
 // package for handling service requests.
 var _ gateway.RequestQoSContext = &requestContext{}
 
-// TODO_TECHDEBT: Need a Validate() method here to allow
-// the caller, e.g. gateway, determine whether the endpoint's
-// response was valid, and whether a retry makes sense.
-//
-// response defines the functionality required from a parsed endpoint response.
-type response interface {
-	GetObservation() qosobservations.SolanaEndpointObservation
-	GetJSONRPCResponse() jsonrpc.Response
-
-	// TODO_TECHDEBT: add method(s) to support retrying a request, e.g. IsUserError(), IsEndpointError().
-}
-
-type endpointResponse struct {
-	protocol.EndpointAddr
-	response
-	// httpStatusCode is the original HTTP status code from the backend endpoint.
-	httpStatusCode int
+// rawEndpointResponse stores raw bytes from endpoint responses.
+// This is used on the hot path to avoid parsing overhead.
+// Heavy parsing for observations is done asynchronously via the ObservationQueue.
+type rawEndpointResponse struct {
+	EndpointAddr   protocol.EndpointAddr
+	ResponseBytes  []byte
+	HTTPStatusCode int
 }
 
 // requestContext provides the functionality required
 // to support QoS for a Solana blockchain service.
+// Uses raw byte passthrough on the hot path to minimize latency.
 type requestContext struct {
 	logger polylog.Logger
 
@@ -65,12 +66,10 @@ type requestContext struct {
 	// - QoS: requests built by the QoS service to get additional data points on endpoints.
 	requestOrigin qosobservations.RequestOrigin
 
-	// endpointResponses is the set of responses received from one or
-	// more endpoints as part of handling this service request.
-	// NOTE: these are all related to a single JSONRPC request,
-	// enhancing to support batch JSONRPC requests will involve the
-	// modification of this field's type.
-	endpointResponses []endpointResponse
+	// rawResponses stores raw endpoint responses.
+	// Raw bytes are stored without parsing for low-latency client response.
+	// Heavy parsing (for observations) is done asynchronously via ObservationQueue.
+	rawResponses []rawEndpointResponse
 
 	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
 	// Used to provide more specific error messages to clients.
@@ -99,24 +98,24 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 }
 
 // UpdateWithResponse is NOT safe for concurrent use
+//
+// Raw bytes are stored without parsing for low-latency client response.
+// Heavy parsing (for observations) is done asynchronously via ObservationQueue.
+//
 // The requestID parameter is unused for Solana QoS (single request only) but required by the interface.
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int, requestID string) {
-	// TODO_IMPROVE: check whether the request was valid, and return an error if it was not.
-	// This would be an extra safety measure, as the caller should have checked the returned value
-	// indicating the validity of the request when calling on QoS instance's ParseHTTPRequest
-	response := unmarshalResponse(rc.logger, rc.JSONRPCReq, responseBz, endpointAddr)
-
-	// TODO_MVP(@adshmh): Drop the unmarshaling error: the returned response interface should provide methods to allow the caller to:
-	// 1. Check if the response from the endpoint was valid or malformed. This is needed to support retrying with a different endpoint if
-	// the originally selected one fails to return a valid response to the user's request.
-	// 2. Return a generic but valid JSONRPC response to the user.
-	rc.endpointResponses = append(rc.endpointResponses,
-		endpointResponse{
-			EndpointAddr:   endpointAddr,
-			response:       response,
-			httpStatusCode: httpStatusCode,
-		},
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int, _ string) {
+	rc.logger = rc.logger.With(
+		"endpoint_addr", endpointAddr,
+		"endpoint_response_len", len(responseBz),
 	)
+
+	// Store raw bytes without parsing for low-latency client response.
+	// Heavy parsing (for observations) is done async via ObservationQueue.
+	rc.rawResponses = append(rc.rawResponses, rawEndpointResponse{
+		EndpointAddr:   endpointAddr,
+		ResponseBytes:  responseBz,
+		HTTPStatusCode: httpStatusCode,
+	})
 }
 
 // SetProtocolError stores a protocol-level error for more specific client error messages.
@@ -125,13 +124,15 @@ func (rc *requestContext) SetProtocolError(err error) {
 	rc.protocolError = err
 }
 
-// TODO_MVP(@adshmh): add `Content-Type: application/json` header.
 // GetHTTPResponse builds the HTTP response that should be returned for
 // a Solana blockchain service request.
+//
+// Returns raw bytes as-is (no parsing/re-encoding) for low-latency client response.
+// Heavy parsing for observations is done asynchronously via ObservationQueue.
 func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 	// No responses received: this is an internal error:
 	// e.g. protocol-level errors like endpoint timing out.
-	if len(rc.endpointResponses) == 0 {
+	if len(rc.rawResponses) == 0 {
 		// Use the specific protocol error if available, otherwise use a generic message.
 		var errToReport error
 		if rc.protocolError != nil {
@@ -143,19 +144,40 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 		return qos.BuildHTTPResponseFromJSONRPCResponse(rc.logger, jsonrpcErrorResponse)
 	}
 
-	// Use the most recent endpoint response.
-	// As of PR #253 there is no retry, meaning there is at most 1 endpoint response.
-	latestResponse := rc.endpointResponses[len(rc.endpointResponses)-1]
-	selectedResponse := latestResponse.GetJSONRPCResponse()
-	resp := qos.BuildHTTPResponseFromJSONRPCResponse(rc.logger, selectedResponse)
-	// Use the original HTTP status code from the backend if available
-	if latestResponse.httpStatusCode != 0 {
-		resp.HTTPStatusCode = latestResponse.httpStatusCode
+	// Return the most recent raw response as-is for single requests
+	latestResponse := rc.rawResponses[len(rc.rawResponses)-1]
+
+	return &rawHTTPResponse{
+		httpStatusCode: latestResponse.HTTPStatusCode,
+		payload:        latestResponse.ResponseBytes,
 	}
-	return resp
+}
+
+// rawHTTPResponse implements pathhttp.HTTPResponse for raw byte passthrough.
+type rawHTTPResponse struct {
+	httpStatusCode int
+	payload        []byte
+}
+
+func (r *rawHTTPResponse) GetPayload() []byte {
+	return r.payload
+}
+
+func (r *rawHTTPResponse) GetHTTPStatusCode() int {
+	if r.httpStatusCode == 0 {
+		return http.StatusOK
+	}
+	return r.httpStatusCode
+}
+
+func (r *rawHTTPResponse) GetHTTPHeaders() map[string]string {
+	return map[string]string{
+		"Content-Type": "application/json",
+	}
 }
 
 // GetObservations returns all the observations contained in the request context.
+// Uses gjson to parse raw bytes for observation creation (async path).
 // Implements the gateway.RequestQoSContext interface.
 func (rc requestContext) GetObservations() qosobservations.Observations {
 	// Set the observation fields common for all requests: successful or failed.
@@ -169,7 +191,7 @@ func (rc requestContext) GetObservations() qosobservations.Observations {
 
 	// No endpoint responses received.
 	// Set request error.
-	if len(rc.endpointResponses) == 0 {
+	if len(rc.rawResponses) == 0 {
 		observations.RequestError = qos.GetRequestErrorForProtocolError()
 
 		return qosobservations.Observations{
@@ -179,12 +201,10 @@ func (rc requestContext) GetObservations() qosobservations.Observations {
 		}
 	}
 
-	// Build the endpoint(s) observations.
-	endpointObservations := make([]*qosobservations.SolanaEndpointObservation, len(rc.endpointResponses))
-	for idx, endpointResponse := range rc.endpointResponses {
-		obs := endpointResponse.GetObservation()
-		obs.EndpointAddr = string(endpointResponse.EndpointAddr)
-		endpointObservations[idx] = &obs
+	// Build endpoint observations from raw bytes using gjson
+	endpointObservations := make([]*qosobservations.SolanaEndpointObservation, len(rc.rawResponses))
+	for idx, rawResp := range rc.rawResponses {
+		endpointObservations[idx] = rc.createEndpointObservationFromRawBytes(rawResp)
 	}
 
 	// Set the endpoint observations fields.
@@ -195,6 +215,66 @@ func (rc requestContext) GetObservations() qosobservations.Observations {
 			Solana: observations,
 		},
 	}
+}
+
+// createEndpointObservationFromRawBytes creates an endpoint observation from raw response bytes.
+// Uses gjson for efficient parsing of only the fields needed for observations.
+// Returns a pointer to avoid copying the protobuf struct which contains a mutex.
+func (rc requestContext) createEndpointObservationFromRawBytes(rawResp rawEndpointResponse) *qosobservations.SolanaEndpointObservation {
+	// Build parsed JSONRPC response observation using gjson
+	parsedResp := rc.parseJSONRPCResponseForObservation(rawResp.ResponseBytes)
+
+	// Create an unrecognized response observation (since we're not doing method-specific parsing on hot path)
+	return &qosobservations.SolanaEndpointObservation{
+		EndpointAddr:   string(rawResp.EndpointAddr),
+		HttpStatusCode: int32(rawResp.HTTPStatusCode),
+		ResponseObservation: &qosobservations.SolanaEndpointObservation_UnrecognizedResponse{
+			UnrecognizedResponse: &qosobservations.SolanaUnrecognizedResponse{
+				JsonrpcResponse: parsedResp,
+				// ValidationError is nil - no validation error if we could parse it
+			},
+		},
+	}
+}
+
+// parseJSONRPCResponseForObservation parses raw bytes into a JsonRpcResponse observation using gjson.
+func (rc requestContext) parseJSONRPCResponseForObservation(responseBz []byte) *qosobservations.JsonRpcResponse {
+	if len(responseBz) == 0 {
+		return nil
+	}
+
+	resp := &qosobservations.JsonRpcResponse{}
+
+	// Extract ID as string
+	idResult := gjson.GetBytes(responseBz, "id")
+	if idResult.Exists() {
+		resp.Id = idResult.String()
+	}
+
+	// Check for error
+	errorResult := gjson.GetBytes(responseBz, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		errorCode := gjson.GetBytes(responseBz, "error.code")
+		errorMsg := gjson.GetBytes(responseBz, "error.message")
+		resp.Error = &qosobservations.JsonRpcResponseError{
+			Code:    errorCode.Int(),
+			Message: errorMsg.String(),
+		}
+	}
+
+	// Extract result preview (truncated for size)
+	resultResult := gjson.GetBytes(responseBz, "result")
+	if resultResult.Exists() && resultResult.Type != gjson.Null {
+		resultStr := resultResult.String()
+		// Truncate result preview to a reasonable length
+		const maxPreviewLen = 200
+		if len(resultStr) > maxPreviewLen {
+			resultStr = resultStr[:maxPreviewLen] + "..."
+		}
+		resp.ResultPreview = resultStr
+	}
+
+	return resp
 }
 
 // GetEndpointSelector is required to satisfy the gateway package's RequestQoSContext interface.
@@ -217,4 +297,11 @@ func (rc *requestContext) Select(allEndpoints protocol.EndpointAddrList) (protoc
 // It is required to satisfy the protocol package's EndpointSelector interface.
 func (rc *requestContext) SelectMultiple(allEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
 	return rc.endpointStore.SelectMultiple(allEndpoints, numEndpoints)
+}
+
+// SelectMultipleWithArchival chooses multiple endpoints with optional archival filtering.
+// Solana does not have an archival concept, so requiresArchival is ignored.
+// It is required to satisfy the protocol package's EndpointSelector interface.
+func (rc *requestContext) SelectMultipleWithArchival(allEndpoints protocol.EndpointAddrList, numEndpoints uint, requiresArchival bool) (protocol.EndpointAddrList, error) {
+	return rc.endpointStore.SelectMultipleWithArchival(allEndpoints, numEndpoints, requiresArchival)
 }

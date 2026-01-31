@@ -704,6 +704,138 @@ func (s *service) refreshFromStorage(ctx context.Context) error {
 	return nil
 }
 
+// SetArchivalStatus marks an endpoint as archival-capable with an expiry time.
+// This is called by health checks when an endpoint passes archival validation.
+// The status is shared across all replicas via Redis storage.
+func (s *service) SetArchivalStatus(ctx context.Context, key EndpointKey, isArchival bool, archivalTTL time.Duration) error {
+	cacheKey := key.String()
+
+	// Get existing score or create new one
+	s.mu.Lock()
+	score, exists := s.cache[cacheKey]
+	if !exists {
+		// Create a new score with initial values
+		score = Score{
+			Value:       s.GetInitialScoreForService(key.ServiceID),
+			LastUpdated: time.Now(),
+		}
+	}
+
+	// Update archival status
+	score.IsArchival = isArchival
+	if isArchival {
+		score.ArchivalExpiresAt = time.Now().Add(archivalTTL)
+	} else {
+		score.ArchivalExpiresAt = time.Time{}
+	}
+	score.LastUpdated = time.Now()
+
+	// Update cache
+	s.cache[cacheKey] = score
+	s.mu.Unlock()
+
+	// Queue async write to storage
+	select {
+	case s.writeCh <- writeRequest{key: key, score: score}:
+	default:
+		// Channel full, write synchronously to avoid data loss
+		if err := s.storage.Set(ctx, key, score); err != nil {
+			if s.logger != nil {
+				s.logger.Error().Err(err).
+					Str("key", cacheKey).
+					Bool("is_archival", isArchival).
+					Msg("Failed to persist archival status to storage")
+			}
+			return err
+		}
+	}
+
+	if s.logger != nil {
+		s.logger.Debug().
+			Str("key", cacheKey).
+			Bool("is_archival", isArchival).
+			Time("expires_at", score.ArchivalExpiresAt).
+			Msg("📜 Set archival status in reputation service")
+	}
+
+	return nil
+}
+
+// IsArchivalCapable returns whether the endpoint has valid archival status.
+// Returns false if not marked as archival or if status has expired.
+//
+// IMPORTANT: This method reads from Redis storage if the endpoint is not in
+// the local cache, ensuring non-leader replicas can access archival status
+// set by health checks running on the leader replica.
+func (s *service) IsArchivalCapable(ctx context.Context, key EndpointKey) bool {
+	cacheKey := key.String()
+
+	// Check local cache first
+	s.mu.RLock()
+	score, exists := s.cache[cacheKey]
+	s.mu.RUnlock()
+
+	if exists {
+		return score.IsArchivalCapable()
+	}
+
+	// Not in cache - read from Redis storage (critical for non-leader replicas)
+	// This ensures archival status set by leader's health checks is accessible
+	if s.storage != nil {
+		storedScore, err := s.storage.Get(ctx, key)
+		if err == nil {
+			// Update local cache with fetched score
+			s.mu.Lock()
+			s.cache[cacheKey] = storedScore
+			s.mu.Unlock()
+
+			return storedScore.IsArchivalCapable()
+		}
+		// Log error but don't fail - just return false
+		if s.logger != nil {
+			s.logger.Debug().
+				Err(err).
+				Str("key", cacheKey).
+				Msg("Failed to fetch archival status from storage")
+		}
+	}
+
+	return false
+}
+
+// SetPerceivedBlockNumber updates the shared perceived block number for a service.
+// Uses Redis SETNX-like behavior: only updates if new value is higher (max wins).
+// This enables all replicas to share a consistent view of the chain tip.
+func (s *service) SetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID, blockNumber uint64) error {
+	if s.storage == nil {
+		return nil // No storage configured, skip
+	}
+
+	return s.storage.SetPerceivedBlockNumber(ctx, serviceID, blockNumber)
+}
+
+// GetPerceivedBlockNumber retrieves the shared perceived block number for a service.
+// Returns the maximum block number observed across all replicas.
+// Returns 0 if no block number has been stored yet or if storage is unavailable.
+func (s *service) GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) uint64 {
+	if s.storage == nil {
+		return 0 // No storage configured
+	}
+
+	blockNumber, err := s.storage.GetPerceivedBlockNumber(ctx, serviceID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Msg("Failed to get perceived block number from storage")
+		}
+		return 0
+	}
+
+	return blockNumber
+}
+
 // clamp constrains a value between min and max.
 func clamp(value, min, max float64) float64 {
 	if value < min {

@@ -36,3 +36,14 @@ func (RandomEndpointSelector) SelectMultiple(endpoints protocol.EndpointAddrList
 
 	return selector.RandomSelectMultiple(endpoints, numEndpoints), nil
 }
+
+// SelectMultipleWithArchival returns multiple randomly selected endpoints with optional archival filtering.
+// NoOp QoS does not have an archival concept, so requiresArchival is ignored.
+// This method fulfills the protocol.EndpointSelector interface.
+func (RandomEndpointSelector) SelectMultipleWithArchival(endpoints protocol.EndpointAddrList, numEndpoints uint, _ bool) (protocol.EndpointAddrList, error) {
+	if len(endpoints) == 0 {
+		return nil, errors.New("RandomEndpointSelector: an empty endpoint list was supplied to the selector")
+	}
+
+	return selector.RandomSelectMultiple(endpoints, numEndpoints), nil
+}

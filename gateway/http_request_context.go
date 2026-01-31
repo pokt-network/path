@@ -389,7 +389,16 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	if concurrencyConfig := rc.getConcurrencyConfigForService(); concurrencyConfig != nil && concurrencyConfig.MaxParallelEndpoints != nil {
 		maxParallelEndpoints = *concurrencyConfig.MaxParallelEndpoints // Per-service override
 	}
-	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultiple(availableEndpoints, uint(maxParallelEndpoints))
+
+	// Check if the request requires archival data (EVM-specific)
+	// Use type assertion to check for RequiresArchival method
+	requiresArchival := false
+	if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+		requiresArchival = archivalChecker.RequiresArchival()
+	}
+
+	// Use archival-aware endpoint selection to filter endpoints appropriately
+	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(availableEndpoints, uint(maxParallelEndpoints), requiresArchival)
 	if err != nil || len(selectedEndpoints) == 0 {
 		// no protocol context will be built: use the endpointLookup observation.
 		rc.updateProtocolObservations(&endpointLookupObs)
@@ -415,14 +424,59 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	rc.protocolContexts = make([]ProtocolRequestContext, 0, numSelectedEndpoints)
 	var lastProtocolCtxSetupErrObs *protocolobservations.Observations
 
+	// Track endpoints that have been attempted to avoid retrying the same one
+	attemptedEndpoints := make(map[protocol.EndpointAddr]bool)
+
 	for i, endpointAddr := range selectedEndpoints {
 		rc.logger.Debug().
 			Str("method", "BuildProtocolContextsFromHTTPRequest").
 			Msgf("Building protocol context for endpoint %d/%d: %s", i+1, numSelectedEndpoints, endpointAddr)
+
+		attemptedEndpoints[endpointAddr] = true
+
 		// filterByReputation=true: Normal requests respect reputation filtering
 		protocolCtx, protocolCtxSetupErrObs, err := rc.protocol.BuildHTTPRequestContextForEndpoint(rc.context, rc.serviceID, endpointAddr, rpcType, httpReq, true)
 		if err != nil {
 			lastProtocolCtxSetupErrObs = &protocolCtxSetupErrObs
+
+			// Handle endpoint unavailable error by trying to re-select using QoS rules
+			if errors.Is(err, protocol.ErrEndpointUnavailable) {
+				rc.logger.Warn().
+					Str("method", "BuildProtocolContextsFromHTTPRequest").
+					Str("endpoint_addr", string(endpointAddr)).
+					Msgf("Endpoint %d/%d became unavailable, attempting re-selection", i+1, numSelectedEndpoints)
+
+				// Get fresh endpoints and try to find a replacement
+				freshEndpoints, _, freshErr := rc.protocol.AvailableHTTPEndpoints(rc.context, rc.serviceID, rpcType, httpReq)
+				if freshErr == nil && len(freshEndpoints) > 0 {
+					// Filter out endpoints we've already attempted
+					for _, freshEndpoint := range freshEndpoints {
+						if attemptedEndpoints[freshEndpoint] {
+							continue
+						}
+						// Try to build context for this fresh endpoint
+						attemptedEndpoints[freshEndpoint] = true
+						replacementCtx, _, replaceErr := rc.protocol.BuildHTTPRequestContextForEndpoint(
+							rc.context, rc.serviceID, freshEndpoint, rpcType, httpReq, true)
+						if replaceErr == nil {
+							rc.protocolContexts = append(rc.protocolContexts, replacementCtx)
+							rc.logger.Info().
+								Str("method", "BuildProtocolContextsFromHTTPRequest").
+								Str("original_endpoint", string(endpointAddr)).
+								Str("replacement_endpoint", string(freshEndpoint)).
+								Msgf("Successfully replaced unavailable endpoint %d/%d with new endpoint", i+1, numSelectedEndpoints)
+							break
+						}
+						rc.logger.Debug().
+							Str("method", "BuildProtocolContextsFromHTTPRequest").
+							Err(replaceErr).
+							Str("replacement_endpoint", string(freshEndpoint)).
+							Msg("Replacement endpoint also failed, trying next")
+					}
+				}
+				continue
+			}
+
 			rc.logger.Warn().
 				Str("method", "BuildProtocolContextsFromHTTPRequest").
 				Err(err).

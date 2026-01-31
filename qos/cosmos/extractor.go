@@ -7,13 +7,16 @@
 // Cosmos chains can return data in different formats depending on the endpoint:
 //   - /status (CometBFT): JSON-RPC with node_info, sync_info
 //   - /cosmos/base/node/v1beta1/status: REST with height field
+//
+// Uses gjson for efficient field extraction without full unmarshalling.
 package cosmos
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/tidwall/gjson"
 
 	"github.com/pokt-network/path/qos/jsonrpc"
 	qostypes "github.com/pokt-network/path/qos/types"
@@ -24,6 +27,7 @@ var _ qostypes.DataExtractor = (*CosmosDataExtractor)(nil)
 
 // CosmosDataExtractor extracts quality data from Cosmos SDK and CometBFT responses.
 // It handles multiple response formats common in the Cosmos ecosystem.
+// Uses gjson for efficient field extraction without full unmarshalling.
 type CosmosDataExtractor struct{}
 
 // NewCosmosDataExtractor creates a new Cosmos data extractor.
@@ -78,19 +82,10 @@ func (e *CosmosDataExtractor) ExtractChainID(request []byte, response []byte) (s
 		return "", fmt.Errorf("empty response")
 	}
 
-	// CometBFT JSON-RPC format
-	var jsonrpcResp jsonrpc.Response
-	if err := json.Unmarshal(response, &jsonrpcResp); err == nil && jsonrpcResp.Result != nil {
-		var result ResultStatus
-		resultBytes, err := json.Marshal(jsonrpcResp.Result)
-		if err != nil {
-			return "", fmt.Errorf("marshal result: %w", err)
-		}
-		if err := json.Unmarshal(resultBytes, &result); err == nil {
-			if result.NodeInfo.Network != "" {
-				return result.NodeInfo.Network, nil
-			}
-		}
+	// Try CometBFT JSON-RPC format - network is in result.node_info.network
+	network := gjson.GetBytes(response, "result.node_info.network")
+	if network.Exists() && network.String() != "" {
+		return network.String(), nil
 	}
 
 	return "", fmt.Errorf("could not extract chain ID from response")
@@ -112,31 +107,27 @@ func (e *CosmosDataExtractor) IsSyncing(request []byte, response []byte) (bool, 
 		return false, fmt.Errorf("empty response")
 	}
 
-	// CometBFT JSON-RPC format
-	var jsonrpcResp jsonrpc.Response
-	if err := json.Unmarshal(response, &jsonrpcResp); err != nil {
-		return false, fmt.Errorf("parse JSON-RPC response: %w", err)
+	// Check for JSON-RPC error
+	errorResult := gjson.GetBytes(response, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		code := gjson.GetBytes(response, "error.code").Int()
+		msg := gjson.GetBytes(response, "error.message").String()
+		return false, fmt.Errorf("status returned error: code=%d, message=%s", code, msg)
 	}
 
-	if jsonrpcResp.Error != nil {
-		return false, fmt.Errorf("status returned error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
-	}
-
-	if jsonrpcResp.Result == nil {
+	// Check for result
+	resultField := gjson.GetBytes(response, "result")
+	if !resultField.Exists() {
 		return false, fmt.Errorf("response missing result field")
 	}
 
-	var result ResultStatus
-	resultBytes, err := json.Marshal(jsonrpcResp.Result)
-	if err != nil {
-		return false, fmt.Errorf("marshal result: %w", err)
-	}
-	if err := json.Unmarshal(resultBytes, &result); err != nil {
-		return false, fmt.Errorf("parse status result: %w", err)
+	// Get catching_up from sync_info
+	catchingUp := gjson.GetBytes(response, "result.sync_info.catching_up")
+	if !catchingUp.Exists() {
+		return false, fmt.Errorf("sync_info.catching_up not found in response")
 	}
 
-	return result.SyncInfo.CatchingUp, nil
+	return catchingUp.Bool(), nil
 }
 
 // IsArchival determines if the endpoint supports archival queries.
@@ -154,15 +145,15 @@ func (e *CosmosDataExtractor) IsArchival(request []byte, response []byte) (bool,
 		return false, fmt.Errorf("empty response")
 	}
 
-	// Try to parse as JSON
-	var parsed map[string]interface{}
-	if err := json.Unmarshal(response, &parsed); err != nil {
-		return false, fmt.Errorf("parse response: %w", err)
+	// Validate JSON
+	if !gjson.ValidBytes(response) {
+		return false, fmt.Errorf("invalid JSON response")
 	}
 
 	// Check for error field (common in REST responses)
-	if errMsg, ok := parsed["error"].(string); ok {
-		errMsgLower := strings.ToLower(errMsg)
+	errorField := gjson.GetBytes(response, "error")
+	if errorField.Exists() && errorField.Type == gjson.String {
+		errMsg := strings.ToLower(errorField.String())
 		pruningIndicators := []string{
 			"pruned",
 			"not available",
@@ -171,17 +162,16 @@ func (e *CosmosDataExtractor) IsArchival(request []byte, response []byte) (bool,
 			"could not retrieve",
 		}
 		for _, indicator := range pruningIndicators {
-			if strings.Contains(errMsgLower, indicator) {
+			if strings.Contains(errMsg, indicator) {
 				return false, nil // Not archival
 			}
 		}
-		return false, fmt.Errorf("query returned error: %s", errMsg)
+		return false, fmt.Errorf("query returned error: %s", errorField.String())
 	}
 
-	// Try JSON-RPC error format
-	var jsonrpcResp jsonrpc.Response
-	if err := json.Unmarshal(response, &jsonrpcResp); err == nil && jsonrpcResp.Error != nil {
-		errMsgLower := strings.ToLower(jsonrpcResp.Error.Message)
+	// Try JSON-RPC error format (error is an object)
+	if errorField.Exists() && errorField.IsObject() {
+		errMsg := strings.ToLower(gjson.GetBytes(response, "error.message").String())
 		pruningIndicators := []string{
 			"pruned",
 			"not available",
@@ -189,12 +179,12 @@ func (e *CosmosDataExtractor) IsArchival(request []byte, response []byte) (bool,
 			"block not found",
 		}
 		for _, indicator := range pruningIndicators {
-			if strings.Contains(errMsgLower, indicator) {
+			if strings.Contains(errMsg, indicator) {
 				return false, nil // Not archival
 			}
 		}
-		return false, fmt.Errorf("query returned error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
+		code := gjson.GetBytes(response, "error.code").Int()
+		return false, fmt.Errorf("query returned error: code=%d, message=%s", code, errMsg)
 	}
 
 	// No error in response - assume archival
@@ -213,33 +203,27 @@ func (e *CosmosDataExtractor) IsValidResponse(request []byte, response []byte) (
 		return false, nil
 	}
 
-	// Try to parse as generic JSON first
-	var parsed map[string]interface{}
-	if err := json.Unmarshal(response, &parsed); err != nil {
+	// Validate JSON
+	if !gjson.ValidBytes(response) {
 		return false, nil // Invalid JSON
 	}
 
-	// Check for explicit error field (REST)
-	if _, hasError := parsed["error"]; hasError {
+	// Check for explicit error field (REST - string error)
+	errorField := gjson.GetBytes(response, "error")
+	if errorField.Exists() && errorField.Type != gjson.Null {
 		return false, nil
 	}
 
 	// Check for JSON-RPC format
-	var jsonrpcResp jsonrpc.Response
-	if err := json.Unmarshal(response, &jsonrpcResp); err == nil {
-		// Valid JSON-RPC response
-		if jsonrpcResp.Version == jsonrpc.Version2 {
-			// Has error - not valid for QoS
-			if jsonrpcResp.Error != nil {
-				return false, nil
-			}
-			// Has result - valid
-			if jsonrpcResp.Result != nil {
-				return true, nil
-			}
-			// Neither result nor error - invalid JSON-RPC
-			return false, nil
+	version := gjson.GetBytes(response, "jsonrpc")
+	if version.Exists() && version.String() == string(jsonrpc.Version2) {
+		// Has result - valid
+		resultField := gjson.GetBytes(response, "result")
+		if resultField.Exists() && resultField.Type != gjson.Null {
+			return true, nil
 		}
+		// Neither result nor error - invalid JSON-RPC
+		return false, nil
 	}
 
 	// Valid JSON but not JSON-RPC - assume REST format is valid
@@ -248,36 +232,23 @@ func (e *CosmosDataExtractor) IsValidResponse(request []byte, response []byte) (
 
 // extractCometBFTBlockHeight extracts block height from CometBFT JSON-RPC status response.
 func (e *CosmosDataExtractor) extractCometBFTBlockHeight(response []byte) (int64, error) {
-	var jsonrpcResp jsonrpc.Response
-	if err := json.Unmarshal(response, &jsonrpcResp); err != nil {
-		return 0, fmt.Errorf("parse JSON-RPC response: %w", err)
+	// Check for JSON-RPC error
+	errorResult := gjson.GetBytes(response, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		code := gjson.GetBytes(response, "error.code").Int()
+		msg := gjson.GetBytes(response, "error.message").String()
+		return 0, fmt.Errorf("JSON-RPC error: code=%d, message=%s", code, msg)
 	}
 
-	if jsonrpcResp.Error != nil {
-		return 0, fmt.Errorf("JSON-RPC error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
-	}
-
-	if jsonrpcResp.Result == nil {
-		return 0, fmt.Errorf("missing result field")
-	}
-
-	var result ResultStatus
-	resultBytes, err := json.Marshal(jsonrpcResp.Result)
-	if err != nil {
-		return 0, fmt.Errorf("marshal result: %w", err)
-	}
-	if err := json.Unmarshal(resultBytes, &result); err != nil {
-		return 0, fmt.Errorf("parse status result: %w", err)
-	}
-
-	if result.SyncInfo.LatestBlockHeight == "" {
+	// Get block height from sync_info
+	heightStr := gjson.GetBytes(response, "result.sync_info.latest_block_height")
+	if !heightStr.Exists() || heightStr.String() == "" {
 		return 0, fmt.Errorf("no block height in result")
 	}
 
-	height, err := strconv.ParseInt(result.SyncInfo.LatestBlockHeight, 10, 64)
+	height, err := strconv.ParseInt(heightStr.String(), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("parse block height %q: %w", result.SyncInfo.LatestBlockHeight, err)
+		return 0, fmt.Errorf("parse block height %q: %w", heightStr.String(), err)
 	}
 
 	return height, nil
@@ -285,18 +256,15 @@ func (e *CosmosDataExtractor) extractCometBFTBlockHeight(response []byte) (int64
 
 // extractCosmosRESTBlockHeight extracts block height from Cosmos SDK REST status response.
 func (e *CosmosDataExtractor) extractCosmosRESTBlockHeight(response []byte) (int64, error) {
-	var result cosmosStatusResponse
-	if err := json.Unmarshal(response, &result); err != nil {
-		return 0, fmt.Errorf("parse REST response: %w", err)
-	}
-
-	if result.Height == "" {
+	// Try direct height field
+	heightStr := gjson.GetBytes(response, "height")
+	if !heightStr.Exists() || heightStr.String() == "" {
 		return 0, fmt.Errorf("no height in response")
 	}
 
-	height, err := strconv.ParseInt(result.Height, 10, 64)
+	height, err := strconv.ParseInt(heightStr.String(), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("parse height %q: %w", result.Height, err)
+		return 0, fmt.Errorf("parse height %q: %w", heightStr.String(), err)
 	}
 
 	return height, nil

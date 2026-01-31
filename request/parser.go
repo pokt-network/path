@@ -111,3 +111,13 @@ func (p *Parser) GetHTTPErrorResponse(ctx context.Context, err error) pathhttp.H
 	}
 	return &parserErrorResponse{err: err.Error(), code: http.StatusNotFound}
 }
+
+// GetQoSServiceForServiceID returns the QoS service for a given service ID.
+// Returns nil if no QoS service is registered for the service ID.
+// Implements the gateway.QoSServiceRegistry interface.
+func (p *Parser) GetQoSServiceForServiceID(serviceID protocol.ServiceID) gateway.QoSService {
+	if qosService, ok := p.QoSServices[serviceID]; ok {
+		return qosService
+	}
+	return nil
+}

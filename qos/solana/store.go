@@ -65,9 +65,20 @@ func (es *EndpointStore) SelectMultiple(
 	allAvailableEndpoints protocol.EndpointAddrList,
 	numEndpoints uint,
 ) (protocol.EndpointAddrList, error) {
+	return es.SelectMultipleWithArchival(allAvailableEndpoints, numEndpoints, false)
+}
+
+// SelectMultipleWithArchival returns multiple endpoint addresses with optional archival filtering.
+// Solana does not have an archival concept, so the requiresArchival parameter is ignored
+// and this method delegates to the standard endpoint selection logic.
+func (es *EndpointStore) SelectMultipleWithArchival(
+	allAvailableEndpoints protocol.EndpointAddrList,
+	numEndpoints uint,
+	_ bool,
+) (protocol.EndpointAddrList, error) {
 	logger := es.logger.With(
 		"qos", "Solana",
-		"method", "SelectMultiple",
+		"method", "SelectMultipleWithArchival",
 		"num_endpoints_available", len(allAvailableEndpoints),
 		"num_endpoints", numEndpoints,
 	)

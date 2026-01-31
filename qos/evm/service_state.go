@@ -2,7 +2,6 @@ package evm
 
 import (
 	"errors"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/jsonrpc"
+	"github.com/pokt-network/path/reputation"
 )
 
 var (
@@ -32,9 +32,6 @@ var (
 type serviceState struct {
 	logger polylog.Logger
 
-	// serviceStateLock is a read-write mutex used to synchronize access to this struct
-	serviceStateLock sync.RWMutex
-
 	// serviceQoSConfig maintains the QoS configs for this service
 	serviceQoSConfig EVMServiceQoSConfig
 
@@ -43,16 +40,26 @@ type serviceState struct {
 
 	// perceivedBlockNumber is the perceived current block number
 	// based on endpoints' responses to `eth_blockNumber` requests.
-	// It is calculated as the maximum of block height reported by
-	// any of the endpoints for the service.
 	// Uses atomic.Uint64 for lock-free reads to avoid contention on hot path.
+	// Updated by blockConsensus calculations.
 	//
 	// See the following link for more details:
 	// https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_blocknumber
 	perceivedBlockNumber atomic.Uint64
 
-	// archivalState contains the current state of the EVM archival check for the service.
-	archivalState archivalState
+	// blockConsensus calculates perceived block using median-anchored consensus.
+	// This protects against malicious endpoints reporting extreme block heights.
+	// The consensus result is stored in perceivedBlockNumber for fast reads.
+	blockConsensus *BlockHeightConsensus
+
+	// archivalHeuristic provides archival request detection for routing decisions.
+	// Cached instance to avoid allocations on the hot path.
+	archivalHeuristic *ArchivalHeuristic
+
+	// reputationSvc provides shared archival status across replicas via Redis.
+	// When set, archival checks use this in addition to the local endpointStore.
+	// This ensures archival status set by health check leader is visible to all replicas.
+	reputationSvc reputation.ReputationService
 }
 
 /* -------------------- QoS Endpoint Check Generator -------------------- */
@@ -70,6 +77,10 @@ func (ss *serviceState) CheckWebsocketConnection() bool {
 
 // GetRequiredQualityChecks returns the list of quality checks required for an endpoint.
 // It is called in the `gateway/hydrator.go` file on each run of the hydrator.
+//
+// Note: Archival capability is determined by external health checks, not by synthetic
+// QoS requests. The health check system marks endpoints as archival-capable via
+// UpdateFromExtractedData when health checks pass.
 func (ss *serviceState) GetRequiredQualityChecks(endpointAddr protocol.EndpointAddr) []gateway.RequestQoSContext {
 	ss.endpointStore.endpointsMu.RLock()
 	defer ss.endpointStore.endpointsMu.RUnlock()
@@ -84,15 +95,6 @@ func (ss *serviceState) GetRequiredQualityChecks(endpointAddr protocol.EndpointA
 	// Chain ID check runs infrequently as an endpoint's EVM chain ID is very unlikely to change regularly.
 	if ss.shouldChainIDCheckRun(endpoint.checkChainID) {
 		checks = append(checks, ss.getEndpointCheck(endpoint.checkChainID.getRequestID(), endpoint.checkChainID.getServicePayload()))
-	}
-
-	// Archival check runs infrequently as the result of a request for an archival block is not expected to change regularly.
-	// Additionally, this check will only run if the service is configured to perform archival checks.
-	if ss.archivalState.shouldArchivalCheckRun(endpoint.checkArchival) {
-		checks = append(
-			checks,
-			ss.getEndpointCheck(endpoint.checkArchival.getRequestID(), endpoint.checkArchival.getServicePayload(&ss.archivalState)),
-		)
 	}
 
 	return checks
@@ -137,10 +139,7 @@ func (ss *serviceState) ApplyObservations(observations *qosobservations.Observat
 		return errNilApplyEVMObservations
 	}
 
-	updatedEndpoints := ss.endpointStore.updateEndpointsFromObservations(
-		evmObservations,
-		ss.archivalState.blockNumberHex,
-	)
+	updatedEndpoints := ss.endpointStore.updateEndpointsFromObservations(evmObservations)
 
 	return ss.updateFromEndpoints(updatedEndpoints)
 }
@@ -149,9 +148,6 @@ func (ss *serviceState) ApplyObservations(observations *qosobservations.Observat
 // - Only endpoints with received observations are considered.
 // - Estimations are derived from these updated endpoints.
 func (ss *serviceState) updateFromEndpoints(updatedEndpoints map[protocol.EndpointAddr]endpoint) error {
-	// Track the maximum block number seen across all endpoints
-	var maxBlockNumber uint64
-
 	for endpointAddr, endpoint := range updatedEndpoints {
 		currentPerceived := ss.perceivedBlockNumber.Load()
 		logger := ss.logger.With(
@@ -172,35 +168,24 @@ func (ss *serviceState) updateFromEndpoints(updatedEndpoints map[protocol.Endpoi
 			continue
 		}
 
-		if blockNumber > maxBlockNumber {
-			maxBlockNumber = blockNumber
-		}
-	}
+		// Update perceived block using consensus mechanism
+		// This protects against malicious endpoints reporting extreme block heights
+		if blockNumber > 0 && ss.blockConsensus != nil {
+			oldBlock := ss.perceivedBlockNumber.Load()
+			newPerceived := ss.blockConsensus.AddObservation(endpointAddr, blockNumber)
 
-	// Atomically update perceived block number to maximum using compare-and-swap loop
-	if maxBlockNumber > 0 {
-		for {
-			current := ss.perceivedBlockNumber.Load()
-			if maxBlockNumber <= current {
-				break // Current value is already >= our max
-			}
-			if ss.perceivedBlockNumber.CompareAndSwap(current, maxBlockNumber) {
+			// Update the atomic for fast reads
+			ss.perceivedBlockNumber.Store(newPerceived)
+
+			if newPerceived != oldBlock {
 				ss.logger.Debug().
-					Uint64("old_block", current).
-					Uint64("new_block", maxBlockNumber).
-					Msg("Updated perceived block number")
-				break
+					Str("endpoint", string(endpointAddr)).
+					Uint64("reported_block", blockNumber).
+					Uint64("old_perceived", oldBlock).
+					Uint64("new_perceived", newPerceived).
+					Msg("Updated perceived block number via consensus")
 			}
-			// CAS failed, another goroutine updated it - retry
 		}
-	}
-
-	// If archival checks are enabled for the service, update the archival state.
-	// This still needs the lock for archival state coordination.
-	if ss.archivalState.isEnabled() {
-		ss.serviceStateLock.Lock()
-		ss.archivalState.updateArchivalState(ss.perceivedBlockNumber.Load(), updatedEndpoints)
-		ss.serviceStateLock.Unlock()
 	}
 
 	return nil
@@ -215,8 +200,9 @@ func (ss *serviceState) getDisqualifiedEndpointsResponse(serviceID protocol.Serv
 	}
 
 	// Populate the data response object using the endpoints in the endpoint store.
+	// Use requiresArchival=true to check full validation including archival (most conservative)
 	for endpointAddr, endpoint := range ss.endpointStore.endpoints {
-		if err := ss.basicEndpointValidation(endpoint); err != nil {
+		if err := ss.basicEndpointValidation(endpointAddr, endpoint, true); err != nil {
 			qosLevelDataResponse.DisqualifiedEndpoints[endpointAddr] = devtools.QoSDisqualifiedEndpoint{
 				EndpointAddr: endpointAddr,
 				Reason:       err.Error(),
@@ -239,9 +225,8 @@ func (ss *serviceState) getDisqualifiedEndpointsResponse(serviceID protocol.Serv
 				errors.Is(err, errInvalidChainIDObs):
 				qosLevelDataResponse.ChainIDCheckErrorsCount++
 
-			// Endpoint is disqualified due to a missing or invalid archival balance.
-			case errors.Is(err, errNoArchivalBalanceObs),
-				errors.Is(err, errInvalidArchivalBalanceObs):
+			// Endpoint is disqualified due to not being archival-capable.
+			case errors.Is(err, errEndpointNotArchival):
 				qosLevelDataResponse.ArchivalCheckErrorsCount++
 
 			default:

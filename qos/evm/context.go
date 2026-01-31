@@ -3,8 +3,10 @@ package evm
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	"github.com/tidwall/gjson"
 
 	"github.com/pokt-network/path/gateway"
 	pathhttp "github.com/pokt-network/path/network/http"
@@ -29,13 +31,13 @@ var _ protocol.EndpointSelector = &requestContext{}
 //   - qos/evm: response → EVMQoSResponse
 //   - observation/evm: observation -> EVMObservation
 //
-// TODO_TECHDEBT: Need to add a Validate() method here to allow the caller (e.g. gateway)
-// determine whether the endpoint's response was valid, and whether a retry makes sense.
-//
 // response defines the functionality required from a parsed endpoint response, which all response types must implement.
 // It provides methods to:
 //  1. Generate observations for endpoint quality tracking
 //  2. Format HTTP responses to send back to clients
+//
+// NOTE: This interface is used by synthetic checks (hydrator) where detailed parsing is needed.
+// For organic requests on the hot path, raw bytes are stored without parsing.
 type response interface {
 	// GetObservation returns an observation of the endpoint's response
 	// for quality metrics tracking, including HTTP status code.
@@ -45,18 +47,9 @@ type response interface {
 	GetHTTPResponse() jsonrpc.HTTPResponse
 }
 
-var _ response = &endpointResponse{}
-
-type endpointResponse struct {
-	protocol.EndpointAddr
-	response
-	unmarshalErr error
-	// httpStatusCode is the original HTTP status code from the backend endpoint.
-	httpStatusCode int
-}
-
-// rawEndpointResponse stores raw bytes for passthrough mode.
-// Used when parsing is skipped for low-latency client responses.
+// rawEndpointResponse stores raw bytes from endpoint responses.
+// This is used on the hot path to avoid parsing overhead.
+// Heavy parsing for observations is done asynchronously via the ObservationQueue.
 type rawEndpointResponse struct {
 	EndpointAddr   protocol.EndpointAddr
 	ResponseBytes  []byte
@@ -64,6 +57,8 @@ type rawEndpointResponse struct {
 }
 
 // requestContext implements the functionality for EVM-based blockchain services.
+// It uses raw byte passthrough on the hot path to minimize latency.
+// Heavy parsing for observations is done asynchronously via the ObservationQueue.
 type requestContext struct {
 	logger polylog.Logger
 
@@ -95,28 +90,17 @@ type requestContext struct {
 	// In the case of a batch request of length 1, the response must be returned as an array.
 	isBatch bool
 
-	// endpointResponses is the set of responses received from one or
-	// more endpoints as part of handling this service request.
-	// Supports both single and batch JSON-RPC requests.
-	endpointResponses []endpointResponse
+	// rawResponses stores raw endpoint responses.
+	// Raw bytes are stored without parsing for low-latency client response.
+	// Heavy parsing (for observations) is done asynchronously via ObservationQueue.
+	rawResponses []rawEndpointResponse
 
 	// endpointSelectionMetadata contains metadata about the endpoint selection process
 	endpointSelectionMetadata EndpointSelectionMetadata
 
-	// --- Passthrough mode fields ---
-	// When passthroughMode is true:
-	//   - UpdateWithResponse stores raw bytes without parsing
-	//   - GetHTTPResponse returns raw bytes as-is
-	//   - Heavy parsing is done asynchronously via sampling (see ObservationQueue)
-	// This reduces latency on the hot path for client responses.
-
-	// passthroughMode enables raw byte passthrough for client responses.
-	// When true, responses are not parsed - they're returned as-is to reduce latency.
-	passthroughMode bool
-
-	// rawResponses stores raw endpoint responses in passthrough mode.
-	// Used by GetHTTPResponse to return raw bytes without parsing.
-	rawResponses []rawEndpointResponse
+	// archivalResult stores the result of archival heuristic detection.
+	// Used to conditionally filter endpoints based on whether the request needs archival data.
+	archivalResult ArchivalHeuristicResult
 
 	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
 	// Used to provide more specific error messages to clients (e.g., "no valid endpoints available").
@@ -139,47 +123,24 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 
 // UpdateWithResponse is NOT safe for concurrent use
 //
-// In passthrough mode (rc.passthroughMode == true):
-//   - Raw bytes are stored without parsing for fast client response
-//   - Heavy parsing is done asynchronously via ObservationQueue sampling
-//
-// In legacy mode (rc.passthroughMode == false):
-//   - Full JSON parsing is done synchronously (existing behavior)
+// Raw bytes are stored without parsing for low-latency client response.
+// Heavy parsing (for observations) is done asynchronously via ObservationQueue.
 //
 // The requestID parameter is the JSON-RPC request ID that this response corresponds to.
 // For batch requests, this ensures error responses use the correct ID.
 // For single requests or when empty, the ID is extracted from the response bytes.
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int, requestID string) {
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int, _ string) {
 	rc.logger = rc.logger.With(
 		"endpoint_addr", endpointAddr,
 		"endpoint_response_len", len(responseBz),
 	)
 
-	// PASSTHROUGH MODE: Store raw bytes without parsing for low-latency client response.
-	// Heavy parsing (if needed) is done async via ObservationQueue sampling.
-	if rc.passthroughMode {
-		rc.rawResponses = append(rc.rawResponses, rawEndpointResponse{
-			EndpointAddr:   endpointAddr,
-			ResponseBytes:  responseBz,
-			HTTPStatusCode: httpStatusCode,
-		})
-		return
-	}
-
-	// LEGACY MODE: Full synchronous parsing (existing behavior)
-	// TODO_IMPROVE: check whether the request was valid, and return an error if it was not.
-	// This would be an extra safety measure, as the caller should have checked the returned value
-	// indicating the validity of the request when calling on QoS instance's ParseHTTPRequest
-
-	response, err := unmarshalResponse(
-		rc.logger, rc.servicePayloads, responseBz, endpointAddr, requestID,
-	)
-
-	rc.endpointResponses = append(rc.endpointResponses, endpointResponse{
+	// Store raw bytes without parsing for low-latency client response.
+	// Heavy parsing (for observations) is done async via ObservationQueue.
+	rc.rawResponses = append(rc.rawResponses, rawEndpointResponse{
 		EndpointAddr:   endpointAddr,
-		response:       response,
-		unmarshalErr:   err,
-		httpStatusCode: httpStatusCode,
+		ResponseBytes:  responseBz,
+		HTTPStatusCode: httpStatusCode,
 	})
 }
 
@@ -197,53 +158,13 @@ func (rc *requestContext) SetProtocolError(err error) {
 // GetHTTPResponse builds the HTTP response that should be returned for
 // an EVM blockchain service request.
 //
-// In passthrough mode: Returns raw bytes as-is (no parsing/re-encoding).
-// In legacy mode: Returns parsed and potentially re-formatted JSON-RPC response.
+// Returns raw bytes as-is (no parsing/re-encoding) for low-latency client response.
+// Heavy parsing for observations is done asynchronously via ObservationQueue.
 //
 // Implements the gateway.RequestQoSContext interface.
 func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
-	// PASSTHROUGH MODE: Return raw bytes as-is (like NoOp)
-	if rc.passthroughMode {
-		return rc.getPassthroughHTTPResponse()
-	}
-
-	// LEGACY MODE: Return parsed response (existing behavior)
-	return rc.getLegacyHTTPResponse()
-}
-
-// getPassthroughHTTPResponse returns raw bytes as-is without parsing.
-// Used in passthrough mode for low-latency client responses.
-func (rc requestContext) getPassthroughHTTPResponse() pathhttp.HTTPResponse {
-	// No raw responses received - return error response with protocol error context if available
+	// No responses received - return error response with protocol error context if available
 	if len(rc.rawResponses) == 0 {
-		rc.logger.Warn().Msg("No responses received from any endpoints in passthrough mode. Returning generic non-response.")
-		responseNoneObj := responseNone{
-			logger:          rc.logger,
-			servicePayloads: rc.servicePayloads,
-			protocolError:   rc.protocolError,
-		}
-		return responseNoneObj.GetHTTPResponse()
-	}
-
-	// Return the most recent raw response as-is
-	latestResponse := rc.rawResponses[len(rc.rawResponses)-1]
-
-	// Use original HTTP status from backend if available, otherwise default to 200 OK
-	statusCode := http.StatusOK
-	if latestResponse.HTTPStatusCode != 0 {
-		statusCode = latestResponse.HTTPStatusCode
-	}
-
-	return &passthroughHTTPResponse{
-		httpStatusCode: statusCode,
-		payload:        latestResponse.ResponseBytes,
-	}
-}
-
-// getLegacyHTTPResponse returns parsed JSON-RPC response (existing behavior).
-func (rc requestContext) getLegacyHTTPResponse() pathhttp.HTTPResponse {
-	// Use a noResponses struct if no responses were reported by the protocol from any endpoints.
-	if len(rc.endpointResponses) == 0 {
 		rc.logger.Warn().Msg("No responses received from any endpoints. Returning generic non-response.")
 		responseNoneObj := responseNone{
 			logger:          rc.logger,
@@ -253,70 +174,88 @@ func (rc requestContext) getLegacyHTTPResponse() pathhttp.HTTPResponse {
 		return responseNoneObj.GetHTTPResponse()
 	}
 
-	numJSONRPCRequests := len(rc.servicePayloads)
-	numEndpointResponses := len(rc.endpointResponses)
-
 	// Handle batch requests according to JSON-RPC 2.0 specification
 	// https://www.jsonrpc.org/specification#batch
 	if rc.isBatch {
-		if numJSONRPCRequests != numEndpointResponses {
-			rc.logger.Warn().Msgf("TODO_INVESTIGATE: The number of JSON-RPC requests (%d) does not match the number of endpoint responses (%d). This should not happen.", numJSONRPCRequests, numEndpointResponses)
-		}
-
 		return rc.getBatchHTTPResponse()
 	}
 
-	// Guard against empty endpoint responses to prevent index out of bounds panic
-	if numEndpointResponses == 0 {
-		rc.logger.Error().Msg("SHOULD NEVER HAPPEN: No endpoint responses available for single JSON-RPC request")
-		return getGenericResponseNoEndpointResponse(rc.logger).GetHTTPResponse()
+	// Return the most recent raw response as-is for single requests
+	latestResponse := rc.rawResponses[len(rc.rawResponses)-1]
+
+	// Check for empty response bytes - endpoint returned no data
+	if len(latestResponse.ResponseBytes) == 0 {
+		rc.logger.Warn().
+			Str("endpoint_addr", string(latestResponse.EndpointAddr)).
+			Msg("Endpoint returned empty response bytes. Returning error response.")
+		responseNoneObj := responseNone{
+			logger:          rc.logger,
+			servicePayloads: rc.servicePayloads,
+			protocolError:   rc.protocolError,
+		}
+		return responseNoneObj.GetHTTPResponse()
 	}
 
-	if numEndpointResponses != 1 {
-		rc.logger.Warn().Msgf("TODO_INVESTIGATE: Expected exactly one endpoint response for single JSON-RPC request, but received %d. Only using the first response for now.", numEndpointResponses)
+	// Strip trailing newline if present (suppliers may use json.Encoder which adds \n)
+	payload := latestResponse.ResponseBytes
+	if payload[len(payload)-1] == '\n' {
+		payload = payload[:len(payload)-1]
 	}
 
-	// Non-batch requests.
-	// Return the only endpoint response reported to the context for single requests.
-	resp := rc.endpointResponses[0].GetHTTPResponse()
-	// Use the original HTTP status code from the backend if available
-	if rc.endpointResponses[0].httpStatusCode != 0 {
-		resp.HTTPStatusCode = rc.endpointResponses[0].httpStatusCode
+	return &rawHTTPResponse{
+		httpStatusCode: latestResponse.HTTPStatusCode,
+		payload:        payload,
+		headers:        rc.buildResponseHeaders(),
 	}
-	return resp
 }
 
-// passthroughHTTPResponse implements pathhttp.HTTPResponse for raw byte passthrough.
-type passthroughHTTPResponse struct {
+// rawHTTPResponse implements pathhttp.HTTPResponse for raw byte passthrough.
+type rawHTTPResponse struct {
 	httpStatusCode int
 	payload        []byte
+	headers        map[string]string
 }
 
-func (r *passthroughHTTPResponse) GetPayload() []byte {
+func (r *rawHTTPResponse) GetPayload() []byte {
 	return r.payload
 }
 
-func (r *passthroughHTTPResponse) GetHTTPStatusCode() int {
+func (r *rawHTTPResponse) GetHTTPStatusCode() int {
+	if r.httpStatusCode == 0 {
+		return http.StatusOK
+	}
 	return r.httpStatusCode
 }
 
-func (r *passthroughHTTPResponse) GetHTTPHeaders() map[string]string {
-	return map[string]string{
+func (r *rawHTTPResponse) GetHTTPHeaders() map[string]string {
+	return r.headers
+}
+
+// buildResponseHeaders builds the HTTP response headers including archival detection result.
+func (rc requestContext) buildResponseHeaders() map[string]string {
+	headers := map[string]string{
 		"Content-Type": "application/json",
 	}
+	// Add archival detection header for visibility
+	headers["X-Archival-Request"] = strconv.FormatBool(rc.archivalResult.RequiresArchival)
+	return headers
 }
 
 // getBatchHTTPResponse handles batch requests by combining individual JSON-RPC responses
 // into an array according to the JSON-RPC 2.0 specification.
 // https://www.jsonrpc.org/specification#batch
 func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
-	// Collect individual response payloads
+	// Collect individual response payloads from raw responses
 	var individualResponses []json.RawMessage
-	for _, endpointResp := range rc.endpointResponses {
-		// Extract the JSON payload from each response
-		payload := endpointResp.GetHTTPResponse().GetPayload()
-		if len(payload) > 0 {
-			individualResponses = append(individualResponses, json.RawMessage(payload))
+	for _, rawResp := range rc.rawResponses {
+		// Use raw bytes directly - no parsing needed
+		if len(rawResp.ResponseBytes) > 0 {
+			// Strip trailing newline if present (suppliers may use json.Encoder which adds \n)
+			respBytes := rawResp.ResponseBytes
+			if respBytes[len(respBytes)-1] == '\n' {
+				respBytes = respBytes[:len(respBytes)-1]
+			}
+			individualResponses = append(individualResponses, json.RawMessage(respBytes))
 		}
 	}
 
@@ -331,6 +270,7 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 	}
 
 	// Validate and construct batch response using jsonrpc package
+	// This does minimal parsing for ID validation only
 	batchResponse, err := jsonrpc.ValidateAndBuildBatchResponse(
 		rc.logger,
 		individualResponses,
@@ -344,8 +284,8 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 
 	// Use original HTTP status from backend if available, otherwise default to 200 OK
 	httpStatusCode := http.StatusOK
-	if len(rc.endpointResponses) > 0 && rc.endpointResponses[0].httpStatusCode != 0 {
-		httpStatusCode = rc.endpointResponses[0].httpStatusCode
+	if len(rc.rawResponses) > 0 && rc.rawResponses[0].HTTPStatusCode != 0 {
+		httpStatusCode = rc.rawResponses[0].HTTPStatusCode
 	}
 	return jsonrpc.HTTPResponse{
 		ResponsePayload: batchResponse,
@@ -354,6 +294,7 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 }
 
 // GetObservations returns all endpoint observations from the request context.
+// Uses gjson to parse raw bytes for observation creation (async path).
 // Implements gateway.RequestQoSContext interface.
 func (rc requestContext) GetObservations() qosobservations.Observations {
 	// Create observations for each JSON-RPC request in the batch (or single request)
@@ -364,25 +305,23 @@ func (rc requestContext) GetObservations() qosobservations.Observations {
 
 	var requestError *qosobservations.RequestError
 	// Set request error as protocol-level error if no endpoint responses were received.
-	if len(rc.endpointResponses) == 0 {
+	if len(rc.rawResponses) == 0 {
 		requestError = qos.GetRequestErrorForProtocolError()
 	}
 
-	// Check for any successfully parsedresponses.
-	var foundParsedJSONRPCResponse bool
-	for _, endpointResponse := range rc.endpointResponses {
-		// Endpoint payload was successfully parsed as JSONRPC response.
-		// Mark the request as having no errors.
-		if endpointResponse.unmarshalErr == nil {
-			foundParsedJSONRPCResponse = true
+	// Check for any valid JSON-RPC responses using gjson (light parsing).
+	var foundValidJSONRPCResponse bool
+	for _, rawResp := range rc.rawResponses {
+		// Use gjson to quickly check if response has valid structure
+		if rc.isValidJSONRPCResponse(rawResp.ResponseBytes) {
+			foundValidJSONRPCResponse = true
 			break
 		}
 	}
 
 	// No valid JSONRPC responses received from any endpoints.
 	// Set request error as backend service malformed payload error.
-	// i.e. the payload from the the endpoint/backend service failed to parse as a valid JSONRPC response.
-	if !foundParsedJSONRPCResponse {
+	if !foundValidJSONRPCResponse && len(rc.rawResponses) > 0 {
 		requestError = qos.GetRequestErrorForJSONRPCBackendServiceUnmarshalError()
 	}
 
@@ -404,13 +343,31 @@ func (rc requestContext) GetObservations() qosobservations.Observations {
 	}
 }
 
+// isValidJSONRPCResponse checks if bytes represent a valid JSON-RPC response using gjson.
+// Returns true if the response has either a result or error field.
+func (rc requestContext) isValidJSONRPCResponse(responseBz []byte) bool {
+	if len(responseBz) == 0 {
+		return false
+	}
+	// Check for jsonrpc version field
+	version := gjson.GetBytes(responseBz, "jsonrpc")
+	if !version.Exists() || version.String() != "2.0" {
+		return false
+	}
+	// Valid JSON-RPC response must have either result or error
+	hasResult := gjson.GetBytes(responseBz, "result").Exists()
+	hasError := gjson.GetBytes(responseBz, "error").Exists()
+	return hasResult || hasError
+}
+
 // createRequestObservations creates observations for all JSON-RPC requests in the batch.
 // For batch requests, jsonrpcReqs contains multiple requests keyed by their ID strings.
 // For single requests, jsonrpcReqs contains one request.
 // Each observation correlates a JSON-RPC request with its corresponding endpoint response(s).
+// Uses gjson to parse raw bytes for observation creation (async path).
 func (rc requestContext) createRequestObservations() []*qosobservations.EVMRequestObservation {
 	// Handle the special case where no endpoint responses were received
-	if len(rc.endpointResponses) == 0 {
+	if len(rc.rawResponses) == 0 {
 		return rc.createNoResponseObservations()
 	}
 
@@ -438,8 +395,7 @@ func (rc requestContext) createNoResponseObservations() []*qosobservations.EVMRe
 }
 
 // createResponseObservations creates observations by correlating endpoint responses with their
-// corresponding JSON-RPC requests from the batch. Each endpoint response contains a JSON-RPC ID
-// that is used to look up the original request in the jsonrpcReqs map.
+// corresponding JSON-RPC requests from the batch. Uses gjson for efficient parsing.
 //
 // For batch requests: multiple responses are correlated with multiple requests
 // For single requests: one response is correlated with one request
@@ -449,28 +405,24 @@ func (rc requestContext) createNoResponseObservations() []*qosobservations.EVMRe
 func (rc requestContext) createResponseObservations() []*qosobservations.EVMRequestObservation {
 	var observations []*qosobservations.EVMRequestObservation
 
-	for _, endpointResp := range rc.endpointResponses {
-		var jsonrpcResponse jsonrpc.Response
-		err := json.Unmarshal(endpointResp.GetHTTPResponse().GetPayload(), &jsonrpcResponse)
-		if err != nil {
-			rc.logger.Error().Err(err).Msg("SHOULD RARELY HAPPEN: requestContext.createResponseObservations() should never fail to unmarshal the JSONRPC response.")
-			continue
-		}
+	for _, rawResp := range rc.rawResponses {
+		// Use gjson to extract only the fields needed for observation
+		idResult := gjson.GetBytes(rawResp.ResponseBytes, "id")
 
-		// Skip responses with null IDs - per JSON-RPC 2.0 spec, these indicate error responses
-		// where the server couldn't parse the request ID. We can't correlate these with specific
-		// requests, so we skip observation creation for them.
-		if jsonrpcResponse.ID.IsEmpty() {
+		// Skip responses with null/missing IDs - per JSON-RPC 2.0 spec, these indicate error responses
+		// where the server couldn't parse the request ID.
+		if !idResult.Exists() || idResult.Type == gjson.Null {
 			rc.logger.Debug().Msg("Skipping observation creation for response with null ID (JSON-RPC error response)")
 			continue
 		}
 
+		// Build the JSON-RPC ID from gjson result
+		responseID := rc.gjsonResultToJSONRPCID(idResult)
+
 		// Look up the original JSON-RPC request using the response ID
-		// This correlation is critical for batch requests where multiple requests/responses
-		// need to be properly matched
-		servicePayload, ok := rc.findServicePayload(jsonrpcResponse.ID)
+		servicePayload, ok := rc.findServicePayload(responseID)
 		if !ok {
-			rc.logger.Warn().Msgf("Could not find JSONRPC request for response ID: %s (endpoint may have modified the ID)", jsonrpcResponse.ID.String())
+			rc.logger.Warn().Msgf("Could not find JSONRPC request for response ID: %s (endpoint may have modified the ID)", responseID.String())
 			continue
 		}
 
@@ -480,21 +432,91 @@ func (rc requestContext) createResponseObservations() []*qosobservations.EVMRequ
 			continue
 		}
 
-		// Create observations for both the request and its corresponding endpoint response
-		endpointObs := endpointResp.GetObservation()
-
-		// Ensure the endpoint address is always set in the observation
-		endpointObs.EndpointAddr = string(endpointResp.EndpointAddr)
+		// Create endpoint observation from raw bytes using gjson
+		endpointObs := rc.createEndpointObservationFromRawBytes(rawResp)
 
 		observations = append(observations, &qosobservations.EVMRequestObservation{
 			JsonrpcRequest: jsonrpcReq.GetObservation(),
 			EndpointObservations: []*qosobservations.EVMEndpointObservation{
-				&endpointObs,
+				endpointObs,
 			},
 		})
 	}
 
 	return observations
+}
+
+// gjsonResultToJSONRPCID converts a gjson result to a jsonrpc.ID.
+func (rc requestContext) gjsonResultToJSONRPCID(result gjson.Result) jsonrpc.ID {
+	switch result.Type {
+	case gjson.String:
+		return jsonrpc.IDFromString(result.String())
+	case gjson.Number:
+		return jsonrpc.IDFromInt(int(result.Int()))
+	default:
+		return jsonrpc.ID{}
+	}
+}
+
+// createEndpointObservationFromRawBytes creates an endpoint observation from raw response bytes.
+// Uses gjson for efficient parsing of only the fields needed for observations.
+// Returns a pointer to avoid copying the protobuf struct which contains a mutex.
+func (rc requestContext) createEndpointObservationFromRawBytes(rawResp rawEndpointResponse) *qosobservations.EVMEndpointObservation {
+	// Build parsed JSONRPC response observation using gjson
+	parsedResp := rc.parseJSONRPCResponseForObservation(rawResp.ResponseBytes)
+
+	// Create an unrecognized response observation (since we're not doing method-specific parsing on hot path)
+	return &qosobservations.EVMEndpointObservation{
+		EndpointAddr:          string(rawResp.EndpointAddr),
+		ParsedJsonrpcResponse: parsedResp,
+		ResponseObservation: &qosobservations.EVMEndpointObservation_UnrecognizedResponse{
+			UnrecognizedResponse: &qosobservations.EVMUnrecognizedResponse{
+				JsonrpcResponse:         parsedResp,
+				HttpStatusCode:          int32(rawResp.HTTPStatusCode),
+				ResponseValidationError: nil, // No validation error if we could parse it
+			},
+		},
+	}
+}
+
+// parseJSONRPCResponseForObservation parses raw bytes into a JsonRpcResponse observation using gjson.
+func (rc requestContext) parseJSONRPCResponseForObservation(responseBz []byte) *qosobservations.JsonRpcResponse {
+	if len(responseBz) == 0 {
+		return nil
+	}
+
+	resp := &qosobservations.JsonRpcResponse{}
+
+	// Extract ID as string
+	idResult := gjson.GetBytes(responseBz, "id")
+	if idResult.Exists() {
+		resp.Id = idResult.String()
+	}
+
+	// Check for error
+	errorResult := gjson.GetBytes(responseBz, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		errorCode := gjson.GetBytes(responseBz, "error.code")
+		errorMsg := gjson.GetBytes(responseBz, "error.message")
+		resp.Error = &qosobservations.JsonRpcResponseError{
+			Code:    errorCode.Int(),
+			Message: errorMsg.String(),
+		}
+	}
+
+	// Extract result preview (truncated for size)
+	resultResult := gjson.GetBytes(responseBz, "result")
+	if resultResult.Exists() && resultResult.Type != gjson.Null {
+		resultStr := resultResult.String()
+		// Truncate result preview to a reasonable length
+		const maxPreviewLen = 200
+		if len(resultStr) > maxPreviewLen {
+			resultStr = resultStr[:maxPreviewLen] + "..."
+		}
+		resp.ResultPreview = resultStr
+	}
+
+	return resp
 }
 
 // convertValidationResults converts endpoint selection validation results to proto format.
@@ -513,11 +535,12 @@ func (rc *requestContext) GetEndpointSelector() protocol.EndpointSelector {
 // Select returns endpoint address using request context's endpoint store.
 // Implements protocol.EndpointSelector interface.
 // Tracks random selection when all endpoints fail validation.
+// Passes archival requirement to endpoint selection for conditional filtering.
 func (rc *requestContext) Select(allEndpoints protocol.EndpointAddrList) (protocol.EndpointAddr, error) {
 	// TODO_FUTURE(@adshmh): Enhance the endpoint selection meta data to track, e.g.:
 	// * Endpoint Selection Latency
 	// * Number of available endpoints
-	selectionResult, err := rc.serviceState.SelectWithMetadata(allEndpoints)
+	selectionResult, err := rc.serviceState.SelectWithMetadata(allEndpoints, rc.archivalResult.RequiresArchival)
 	if err != nil {
 		return protocol.EndpointAddr(""), err
 	}
@@ -532,6 +555,19 @@ func (rc *requestContext) Select(allEndpoints protocol.EndpointAddrList) (protoc
 // Implements the protocol.EndpointSelector interface.
 func (rc *requestContext) SelectMultiple(allEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
 	return rc.serviceState.SelectMultiple(allEndpoints, numEndpoints)
+}
+
+// SelectMultipleWithArchival returns multiple endpoint addresses with optional archival filtering.
+// When requiresArchival is true, only endpoints that have passed archival capability checks are considered.
+// Implements the protocol.EndpointSelector interface.
+func (rc *requestContext) SelectMultipleWithArchival(allEndpoints protocol.EndpointAddrList, numEndpoints uint, requiresArchival bool) (protocol.EndpointAddrList, error) {
+	return rc.serviceState.SelectMultipleWithArchival(allEndpoints, numEndpoints, requiresArchival)
+}
+
+// RequiresArchival returns true if the current request requires archival data.
+// This is determined by analyzing the request payload for archival data patterns.
+func (rc *requestContext) RequiresArchival() bool {
+	return rc.archivalResult.RequiresArchival
 }
 
 // findServicePayload finds a service payload by ID using value-based comparison.

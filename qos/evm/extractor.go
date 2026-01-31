@@ -9,10 +9,11 @@
 package evm
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/tidwall/gjson"
 
 	"github.com/pokt-network/path/qos/jsonrpc"
 	qostypes "github.com/pokt-network/path/qos/types"
@@ -23,6 +24,7 @@ var _ qostypes.DataExtractor = (*EVMDataExtractor)(nil)
 
 // EVMDataExtractor extracts quality data from EVM JSON-RPC responses.
 // It knows how to parse responses from eth_blockNumber, eth_chainId, eth_syncing, etc.
+// Uses gjson for efficient field extraction without full unmarshalling.
 type EVMDataExtractor struct{}
 
 // NewEVMDataExtractor creates a new EVM data extractor.
@@ -104,34 +106,32 @@ func (e *EVMDataExtractor) IsSyncing(request []byte, response []byte) (bool, err
 		return false, fmt.Errorf("not an eth_syncing request")
 	}
 
-	jsonrpcResp, err := e.parseJSONRPCResponse(response)
-	if err != nil {
-		return false, fmt.Errorf("parse syncing response: %w", err)
+	// Check for error first
+	errorResult := gjson.GetBytes(response, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		code := gjson.GetBytes(response, "error.code").Int()
+		msg := gjson.GetBytes(response, "error.message").String()
+		return false, fmt.Errorf("eth_syncing returned error: code=%d, message=%s", code, msg)
 	}
 
-	if jsonrpcResp.Error != nil {
-		return false, fmt.Errorf("eth_syncing returned error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
-	}
-
-	if jsonrpcResp.Result == nil {
+	// Get the result field
+	resultField := gjson.GetBytes(response, "result")
+	if !resultField.Exists() {
 		return false, fmt.Errorf("eth_syncing response missing result field")
 	}
 
-	// Try to unmarshal as boolean first (false = not syncing)
-	var syncResult bool
-	if err := json.Unmarshal(*jsonrpcResp.Result, &syncResult); err == nil {
-		// eth_syncing returns `false` when NOT syncing (node is fully synced)
-		// It returns an object when syncing. So if we get a bool, it's `false`.
-		// We return `false` to indicate "not syncing".
-		return syncResult, nil
+	// If result is a boolean false, the node is not syncing
+	if resultField.Type == gjson.False {
+		return false, nil
 	}
 
-	// If not a boolean, it's an object which means the node IS syncing
-	// The object contains fields like startingBlock, currentBlock, highestBlock
-	var syncStatus map[string]interface{}
-	if err := json.Unmarshal(*jsonrpcResp.Result, &syncStatus); err == nil {
-		// Successfully parsed as object - node is syncing
+	// If result is a boolean true (shouldn't happen per spec, but handle it)
+	if resultField.Type == gjson.True {
+		return true, nil
+	}
+
+	// If result is an object, the node is syncing
+	if resultField.IsObject() {
 		return true, nil
 	}
 
@@ -157,23 +157,42 @@ func (e *EVMDataExtractor) IsSyncing(request []byte, response []byte) (bool, err
 //   - false if endpoint is not archival (query failed with specific error)
 //   - Error if archival status cannot be determined
 func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, error) {
-	// Historical queries typically use eth_getBalance, eth_getTransactionCount, etc.
-	// We don't strictly filter by method here because many methods can be used for archival checks,
-	// and we rely on the error message indicators below.
-	// However, we should at least check if it's a JSON-RPC request.
+	// This method should ONLY return true/false when the request is an archival-related query.
+	// For non-archival queries (eth_blockNumber, eth_chainId, etc.), return an error to indicate
+	// that archival status cannot be determined from this request.
+	//
+	// Archival-related queries are those that access historical state:
+	// - eth_getBalance with a block parameter (not "latest")
+	// - eth_getStorageAt with a historical block
+	// - eth_call with a historical block
+	// - etc.
+
 	if len(request) == 0 {
 		return false, fmt.Errorf("empty request")
 	}
 
-	jsonrpcResp, err := e.parseJSONRPCResponse(response)
-	if err != nil {
-		return false, fmt.Errorf("parse archival response: %w", err)
+	// Check if this is an archival-related request by examining the method
+	method := gjson.GetBytes(request, "method").String()
+
+	// Only these methods with historical block parameters can determine archival status
+	archivalMethods := map[string]bool{
+		"eth_getBalance":          true,
+		"eth_getStorageAt":        true,
+		"eth_getTransactionCount": true,
+		"eth_getCode":             true,
+		"eth_call":                true,
 	}
 
-	// If there's an error in the response, check if it's an archival-related error
-	if jsonrpcResp.Error != nil {
-		// Common error messages for non-archival nodes
-		errMsg := strings.ToLower(jsonrpcResp.Error.Message)
+	if !archivalMethods[method] {
+		// This request cannot determine archival status
+		return false, fmt.Errorf("not an archival-related request (method: %s)", method)
+	}
+
+	// Check for error in the response
+	errorResult := gjson.GetBytes(response, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		// Check if it's an archival-related error
+		errMsg := strings.ToLower(gjson.GetBytes(response, "error.message").String())
 		archivalErrorIndicators := []string{
 			"missing trie node",
 			"pruned",
@@ -181,6 +200,9 @@ func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, er
 			"block not found",
 			"header not found",
 			"state not available",
+			"state histories",      // "state histories haven't been fully indexed yet"
+			"not fully indexed",    // catch variations
+			"historical data",      // "historical data not available"
 		}
 
 		for _, indicator := range archivalErrorIndicators {
@@ -191,12 +213,14 @@ func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, er
 		}
 
 		// Some other error - can't determine archival status
-		return false, fmt.Errorf("archival check returned error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
+		code := gjson.GetBytes(response, "error.code").Int()
+		return false, fmt.Errorf("archival check returned error: code=%d, message=%s", code, errMsg)
 	}
 
-	// No error and has result - this is an archival node
-	if jsonrpcResp.Result != nil {
+	// Check for result field
+	resultField := gjson.GetBytes(response, "result")
+	if resultField.Exists() && resultField.Type != gjson.Null {
+		// The archival query succeeded - endpoint is archival-capable
 		return true, nil
 	}
 
@@ -220,19 +244,24 @@ func (e *EVMDataExtractor) IsValidResponse(request []byte, response []byte) (boo
 		return false, nil
 	}
 
-	jsonrpcResp, err := e.parseJSONRPCResponse(response)
-	if err != nil {
-		return false, nil // Invalid JSON or structure
+	// Validate JSON
+	if !gjson.ValidBytes(response) {
+		return false, nil
 	}
 
 	// Check JSON-RPC version
-	if jsonrpcResp.Version != jsonrpc.Version2 {
+	version := gjson.GetBytes(response, "jsonrpc").String()
+	if version != string(jsonrpc.Version2) {
 		return false, nil
 	}
 
 	// Check for valid result/error combination
-	hasResult := jsonrpcResp.Result != nil
-	hasError := jsonrpcResp.Error != nil
+	resultField := gjson.GetBytes(response, "result")
+	errorField := gjson.GetBytes(response, "error")
+
+	// hasResult is true if result field exists (including null, which is a valid result)
+	hasResult := resultField.Exists()
+	hasError := errorField.Exists() && errorField.Type != gjson.Null
 
 	// Must have exactly one of result or error
 	if !hasResult && !hasError {
@@ -251,48 +280,34 @@ func (e *EVMDataExtractor) IsValidResponse(request []byte, response []byte) (boo
 }
 
 // isMethod checks if the JSON-RPC request calls the specified method.
+// Uses gjson for efficient parsing.
 func isMethod(request []byte, method string) bool {
-	var req struct {
-		Method string `json:"method"`
-	}
-	if err := json.Unmarshal(request, &req); err != nil {
-		return false
-	}
-	return req.Method == method
+	return gjson.GetBytes(request, "method").String() == method
 }
 
 // extractStringResult extracts the result field as a string from a JSON-RPC response.
 // Used for responses where the result is a simple string (e.g., hex values).
 func (e *EVMDataExtractor) extractStringResult(response []byte) (string, error) {
-	jsonrpcResp, err := e.parseJSONRPCResponse(response)
-	if err != nil {
-		return "", err
+	// Check for error first
+	errorResult := gjson.GetBytes(response, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		code := gjson.GetBytes(response, "error.code").Int()
+		msg := gjson.GetBytes(response, "error.message").String()
+		return "", fmt.Errorf("JSON-RPC error: code=%d, message=%s", code, msg)
 	}
 
-	if jsonrpcResp.Error != nil {
-		return "", fmt.Errorf("JSON-RPC error: code=%d, message=%s",
-			jsonrpcResp.Error.Code, jsonrpcResp.Error.Message)
-	}
-
-	if jsonrpcResp.Result == nil {
+	// Get the result field
+	resultField := gjson.GetBytes(response, "result")
+	if !resultField.Exists() || resultField.Type == gjson.Null {
 		return "", fmt.Errorf("response missing result field")
 	}
 
-	var result string
-	if err := json.Unmarshal(*jsonrpcResp.Result, &result); err != nil {
-		return "", fmt.Errorf("unmarshal result as string: %w", err)
+	// Result should be a string
+	if resultField.Type != gjson.String {
+		return "", fmt.Errorf("result is not a string")
 	}
 
-	return result, nil
-}
-
-// parseJSONRPCResponse parses raw bytes into a JSON-RPC response struct.
-func (e *EVMDataExtractor) parseJSONRPCResponse(response []byte) (*jsonrpc.Response, error) {
-	var jsonrpcResp jsonrpc.Response
-	if err := json.Unmarshal(response, &jsonrpcResp); err != nil {
-		return nil, fmt.Errorf("unmarshal JSON-RPC response: %w", err)
-	}
-	return &jsonrpcResp, nil
+	return resultField.String(), nil
 }
 
 // parseHexToInt64 converts a hex string (with or without "0x" prefix) to int64.

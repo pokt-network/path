@@ -68,6 +68,7 @@ func (h *DefaultObservationHandler) HandleExtractedData(obs *QueuedObservation, 
 		Int64("block_height", data.BlockHeight).
 		Str("chain_id", data.ChainID).
 		Bool("is_syncing", data.IsSyncing).
+		Bool("archival_check_performed", data.ArchivalCheckPerformed).
 		Bool("is_archival", data.IsArchival).
 		Bool("is_valid", data.IsValidResponse).
 		Int("http_status", data.HTTPStatusCode).

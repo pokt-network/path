@@ -110,7 +110,6 @@ func (rv *requestValidator) buildJSONRPCRequestContext(
 		servicePayloads:              servicePayloads,
 		isBatch:                      isBatch,
 		observations:                 requestObservation,
-		endpointResponseValidator:    getJSONRPCRequestEndpointResponseValidator(jsonrpcReqs),
 		protocolErrorResponseBuilder: buildJSONRPCProtocolErrorResponse(getJsonRpcIDForErrorResponse(jsonrpcReqs)),
 		// Protocol-level request error observation is the same for JSONRPC and REST.
 		protocolErrorObservationBuilder: buildProtocolErrorObservation,
@@ -134,17 +133,6 @@ func buildJSONRPCServicePayload(rpcType sharedtypes.RPCType, jsonrpcReq jsonrpc.
 		Headers: map[string]string{},
 		RPCType: rpcType, // Add the RPCType hint the so protocol sets correct HTTP headers for the endpoint.
 	}, nil
-}
-
-func getJSONRPCRequestEndpointResponseValidator(
-	jsonrpcReqs map[jsonrpc.ID]jsonrpc.Request,
-) func(polylog.Logger, []byte, string) response {
-
-	// Delegate the unmarshaling/validation of endpoint response to the specialized JSONRPC unmarshaler.
-	// The requestID parameter is used for batch request error handling.
-	return func(logger polylog.Logger, endpointResponseBz []byte, requestID string) response {
-		return unmarshalJSONRPCRequestEndpointResponse(logger, jsonrpcReqs, endpointResponseBz, requestID)
-	}
 }
 
 func buildJSONRPCProtocolErrorResponse(
@@ -295,4 +283,28 @@ func truncateErrorMessage(errMsg string) string {
 		return errMsg
 	}
 	return errMsg[:maxErrMessageLen]
+}
+
+// getJsonRpcIDForErrorResponse determines the appropriate ID to use in error responses when no endpoint response was received.
+// Follows JSON-RPC 2.0 specification guidelines for ID handling in error scenarios:
+//
+// Single request (len == 1):
+//   - Returns the original request's ID to maintain proper request-response correlation
+//   - Allows client to match the error response back to the specific request that failed
+//
+// Batch request or no requests (len != 1):
+//   - Returns null ID (empty jsonrpc.ID{}) per JSON-RPC spec requirement
+//   - Per spec: "If there was an error in detecting the id in the Request object, it MUST be Null"
+//   - For batch requests, no single ID represents the entire failed batch
+//   - For zero requests, no valid ID exists to return
+//
+// This approach ensures specification compliance and clear error semantics for clients.
+// Reference: https://www.jsonrpc.org/specification#response_object
+func getJsonRpcIDForErrorResponse(jsonrpcReqs map[jsonrpc.ID]jsonrpc.Request) jsonrpc.ID {
+	if len(jsonrpcReqs) == 1 {
+		for id := range jsonrpcReqs {
+			return id
+		}
+	}
+	return jsonrpc.ID{}
 }

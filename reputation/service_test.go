@@ -16,14 +16,16 @@ import (
 
 // mockStorage is a simple in-memory storage for testing.
 type mockStorage struct {
-	mu     sync.RWMutex
-	scores map[string]Score
-	closed bool
+	mu              sync.RWMutex
+	scores          map[string]Score
+	perceivedBlocks map[string]uint64
+	closed          bool
 }
 
 func newMockStorage() *mockStorage {
 	return &mockStorage{
-		scores: make(map[string]Score),
+		scores:          make(map[string]Score),
+		perceivedBlocks: make(map[string]uint64),
 	}
 }
 
@@ -124,6 +126,28 @@ func (m *mockStorage) Close() error {
 	defer m.mu.Unlock()
 	m.closed = true
 	return nil
+}
+
+func (m *mockStorage) SetPerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID, blockNumber uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrStorageClosed
+	}
+	key := string(serviceID)
+	if blockNumber > m.perceivedBlocks[key] {
+		m.perceivedBlocks[key] = blockNumber
+	}
+	return nil
+}
+
+func (m *mockStorage) GetPerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) (uint64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0, ErrStorageClosed
+	}
+	return m.perceivedBlocks[string(serviceID)], nil
 }
 
 func TestService_RecordSignal(t *testing.T) {

@@ -37,12 +37,14 @@ type RedisStorage struct {
 
 // Redis hash field names
 const (
-	fieldValue           = "value"
-	fieldLastUpdated     = "last_updated"
-	fieldSuccessCount    = "success_count"
-	fieldErrorCount      = "error_count"
-	fieldCriticalStrikes = "critical_strikes"
-	fieldCooldownUntil   = "cooldown_until"
+	fieldValue            = "value"
+	fieldLastUpdated      = "last_updated"
+	fieldSuccessCount     = "success_count"
+	fieldErrorCount       = "error_count"
+	fieldCriticalStrikes  = "critical_strikes"
+	fieldCooldownUntil    = "cooldown_until"
+	fieldIsArchival       = "is_archival"
+	fieldArchivalExpires  = "archival_expires_at"
 )
 
 // NewRedisStorage creates a new Redis-backed storage.
@@ -159,6 +161,12 @@ func (r *RedisStorage) GetMultiple(ctx context.Context, keys []reputation.Endpoi
 func (r *RedisStorage) Set(ctx context.Context, key reputation.EndpointKey, score reputation.Score) error {
 	redisKey := r.buildKey(key)
 
+	// Convert bool to "1" or "0" for Redis storage
+	isArchivalStr := "0"
+	if score.IsArchival {
+		isArchivalStr = "1"
+	}
+
 	fields := map[string]interface{}{
 		fieldValue:           strconv.FormatFloat(score.Value, 'f', -1, 64),
 		fieldLastUpdated:     strconv.FormatInt(score.LastUpdated.Unix(), 10),
@@ -166,6 +174,8 @@ func (r *RedisStorage) Set(ctx context.Context, key reputation.EndpointKey, scor
 		fieldErrorCount:      strconv.FormatInt(score.ErrorCount, 10),
 		fieldCriticalStrikes: strconv.Itoa(score.CriticalStrikes),
 		fieldCooldownUntil:   strconv.FormatInt(score.CooldownUntil.Unix(), 10),
+		fieldIsArchival:      isArchivalStr,
+		fieldArchivalExpires: strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
 	}
 
 	pipe := r.client.Pipeline()
@@ -194,6 +204,12 @@ func (r *RedisStorage) SetMultiple(ctx context.Context, scores map[reputation.En
 	for key, score := range scores {
 		redisKey := r.buildKey(key)
 
+		// Convert bool to "1" or "0" for Redis storage
+		isArchivalStr := "0"
+		if score.IsArchival {
+			isArchivalStr = "1"
+		}
+
 		fields := map[string]interface{}{
 			fieldValue:           strconv.FormatFloat(score.Value, 'f', -1, 64),
 			fieldLastUpdated:     strconv.FormatInt(score.LastUpdated.Unix(), 10),
@@ -201,6 +217,8 @@ func (r *RedisStorage) SetMultiple(ctx context.Context, scores map[reputation.En
 			fieldErrorCount:      strconv.FormatInt(score.ErrorCount, 10),
 			fieldCriticalStrikes: strconv.Itoa(score.CriticalStrikes),
 			fieldCooldownUntil:   strconv.FormatInt(score.CooldownUntil.Unix(), 10),
+			fieldIsArchival:      isArchivalStr,
+			fieldArchivalExpires: strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
 		}
 
 		pipe.HSet(ctx, redisKey, fields)
@@ -327,5 +345,73 @@ func (r *RedisStorage) parseScore(data map[string]string) (reputation.Score, err
 		}
 	}
 
+	// Parse archival fields (for multi-instance coordination)
+	if v, ok := data[fieldIsArchival]; ok {
+		score.IsArchival = v == "1" || v == "true"
+	}
+
+	if v, ok := data[fieldArchivalExpires]; ok {
+		ts, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return score, fmt.Errorf("invalid archival_expires_at: %w", err)
+		}
+		// Unix timestamp 0 means no archival expiry set
+		if ts > 0 {
+			score.ArchivalExpiresAt = time.Unix(ts, 0)
+		}
+	}
+
 	return score, nil
+}
+
+// perceivedBlockKey returns the Redis key for storing perceived block number.
+func (s *RedisStorage) perceivedBlockKey(serviceID protocol.ServiceID) string {
+	return fmt.Sprintf("%schain_state:%s:perceived_block", s.keyPrefix, serviceID)
+}
+
+// SetPerceivedBlockNumber stores the perceived block number for a service.
+// Uses Redis atomic GETSET pattern: only updates if new value is higher.
+// This enables sharing chain state across replicas with "max wins" semantics.
+func (s *RedisStorage) SetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID, blockNumber uint64) error {
+	key := s.perceivedBlockKey(serviceID)
+
+	// Use Lua script for atomic compare-and-set (only update if higher)
+	// This ensures that across all replicas, the max value always wins
+	script := redis.NewScript(`
+		local current = redis.call('GET', KEYS[1])
+		local newVal = tonumber(ARGV[1])
+		if current == false or tonumber(current) < newVal then
+			redis.call('SET', KEYS[1], ARGV[1])
+			return 1
+		end
+		return 0
+	`)
+
+	_, err := script.Run(ctx, s.client, []string{key}, blockNumber).Result()
+	if err != nil {
+		return fmt.Errorf("failed to set perceived block number: %w", err)
+	}
+
+	return nil
+}
+
+// GetPerceivedBlockNumber retrieves the perceived block number for a service.
+// Returns 0 if no block number has been stored yet.
+func (s *RedisStorage) GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) (uint64, error) {
+	key := s.perceivedBlockKey(serviceID)
+
+	result, err := s.client.Get(ctx, key).Result()
+	if err == redis.Nil {
+		return 0, nil // Not found, return 0
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to get perceived block number: %w", err)
+	}
+
+	blockNumber, err := strconv.ParseUint(result, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid perceived block number value: %w", err)
+	}
+
+	return blockNumber, nil
 }

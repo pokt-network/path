@@ -15,6 +15,19 @@ type ServiceReadinessReporter interface {
 	// Returns endpoint count, whether sessions are available, and any error.
 	GetServiceReadiness(serviceID protocol.ServiceID) (endpointCount int, hasSession bool, err error)
 
+	// GetServiceEndpointDetails returns detailed endpoint information for a specific service.
+	// Includes reputation scores, archival status, latency metrics, and more.
+	GetServiceEndpointDetails(serviceID protocol.ServiceID) ([]protocol.EndpointDetails, error)
+
+	// GetServicePerceivedBlockHeight returns the perceived block height for a service.
+	// This is the highest block number observed across all endpoints for the service.
+	// Returns 0 if no block number has been observed yet.
+	GetServicePerceivedBlockHeight(serviceID protocol.ServiceID) uint64
+
+	// GetServiceBlockConsensusStats returns block consensus statistics for a service.
+	// Returns (medianBlock, observationCount) for observability.
+	GetServiceBlockConsensusStats(serviceID protocol.ServiceID) (medianBlock uint64, observationCount int)
+
 	// ConfiguredServiceIDs returns all configured service IDs.
 	ConfiguredServiceIDs() map[protocol.ServiceID]struct{}
 }
@@ -36,10 +49,14 @@ type ServiceReadinessResponse struct {
 
 // ServiceReadyInfo contains readiness info for a single service.
 type ServiceReadyInfo struct {
-	Ready         bool   `json:"ready"`
-	EndpointCount int    `json:"endpoint_count"`
-	HasSession    bool   `json:"has_session"`
-	Error         string `json:"error,omitempty"`
+	Ready                bool                       `json:"ready"`
+	EndpointCount        int                        `json:"endpoint_count"`
+	HasSession           bool                       `json:"has_session"`
+	PerceivedBlockHeight uint64                     `json:"perceived_block_height,omitempty"`
+	MedianBlockHeight    uint64                     `json:"median_block_height,omitempty"`
+	BlockObservations    int                        `json:"block_observations,omitempty"`
+	Error                string                     `json:"error,omitempty"`
+	Endpoints            []protocol.EndpointDetails `json:"endpoints,omitempty"`
 }
 
 // handleHealth is a minimal liveness probe endpoint.
@@ -51,11 +68,15 @@ func (r *router) handleHealth(w http.ResponseWriter, req *http.Request) {
 
 // handleReady handles both /ready and /ready/{serviceId} endpoints.
 // Returns 200 if ready, 503 if not ready.
+// Supports optional query parameter ?detailed=true to include endpoint details.
 func (r *router) handleReady(w http.ResponseWriter, req *http.Request) {
 	// Extract service ID from path if present: /ready/{serviceId}
 	path := strings.TrimPrefix(req.URL.Path, "/ready")
 	path = strings.TrimPrefix(path, "/")
 	serviceID := protocol.ServiceID(path)
+
+	// Check if detailed endpoint info is requested
+	includeDetails := req.URL.Query().Get("detailed") == "true"
 
 	// Check if we have a readiness reporter
 	reporter, ok := r.readinessReporter()
@@ -70,15 +91,15 @@ func (r *router) handleReady(w http.ResponseWriter, req *http.Request) {
 
 	if serviceID != "" {
 		// Single service readiness check
-		r.handleServiceReadiness(w, reporter, serviceID)
+		r.handleServiceReadiness(w, reporter, serviceID, includeDetails)
 	} else {
 		// All services readiness check
-		r.handleAllServicesReadiness(w, reporter)
+		r.handleAllServicesReadiness(w, reporter, includeDetails)
 	}
 }
 
 // handleServiceReadiness checks readiness for a specific service.
-func (r *router) handleServiceReadiness(w http.ResponseWriter, reporter ServiceReadinessReporter, serviceID protocol.ServiceID) {
+func (r *router) handleServiceReadiness(w http.ResponseWriter, reporter ServiceReadinessReporter, serviceID protocol.ServiceID, includeDetails bool) {
 	endpointCount, hasSession, err := reporter.GetServiceReadiness(serviceID)
 
 	info := ServiceReadyInfo{
@@ -92,6 +113,20 @@ func (r *router) handleServiceReadiness(w http.ResponseWriter, reporter ServiceR
 	} else {
 		// Ready if we have at least one endpoint and a session
 		info.Ready = endpointCount > 0 && hasSession
+	}
+
+	// Include endpoint details and block consensus stats if requested
+	if includeDetails {
+		details, detailsErr := reporter.GetServiceEndpointDetails(serviceID)
+		if detailsErr != nil {
+			r.logger.Warn().Err(detailsErr).Str("service_id", string(serviceID)).Msg("Failed to get endpoint details")
+		} else {
+			info.Endpoints = details
+		}
+
+		// Include block consensus stats
+		info.PerceivedBlockHeight = reporter.GetServicePerceivedBlockHeight(serviceID)
+		info.MedianBlockHeight, info.BlockObservations = reporter.GetServiceBlockConsensusStats(serviceID)
 	}
 
 	response := ServiceReadinessResponse{
@@ -109,7 +144,7 @@ func (r *router) handleServiceReadiness(w http.ResponseWriter, reporter ServiceR
 }
 
 // handleAllServicesReadiness checks readiness for all configured services.
-func (r *router) handleAllServicesReadiness(w http.ResponseWriter, reporter ServiceReadinessReporter) {
+func (r *router) handleAllServicesReadiness(w http.ResponseWriter, reporter ServiceReadinessReporter, includeDetails bool) {
 	configuredServices := reporter.ConfiguredServiceIDs()
 	if len(configuredServices) == 0 {
 		response := ServiceReadinessResponse{
@@ -140,6 +175,20 @@ func (r *router) handleAllServicesReadiness(w http.ResponseWriter, reporter Serv
 			if !info.Ready {
 				allReady = false
 			}
+		}
+
+		// Include endpoint details and block consensus stats if requested
+		if includeDetails {
+			details, detailsErr := reporter.GetServiceEndpointDetails(serviceID)
+			if detailsErr != nil {
+				r.logger.Warn().Err(detailsErr).Str("service_id", string(serviceID)).Msg("Failed to get endpoint details")
+			} else {
+				info.Endpoints = details
+			}
+
+			// Include block consensus stats
+			info.PerceivedBlockHeight = reporter.GetServicePerceivedBlockHeight(serviceID)
+			info.MedianBlockHeight, info.BlockObservations = reporter.GetServiceBlockConsensusStats(serviceID)
 		}
 
 		services[string(serviceID)] = info

@@ -80,6 +80,15 @@ type Score struct {
 	// Endpoints in cooldown are excluded from selection even if their score is above threshold.
 	// Set when CriticalStrikes exceeds StrikeThreshold.
 	CooldownUntil time.Time
+
+	// IsArchival indicates whether the endpoint has passed archival health checks.
+	// When true, the endpoint can serve historical blockchain data.
+	// This is shared across all replicas via Redis storage.
+	IsArchival bool
+
+	// ArchivalExpiresAt indicates when the archival status should be re-validated.
+	// After expiry, the endpoint needs to pass health checks again to be archival-capable.
+	ArchivalExpiresAt time.Time
 }
 
 // LatencyMetrics tracks response latency statistics for an endpoint.
@@ -147,6 +156,32 @@ func (s Score) CooldownRemaining() time.Duration {
 		return 0
 	}
 	remaining := time.Until(s.CooldownUntil)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// IsArchivalCapable returns true if the endpoint has valid archival status.
+// Returns false if not marked as archival or if archival status has expired.
+func (s Score) IsArchivalCapable() bool {
+	if !s.IsArchival {
+		return false
+	}
+	// If ArchivalExpiresAt is zero, the status was never set properly
+	if s.ArchivalExpiresAt.IsZero() {
+		return false
+	}
+	// Check if the status has expired
+	return time.Now().Before(s.ArchivalExpiresAt)
+}
+
+// ArchivalRemaining returns the remaining archival validity duration, or 0 if expired/not set.
+func (s Score) ArchivalRemaining() time.Duration {
+	if s.ArchivalExpiresAt.IsZero() {
+		return 0
+	}
+	remaining := time.Until(s.ArchivalExpiresAt)
 	if remaining < 0 {
 		return 0
 	}
@@ -279,6 +314,27 @@ type ReputationService interface {
 	// SetLogger sets the logger for the reputation service.
 	// This enables debug logging for latency scoring and other operations.
 	SetLogger(logger polylog.Logger)
+
+	// SetArchivalStatus marks an endpoint as archival-capable with an expiry time.
+	// This is called by health checks when an endpoint passes archival validation.
+	// The status is shared across all replicas via Redis storage.
+	// The archivalTTL parameter defines how long the archival status remains valid.
+	SetArchivalStatus(ctx context.Context, key EndpointKey, isArchival bool, archivalTTL time.Duration) error
+
+	// IsArchivalCapable returns whether the endpoint has valid archival status.
+	// Returns false if not marked as archival or if status has expired.
+	IsArchivalCapable(ctx context.Context, key EndpointKey) bool
+
+	// SetPerceivedBlockNumber updates the shared perceived block number for a service.
+	// This is called when a replica observes a new block height, enabling all replicas
+	// to share a consistent view of the chain tip for sync_allowance validation.
+	// Only updates if the new value is higher than the stored value (max wins).
+	SetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID, blockNumber uint64) error
+
+	// GetPerceivedBlockNumber retrieves the shared perceived block number for a service.
+	// Returns the maximum block number observed across all replicas.
+	// Returns 0 if no block number has been stored yet.
+	GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) uint64
 }
 
 // Config holds configuration for the reputation system.

@@ -26,9 +26,11 @@ type endpointStore struct {
 
 // updateEndpointsFromObservations creates/updates endpoint entries in the store based
 // on the supplied observations. It returns the set of created/updated endpoints.
+//
+// Note: Archival capability is determined by external health checks, not by observations.
+// Health checks mark endpoints as archival-capable via UpdateFromExtractedData.
 func (es *endpointStore) updateEndpointsFromObservations(
 	evmObservations *qosobservations.EVMRequestObservations,
-	archivalBlockHeight string,
 ) map[protocol.EndpointAddr]endpoint {
 	es.endpointsMu.Lock()
 	defer es.endpointsMu.Unlock()
@@ -62,11 +64,7 @@ func (es *endpointStore) updateEndpointsFromObservations(
 		// e.g. when the first observation(s) are received for an endpoint.
 		storedEndpoint := es.endpoints[endpointAddr]
 
-		isEndpointMutatedByObservation := applyObservation(
-			&storedEndpoint,
-			observation,
-			archivalBlockHeight,
-		)
+		isEndpointMutatedByObservation := applyObservation(&storedEndpoint, observation)
 
 		// If the observation did not mutate the endpoint, there is no need to update the stored endpoint entry.
 		if !isEndpointMutatedByObservation {
@@ -84,9 +82,8 @@ func (es *endpointStore) updateEndpointsFromObservations(
 // applyObservation updates the data stored regarding the endpoint using the supplied observation.
 // It returns true if the observation was recognized (i.e. mutated the endpoint).
 //
-// For archival balance observations:
-// - Only updates the archival balance if the balance was observed at the specified archival block height
-// - This ensures accurate historical balance validation at the specific block number
+// Note: Archival capability is determined by external health checks, not by observations.
+// Health checks mark endpoints as archival-capable via UpdateFromExtractedData.
 //
 // TODO_TECHDEBT(@adshmh): add a method to distinguish the following two scenarios:
 //   - an endpoint that returned in invalid response.
@@ -94,7 +91,6 @@ func (es *endpointStore) updateEndpointsFromObservations(
 func applyObservation(
 	endpoint *endpoint,
 	observation *qosobservations.EVMEndpointObservation,
-	archivalBlockHeight string,
 ) (endpointWasMutated bool) {
 	// If emptyResponse is not nil, the observation is for an empty response check.
 	if observation.GetEmptyResponse() != nil {
@@ -115,18 +111,6 @@ func applyObservation(
 		applyChainIDObservation(endpoint, observation.GetChainIdResponse())
 		endpointWasMutated = true
 		return
-	}
-
-	// If getBalanceResponse is not nil, the observation is for a getBalance check (which may be an archival check).
-	if getBalanceResponse := observation.GetGetBalanceResponse(); getBalanceResponse != nil {
-		balanceBlockHeight := getBalanceResponse.GetBlockNumber()
-
-		// Only update the archival balance if the balance was observed at the archival block height.
-		if balanceBlockHeight == archivalBlockHeight {
-			applyArchivalObservation(endpoint, getBalanceResponse)
-			endpointWasMutated = true
-			return
-		}
 	}
 
 	// If unrecognizedResponse is not nil, the observation is for an unrecognized response.
@@ -173,14 +157,6 @@ func applyChainIDObservation(endpoint *endpoint, chainIDResponse *qosobservation
 	endpoint.checkChainID = endpointCheckChainID{
 		chainID:   &observedChainID,
 		expiresAt: time.Now().Add(checkChainIDInterval),
-	}
-}
-
-// applyArchivalObservation updates the archival check if a valid observation is provided.
-func applyArchivalObservation(endpoint *endpoint, archivalResponse *qosobservations.EVMGetBalanceResponse) {
-	endpoint.checkArchival = endpointCheckArchival{
-		observedArchivalBalance: archivalResponse.GetBalance(),
-		expiresAt:               time.Now().Add(checkArchivalInterval),
 	}
 }
 

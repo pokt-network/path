@@ -27,6 +27,22 @@ const (
 	// that an endpoint can be before it's considered out of sync.
 	// 0 means disabled (no sync allowance check).
 	DefaultSyncAllowance = 0
+
+	// DefaultMinHealthCheckWorkers is the minimum number of concurrent health check workers.
+	// This baseline ensures reasonable parallelism even for small deployments.
+	// For larger deployments, workers are dynamically scaled based on services and checks.
+	DefaultMinHealthCheckWorkers = 100
+
+	// DefaultEndpointsPerServiceEstimate is the estimated number of endpoints (suppliers) per service.
+	// Used to calculate the optimal worker pool size at startup.
+	// Total jobs per cycle = services × endpoints × checks_per_service
+	// With 50 suppliers per session, this is a conservative baseline.
+	DefaultEndpointsPerServiceEstimate = 50
+
+	// HealthCheckWorkerMultiplier is the factor by which to multiply the total health check
+	// job count to determine the optimal worker pool size. A multiplier of 2 ensures all checks
+	// can run in parallel with headroom for retries and timeout handling.
+	HealthCheckWorkerMultiplier = 2
 )
 
 // Observation pipeline configuration defaults

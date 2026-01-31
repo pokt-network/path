@@ -112,7 +112,6 @@ func (rv *requestValidator) buildRESTRequestContext(
 			jsonrpc.IDFromStr(restRequestID): servicePayload,
 		},
 		observations:                 requestObservation,
-		endpointResponseValidator:    getRESTRequestEndpointResponseValidator(httpRequestURL.Path),
 		protocolErrorResponseBuilder: buildRESTProtocolErrorResponse(),
 		// Protocol-level request error observation is the same for JSONRPC and REST.
 		protocolErrorObservationBuilder: buildProtocolErrorObservation,
@@ -136,14 +135,6 @@ func buildRESTServicePayload(
 		Path:    path,
 		Headers: map[string]string{},
 		RPCType: rpcType, // Add the RPCType hint, so protocol sets correct HTTP headers for the endpoint.
-	}
-}
-
-func getRESTRequestEndpointResponseValidator(requestPath string) func(polylog.Logger, []byte, string) response {
-	// Delegate the unmarshaling/validation of endpoint response to the specialized REST unmarshaler.
-	// The requestID parameter is unused for REST but required by the interface for batch request support.
-	return func(logger polylog.Logger, endpointResponseBz []byte, requestID string) response {
-		return unmarshalRESTRequestEndpointResponse(logger, requestPath, endpointResponseBz)
 	}
 }
 

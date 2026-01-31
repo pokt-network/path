@@ -21,6 +21,7 @@ import (
 	"github.com/pokt-network/path/health"
 	"github.com/pokt-network/path/metrics/devtools"
 	protocolPkg "github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 	"github.com/pokt-network/path/request"
 	"github.com/pokt-network/path/router"
 )
@@ -82,6 +83,32 @@ func main() {
 	qosInstances, err := getServiceQoSInstances(logger, config, unifiedServicesConfig, protocol)
 	if err != nil {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to setup QoS instances"}`, err)
+	}
+
+	// Wire up reputation service to QoS instances for shared state across replicas.
+	// The reputation service provides Redis-backed storage for:
+	// - Archival status: ensures all replicas can access archival endpoint info set by health checks
+	// - Perceived block number: ensures sync_allowance validation uses consistent chain tip
+	// - Reputation scores: already handled by the reputation service's periodic refresh
+	if reputationSvc := protocol.GetReputationService(); reputationSvc != nil {
+		const perceivedBlockSyncInterval = 5 * time.Second
+
+		for serviceID, qosInstance := range qosInstances {
+			// Set reputation service for archival status lookups
+			if evmQoS, ok := qosInstance.(interface{ SetReputationService(reputation.ReputationService) }); ok {
+				evmQoS.SetReputationService(reputationSvc)
+				logger.Debug().Str("service_id", string(serviceID)).Msg("Wired reputation service to QoS instance")
+			}
+
+			// Start background sync for perceived block number
+			if evmQoS, ok := qosInstance.(interface {
+				StartBackgroundSync(ctx context.Context, syncInterval time.Duration)
+			}); ok {
+				evmQoS.StartBackgroundSync(backgroundCtx, perceivedBlockSyncInterval)
+				logger.Debug().Str("service_id", string(serviceID)).Msg("Started background sync for QoS instance")
+			}
+		}
+		logger.Info().Msg("Reputation service wired to QoS instances for shared state (archival, block height)")
 	}
 
 	// Setup metrics reporter, to be used by Gateway and Health Checks
@@ -197,6 +224,10 @@ func main() {
 		Logger:      logger,
 		QoSServices: qosInstances,
 	}
+
+	// Wire up the QoS service registry to the protocol for endpoint details reporting.
+	// This enables /ready/<service>?detailed=true to include archival status information.
+	protocol.SetQoSServiceRegistry(requestParser)
 
 	// NOTE: the gateway uses the requestParser to get the correct QoS instance for any incoming request.
 	gtw := &gateway.Gateway{

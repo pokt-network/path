@@ -204,3 +204,10 @@ func (rc *batchJSONRPCRequestContext) Select(allEndpoints protocol.EndpointAddrL
 func (rc *batchJSONRPCRequestContext) SelectMultiple(allEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
 	return rc.endpointStore.SelectMultiple(allEndpoints, numEndpoints)
 }
+
+// SelectMultipleWithArchival chooses multiple endpoints with optional archival filtering.
+// Solana does not have an archival concept, so requiresArchival is ignored.
+// It is required to satisfy the protocol package's EndpointSelector interface.
+func (rc *batchJSONRPCRequestContext) SelectMultipleWithArchival(allEndpoints protocol.EndpointAddrList, numEndpoints uint, requiresArchival bool) (protocol.EndpointAddrList, error) {
+	return rc.endpointStore.SelectMultipleWithArchival(allEndpoints, numEndpoints, requiresArchival)
+}
