@@ -2,10 +2,12 @@ package reputation
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/protocol"
 )
@@ -834,6 +836,51 @@ func (s *service) GetPerceivedBlockNumber(ctx context.Context, serviceID protoco
 	}
 
 	return blockNumber
+}
+
+// GetArchivalEndpoints returns all endpoint keys for the given service
+// that have valid (non-expired) archival status in the local cache.
+// This enables bootstrapping the EVM archival cache at startup when the
+// endpoint store is empty but the reputation cache has been populated from Redis.
+func (s *service) GetArchivalEndpoints(ctx context.Context, serviceID protocol.ServiceID) []EndpointKey {
+	prefix := string(serviceID) + ":"
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []EndpointKey
+	for cacheKey, score := range s.cache {
+		// Quick prefix check to filter by service
+		if !strings.HasPrefix(cacheKey, prefix) {
+			continue
+		}
+
+		if !score.IsArchivalCapable() {
+			continue
+		}
+
+		// Parse "serviceID:endpointAddr:rpcType" back to EndpointKey.
+		// EndpointAddr may contain colons (e.g., URLs with ports),
+		// so split and take: first part = serviceID, last part = rpcType, middle = endpointAddr.
+		parts := strings.Split(cacheKey, ":")
+		if len(parts) < 3 {
+			continue
+		}
+
+		rpcTypeStr := parts[len(parts)-1]
+		endpointAddr := strings.Join(parts[1:len(parts)-1], ":")
+
+		rpcTypeUpper := strings.ToUpper(rpcTypeStr)
+		rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[rpcTypeUpper])
+
+		result = append(result, NewEndpointKey(
+			serviceID,
+			protocol.EndpointAddr(endpointAddr),
+			rpcType,
+		))
+	}
+
+	return result
 }
 
 // clamp constrains a value between min and max.

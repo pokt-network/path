@@ -325,6 +325,12 @@ type ReputationService interface {
 	// Returns false if not marked as archival or if status has expired.
 	IsArchivalCapable(ctx context.Context, key EndpointKey) bool
 
+	// GetArchivalEndpoints returns all endpoint keys for the given service
+	// that have valid (non-expired) archival status in the local cache.
+	// This is useful at startup when the endpoint store is empty but the
+	// reputation cache has been populated from Redis.
+	GetArchivalEndpoints(ctx context.Context, serviceID protocol.ServiceID) []EndpointKey
+
 	// SetPerceivedBlockNumber updates the shared perceived block number for a service.
 	// This is called when a replica observes a new block height, enabling all replicas
 	// to share a consistent view of the chain tip for sync_allowance validation.

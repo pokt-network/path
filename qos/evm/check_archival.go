@@ -5,10 +5,6 @@ import (
 	"time"
 )
 
-// checkArchivalTTL is how long an archival status from health checks remains valid.
-// Health checks run periodically, so this should be longer than the health check interval.
-const checkArchivalTTL = 30 * time.Minute
-
 var (
 	// errEndpointNotArchival is returned when an endpoint has not been marked as archival-capable.
 	errEndpointNotArchival = errors.New("endpoint has not been marked as archival-capable by health checks")

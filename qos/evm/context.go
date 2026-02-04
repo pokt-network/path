@@ -80,6 +80,10 @@ type requestContext struct {
 	// The length of the request payload in bytes.
 	requestPayloadLength uint
 
+	// requestID is the correlation ID for request tracing across layers.
+	// Propagated from gateway for log correlation.
+	requestID string
+
 	serviceState *serviceState
 
 	// JSON-RPC requests - supports both single and batch requests per JSON-RPC 2.0 spec
@@ -540,7 +544,7 @@ func (rc *requestContext) Select(allEndpoints protocol.EndpointAddrList) (protoc
 	// TODO_FUTURE(@adshmh): Enhance the endpoint selection meta data to track, e.g.:
 	// * Endpoint Selection Latency
 	// * Number of available endpoints
-	selectionResult, err := rc.serviceState.SelectWithMetadata(allEndpoints, rc.archivalResult.RequiresArchival)
+	selectionResult, err := rc.serviceState.SelectWithMetadata(allEndpoints, rc.archivalResult.RequiresArchival, rc.requestID)
 	if err != nil {
 		return protocol.EndpointAddr(""), err
 	}
@@ -554,14 +558,14 @@ func (rc *requestContext) Select(allEndpoints protocol.EndpointAddrList) (protoc
 // SelectMultiple returns multiple endpoint addresses using the request context's endpoint store.
 // Implements the protocol.EndpointSelector interface.
 func (rc *requestContext) SelectMultiple(allEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
-	return rc.serviceState.SelectMultiple(allEndpoints, numEndpoints)
+	return rc.serviceState.SelectMultiple(allEndpoints, numEndpoints, rc.requestID)
 }
 
 // SelectMultipleWithArchival returns multiple endpoint addresses with optional archival filtering.
 // When requiresArchival is true, only endpoints that have passed archival capability checks are considered.
 // Implements the protocol.EndpointSelector interface.
 func (rc *requestContext) SelectMultipleWithArchival(allEndpoints protocol.EndpointAddrList, numEndpoints uint, requiresArchival bool) (protocol.EndpointAddrList, error) {
-	return rc.serviceState.SelectMultipleWithArchival(allEndpoints, numEndpoints, requiresArchival)
+	return rc.serviceState.SelectMultipleWithArchival(allEndpoints, numEndpoints, requiresArchival, rc.requestID)
 }
 
 // RequiresArchival returns true if the current request requires archival data.
@@ -580,4 +584,9 @@ func (rc *requestContext) findServicePayload(targetID jsonrpc.ID) (protocol.Payl
 		}
 	}
 	return protocol.Payload{}, false
+}
+
+// GetRequestID returns the request correlation ID for log tracing.
+func (rc *requestContext) GetRequestID() string {
+	return rc.requestID
 }

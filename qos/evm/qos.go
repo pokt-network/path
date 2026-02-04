@@ -71,6 +71,7 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 		endpointStore:     store,
 		archivalHeuristic: NewArchivalHeuristic(0), // Use default threshold
 		blockConsensus:    blockConsensus,
+		archivalCache:     NewArchivalCache(), // Local cache for O(1) archival lookups
 	}
 
 	evmRequestValidator := &evmRequestValidator{
@@ -158,21 +159,57 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 		}
 	}
 
-	// Update archival status: ONLY clear (set false), never set true.
-	// Setting archival=true is done ONLY by health checks via markEndpointArchival()
-	// which validates the response contains the expected value.
-	//
-	// User requests can clear archival status when they fail, catching false positives
-	// where health check passed but actual requests fail.
-	if data.ArchivalCheckPerformed && !data.IsArchival {
-		// Archival query failed - clear archival status immediately
+	// Update archival status: Handle both setting and clearing archival capability.
+	// This allows both health checks and user request responses to update archival status.
+	// - Health checks validate archival capability via eth_getBlockByNumber for ancient blocks
+	// - User requests can confirm (IsArchival=true) or invalidate (IsArchival=false) archival status
+	if data.ArchivalCheckPerformed {
+		// Default TTL for archival status (8 hours - matches health check archival TTL)
+		archivalTTL := 8 * time.Hour
+		expiresAt := time.Now().Add(archivalTTL)
+
 		storedEndpoint.checkArchival = endpointCheckArchival{
-			isArchival: false,
-			expiresAt:  time.Time{}, // Zero time = invalid
+			isArchival: data.IsArchival,
+			expiresAt:  expiresAt,
 		}
-		qos.logger.Warn().
-			Str("endpoint", string(endpointAddr)).
-			Msg("Cleared archival status - endpoint failed archival query")
+
+		if data.IsArchival {
+			qos.logger.Info().
+				Str("endpoint", string(endpointAddr)).
+				Time("expires_at", expiresAt).
+				Msg("Confirmed archival status - endpoint supports archival queries")
+
+			// Update local cache for fast lookups in hot path
+			if qos.archivalCache != nil {
+				key := reputation.NewEndpointKey(
+					qos.serviceQoSConfig.GetServiceID(),
+					endpointAddr,
+					sharedtypes.RPCType_JSON_RPC,
+				)
+				qos.archivalCache.Set(key.String(), true, archivalTTL)
+			}
+
+			// Write to Redis for cross-replica sync (async, non-blocking)
+			if qos.reputationSvc != nil {
+				go func(addr protocol.EndpointAddr, ttl time.Duration) {
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+					// IMPORTANT: RPCType_JSON_RPC must match between all archival writes and reads
+					// for cross-replica consistency. Health checks, UpdateFromExtractedData, and
+					// endpoint selection filtering all must use the same RPC type.
+					key := reputation.NewEndpointKey(
+						qos.serviceQoSConfig.GetServiceID(),
+						addr,
+						sharedtypes.RPCType_JSON_RPC,
+					)
+					_ = qos.reputationSvc.SetArchivalStatus(ctx, key, true, ttl)
+				}(endpointAddr, archivalTTL)
+			}
+		} else {
+			qos.logger.Warn().
+				Str("endpoint", string(endpointAddr)).
+				Msg("Cleared archival status - endpoint failed archival query")
+		}
 	}
 
 	// Store the updated endpoint back
@@ -181,9 +218,9 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 
 	// Update perceived block using consensus mechanism
 	// This protects against malicious endpoints reporting extreme block heights
-	if blockNumber > 0 && qos.serviceState.blockConsensus != nil {
+	if blockNumber > 0 && qos.blockConsensus != nil {
 		oldBlock := qos.perceivedBlockNumber.Load()
-		newPerceived := qos.serviceState.blockConsensus.AddObservation(endpointAddr, blockNumber)
+		newPerceived := qos.blockConsensus.AddObservation(endpointAddr, blockNumber)
 
 		// Update the atomic for fast reads
 		qos.perceivedBlockNumber.Store(newPerceived)
@@ -197,11 +234,11 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 				Msg("Updated perceived block number via consensus")
 
 			// Also update Redis for cross-replica sync (async, non-blocking)
-			if qos.serviceState.reputationSvc != nil {
+			if qos.reputationSvc != nil {
 				go func(bn uint64) {
 					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 					defer cancel()
-					_ = qos.serviceState.reputationSvc.SetPerceivedBlockNumber(ctx, qos.serviceState.serviceQoSConfig.GetServiceID(), bn)
+					_ = qos.reputationSvc.SetPerceivedBlockNumber(ctx, qos.serviceQoSConfig.GetServiceID(), bn)
 				}(newPerceived)
 			}
 		}
@@ -225,10 +262,10 @@ func (qos *QoS) GetPerceivedBlockNumber() uint64 {
 //
 // Implements gateway.QoSBlockConsensusReporter interface.
 func (qos *QoS) GetBlockConsensusStats() (medianBlock uint64, observationCount int) {
-	if qos.serviceState.blockConsensus == nil {
+	if qos.blockConsensus == nil {
 		return 0, 0
 	}
-	return qos.serviceState.blockConsensus.GetMedianBlock(), qos.serviceState.blockConsensus.GetObservationCount()
+	return qos.blockConsensus.GetMedianBlock(), qos.blockConsensus.GetObservationCount()
 }
 
 // GetEndpointArchivalStatus returns the archival status for a specific endpoint.
@@ -248,18 +285,21 @@ func (qos *QoS) GetEndpointArchivalStatus(endpointAddr protocol.EndpointAddr) (i
 	}
 
 	// Check reputation service (Redis) for shared archival status
-	if qos.serviceState.reputationSvc != nil {
+	if qos.reputationSvc != nil {
+		// IMPORTANT: RPCType_JSON_RPC must match between all archival writes and reads
+		// for cross-replica consistency. Health checks, UpdateFromExtractedData, and
+		// endpoint selection filtering all must use the same RPC type.
 		key := reputation.NewEndpointKey(
-			qos.serviceState.serviceQoSConfig.GetServiceID(),
+			qos.serviceQoSConfig.GetServiceID(),
 			endpointAddr,
 			sharedtypes.RPCType_JSON_RPC,
 		)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		if qos.serviceState.reputationSvc.IsArchivalCapable(ctx, key) {
+		if qos.reputationSvc.IsArchivalCapable(ctx, key) {
 			// Get the score to retrieve expiration time
-			score, err := qos.serviceState.reputationSvc.GetScore(ctx, key)
+			score, err := qos.reputationSvc.GetScore(ctx, key)
 			if err == nil && score.IsArchivalCapable() {
 				return true, score.ArchivalExpiresAt
 			}
@@ -274,7 +314,7 @@ func (qos *QoS) GetEndpointArchivalStatus(endpointAddr protocol.EndpointAddr) (i
 // The reputation service provides archival status via Redis, enabling non-leader replicas
 // to access archival endpoint information set by health checks running on the leader.
 func (qos *QoS) SetReputationService(svc reputation.ReputationService) {
-	qos.serviceState.reputationSvc = svc
+	qos.reputationSvc = svc
 }
 
 // StartBackgroundSync starts a background goroutine that periodically syncs
@@ -287,19 +327,19 @@ func (qos *QoS) SetReputationService(svc reputation.ReputationService) {
 // IMPORTANT: This performs an immediate sync on startup to ensure the replica
 // has the latest perceived block number before serving requests.
 func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Duration) {
-	if qos.serviceState.reputationSvc == nil {
+	if qos.reputationSvc == nil {
 		qos.logger.Warn().Msg("Cannot start background sync: reputation service not set")
 		return
 	}
 
-	serviceID := qos.serviceState.serviceQoSConfig.GetServiceID()
+	serviceID := qos.serviceQoSConfig.GetServiceID()
 
 	// syncFromRedis fetches perceived block number from Redis and adds it to local consensus.
 	// The Redis value represents consensus from other replicas, so we treat it as another
 	// observation and let the local consensus mechanism decide the actual perceived block.
 	syncFromRedis := func() {
 		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		redisBlockNumber := qos.serviceState.reputationSvc.GetPerceivedBlockNumber(fetchCtx, serviceID)
+		redisBlockNumber := qos.reputationSvc.GetPerceivedBlockNumber(fetchCtx, serviceID)
 		cancel()
 
 		if redisBlockNumber == 0 {
@@ -308,9 +348,9 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 
 		// Add Redis value as an observation to local consensus
 		// Use a synthetic endpoint address to identify Redis-sourced observations
-		if qos.serviceState.blockConsensus != nil {
+		if qos.blockConsensus != nil {
 			oldBlock := qos.perceivedBlockNumber.Load()
-			newPerceived := qos.serviceState.blockConsensus.AddObservation(
+			newPerceived := qos.blockConsensus.AddObservation(
 				protocol.EndpointAddr("redis-sync"),
 				redisBlockNumber,
 			)
@@ -357,4 +397,146 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 			}
 		}
 	}()
+}
+
+// StartArchivalCacheRefreshWorker starts a background goroutine that periodically
+// refreshes the archival cache from Redis. This ensures all replicas have consistent
+// archival status without blocking the hot request path.
+//
+// The refreshInterval determines how often to refresh (recommended: 2 hours, with 8-hour TTL).
+// Call this after SetReputationService to enable cross-replica sync.
+//
+// IMPORTANT: Performs immediate refresh on startup to ensure cache is warm before serving requests.
+//
+// Recommended startup sequence for full cross-replica sync:
+//   1. qos.SetReputationService(svc)
+//   2. qos.StartBackgroundSync(ctx, 5*time.Second)        // Perceived block number
+//   3. qos.StartArchivalCacheRefreshWorker(ctx, 2*time.Hour) // Archival status
+func (qos *QoS) StartArchivalCacheRefreshWorker(ctx context.Context, refreshInterval time.Duration) {
+	if qos.reputationSvc == nil {
+		qos.logger.Warn().Msg("Cannot start archival cache refresh: reputation service not set")
+		return
+	}
+	if qos.archivalCache == nil {
+		qos.logger.Warn().Msg("Cannot start archival cache refresh: cache not initialized")
+		return
+	}
+
+	serviceID := qos.serviceQoSConfig.GetServiceID()
+
+	refreshFromRedis := func() {
+		qos.refreshArchivalCacheFromRedis(ctx)
+	}
+
+	// Immediate refresh on startup for cache warming
+	refreshFromRedis()
+	qos.logger.Info().
+		Str("service_id", string(serviceID)).
+		Msg("Completed initial archival cache refresh from Redis")
+
+	go func() {
+		ticker := time.NewTicker(refreshInterval)
+		defer ticker.Stop()
+
+		// Also run cleanup every hour to remove expired entries
+		cleanupTicker := time.NewTicker(1 * time.Hour)
+		defer cleanupTicker.Stop()
+
+		qos.logger.Info().
+			Str("service_id", string(serviceID)).
+			Dur("refresh_interval", refreshInterval).
+			Msg("Started archival cache refresh worker")
+
+		for {
+			select {
+			case <-ctx.Done():
+				qos.logger.Debug().
+					Str("service_id", string(serviceID)).
+					Msg("Stopping archival cache refresh worker")
+				return
+			case <-ticker.C:
+				qos.logger.Debug().Msg("Refreshing archival cache from Redis")
+				refreshFromRedis()
+			case <-cleanupTicker.C:
+				qos.logger.Debug().Msg("Cleaning up expired archival cache entries")
+				qos.archivalCache.Cleanup()
+			}
+		}
+	}()
+}
+
+// refreshArchivalCacheFromRedis fetches archival status for all known endpoints from Redis
+// and updates the local cache. This runs in background, not blocking requests.
+//
+// Two sources of endpoints are checked:
+//  1. Local endpointStore - works once endpoints are populated from sessions
+//  2. Reputation service cache (GetArchivalEndpoints) - works at cold start when
+//     endpointStore is empty but reputation.Start() has already loaded data from Redis
+func (qos *QoS) refreshArchivalCacheFromRedis(parentCtx context.Context) {
+	serviceID := qos.serviceQoSConfig.GetServiceID()
+
+	// Use 8-hour TTL matching archival status expiry
+	const archivalTTL = 8 * time.Hour
+
+	var refreshed, failed int
+
+	// Pass 1: Check all endpoints from local endpointStore
+	qos.endpointStore.endpointsMu.RLock()
+	endpoints := make([]protocol.EndpointAddr, 0, len(qos.endpointStore.endpoints))
+	for addr := range qos.endpointStore.endpoints {
+		endpoints = append(endpoints, addr)
+	}
+	qos.endpointStore.endpointsMu.RUnlock()
+
+	if len(endpoints) > 0 {
+		qos.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Int("endpoint_count", len(endpoints)).
+			Msg("Refreshing archival cache from endpoint store")
+
+		for _, addr := range endpoints {
+			key := reputation.NewEndpointKey(
+				serviceID,
+				addr,
+				sharedtypes.RPCType_JSON_RPC,
+			)
+
+			// Use 2-second timeout per Redis operation (not aggressive per research)
+			ctx, cancel := context.WithTimeout(parentCtx, 2*time.Second)
+			isArchival := qos.reputationSvc.IsArchivalCapable(ctx, key)
+			cancel()
+
+			if ctx.Err() != nil {
+				failed++
+				continue
+			}
+
+			if isArchival {
+				qos.archivalCache.Set(key.String(), true, archivalTTL)
+				refreshed++
+			}
+		}
+	}
+
+	// Pass 2: Bootstrap from reputation service cache.
+	// At cold start, endpointStore is empty but reputation.Start() has already
+	// loaded all data from Redis into its local cache. Query it directly.
+	archivalKeys := qos.reputationSvc.GetArchivalEndpoints(parentCtx, serviceID)
+	var bootstrapped int
+	for _, key := range archivalKeys {
+		cacheKey := key.String()
+		if isArchival, ok := qos.archivalCache.Get(cacheKey); !ok || !isArchival {
+			qos.archivalCache.Set(cacheKey, true, archivalTTL)
+			bootstrapped++
+		}
+	}
+
+	qos.logger.Info().
+		Str("service_id", string(serviceID)).
+		Int("refreshed_from_store", refreshed).
+		Int("bootstrapped_from_reputation", bootstrapped).
+		Int("failed", failed).
+		Int("store_endpoints", len(endpoints)).
+		Int("reputation_archival_keys", len(archivalKeys)).
+		Msg("Archival cache refresh complete")
 }

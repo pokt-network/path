@@ -60,6 +60,11 @@ type serviceState struct {
 	// When set, archival checks use this in addition to the local endpointStore.
 	// This ensures archival status set by health check leader is visible to all replicas.
 	reputationSvc reputation.ReputationService
+
+	// archivalCache provides fast local lookups for archival endpoint status.
+	// Populated by UpdateFromExtractedData and background refresh worker.
+	// Replaces synchronous Redis calls in the hot path.
+	archivalCache *ArchivalCache
 }
 
 /* -------------------- QoS Endpoint Check Generator -------------------- */

@@ -37,14 +37,14 @@ type RedisStorage struct {
 
 // Redis hash field names
 const (
-	fieldValue            = "value"
-	fieldLastUpdated      = "last_updated"
-	fieldSuccessCount     = "success_count"
-	fieldErrorCount       = "error_count"
-	fieldCriticalStrikes  = "critical_strikes"
-	fieldCooldownUntil    = "cooldown_until"
-	fieldIsArchival       = "is_archival"
-	fieldArchivalExpires  = "archival_expires_at"
+	fieldValue           = "value"
+	fieldLastUpdated     = "last_updated"
+	fieldSuccessCount    = "success_count"
+	fieldErrorCount      = "error_count"
+	fieldCriticalStrikes = "critical_strikes"
+	fieldCooldownUntil   = "cooldown_until"
+	fieldIsArchival      = "is_archival"
+	fieldArchivalExpires = "archival_expires_at"
 )
 
 // NewRedisStorage creates a new Redis-backed storage.
@@ -81,6 +81,9 @@ func (r *RedisStorage) buildKey(key reputation.EndpointKey) string {
 }
 
 // parseKey extracts the EndpointKey from a Redis key string.
+// Key format after prefix removal: "serviceID:endpointAddr:rpcType"
+// EndpointAddr may contain colons (e.g., URLs like "pokt1abc-https://node.com:8545"),
+// so we split serviceID at the first colon and rpcType at the last colon.
 func (r *RedisStorage) parseKey(redisKey string) (reputation.EndpointKey, bool) {
 	// Remove prefix
 	withoutPrefix := strings.TrimPrefix(redisKey, r.keyPrefix)
@@ -88,18 +91,31 @@ func (r *RedisStorage) parseKey(redisKey string) (reputation.EndpointKey, bool) 
 		return reputation.EndpointKey{}, false // Key didn't have the expected prefix
 	}
 
-	// Split into serviceID:endpointAddr:rpcType
-	parts := strings.SplitN(withoutPrefix, ":", 3)
-	if len(parts) != 3 {
+	// Find rpcType: always the last colon-separated segment
+	lastColon := strings.LastIndex(withoutPrefix, ":")
+	if lastColon <= 0 {
+		return reputation.EndpointKey{}, false
+	}
+	rpcTypeStr := withoutPrefix[lastColon+1:]
+
+	// Find serviceID: always the first colon-separated segment
+	rest := withoutPrefix[:lastColon]
+	firstColon := strings.Index(rest, ":")
+	if firstColon <= 0 {
+		return reputation.EndpointKey{}, false
+	}
+	serviceID := rest[:firstColon]
+	endpointAddr := rest[firstColon+1:]
+
+	if endpointAddr == "" {
 		return reputation.EndpointKey{}, false
 	}
 
-	// Parse RPC type from string
-	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[parts[2]])
+	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(rpcTypeStr)])
 
 	return reputation.NewEndpointKey(
-		protocol.ServiceID(parts[0]),
-		protocol.EndpointAddr(parts[1]),
+		protocol.ServiceID(serviceID),
+		protocol.EndpointAddr(endpointAddr),
 		rpcType,
 	), true
 }

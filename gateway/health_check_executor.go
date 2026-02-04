@@ -1267,11 +1267,13 @@ func (e *HealthCheckExecutor) markEndpointArchival(serviceID protocol.ServiceID,
 		return
 	}
 
-	// Convert check type to RPC type for the reputation key
-	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(string(check.Type))])
-	if rpcType == sharedtypes.RPCType_UNKNOWN_RPC {
-		rpcType = sharedtypes.RPCType_JSON_RPC // Default to JSON_RPC
-	}
+	// IMPORTANT: Always use RPCType_JSON_RPC for archival status keys, regardless of health check type.
+	// This ensures consistency with endpoint selection filtering, which always uses RPCType_JSON_RPC
+	// when checking archival status. If we used different RPC types here, non-leader replicas would
+	// not find archival endpoints in Redis (different keys = different storage buckets).
+	// For cross-replica consistency, health checks, UpdateFromExtractedData, and endpoint selection
+	// filtering all must use the same RPC type: RPCType_JSON_RPC.
+	rpcType := sharedtypes.RPCType_JSON_RPC
 
 	// Build reputation key
 	key := reputation.NewEndpointKey(serviceID, endpointAddr, rpcType)
@@ -1307,11 +1309,13 @@ func (e *HealthCheckExecutor) markEndpointArchival(serviceID protocol.ServiceID,
 // This is called when an archival health check FAILS validation (expected_response_contains didn't match).
 // This ensures endpoints that return errors are not marked as archival-capable.
 func (e *HealthCheckExecutor) clearEndpointArchival(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, check HealthCheckConfig) {
-	// Convert check type to RPC type for the reputation key
-	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(string(check.Type))])
-	if rpcType == sharedtypes.RPCType_UNKNOWN_RPC {
-		rpcType = sharedtypes.RPCType_JSON_RPC // Default to JSON_RPC
-	}
+	// IMPORTANT: Always use RPCType_JSON_RPC for archival status keys, regardless of health check type.
+	// This ensures consistency with endpoint selection filtering, which always uses RPCType_JSON_RPC
+	// when checking archival status. If we used different RPC types here, non-leader replicas would
+	// not find archival endpoints in Redis (different keys = different storage buckets).
+	// For cross-replica consistency, health checks, UpdateFromExtractedData, and endpoint selection
+	// filtering all must use the same RPC type: RPCType_JSON_RPC.
+	rpcType := sharedtypes.RPCType_JSON_RPC
 
 	// Clear archival status via reputation service (synced to Redis)
 	if e.reputationSvc != nil {

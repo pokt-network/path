@@ -44,10 +44,21 @@ type evmRequestValidator struct {
 //
 // EVM only supports JSON-RPC, so detectedRPCType is logged but not used for routing.
 func (erv *evmRequestValidator) validateHTTPRequest(req *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
+	// Extract request ID from HTTP headers for log correlation.
+	// Check common headers: X-Request-ID, X-Correlation-ID, X-Trace-ID (matching gateway pattern)
+	requestID := req.Header.Get("X-Request-ID")
+	if requestID == "" {
+		requestID = req.Header.Get("X-Correlation-ID")
+	}
+	if requestID == "" {
+		requestID = req.Header.Get("X-Trace-ID")
+	}
+
 	logger := erv.logger.With(
 		"qos", "EVM",
 		"method", "validateHTTPRequest",
 		"detected_rpc_type", detectedRPCType.String(),
+		"request_id", requestID,
 	)
 
 	// Read the HTTP request body with size limit to prevent OOM attacks
@@ -82,16 +93,29 @@ func (erv *evmRequestValidator) validateHTTPRequest(req *http.Request, detectedR
 		perceivedBlock := erv.serviceState.perceivedBlockNumber.Load()
 		archivalResult = erv.serviceState.archivalHeuristic.IsArchivalRequest(body, perceivedBlock)
 
-		logger.Debug().
-			Bool("requires_archival", archivalResult.RequiresArchival).
-			Str("archival_reason", archivalResult.Reason).
-			Str("method", archivalResult.Method).
-			Msg("Archival detection completed")
+		// CODE_PATH: Log archival heuristic detection result for request tracing
+		if archivalResult.RequiresArchival {
+			logger.Info().Str("code_path", "ARCHIVAL_REQUEST_DETECTED").
+				Bool("requires_archival", archivalResult.RequiresArchival).
+				Str("archival_reason", archivalResult.Reason).
+				Str("method", archivalResult.Method).
+				Uint64("requested_block", archivalResult.RequestedBlock).
+				Str("block_tag", string(archivalResult.BlockTag)).
+				Uint64("perceived_block", perceivedBlock).
+				Msg("archival request detected - will route to archival-capable endpoints")
+		} else {
+			logger.Debug().Str("code_path", "NON_ARCHIVAL_REQUEST").
+				Bool("requires_archival", archivalResult.RequiresArchival).
+				Str("archival_reason", archivalResult.Reason).
+				Str("method", archivalResult.Method).
+				Uint64("perceived_block", perceivedBlock).
+				Msg("non-archival request - eligible for all valid endpoints")
+		}
 	}
 
 	// Request is valid, return a fully initialized requestContext
 	return &requestContext{
-		logger:               erv.logger,
+		logger:               logger, // Use logger with request_id field
 		chainID:              erv.chainID,
 		serviceID:            erv.serviceID,
 		requestPayloadLength: uint(len(body)),
@@ -99,6 +123,7 @@ func (erv *evmRequestValidator) validateHTTPRequest(req *http.Request, detectedR
 		isBatch:              isBatch,
 		serviceState:         erv.serviceState,
 		archivalResult:       archivalResult,
+		requestID:            requestID,
 		// Set the origin of the request as ORGANIC (i.e. from a user).
 		requestOrigin: qosobservations.RequestOrigin_REQUEST_ORIGIN_ORGANIC,
 	}, true

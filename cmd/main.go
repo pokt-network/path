@@ -92,10 +92,13 @@ func main() {
 	// - Reputation scores: already handled by the reputation service's periodic refresh
 	if reputationSvc := protocol.GetReputationService(); reputationSvc != nil {
 		const perceivedBlockSyncInterval = 5 * time.Second
+		const archivalCacheRefreshInterval = 5 * time.Second
 
 		for serviceID, qosInstance := range qosInstances {
 			// Set reputation service for archival status lookups
-			if evmQoS, ok := qosInstance.(interface{ SetReputationService(reputation.ReputationService) }); ok {
+			if evmQoS, ok := qosInstance.(interface {
+				SetReputationService(reputation.ReputationService)
+			}); ok {
 				evmQoS.SetReputationService(reputationSvc)
 				logger.Debug().Str("service_id", string(serviceID)).Msg("Wired reputation service to QoS instance")
 			}
@@ -106,6 +109,14 @@ func main() {
 			}); ok {
 				evmQoS.StartBackgroundSync(backgroundCtx, perceivedBlockSyncInterval)
 				logger.Debug().Str("service_id", string(serviceID)).Msg("Started background sync for QoS instance")
+			}
+
+			// Start archival cache refresh worker for cross-replica archival status sync
+			if evmQoS, ok := qosInstance.(interface {
+				StartArchivalCacheRefreshWorker(ctx context.Context, refreshInterval time.Duration)
+			}); ok {
+				evmQoS.StartArchivalCacheRefreshWorker(backgroundCtx, archivalCacheRefreshInterval)
+				logger.Debug().Str("service_id", string(serviceID)).Msg("Started archival cache refresh worker for QoS instance")
 			}
 		}
 		logger.Info().Msg("Reputation service wired to QoS instances for shared state (archival, block height)")

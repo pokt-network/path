@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -147,6 +148,9 @@ type requestContext struct {
 	// hedgeResult tracks the outcome of hedge racing, if hedging was used.
 	// Values: "primary_only", "primary_won", "hedge_won", "both_failed", "no_hedge", or empty if not used.
 	hedgeResult string
+
+	// archivalRequestDetected tracks whether this request requires archival data.
+	archivalRequestDetected bool
 }
 
 // InitFromHTTPRequest builds the required context for serving an HTTP request.
@@ -580,17 +584,26 @@ func (rc *requestContext) writeHTTPResponse(response pathhttp.HTTPResponse, w ht
 //   - X-Supplier-Address: The supplier address of the endpoint (comma-separated for batched relays)
 //   - X-Session-ID: The session ID (comma-separated for batched relays if different)
 //   - X-Environment: The environment from PATH_ENVIRONMENT env variable
+//   - X-Archival-Request: Whether the request requires archival data (true/false)
+//   - X-Retry-Count: Number of retries attempted
+//   - X-Suppliers-Tried: Comma-separated list of supplier addresses tried
 //
 // For batched relays, up to 10 samples are included.
 func (rc *requestContext) addRelayMetadataHeaders(w http.ResponseWriter) {
+	// ALWAYS add archival request header (even on errors)
+	w.Header().Set("X-Archival-Request", strconv.FormatBool(rc.archivalRequestDetected))
+
 	// ALWAYS add retry count header (even on errors, even if 0)
 	w.Header().Set("X-Retry-Count", fmt.Sprintf("%d", rc.retryCount))
 
-	// ALWAYS add suppliers tried header if any were attempted (even on errors)
+	// ALWAYS add suppliers tried header (even on errors, even if empty)
+	suppliersTriedStr := strings.Join(rc.suppliersTried, ",")
+	w.Header().Set("X-Suppliers-Tried", suppliersTriedStr)
+
+	// Log suppliers tried details if any were attempted
 	if len(rc.suppliersTried) > 0 {
-		w.Header().Set("X-Suppliers-Tried", strings.Join(rc.suppliersTried, ","))
 		rc.logger.Debug().
-			Str("suppliers_tried", strings.Join(rc.suppliersTried, ",")).
+			Str("suppliers_tried", suppliersTriedStr).
 			Int("retry_count", rc.retryCount).
 			Str("hedge_result", rc.hedgeResult).
 			Msg("🔍 FINAL X-Suppliers-Tried header set")

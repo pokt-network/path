@@ -981,3 +981,95 @@ func TestService_MultipleServicesWithDifferentConfigs(t *testing.T) {
 	emptyMinThreshold := svc.GetMinThresholdForService("")
 	require.Equal(t, 25.0, emptyMinThreshold, "empty service ID should use global min threshold")
 }
+
+func TestService_GetArchivalEndpoints(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	defer store.Close()
+
+	config := Config{
+		Enabled:      true,
+		InitialScore: 80,
+	}
+	config.HydrateDefaults()
+
+	svc := NewService(config, store)
+	err := svc.Start(ctx)
+	require.NoError(t, err)
+	defer func() { _ = svc.Stop() }()
+
+	// Set archival status for some endpoints
+	archivalTTL := 8 * time.Hour
+	key1 := NewEndpointKey("eth", "ep1-url", sharedtypes.RPCType_JSON_RPC)
+	key2 := NewEndpointKey("eth", "ep2-url", sharedtypes.RPCType_JSON_RPC)
+	key3 := NewEndpointKey("eth", "ep3-url", sharedtypes.RPCType_JSON_RPC)
+	key4 := NewEndpointKey("solana", "ep4-url", sharedtypes.RPCType_JSON_RPC)
+
+	// Mark key1 and key2 as archival for "eth"
+	err = svc.SetArchivalStatus(ctx, key1, true, archivalTTL)
+	require.NoError(t, err)
+	err = svc.SetArchivalStatus(ctx, key2, true, archivalTTL)
+	require.NoError(t, err)
+
+	// Mark key3 as NOT archival (explicitly false)
+	err = svc.SetArchivalStatus(ctx, key3, false, archivalTTL)
+	require.NoError(t, err)
+
+	// Mark key4 as archival but for "solana" service
+	err = svc.SetArchivalStatus(ctx, key4, true, archivalTTL)
+	require.NoError(t, err)
+
+	// Get archival endpoints for "eth" - should return key1 and key2
+	ethArchival := svc.GetArchivalEndpoints(ctx, "eth")
+	require.Len(t, ethArchival, 2, "should return 2 archival endpoints for eth")
+
+	// Verify the returned keys match
+	found := make(map[string]bool)
+	for _, k := range ethArchival {
+		found[k.String()] = true
+	}
+	require.True(t, found[key1.String()], "key1 should be in archival endpoints")
+	require.True(t, found[key2.String()], "key2 should be in archival endpoints")
+
+	// Get archival endpoints for "solana" - should return key4
+	solanaArchival := svc.GetArchivalEndpoints(ctx, "solana")
+	require.Len(t, solanaArchival, 1, "should return 1 archival endpoint for solana")
+	require.Equal(t, key4.String(), solanaArchival[0].String())
+
+	// Get archival endpoints for unknown service - should be empty
+	unknownArchival := svc.GetArchivalEndpoints(ctx, "unknown")
+	require.Empty(t, unknownArchival, "should return empty for unknown service")
+}
+
+func TestService_GetArchivalEndpoints_ExpiredEntries(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	defer store.Close()
+
+	config := Config{
+		Enabled:      true,
+		InitialScore: 80,
+	}
+	config.HydrateDefaults()
+
+	svc := NewService(config, store).(*service)
+	err := svc.Start(ctx)
+	require.NoError(t, err)
+	defer func() { _ = svc.Stop() }()
+
+	key := NewEndpointKey("eth", "ep1-url", sharedtypes.RPCType_JSON_RPC)
+
+	// Manually set an expired archival entry in the cache
+	svc.mu.Lock()
+	svc.cache[key.String()] = Score{
+		Value:             80,
+		IsArchival:        true,
+		ArchivalExpiresAt: time.Now().Add(-1 * time.Hour), // expired
+		LastUpdated:       time.Now(),
+	}
+	svc.mu.Unlock()
+
+	// GetArchivalEndpoints should NOT return expired entries
+	archival := svc.GetArchivalEndpoints(ctx, "eth")
+	require.Empty(t, archival, "expired archival entries should not be returned")
+}

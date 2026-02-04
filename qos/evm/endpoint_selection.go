@@ -1,7 +1,6 @@
 package evm
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -47,24 +46,35 @@ type EndpointSelectionMetadata struct {
 // Endpoints are selected with TLD diversity preference when possible.
 // If numEndpoints is 0, it defaults to 1. If numEndpoints is greater than available endpoints, it returns all valid endpoints.
 // Note: SelectMultiple does not support archival filtering - it's used for hedge racing where we want all valid endpoints.
-func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
-	return ss.SelectMultipleWithArchival(availableEndpoints, numEndpoints, false)
+func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrList, numEndpoints uint, requestID string) (protocol.EndpointAddrList, error) {
+	return ss.SelectMultipleWithArchival(availableEndpoints, numEndpoints, false, requestID)
 }
 
 // SelectMultipleWithArchival returns multiple endpoint addresses with optional archival filtering.
 // When requiresArchival is true, only endpoints that have passed archival capability checks are considered.
 // When requiresArchival is false, all valid endpoints are considered (same behavior as SelectMultiple).
 // This enables archival requests to be routed only to archival-capable endpoints.
-func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.EndpointAddrList, numEndpoints uint, requiresArchival bool) (protocol.EndpointAddrList, error) {
+func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.EndpointAddrList, numEndpoints uint, requiresArchival bool, requestID string) (protocol.EndpointAddrList, error) {
 	logger := ss.logger.With("method", "SelectMultipleWithArchival").
 		With("chain_id", ss.serviceQoSConfig.getEVMChainID()).
 		With("service_id", ss.serviceQoSConfig.GetServiceID()).
 		With("num_endpoints", numEndpoints).
-		With("requires_archival", requiresArchival)
-	logger.Debug().Msgf("filtering %d available endpoints to select up to %d.", len(availableEndpoints), numEndpoints)
+		With("requires_archival", requiresArchival).
+		With("request_id", requestID)
+
+	// CODE_PATH: Entry point for endpoint selection
+	if requiresArchival {
+		logger.Debug().Str("code_path", "ARCHIVAL_SELECTION_ENTRY").
+			Int("available_endpoints", len(availableEndpoints)).
+			Msgf("filtering %d available endpoints to select up to %d archival-capable.", len(availableEndpoints), numEndpoints)
+	} else {
+		logger.Debug().Str("code_path", "STANDARD_SELECTION_ENTRY").
+			Int("available_endpoints", len(availableEndpoints)).
+			Msgf("filtering %d available endpoints to select up to %d.", len(availableEndpoints), numEndpoints)
+	}
 
 	// Filter valid endpoints with archival filtering when required
-	filteredEndpointsAddr, _, err := ss.filterValidEndpointsWithDetails(availableEndpoints, requiresArchival)
+	filteredEndpointsAddr, _, err := ss.filterValidEndpointsWithDetails(availableEndpoints, requiresArchival, requestID)
 	if err != nil {
 		logger.Error().Err(err).Msg("error filtering endpoints")
 		return nil, err
@@ -77,19 +87,31 @@ func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.E
 		if requiresArchival {
 			archivalEndpoints := ss.filterArchivalEndpointsForFallback(availableEndpoints)
 			if len(archivalEndpoints) > 0 {
-				logger.Warn().Msgf("SELECTING RANDOM ARCHIVAL ENDPOINTS (fallback) from %d archival-capable endpoints", len(archivalEndpoints))
+				// CODE_PATH: Archival fallback - random selection from archival-capable endpoints
+				logger.Warn().Str("code_path", "ARCHIVAL_FALLBACK_RANDOM").
+					Int("archival_endpoints", len(archivalEndpoints)).
+					Int("total_endpoints", len(availableEndpoints)).
+					Msgf("selecting random archival endpoints (fallback) from %d archival-capable endpoints", len(archivalEndpoints))
 				return selector.RandomSelectMultiple(archivalEndpoints, numEndpoints), nil
 			}
-			// No archival endpoints available - log and fail gracefully
-			logger.Error().Msgf("NO ARCHIVAL ENDPOINTS available for archival request from %d total endpoints", len(availableEndpoints))
+			// CODE_PATH: No archival endpoints available - request will fail
+			logger.Error().Str("code_path", "ARCHIVAL_NO_ENDPOINTS").
+				Int("total_endpoints", len(availableEndpoints)).
+				Msg("no archival-capable endpoints available for archival request")
 			return nil, fmt.Errorf("no archival-capable endpoints available for archival request")
 		}
-		logger.Warn().Msgf("SELECTING RANDOM ENDPOINTS because all endpoints failed validation from: %s", availableEndpoints.String())
+		// CODE_PATH: Standard fallback - random selection from all endpoints
+		logger.Warn().Str("code_path", "STANDARD_FALLBACK_RANDOM").
+			Int("total_endpoints", len(availableEndpoints)).
+			Msgf("selecting random endpoints because all endpoints failed validation from: %s", availableEndpoints.String())
 		return selector.RandomSelectMultiple(availableEndpoints, numEndpoints), nil
 	}
 
-	// Use the diversity-aware selection
-	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(availableEndpoints))
+	// CODE_PATH: Selection success - using diversity-aware selection
+	logger.Debug().Str("code_path", "SELECTION_SUCCESS").
+		Int("filtered_endpoints", len(filteredEndpointsAddr)).
+		Int("available_endpoints", len(availableEndpoints)).
+		Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(availableEndpoints))
 	return selector.SelectEndpointsWithDiversity(logger, filteredEndpointsAddr, numEndpoints), nil
 }
 
@@ -99,16 +121,17 @@ func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.E
 //
 // When requiresArchival is true, only endpoints that have passed the archival check are considered.
 // When requiresArchival is false, the archival check is skipped, allowing all valid endpoints.
-func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointAddrList, requiresArchival bool) (EndpointSelectionResult, error) {
+func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointAddrList, requiresArchival bool, requestID string) (EndpointSelectionResult, error) {
 	logger := ss.logger.With("method", "SelectWithMetadata").
 		With("chain_id", ss.serviceQoSConfig.getEVMChainID()).
 		With("service_id", ss.serviceQoSConfig.GetServiceID()).
-		With("requires_archival", requiresArchival)
+		With("requires_archival", requiresArchival).
+		With("request_id", requestID)
 
 	availableCount := len(availableEndpoints)
 	logger.Debug().Msgf("filtering %d available endpoints.", availableCount)
 
-	filteredEndpointsAddr, validationResults, err := ss.filterValidEndpointsWithDetails(availableEndpoints, requiresArchival)
+	filteredEndpointsAddr, validationResults, err := ss.filterValidEndpointsWithDetails(availableEndpoints, requiresArchival, requestID)
 	if err != nil {
 		logger.Error().Err(err).Msg("error filtering endpoints")
 		return EndpointSelectionResult{}, err
@@ -155,10 +178,11 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 //
 // Performance: Copies endpoint data under lock, then releases lock before validation loop
 // to minimize lock contention on the hot path.
-func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints protocol.EndpointAddrList, requiresArchival bool) (protocol.EndpointAddrList, []*qosobservations.EndpointValidationResult, error) {
+func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints protocol.EndpointAddrList, requiresArchival bool, requestID string) (protocol.EndpointAddrList, []*qosobservations.EndpointValidationResult, error) {
 	logger := ss.logger.With("method", "filterValidEndpointsWithDetails").
 		With("qos_instance", "evm").
-		With("requires_archival", requiresArchival)
+		With("requires_archival", requiresArchival).
+		With("request_id", requestID)
 
 	if len(availableEndpoints) == 0 {
 		return nil, nil, errEmptyEndpointListObs
@@ -186,6 +210,14 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 	var filteredEndpointsAddr protocol.EndpointAddrList
 	var validationResults []*qosobservations.EndpointValidationResult
 
+	// CODE_PATH: Start validation loop
+	logger.Debug().Str("code_path", "VALIDATION_LOOP_START").
+		Int("endpoints_to_validate", len(endpointsCopy)).
+		Msg("starting endpoint validation loop")
+
+	// Track validation statistics for summary logging
+	var validCount, invalidCount, archivalFilteredCount int
+
 	// TODO_FUTURE: use service-specific metrics to add an endpoint ranking method
 	// which can be used to assign a rank/score to a valid endpoint to guide endpoint selection.
 	for _, data := range endpointsCopy {
@@ -193,15 +225,43 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 		logger.Debug().Msg("processing endpoint")
 
 		if !data.found {
+			// For archival requests: only allow fresh endpoints confirmed archival in cache,
+			// but only when the cache has been populated (Len > 0). If the cache is empty
+			// (cold start, health checks still running), fall back to allowing fresh endpoints
+			// through to avoid blocking all archival requests indefinitely.
+			if requiresArchival && ss.archivalCache != nil && ss.archivalCache.Len() > 0 {
+				key := reputation.NewEndpointKey(
+					ss.serviceQoSConfig.GetServiceID(),
+					data.addr,
+					sharedtypes.RPCType_JSON_RPC,
+				)
+				if isArchival, ok := ss.archivalCache.Get(key.String()); !ok || !isArchival {
+					invalidCount++
+					archivalFilteredCount++
+					logger.Debug().Str("code_path", "FRESH_ENDPOINT_ARCHIVAL_FILTERED").
+						Str("endpoint_addr", string(data.addr)).
+						Msg("fresh endpoint filtered: not confirmed archival in cache")
+
+					failureReason := qosobservations.EndpointValidationFailureReason_ENDPOINT_VALIDATION_FAILURE_REASON_ARCHIVAL_CHECK_FAILED
+					failureDetails := "fresh endpoint not confirmed archival in cache"
+					validationResults = append(validationResults, &qosobservations.EndpointValidationResult{
+						EndpointAddr:   string(data.addr),
+						Success:        false,
+						FailureReason:  &failureReason,
+						FailureDetails: &failureDetails,
+					})
+					continue
+				}
+			}
+
+			// Non-archival requests OR archival-confirmed fresh endpoints: allow through.
 			// It is valid for an endpoint to not be in the store yet (e.g., first request,
-			// no observations collected). Treat it as a fresh endpoint and allow it.
-			// It will be added to the store once observations are collected.
+			// no observations collected). It will be added to the store once observations are collected.
 			logger.Warn().
 				Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 				Uint64("sync_allowance", ss.serviceQoSConfig.getSyncAllowance()).
 				Msg("🔍 Sync allowance check SKIPPED (endpoint not yet in store - fresh endpoint)")
 
-			// Create validation result for endpoint not in store (but still valid)
 			result := &qosobservations.EndpointValidationResult{
 				EndpointAddr: string(data.addr),
 				Success:      true,
@@ -213,10 +273,37 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 		}
 
 		if err := ss.basicEndpointValidation(data.addr, data.endpoint, requiresArchival); err != nil {
-			logger.Warn().
-				Err(err).
-				Str("endpoint_addr", string(data.addr)).
-				Msg("⚠️ SKIPPING endpoint because it failed basic validation")
+			invalidCount++
+
+			// Check if this is a structured filter error with details
+			var filterErr *EndpointFilterError
+			if errors.As(err, &filterErr) {
+				logEvent := logger.Warn().
+					Err(err).
+					Str("endpoint_addr", string(data.addr)).
+					Str("filter_layer", string(filterErr.Layer)).
+					Str("filter_reason", filterErr.Reason)
+				// Add each detail field to the log
+				for k, v := range filterErr.Details {
+					logEvent = logEvent.Str(k, fmt.Sprintf("%v", v))
+				}
+				logEvent.Msg("SKIPPING endpoint: structured validation failure")
+
+				// CODE_PATH: Track archival filtering specifically
+				if filterErr.Layer == FilterLayerArchival {
+					archivalFilteredCount++
+					logger.Debug().Str("code_path", "ARCHIVAL_FILTER_REJECTED").
+						Str("endpoint_addr", string(data.addr)).
+						Str("filter_reason", filterErr.Reason).
+						Bool("redis_checked", filterErr.Details["redis_checked"] == true).
+						Msg("endpoint rejected by archival filter")
+				}
+			} else {
+				logger.Warn().
+					Err(err).
+					Str("endpoint_addr", string(data.addr)).
+					Msg("SKIPPING endpoint because it failed basic validation")
+			}
 
 			// Create validation result for validation failure
 			failureReason := ss.categorizeValidationFailure(err)
@@ -232,6 +319,7 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 		}
 
 		// Endpoint passed validation - record success and add to valid list
+		validCount++
 		result := &qosobservations.EndpointValidationResult{
 			EndpointAddr: string(data.addr),
 			Success:      true,
@@ -241,6 +329,14 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 		filteredEndpointsAddr = append(filteredEndpointsAddr, data.addr)
 		logger.Debug().Msgf("endpoint passed validation: %s", data.addr)
 	}
+
+	// CODE_PATH: Validation loop complete - summary
+	logger.Debug().Str("code_path", "VALIDATION_COMPLETE").
+		Int("valid_count", validCount).
+		Int("invalid_count", invalidCount).
+		Int("archival_filtered_count", archivalFilteredCount).
+		Int("total_validated", len(endpointsCopy)).
+		Msg("endpoint validation loop complete")
 
 	return filteredEndpointsAddr, validationResults, nil
 }
@@ -328,26 +424,40 @@ func (ss *serviceState) basicEndpointValidation(endpointAddr protocol.EndpointAd
 	// Archival requests will only be routed to archival-capable endpoints.
 	// Archival capability is determined by external health checks, not by QoS observations.
 	if requiresArchival {
+		// Build diagnostic details for logging regardless of outcome
+		archivalDetails := &ArchivalFilterDetails{
+			IsArchival:   endpoint.checkArchival.isArchival,
+			ExpiresAt:    endpoint.checkArchival.expiresAt,
+			IsExpired:    !endpoint.checkArchival.expiresAt.IsZero() && time.Now().After(endpoint.checkArchival.expiresAt),
+			RedisChecked: false, // DEPRECATED: kept for backward compatibility
+			CacheChecked: false,
+		}
+		if archivalDetails.IsExpired {
+			archivalDetails.TimeSinceExpiry = time.Since(endpoint.checkArchival.expiresAt)
+		}
+
 		// Check archival from local endpointStore first (fast path for leader replica)
 		if isArchivalCapable(endpoint.checkArchival) == nil {
 			return nil // Local check passed
 		}
 
-		// Local check failed - try reputation service (shared across replicas via Redis)
-		// This is the key fix: non-leader replicas will get archival status from Redis
-		if ss.reputationSvc != nil {
-			// Build reputation key - use JSON_RPC as default RPC type for archival checks
+		// Check local archival cache (populated by background refresh and UpdateFromExtractedData)
+		// This replaces synchronous Redis call - O(1) lookup, no network latency
+		if ss.archivalCache != nil {
+			archivalDetails.CacheChecked = true
 			key := reputation.NewEndpointKey(
 				ss.serviceQoSConfig.GetServiceID(),
 				endpointAddr,
 				sharedtypes.RPCType_JSON_RPC,
 			)
-			if ss.reputationSvc.IsArchivalCapable(context.Background(), key) {
-				return nil // Redis check passed
+			if isArchival, ok := ss.archivalCache.Get(key.String()); ok && isArchival {
+				archivalDetails.CacheIsArchival = true
+				return nil // Cache check passed
 			}
 		}
 
-		return fmt.Errorf("archival capability check failed: %w", errEndpointNotArchival)
+		// Both checks failed - return structured error with diagnostic details
+		return NewArchivalFilterError(string(endpointAddr), archivalDetails, errEndpointNotArchival)
 	}
 
 	return nil
@@ -409,8 +519,15 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 			Uint64("min_allowed_block", minAllowedBlockNumber).
 			Int64("blocks_behind", blocksBehind).
 			Msg("⛔ Endpoint filtered: block height outside sync allowance")
-		return fmt.Errorf("%w: block number %d is outside the sync allowance relative to min allowed block number %d and sync allowance %d",
-			errOutsideSyncAllowanceBlockNumberObs, parsedBlockNumber, minAllowedBlockNumber, syncAllowance)
+
+		// Return structured error with diagnostic details
+		blockDetails := &BlockHeightFilterDetails{
+			EndpointBlock:  parsedBlockNumber,
+			PerceivedBlock: perceivedBlock,
+			SyncAllowance:  syncAllowance,
+			BlocksBehind:   blocksBehind,
+		}
+		return NewBlockHeightFilterError("", blockDetails, errOutsideSyncAllowanceBlockNumberObs)
 	}
 
 	// Log the sync allowance validation details only if it passes (to reduce noise)
@@ -457,8 +574,18 @@ func (ss *serviceState) isChainIDValid(check endpointCheckChainID) error {
 			Str("endpoint_chain_id", string(chainID)).
 			Str("expected_chain_id", string(expectedChainID)).
 			Msg("❌ Endpoint failed chain ID check - mismatch")
-		return fmt.Errorf("%w: chain ID %s does not match expected chain ID %s",
-			errInvalidChainIDObs, chainID, expectedChainID)
+
+		// Return structured error with diagnostic details
+		return NewEndpointFilterError(
+			FilterLayerLocalStore,
+			"chain_id_mismatch",
+			"", // addr not available in this function
+			errInvalidChainIDObs,
+			map[string]interface{}{
+				"endpoint_chain_id": string(chainID),
+				"expected_chain_id": string(expectedChainID),
+			},
+		)
 	}
 	return nil
 }
@@ -467,7 +594,15 @@ func (ss *serviceState) isChainIDValid(check endpointCheckChainID) error {
 // Used when normal validation fails but we need to respect archival requirements.
 // Checks both local endpointStore and Redis/reputation service for archival status.
 func (ss *serviceState) filterArchivalEndpointsForFallback(availableEndpoints protocol.EndpointAddrList) protocol.EndpointAddrList {
+	logger := ss.logger.With("method", "filterArchivalEndpointsForFallback")
+
+	// CODE_PATH: Start fallback archival filtering
+	logger.Debug().Str("code_path", "FALLBACK_ARCHIVAL_FILTER_START").
+		Int("endpoints_to_check", len(availableEndpoints)).
+		Msg("starting fallback archival endpoint filtering")
+
 	var archivalEndpoints protocol.EndpointAddrList
+	var localHits, cacheHits int
 
 	// Check each endpoint for archival capability
 	ss.endpointStore.endpointsMu.RLock()
@@ -476,23 +611,33 @@ func (ss *serviceState) filterArchivalEndpointsForFallback(availableEndpoints pr
 
 		// Check local store first
 		if found && endpoint.checkArchival.isValid() {
+			localHits++
 			archivalEndpoints = append(archivalEndpoints, addr)
 			continue
 		}
 
-		// Check reputation service (Redis) for shared archival status
-		if ss.reputationSvc != nil {
+		// Check local archival cache (no Redis call in hot path)
+		if ss.archivalCache != nil {
 			key := reputation.NewEndpointKey(
 				ss.serviceQoSConfig.GetServiceID(),
 				addr,
 				sharedtypes.RPCType_JSON_RPC,
 			)
-			if ss.reputationSvc.IsArchivalCapable(context.Background(), key) {
+			if isArchival, ok := ss.archivalCache.Get(key.String()); ok && isArchival {
+				cacheHits++
 				archivalEndpoints = append(archivalEndpoints, addr)
 			}
 		}
 	}
 	ss.endpointStore.endpointsMu.RUnlock()
+
+	// CODE_PATH: Complete fallback archival filtering
+	logger.Debug().Str("code_path", "FALLBACK_ARCHIVAL_FILTER_COMPLETE").
+		Int("archival_endpoints_found", len(archivalEndpoints)).
+		Int("local_hits", localHits).
+		Int("cache_hits", cacheHits).
+		Int("total_checked", len(availableEndpoints)).
+		Msg("fallback archival endpoint filtering complete")
 
 	return archivalEndpoints
 }

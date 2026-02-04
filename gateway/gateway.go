@@ -155,6 +155,12 @@ func (g Gateway) handleHTTPServiceRequest(
 		return
 	}
 
+	// Extract archival requirement from QoS context if available (EVM-specific)
+	// Use type assertion to check for RequiresArchival method
+	if archivalChecker, ok := gatewayRequestCtx.qosCtx.(interface{ RequiresArchival() bool }); ok {
+		gatewayRequestCtx.archivalRequestDetected = archivalChecker.RequiresArchival()
+	}
+
 	// TODO_TECHDEBT(@adshmh): Build a single protocol context to handle a request.
 	// - Obtaining a response to the user's request is protocol context's main responsibility.
 	// - The protocol context can/should:
