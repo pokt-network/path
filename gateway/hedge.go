@@ -126,7 +126,7 @@ func (hr *hedgeRacer) race(
 			Str("primary_supplier", primarySupplier).
 			Dur("latency", result.duration).
 			Bool("success", result.err == nil).
-			Int("suppliers_tracked_before", len(hr.rc.suppliersTried)).
+			Int("suppliers_tracked_before", hr.rc.getSuppliersTriedCount()).
 			Msg("⚡ Primary responded before hedge delay (no hedge needed)")
 
 		// Record metric: primary_only (no hedge was started)
@@ -157,7 +157,7 @@ func (hr *hedgeRacer) race(
 
 			// Pre-register both suppliers for X-Suppliers-Tried header
 			// This ensures both are tracked even if one is cancelled before responding
-			hr.rc.suppliersTried = append(hr.rc.suppliersTried, primarySupplier, hedgeSupplier)
+			hr.rc.addSuppliersTried(primarySupplier, hedgeSupplier)
 
 			// Build protocol context for hedge endpoint
 			hedgeCtx, _, err := hr.rc.protocol.BuildHTTPRequestContextForEndpoint(
@@ -433,24 +433,15 @@ func (hr *hedgeRacer) selectHedgeEndpoint(
 
 // handleResult extracts response data and tracks suppliers.
 func (hr *hedgeRacer) handleResult(result hedgeResult) ([]protocol.Response, error) {
-	// Track supplier tried
-	if result.supplierAddr != "" && len(hr.rc.suppliersTried) < 10 {
-		alreadyTracked := false
-		for _, s := range hr.rc.suppliersTried {
-			if s == result.supplierAddr {
-				alreadyTracked = true
-				break
-			}
-		}
-		if !alreadyTracked {
-			hr.rc.suppliersTried = append(hr.rc.suppliersTried, result.supplierAddr)
-			hr.logger.Debug().
-				Str("supplier", result.supplierAddr).
-				Bool("is_hedge", result.isHedge).
-				Str("source", "handleResult").
-				Int("total_suppliers_tried", len(hr.rc.suppliersTried)).
-				Msg("🔍 TRACKED supplier in suppliersTried (winner)")
-		}
+	// Track supplier tried using thread-safe method
+	// This is critical for batch requests where multiple goroutines share the requestContext
+	if added := hr.rc.addSupplierTried(result.supplierAddr); added {
+		hr.logger.Debug().
+			Str("supplier", result.supplierAddr).
+			Bool("is_hedge", result.isHedge).
+			Str("source", "handleResult").
+			Int("total_suppliers_tried", hr.rc.getSuppliersTriedCount()).
+			Msg("🔍 TRACKED supplier in suppliersTried (winner)")
 	}
 
 	return result.responses, result.err
@@ -476,24 +467,15 @@ func (hr *hedgeRacer) recordWinner(result hedgeResult) {
 
 // recordLoser records the losing request for reputation tracking.
 func (hr *hedgeRacer) recordLoser(result hedgeResult) {
-	// Track loser's supplier for X-Suppliers-Tried header
-	if result.supplierAddr != "" && len(hr.rc.suppliersTried) < 10 {
-		alreadyTracked := false
-		for _, s := range hr.rc.suppliersTried {
-			if s == result.supplierAddr {
-				alreadyTracked = true
-				break
-			}
-		}
-		if !alreadyTracked {
-			hr.rc.suppliersTried = append(hr.rc.suppliersTried, result.supplierAddr)
-			hr.logger.Debug().
-				Str("supplier", result.supplierAddr).
-				Bool("is_hedge", result.isHedge).
-				Str("source", "recordLoser").
-				Int("total_suppliers_tried", len(hr.rc.suppliersTried)).
-				Msg("🔍 TRACKED supplier in suppliersTried (loser)")
-		}
+	// Track loser's supplier for X-Suppliers-Tried header using thread-safe method
+	// This is critical for batch requests where multiple goroutines share the requestContext
+	if added := hr.rc.addSupplierTried(result.supplierAddr); added {
+		hr.logger.Debug().
+			Str("supplier", result.supplierAddr).
+			Bool("is_hedge", result.isHedge).
+			Str("source", "recordLoser").
+			Int("total_suppliers_tried", hr.rc.getSuppliersTriedCount()).
+			Msg("🔍 TRACKED supplier in suppliersTried (loser)")
 	}
 
 	requestType := "primary"

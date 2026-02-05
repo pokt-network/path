@@ -438,7 +438,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					Bool("hedge_started", racer.hedgeStarted).
 					Str("primary_endpoint", string(primaryEndpoint)).
 					Str("hedge_endpoint", string(racer.hedgeEndpoint)).
-					Int("suppliers_tracked", len(rc.suppliersTried)).
+					Int("suppliers_tracked", rc.getSuppliersTriedCount()).
 					Err(hedgeErr).
 					Msg("🔍 Hedge race completed")
 
@@ -497,7 +497,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 						Str("endpoint", string(endpointAddr)).
 						Int("status_code", statusCode).
 						Str("hedge_result", rc.hedgeResult).
-						Int("suppliers_tracked", len(rc.suppliersTried)).
+						Int("suppliers_tracked", rc.getSuppliersTriedCount()).
 						Int("retry_count", rc.retryCount).
 						Msg("🔍 Hedge race response failed heuristic check, will retry")
 				} else {
@@ -568,26 +568,16 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		}
 
 		// Track supplier tried for response headers (up to 10) - track ALL attempts including failures
-		if supplierForTracking != "" && len(rc.suppliersTried) < 10 {
-			// Only add if not already tracked (avoid duplicates on retry to same supplier)
-			alreadyTracked := false
-			for _, s := range rc.suppliersTried {
-				if s == supplierForTracking {
-					alreadyTracked = true
-					break
-				}
-			}
-			if !alreadyTracked {
-				rc.suppliersTried = append(rc.suppliersTried, supplierForTracking)
-				logger.Debug().
-					Str("supplier", supplierForTracking).
-					Int("attempt", attempt).
-					Int("retry_count", rc.retryCount).
-					Int("status_code", statusCode).
-					Str("source", "handleSingleRelayRequest").
-					Int("total_suppliers_tried", len(rc.suppliersTried)).
-					Msg("🔍 TRACKED supplier in suppliersTried (normal/retry path)")
-			}
+		// Use thread-safe method for consistency with batch request code path
+		if added := rc.addSupplierTried(supplierForTracking); added {
+			logger.Debug().
+				Str("supplier", supplierForTracking).
+				Int("attempt", attempt).
+				Int("retry_count", rc.retryCount).
+				Int("status_code", statusCode).
+				Str("source", "handleSingleRelayRequest").
+				Int("total_suppliers_tried", rc.getSuppliersTriedCount()).
+				Msg("🔍 TRACKED supplier in suppliersTried (normal/retry path)")
 		}
 
 		// Extract response bytes for heuristic analysis
@@ -1506,27 +1496,15 @@ func (rc *requestContext) handleSuccessfulResponse(
 		}
 
 		// Track supplier tried for response headers (up to 10)
-		if len(rc.suppliersTried) < 10 {
-			supplierAddr := response.Metadata.SupplierAddress
-			if supplierAddr != "" {
-				// Only add if not already tracked (avoid duplicates)
-				alreadyTracked := false
-				for _, s := range rc.suppliersTried {
-					if s == supplierAddr {
-						alreadyTracked = true
-						break
-					}
-				}
-				if !alreadyTracked {
-					rc.suppliersTried = append(rc.suppliersTried, supplierAddr)
-					logger.Debug().
-						Str("supplier", supplierAddr).
-						Int("result_index", result.index).
-						Str("source", "handleSuccessfulResponse-parallel").
-						Int("total_suppliers_tried", len(rc.suppliersTried)).
-						Msg("🔍 TRACKED supplier in suppliersTried (parallel path)")
-				}
-			}
+		// Use thread-safe method since parallel requests may run concurrently
+		supplierAddr := response.Metadata.SupplierAddress
+		if added := rc.addSupplierTried(supplierAddr); added {
+			logger.Debug().
+				Str("supplier", supplierAddr).
+				Int("result_index", result.index).
+				Str("source", "handleSuccessfulResponse-parallel").
+				Int("total_suppliers_tried", rc.getSuppliersTriedCount()).
+				Msg("🔍 TRACKED supplier in suppliersTried (parallel path)")
 		}
 	}
 

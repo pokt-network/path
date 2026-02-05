@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -143,7 +144,9 @@ type requestContext struct {
 
 	// suppliersTried tracks all supplier addresses that were attempted during the request.
 	// Includes the initial attempt and all retry attempts (up to 10 for header size limits).
+	// Access must be protected by suppliersMu when used from batch request goroutines.
 	suppliersTried []string
+	suppliersMu    sync.Mutex // Protects suppliersTried for concurrent batch request access
 
 	// hedgeResult tracks the outcome of hedge racing, if hedging was used.
 	// Values: "primary_only", "primary_won", "hedge_won", "both_failed", "no_hedge", or empty if not used.
@@ -151,6 +154,77 @@ type requestContext struct {
 
 	// archivalRequestDetected tracks whether this request requires archival data.
 	archivalRequestDetected bool
+}
+
+// addSupplierTried safely adds a supplier address to the suppliersTried list.
+// Thread-safe for use from concurrent batch request goroutines.
+// Returns true if the supplier was added, false if already present or limit reached.
+func (rc *requestContext) addSupplierTried(supplier string) bool {
+	if supplier == "" {
+		return false
+	}
+	rc.suppliersMu.Lock()
+	defer rc.suppliersMu.Unlock()
+
+	// Check limit
+	if len(rc.suppliersTried) >= 10 {
+		return false
+	}
+
+	// Check if already tracked
+	for _, s := range rc.suppliersTried {
+		if s == supplier {
+			return false
+		}
+	}
+
+	rc.suppliersTried = append(rc.suppliersTried, supplier)
+	return true
+}
+
+// addSuppliersTried safely adds multiple supplier addresses to the suppliersTried list.
+// Thread-safe for use from concurrent batch request goroutines.
+func (rc *requestContext) addSuppliersTried(suppliers ...string) {
+	rc.suppliersMu.Lock()
+	defer rc.suppliersMu.Unlock()
+
+	for _, supplier := range suppliers {
+		if supplier == "" {
+			continue
+		}
+		if len(rc.suppliersTried) >= 10 {
+			return
+		}
+		// Check if already tracked
+		alreadyTracked := false
+		for _, s := range rc.suppliersTried {
+			if s == supplier {
+				alreadyTracked = true
+				break
+			}
+		}
+		if !alreadyTracked {
+			rc.suppliersTried = append(rc.suppliersTried, supplier)
+		}
+	}
+}
+
+// getSuppliersTried safely returns a copy of the suppliersTried list.
+// Thread-safe for use from concurrent batch request goroutines.
+func (rc *requestContext) getSuppliersTried() []string {
+	rc.suppliersMu.Lock()
+	defer rc.suppliersMu.Unlock()
+	result := make([]string, len(rc.suppliersTried))
+	copy(result, rc.suppliersTried)
+	return result
+}
+
+// getSuppliersTriedCount safely returns the count of suppliers tried.
+// Thread-safe for use from concurrent batch request goroutines.
+func (rc *requestContext) getSuppliersTriedCount() int {
+	rc.suppliersMu.Lock()
+	defer rc.suppliersMu.Unlock()
+	return len(rc.suppliersTried)
 }
 
 // InitFromHTTPRequest builds the required context for serving an HTTP request.
@@ -597,11 +671,13 @@ func (rc *requestContext) addRelayMetadataHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Retry-Count", fmt.Sprintf("%d", rc.retryCount))
 
 	// ALWAYS add suppliers tried header (even on errors, even if empty)
-	suppliersTriedStr := strings.Join(rc.suppliersTried, ",")
+	// Use thread-safe getter since suppliersTried may be modified by concurrent batch goroutines
+	suppliersTried := rc.getSuppliersTried()
+	suppliersTriedStr := strings.Join(suppliersTried, ",")
 	w.Header().Set("X-Suppliers-Tried", suppliersTriedStr)
 
 	// Log suppliers tried details if any were attempted
-	if len(rc.suppliersTried) > 0 {
+	if len(suppliersTried) > 0 {
 		rc.logger.Debug().
 			Str("suppliers_tried", suppliersTriedStr).
 			Int("retry_count", rc.retryCount).
