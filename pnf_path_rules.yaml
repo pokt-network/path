@@ -1596,17 +1596,49 @@
       reputation_signal: major_error
 
 - service_id: tron
-  # Block time: ~3s | Source: chainspect.app, tronscan.org
+  # Block time: ~3s | Source: tronscan.org, chainspect.app
   # Formula: 300s / 3s = 100 blocks for 5 minutes
   sync_allowance: 100
   check_interval: 15s
   enabled: true
   checks:
+    # Primary sync check - REST API (Tron's native interface)
     - name: getNowBlock
       type: rest
       method: POST
       path: /wallet/getnowblock
       body: '{}'
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: minor_error
+      sync_check: true
+    
+    # Node list check - verifies the node has peers and is connected to the network
+    - name: listNodes
+      type: rest
+      method: GET
+      path: /wallet/listnodes
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: major_error
+    
+    # Chain parameters check - verifies the node is on the correct chain
+    # and can serve governance/config data
+    - name: getChainParameters
+      type: rest
+      method: GET
+      path: /wallet/getchainparameters
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: major_error
+    
+    # JSON-RPC sync check - for suppliers that expose /jsonrpc
+    # Validates EVM-compatible interface is also functional
+    - name: eth_blockNumber
+      type: json_rpc
+      method: POST
+      path: /jsonrpc
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
       reputation_signal: minor_error
