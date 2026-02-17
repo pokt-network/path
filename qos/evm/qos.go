@@ -317,6 +317,55 @@ func (qos *QoS) SetReputationService(svc reputation.ReputationService) {
 	qos.reputationSvc = svc
 }
 
+// ConsumeExternalBlockHeight consumes block heights from an external fetcher channel
+// and applies them as a floor to the block consensus. This ensures that if all session
+// endpoints are behind the real chain tip, the perceived block is corrected.
+// Heights are also written to Redis so other replicas benefit.
+func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64) {
+	go func() {
+		serviceID := qos.serviceQoSConfig.GetServiceID()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case height, ok := <-heights:
+				if !ok {
+					return
+				}
+				if height <= 0 {
+					continue
+				}
+				h := uint64(height)
+
+				if qos.blockConsensus != nil {
+					oldExternal := qos.blockConsensus.GetExternalBlockHeight()
+					qos.blockConsensus.SetExternalBlockHeight(h)
+
+					if h != oldExternal {
+						qos.logger.Debug().
+							Str("service_id", string(serviceID)).
+							Uint64("external_block", h).
+							Uint64("old_external_block", oldExternal).
+							Msg("Updated external block height floor")
+					}
+				}
+
+				// Write to Redis so other replicas benefit from the external source
+				if qos.reputationSvc != nil {
+					currentPerceived := qos.perceivedBlockNumber.Load()
+					if h > currentPerceived {
+						go func(block uint64) {
+							rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+							defer cancel()
+							_ = qos.reputationSvc.SetPerceivedBlockNumber(rCtx, serviceID, block)
+						}(h)
+					}
+				}
+			}
+		}
+	}()
+}
+
 // StartBackgroundSync starts a background goroutine that periodically syncs
 // perceived block number from Redis. This ensures all replicas converge to
 // the same max block number for sync_allowance validation.

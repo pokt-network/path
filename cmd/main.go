@@ -122,6 +122,43 @@ func main() {
 		logger.Info().Msg("Reputation service wired to QoS instances for shared state (archival, block height)")
 	}
 
+	// Start external block height fetchers for services that have external_block_sources configured.
+	// These fetchers periodically query external RPC endpoints for ground-truth block heights,
+	// which act as a floor for perceivedBlockNumber to detect when all session endpoints are stale.
+	for serviceID, qosInstance := range qosInstances {
+		merged := unifiedServicesConfig.GetMergedServiceConfig(serviceID)
+		if merged == nil || len(merged.ExternalBlockSources) == 0 {
+			continue
+		}
+
+		// Build config list from the merged service config
+		var configs []gateway.ExternalBlockSourceConfig
+		for _, src := range merged.ExternalBlockSources {
+			configs = append(configs, gateway.ExternalBlockSourceConfig{
+				URL:      src.URL,
+				Method:   src.Method,
+				Path:     src.Path,
+				Interval: src.Interval,
+				Timeout:  src.Timeout,
+			})
+		}
+
+		fetcher := gateway.NewExternalBlockHeightFetcher(logger, configs)
+		heightsCh := fetcher.Start(backgroundCtx)
+
+		// Connect fetcher output to QoS consumer
+		if consumer, ok := qosInstance.(interface {
+			ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64)
+		}); ok {
+			consumer.ConsumeExternalBlockHeight(backgroundCtx, heightsCh)
+
+			logger.Info().
+				Str("service_id", string(serviceID)).
+				Int("source_count", len(configs)).
+				Msg("Started external block height fetcher")
+		}
+	}
+
 	// Setup metrics reporter, to be used by Gateway and Health Checks
 	metricsReporter, err := setupMetricsServer(logger, config.Metrics.PrometheusAddr)
 	if err != nil {

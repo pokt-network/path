@@ -3,6 +3,7 @@ package evm
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -72,6 +73,13 @@ type BlockHeightConsensus struct {
 	// cachedPerceived is the last calculated perceived block
 	// Updated on each AddObservation call
 	cachedPerceived uint64
+
+	// externalBlockHeight is an optional floor from an external RPC source.
+	// When set (> 0), the perceived block height will never be lower than
+	// this value, ensuring behind-on-block suppliers are correctly filtered
+	// even when all session endpoints are equally stale.
+	// Lock-free via atomic for zero contention on the hot path.
+	externalBlockHeight atomic.Uint64
 }
 
 // NewBlockHeightConsensus creates a new consensus calculator.
@@ -128,6 +136,18 @@ func (c *BlockHeightConsensus) GetObservationCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.observations)
+}
+
+// SetExternalBlockHeight sets the external block height floor.
+// If the external source reports a higher block than internal consensus,
+// the perceived block is raised to match.
+func (c *BlockHeightConsensus) SetExternalBlockHeight(height uint64) {
+	c.externalBlockHeight.Store(height)
+}
+
+// GetExternalBlockHeight returns the current external block height floor.
+func (c *BlockHeightConsensus) GetExternalBlockHeight() uint64 {
+	return c.externalBlockHeight.Load()
 }
 
 // GetMedianBlock returns the current median block height.
@@ -214,7 +234,18 @@ func (c *BlockHeightConsensus) calculatePerceivedLocked() uint64 {
 
 	// If all observations were outliers (shouldn't happen), fall back to median
 	if maxValid == 0 {
-		return median
+		maxValid = median
+	}
+
+	// External block height acts as a floor — if all session endpoints are behind
+	// the real chain tip, the external source corrects the perceived block.
+	if ext := c.externalBlockHeight.Load(); ext > 0 && ext > maxValid {
+		c.logger.Warn().
+			Uint64("consensus_block", maxValid).
+			Uint64("external_block", ext).
+			Int("observation_count", len(c.observations)).
+			Msg("Session endpoints behind external source — using external block as floor")
+		maxValid = ext
 	}
 
 	return maxValid

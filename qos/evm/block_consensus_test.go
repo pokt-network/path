@@ -136,6 +136,93 @@ func TestBlockHeightConsensus_ObservationCount(t *testing.T) {
 	require.Equal(t, 3, count)
 }
 
+func TestExternalBlockFloor_OverridesWhenHigher(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+
+	// Establish consensus at 80
+	consensus.AddObservation("endpoint1", 80)
+	consensus.AddObservation("endpoint2", 80)
+	consensus.AddObservation("endpoint3", 80)
+	assert.Equal(t, uint64(80), consensus.GetPerceivedBlock())
+
+	// Set external block height higher than consensus
+	consensus.SetExternalBlockHeight(100)
+	assert.Equal(t, uint64(100), consensus.GetExternalBlockHeight())
+
+	// Next observation should use external as floor
+	perceived := consensus.AddObservation("endpoint4", 80)
+	assert.Equal(t, uint64(100), perceived)
+}
+
+func TestExternalBlockFloor_IgnoredWhenLower(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+
+	// Establish consensus at 100
+	consensus.AddObservation("endpoint1", 100)
+	consensus.AddObservation("endpoint2", 100)
+	consensus.AddObservation("endpoint3", 100)
+	assert.Equal(t, uint64(100), consensus.GetPerceivedBlock())
+
+	// Set external block height lower than consensus
+	consensus.SetExternalBlockHeight(80)
+
+	// Consensus should still be 100
+	perceived := consensus.AddObservation("endpoint4", 100)
+	assert.Equal(t, uint64(100), perceived)
+}
+
+func TestExternalBlockFloor_ZeroMeansDisabled(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+
+	// Establish consensus at 50
+	consensus.AddObservation("endpoint1", 50)
+	consensus.AddObservation("endpoint2", 50)
+	consensus.AddObservation("endpoint3", 50)
+
+	// External block height is 0 (default / not set) — should have no effect
+	assert.Equal(t, uint64(0), consensus.GetExternalBlockHeight())
+	assert.Equal(t, uint64(50), consensus.GetPerceivedBlock())
+}
+
+func TestExternalBlockFloor_MultipleUpdates(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+
+	// Establish consensus at 80
+	consensus.AddObservation("endpoint1", 80)
+	consensus.AddObservation("endpoint2", 80)
+	consensus.AddObservation("endpoint3", 80)
+
+	// Set external floor at 100, verify it's used as floor
+	consensus.SetExternalBlockHeight(100)
+	perceived := consensus.AddObservation("endpoint4", 80)
+	assert.Equal(t, uint64(100), perceived)
+
+	// Update external floor higher to 120
+	consensus.SetExternalBlockHeight(120)
+	perceived = consensus.AddObservation("endpoint5", 80)
+	assert.Equal(t, uint64(120), perceived)
+
+	// Internal consensus catches up to external floor — external no longer used.
+	// We need to gradually increase within sync_allowance to avoid outlier rejection.
+	// sync_allowance=10, multiplier=3, so max deviation from median is 30 blocks.
+	// Add enough observations at 110 (within 30 of median ~80) to shift the median.
+	for i := 0; i < 10; i++ {
+		consensus.AddObservation(protocol.EndpointAddr("fast"), 110)
+	}
+	// Now the median has shifted up, add observations at 125 (within 30 of new median)
+	for i := 0; i < 10; i++ {
+		consensus.AddObservation(protocol.EndpointAddr("faster"), 125)
+	}
+
+	// Consensus is now at 125, which is above the external floor of 120
+	perceived = consensus.GetPerceivedBlock()
+	assert.True(t, perceived >= 120, "perceived %d should be >= 120 (external floor)", perceived)
+}
+
 func TestCalculateMedian(t *testing.T) {
 	tests := []struct {
 		name     string
