@@ -79,17 +79,21 @@ func init() {
 // -------------------- Test Function --------------------
 
 func Test_PATH_E2E(t *testing.T) {
-	// Initialize test context with a reasonable timeout to prevent hanging
-	// Each method gets maxDuration which is typically ~10-20 seconds, so 5 minutes should be plenty
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	setupSIGINTHandler(cancel)
-
-	// Get gateway URL and optional teardown function for E2E mode
+	// Get gateway URL and optional teardown function for E2E mode.
+	// This is done BEFORE creating the test context because Docker image
+	// build + container startup can take several minutes, and the test
+	// timeout should only govern the actual test execution, not setup.
 	gatewayURL, teardownFn := getGatewayURLForTestMode(t, cfg)
 	if teardownFn != nil {
 		defer teardownFn()
 	}
+
+	// Initialize test context with a reasonable timeout to prevent hanging.
+	// Each method gets maxDuration which is typically ~10-20 seconds, so 5 minutes should be plenty.
+	// This timeout starts AFTER Docker setup is complete.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	setupSIGINTHandler(cancel)
 
 	// Get test cases from config based on `TEST_PROTOCOL` env var
 	testServices, err := cfg.getTestServices()
