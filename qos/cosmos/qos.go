@@ -13,6 +13,7 @@ import (
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
 	qostypes "github.com/pokt-network/path/qos/types"
+	"github.com/pokt-network/path/reputation"
 )
 
 // QoS implements gateway.QoSService by providing:
@@ -33,6 +34,10 @@ type QoS struct {
 	logger polylog.Logger
 	*serviceState
 	*requestValidator
+
+	// reputationSvc provides shared perceived block number across replicas via Redis.
+	// Set via SetReputationService; nil when reputation is disabled.
+	reputationSvc reputation.ReputationService
 }
 
 // NewSimpleQoSInstance creates a minimal CosmosSDK QoS instance without chain-specific validation.
@@ -202,6 +207,15 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 			Uint64("new_block", blockNumber).
 			Msg("Updating perceived block number from observation pipeline")
 		qos.perceivedBlockNumber = blockNumber
+
+		// Write to Redis for cross-replica sync (async, non-blocking)
+		if qos.reputationSvc != nil {
+			go func(bn uint64, svcID protocol.ServiceID) {
+				rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = qos.reputationSvc.SetPerceivedBlockNumber(rCtx, svcID, bn)
+			}(blockNumber, qos.serviceQoSConfig.GetServiceID())
+		}
 	}
 
 	return nil
@@ -275,8 +289,99 @@ func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan i
 						Uint64("external_block", h).
 						Msg("External block floor applied — raising perceived block")
 					qos.perceivedBlockNumber = h
+
+					// Write to Redis so other replicas benefit from the external source.
+					if qos.reputationSvc != nil {
+						go func(bn uint64, svcID protocol.ServiceID) {
+							rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+							defer cancel()
+							_ = qos.reputationSvc.SetPerceivedBlockNumber(rCtx, svcID, bn)
+						}(h, serviceID)
+					}
 				}
 				qos.serviceStateLock.Unlock()
+			}
+		}
+	}()
+}
+
+// SetReputationService sets the reputation service for shared state across replicas.
+// The reputation service provides perceived block number via Redis, enabling
+// all replicas to converge on the same chain tip for sync_allowance validation.
+func (qos *QoS) SetReputationService(svc reputation.ReputationService) {
+	qos.reputationSvc = svc
+}
+
+// StartBackgroundSync starts a background goroutine that periodically syncs
+// perceived block number from Redis. This ensures all replicas converge to
+// the same max block number for sync_allowance validation.
+//
+// The syncInterval determines how often to check Redis (e.g., 5 seconds).
+// Call this after SetReputationService to enable cross-replica sync.
+//
+// IMPORTANT: This performs an immediate sync on startup to ensure the replica
+// has the latest perceived block number before serving requests.
+func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Duration) {
+	if qos.reputationSvc == nil {
+		qos.logger.Warn().Msg("Cannot start background sync: reputation service not set")
+		return
+	}
+
+	serviceID := qos.serviceQoSConfig.GetServiceID()
+
+	// syncFromRedis fetches perceived block number from Redis and updates local
+	// state if the Redis value is higher (simple max semantics).
+	syncFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		redisBlockNumber := qos.reputationSvc.GetPerceivedBlockNumber(fetchCtx, serviceID)
+		cancel()
+
+		if redisBlockNumber == 0 {
+			return // No data in Redis yet
+		}
+
+		qos.serviceStateLock.Lock()
+		oldBlock := qos.perceivedBlockNumber
+		if redisBlockNumber > qos.perceivedBlockNumber {
+			qos.perceivedBlockNumber = redisBlockNumber
+		}
+		qos.serviceStateLock.Unlock()
+
+		if redisBlockNumber > oldBlock {
+			qos.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Uint64("redis_block", redisBlockNumber).
+				Uint64("old_perceived", oldBlock).
+				Uint64("new_perceived", redisBlockNumber).
+				Msg("Updated perceived block number from Redis sync")
+		}
+	}
+
+	// Perform immediate sync on startup to have latest data before serving requests
+	syncFromRedis()
+	qos.logger.Info().
+		Str("service_id", string(serviceID)).
+		Uint64("perceived_block", qos.perceivedBlockNumber).
+		Msg("Completed initial perceived block number sync from Redis")
+
+	go func() {
+		ticker := time.NewTicker(syncInterval)
+		defer ticker.Stop()
+
+		qos.logger.Info().
+			Str("service_id", string(serviceID)).
+			Dur("sync_interval", syncInterval).
+			Msg("Started background sync for perceived block number")
+
+		for {
+			select {
+			case <-ctx.Done():
+				qos.logger.Debug().
+					Str("service_id", string(serviceID)).
+					Msg("Stopping background sync for perceived block number")
+				return
+			case <-ticker.C:
+				syncFromRedis()
 			}
 		}
 	}()

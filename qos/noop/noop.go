@@ -19,6 +19,7 @@ import (
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
 	qostypes "github.com/pokt-network/path/qos/types"
+	"github.com/pokt-network/path/reputation"
 )
 
 // maxRequestBodySize is the maximum allowed size for HTTP request bodies (100MB).
@@ -46,6 +47,10 @@ type NoOpQoS struct {
 	// syncAllowance is the number of blocks an endpoint may lag behind the
 	// perceived block height before being filtered. 0 disables filtering.
 	syncAllowance atomic.Uint64
+
+	// reputationSvc provides shared perceived block height across replicas via Redis.
+	// Set via SetReputationService; nil when reputation is disabled.
+	reputationSvc reputation.ReputationService
 }
 
 // NewNoOpQoSService creates a new NoOp QoS service instance.
@@ -141,6 +146,15 @@ func (n *NoOpQoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, da
 			Uint64("new_block", blockHeight).
 			Msg("Updating perceived block height from observation pipeline")
 		n.perceivedBlockHeight = blockHeight
+
+		// Write to Redis for cross-replica sync (async, non-blocking)
+		if n.reputationSvc != nil {
+			go func(bn uint64, svcID protocol.ServiceID) {
+				rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = n.reputationSvc.SetPerceivedBlockNumber(rCtx, svcID, bn)
+			}(blockHeight, n.serviceID)
+		}
 	}
 
 	return nil
@@ -218,8 +232,99 @@ func (n *NoOpQoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan
 						Uint64("external_block", h).
 						Msg("External block floor applied — raising perceived block height")
 					n.perceivedBlockHeight = h
+
+					// Write to Redis so other replicas benefit from the external source.
+					if n.reputationSvc != nil {
+						go func(bn uint64, svcID protocol.ServiceID) {
+							rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+							defer cancel()
+							_ = n.reputationSvc.SetPerceivedBlockNumber(rCtx, svcID, bn)
+						}(h, n.serviceID)
+					}
 				}
 				n.serviceStateMu.Unlock()
+			}
+		}
+	}()
+}
+
+// SetReputationService sets the reputation service for shared state across replicas.
+// The reputation service provides perceived block height via Redis, enabling
+// all replicas to converge on the same chain tip for sync_allowance validation.
+func (n *NoOpQoS) SetReputationService(svc reputation.ReputationService) {
+	n.reputationSvc = svc
+}
+
+// StartBackgroundSync starts a background goroutine that periodically syncs
+// perceived block height from Redis. This ensures all replicas converge to
+// the same max block height for sync_allowance validation.
+//
+// The syncInterval determines how often to check Redis (e.g., 5 seconds).
+// Call this after SetReputationService to enable cross-replica sync.
+//
+// IMPORTANT: This performs an immediate sync on startup to ensure the replica
+// has the latest perceived block height before serving requests.
+func (n *NoOpQoS) StartBackgroundSync(ctx context.Context, syncInterval time.Duration) {
+	if n.reputationSvc == nil {
+		n.logger.Warn().Msg("Cannot start background sync: reputation service not set")
+		return
+	}
+
+	serviceID := n.serviceID
+
+	// syncFromRedis fetches perceived block height from Redis and updates local
+	// state if the Redis value is higher (simple max semantics).
+	syncFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		redisBlockHeight := n.reputationSvc.GetPerceivedBlockNumber(fetchCtx, serviceID)
+		cancel()
+
+		if redisBlockHeight == 0 {
+			return // No data in Redis yet
+		}
+
+		n.serviceStateMu.Lock()
+		oldBlock := n.perceivedBlockHeight
+		if redisBlockHeight > n.perceivedBlockHeight {
+			n.perceivedBlockHeight = redisBlockHeight
+		}
+		n.serviceStateMu.Unlock()
+
+		if redisBlockHeight > oldBlock {
+			n.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Uint64("redis_block", redisBlockHeight).
+				Uint64("old_perceived", oldBlock).
+				Uint64("new_perceived", redisBlockHeight).
+				Msg("Updated perceived block height from Redis sync")
+		}
+	}
+
+	// Perform immediate sync on startup to have latest data before serving requests
+	syncFromRedis()
+	n.logger.Info().
+		Str("service_id", string(serviceID)).
+		Uint64("perceived_block", n.perceivedBlockHeight).
+		Msg("Completed initial perceived block height sync from Redis")
+
+	go func() {
+		ticker := time.NewTicker(syncInterval)
+		defer ticker.Stop()
+
+		n.logger.Info().
+			Str("service_id", string(serviceID)).
+			Dur("sync_interval", syncInterval).
+			Msg("Started background sync for perceived block height")
+
+		for {
+			select {
+			case <-ctx.Done():
+				n.logger.Debug().
+					Str("service_id", string(serviceID)).
+					Msg("Stopping background sync for perceived block height")
+				return
+			case <-ticker.C:
+				syncFromRedis()
 			}
 		}
 	}()
