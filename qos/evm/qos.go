@@ -327,6 +327,17 @@ func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan i
 	if gracePeriod > 0 && qos.blockConsensus != nil {
 		qos.blockConsensus.SetExternalBlockGracePeriod(gracePeriod)
 	}
+
+	// Resolve effective grace period for the Redis write guard.
+	// During the grace period, external heights are stored in consensus but NOT
+	// written to Redis as perceivedBlockNumber — this prevents other replicas
+	// from picking up the external height before suppliers have reported.
+	effectiveGrace := defaultExternalBlockGracePeriod
+	if gracePeriod > 0 {
+		effectiveGrace = gracePeriod
+	}
+	startedAt := time.Now()
+
 	go func() {
 		serviceID := qos.serviceQoSConfig.GetServiceID()
 		for {
@@ -355,10 +366,20 @@ func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan i
 					}
 				}
 
-				// Write to Redis so other replicas benefit from the external source
+				// Only write to Redis after the grace period has elapsed.
+				// This prevents other replicas from using the external height
+				// as perceivedBlockNumber before suppliers have had time to report.
+				if time.Since(startedAt) < effectiveGrace {
+					continue
+				}
+
+				// Write to Redis so other replicas benefit from the external source.
+				// Only write if suppliers have already reported (perceived > 0).
+				// If no supplier has reported yet, writing external height to Redis
+				// could cause other replicas to filter all endpoints.
 				if qos.reputationSvc != nil {
 					currentPerceived := qos.perceivedBlockNumber.Load()
-					if h > currentPerceived {
+					if currentPerceived > 0 && h > currentPerceived {
 						go func(block uint64) {
 							rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 							defer cancel()

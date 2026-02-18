@@ -3,6 +3,7 @@ package cosmos
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
@@ -205,4 +206,68 @@ func (qos *QoS) GetPerceivedBlockNumber() uint64 {
 	qos.serviceStateLock.RLock()
 	defer qos.serviceStateLock.RUnlock()
 	return qos.perceivedBlockNumber
+}
+
+// ConsumeExternalBlockHeight consumes block heights from an external fetcher channel
+// and uses them as a floor for perceivedBlockNumber. This ensures that if all session
+// endpoints are behind the real chain tip, the perceived block is corrected.
+// The gracePeriod delays applying the external floor after startup, giving suppliers
+// time to report their block heights. Use 0 for the default (60s).
+func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64, gracePeriod time.Duration) {
+	const defaultGracePeriod = 60 * time.Second
+	effectiveGrace := defaultGracePeriod
+	if gracePeriod > 0 {
+		effectiveGrace = gracePeriod
+	}
+	startedAt := time.Now()
+
+	go func() {
+		serviceID := qos.serviceQoSConfig.GetServiceID()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case height, ok := <-heights:
+				if !ok {
+					return
+				}
+				if height <= 0 {
+					continue
+				}
+
+				// Skip during grace period to let suppliers report first
+				if time.Since(startedAt) < effectiveGrace {
+					qos.logger.Debug().
+						Str("service_id", string(serviceID)).
+						Int64("external_block", height).
+						Dur("grace_remaining", effectiveGrace-time.Since(startedAt)).
+						Msg("External block floor deferred — grace period active")
+					continue
+				}
+
+				h := uint64(height)
+				qos.serviceStateLock.Lock()
+				// Only apply external floor if suppliers have already reported.
+				// If perceivedBlockNumber is still 0, no supplier has reported yet
+				// and applying the floor would filter ALL endpoints.
+				if qos.perceivedBlockNumber == 0 {
+					qos.serviceStateLock.Unlock()
+					qos.logger.Debug().
+						Str("service_id", string(serviceID)).
+						Uint64("external_block", h).
+						Msg("External block floor skipped — no suppliers have reported yet")
+					continue
+				}
+				if h > qos.perceivedBlockNumber {
+					qos.logger.Info().
+						Str("service_id", string(serviceID)).
+						Uint64("old_perceived", qos.perceivedBlockNumber).
+						Uint64("external_block", h).
+						Msg("External block floor applied — raising perceived block")
+					qos.perceivedBlockNumber = h
+				}
+				qos.serviceStateLock.Unlock()
+			}
+		}
+	}()
 }

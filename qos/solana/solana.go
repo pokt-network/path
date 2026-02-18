@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
@@ -148,4 +149,64 @@ func (q *QoS) GetPerceivedBlockNumber() uint64 {
 	q.serviceStateLock.RLock()
 	defer q.serviceStateLock.RUnlock()
 	return q.perceivedBlockHeight
+}
+
+// ConsumeExternalBlockHeight consumes block heights from an external fetcher channel
+// and uses them as a floor for perceivedBlockHeight. This ensures that if all session
+// endpoints are behind the real chain tip, the perceived block is corrected.
+// The gracePeriod delays applying the external floor after startup, giving suppliers
+// time to report their block heights. Use 0 for the default (60s).
+func (q *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64, gracePeriod time.Duration) {
+	const defaultGracePeriod = 60 * time.Second
+	effectiveGrace := defaultGracePeriod
+	if gracePeriod > 0 {
+		effectiveGrace = gracePeriod
+	}
+	startedAt := time.Now()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case height, ok := <-heights:
+				if !ok {
+					return
+				}
+				if height <= 0 {
+					continue
+				}
+
+				// Skip during grace period to let suppliers report first
+				if time.Since(startedAt) < effectiveGrace {
+					q.logger.Debug().
+						Int64("external_block", height).
+						Dur("grace_remaining", effectiveGrace-time.Since(startedAt)).
+						Msg("External block floor deferred — grace period active")
+					continue
+				}
+
+				h := uint64(height)
+				q.serviceStateLock.Lock()
+				// Only apply external floor if suppliers have already reported.
+				// If perceivedBlockHeight is still 0, no supplier has reported yet
+				// and applying the floor would filter ALL endpoints.
+				if q.perceivedBlockHeight == 0 {
+					q.serviceStateLock.Unlock()
+					q.logger.Debug().
+						Uint64("external_block", h).
+						Msg("External block floor skipped — no suppliers have reported yet")
+					continue
+				}
+				if h > q.perceivedBlockHeight {
+					q.logger.Info().
+						Uint64("old_perceived", q.perceivedBlockHeight).
+						Uint64("external_block", h).
+						Msg("External block floor applied — raising perceived block height")
+					q.perceivedBlockHeight = h
+				}
+				q.serviceStateLock.Unlock()
+			}
+		}
+	}()
 }
