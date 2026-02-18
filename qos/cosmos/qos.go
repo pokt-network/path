@@ -3,6 +3,7 @@ package cosmos
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -71,9 +72,9 @@ func NewSimpleQoSInstanceWithAPIs(logger polylog.Logger, serviceID protocol.Serv
 	// Create a minimal config wrapper
 	minimalConfig := &simpleCosmosConfig{
 		serviceID:     serviceID,
-		syncAllowance: syncAllowance,
 		supportedAPIs: supportedAPIs,
 	}
+	minimalConfig.syncAllowance.Store(syncAllowance)
 
 	serviceState := &serviceState{
 		logger:           logger,
@@ -100,7 +101,7 @@ func NewSimpleQoSInstanceWithAPIs(logger polylog.Logger, serviceID protocol.Serv
 // simpleCosmosConfig is a minimal config for services without chain-specific params.
 type simpleCosmosConfig struct {
 	serviceID     protocol.ServiceID
-	syncAllowance uint64                           // If 0, uses default
+	syncAllowance atomic.Uint64                    // If 0, uses default. Updated dynamically when external health check rules are loaded.
 	supportedAPIs map[sharedtypes.RPCType]struct{} // Supported RPC types
 }
 
@@ -109,10 +110,19 @@ func (c *simpleCosmosConfig) GetServiceQoSType() string        { return QoSType 
 func (c *simpleCosmosConfig) getCosmosSDKChainID() string      { return "" }
 func (c *simpleCosmosConfig) getEVMChainID() string            { return "" }
 func (c *simpleCosmosConfig) getSyncAllowance() uint64 {
-	if c.syncAllowance == 0 {
-		return defaultCosmosSDKBlockNumberSyncAllowance
+	if v := c.syncAllowance.Load(); v > 0 {
+		return v
 	}
-	return c.syncAllowance
+	return defaultCosmosSDKBlockNumberSyncAllowance
+}
+
+// SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
+// This is called when external health check rules are loaded/refreshed, since those
+// rules may specify a sync_allowance that wasn't available at QoS creation time.
+func (qos *QoS) SetSyncAllowance(syncAllowance uint64) {
+	if cfg, ok := qos.serviceState.serviceQoSConfig.(*simpleCosmosConfig); ok {
+		cfg.syncAllowance.Store(syncAllowance)
+	}
 }
 func (c *simpleCosmosConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
 	if c.supportedAPIs != nil {

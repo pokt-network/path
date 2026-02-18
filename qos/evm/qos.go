@@ -3,6 +3,7 @@ package evm
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -58,9 +59,9 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 
 	// Create a minimal config wrapper for backward compatibility with serviceState
 	minimalConfig := &simpleServiceConfig{
-		serviceID:     serviceID,
-		syncAllowance: syncAllowance,
+		serviceID: serviceID,
 	}
+	minimalConfig.syncAllowance.Store(syncAllowance)
 
 	// Create block consensus calculator for robust perceived block height
 	blockConsensus := NewBlockHeightConsensus(logger, minimalConfig.getSyncAllowance())
@@ -91,20 +92,29 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 // simpleServiceConfig is a minimal config for services without chain-specific params.
 type simpleServiceConfig struct {
 	serviceID     protocol.ServiceID
-	syncAllowance uint64 // If 0, uses default
+	syncAllowance atomic.Uint64 // If 0, uses default. Updated dynamically when external health check rules are loaded.
 }
 
 func (c *simpleServiceConfig) GetServiceID() protocol.ServiceID { return c.serviceID }
 func (c *simpleServiceConfig) GetServiceQoSType() string        { return QoSType }
 func (c *simpleServiceConfig) getEVMChainID() string            { return "" }
 func (c *simpleServiceConfig) getSyncAllowance() uint64 {
-	if c.syncAllowance == 0 {
-		return defaultEVMBlockNumberSyncAllowance
+	if v := c.syncAllowance.Load(); v > 0 {
+		return v
 	}
-	return c.syncAllowance
+	return defaultEVMBlockNumberSyncAllowance
 }
 func (c *simpleServiceConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
 	return map[sharedtypes.RPCType]struct{}{sharedtypes.RPCType_JSON_RPC: {}}
+}
+
+// SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
+// This is called when external health check rules are loaded/refreshed, since those
+// rules may specify a sync_allowance that wasn't available at QoS creation time.
+func (qos *QoS) SetSyncAllowance(syncAllowance uint64) {
+	if cfg, ok := qos.serviceState.serviceQoSConfig.(*simpleServiceConfig); ok {
+		cfg.syncAllowance.Store(syncAllowance)
+	}
 }
 
 // ParseHTTPRequest builds a request context from an HTTP request.

@@ -501,6 +501,16 @@ func (e *HealthCheckExecutor) refreshExternalConfig(ctx context.Context) {
 			if cfg.SyncAllowance != nil && *cfg.SyncAllowance > 0 {
 				e.unifiedServicesConfig.SetServiceSyncAllowance(cfg.ServiceID, *cfg.SyncAllowance)
 				syncAllowanceCount++
+
+				// Also propagate to the QoS instance so it uses the updated value
+				// for endpoint selection. QoS instances are created at startup before
+				// external rules are loaded, so they start with syncAllowance=0.
+				if qosInstance, ok := e.qosInstances[cfg.ServiceID]; ok {
+					if setter, ok := qosInstance.(interface{ SetSyncAllowance(uint64) }); ok {
+						setter.SetSyncAllowance(uint64(*cfg.SyncAllowance))
+					}
+				}
+
 				e.logger.Info().
 					Str("service_id", string(cfg.ServiceID)).
 					Int("sync_allowance", *cfg.SyncAllowance).
