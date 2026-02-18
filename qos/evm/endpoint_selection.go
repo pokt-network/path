@@ -550,6 +550,12 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 func (ss *serviceState) isChainIDValid(check endpointCheckChainID) error {
 	expectedChainID := ss.serviceQoSConfig.getEVMChainID()
 
+	// When no expected chain ID is configured (e.g., NewSimpleQoSInstance),
+	// chain ID validation is delegated to active health checks. Skip it here.
+	if expectedChainID == "" {
+		return nil
+	}
+
 	if check.chainID == nil {
 		ss.logger.Debug().
 			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).

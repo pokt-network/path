@@ -98,7 +98,8 @@ func (ss *serviceState) GetRequiredQualityChecks(endpointAddr protocol.EndpointA
 	}
 
 	// Chain ID check runs infrequently as an endpoint's EVM chain ID is very unlikely to change regularly.
-	if ss.shouldChainIDCheckRun(endpoint.checkChainID) {
+	// Skip entirely when no expected chain ID is configured (validation delegated to health checks).
+	if ss.serviceQoSConfig.getEVMChainID() != "" && ss.shouldChainIDCheckRun(endpoint.checkChainID) {
 		checks = append(checks, ss.getEndpointCheck(endpoint.checkChainID.getRequestID(), endpoint.checkChainID.getServicePayload()))
 	}
 
