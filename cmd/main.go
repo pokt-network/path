@@ -147,15 +147,25 @@ func main() {
 		fetcher := gateway.NewExternalBlockHeightFetcher(logger, configs)
 		heightsCh := fetcher.Start(backgroundCtx)
 
+		// Determine grace period from config (first source with a value wins, else default)
+		var gracePeriod time.Duration
+		for _, src := range merged.ExternalBlockSources {
+			if src.GracePeriod > 0 {
+				gracePeriod = src.GracePeriod
+				break
+			}
+		}
+
 		// Connect fetcher output to QoS consumer
 		if consumer, ok := qosInstance.(interface {
-			ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64)
+			ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64, gracePeriod time.Duration)
 		}); ok {
-			consumer.ConsumeExternalBlockHeight(backgroundCtx, heightsCh)
+			consumer.ConsumeExternalBlockHeight(backgroundCtx, heightsCh, gracePeriod)
 
 			logger.Info().
 				Str("service_id", string(serviceID)).
 				Int("source_count", len(configs)).
+				Dur("grace_period", gracePeriod).
 				Msg("Started external block height fetcher")
 		}
 	}

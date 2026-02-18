@@ -192,12 +192,13 @@ type ServiceHealthCheckOverride struct {
 // ensuring behind-on-block suppliers are correctly filtered even when
 // all session endpoints are equally stale.
 type ExternalBlockSource struct {
-	URL      string        `yaml:"url"`                // RPC endpoint URL
-	Type     string        `yaml:"type,omitempty"`     // "jsonrpc" (default) or "rest". REST uses GET, JSON-RPC uses POST.
-	Method   string        `yaml:"method,omitempty"`   // JSON-RPC method. Default: "eth_blockNumber". Use "status" for Cosmos, "getBlockHeight" for Solana.
-	Path     string        `yaml:"path,omitempty"`     // Request path appended to URL. Default: "/"
-	Interval time.Duration `yaml:"interval,omitempty"` // Poll interval. Default: 30s
-	Timeout  time.Duration `yaml:"timeout,omitempty"`  // HTTP timeout. Default: 5s
+	URL         string        `yaml:"url"`                  // RPC endpoint URL
+	Type        string        `yaml:"type,omitempty"`       // "jsonrpc" (default) or "rest". REST uses GET, JSON-RPC uses POST.
+	Method      string        `yaml:"method,omitempty"`     // JSON-RPC method. Default: "eth_blockNumber". Use "status" for Cosmos, "getBlockHeight" for Solana.
+	Path        string        `yaml:"path,omitempty"`       // Request path appended to URL. Default: "/"
+	Interval    time.Duration `yaml:"interval,omitempty"`   // Poll interval. Default: 30s
+	Timeout     time.Duration `yaml:"timeout,omitempty"`    // HTTP timeout. Default: 5s
+	GracePeriod time.Duration `yaml:"grace_period,omitempty"` // Wait after startup before applying external floor. Default: 60s
 }
 
 // ServiceFallbackConfig holds per-service fallback endpoint configuration.

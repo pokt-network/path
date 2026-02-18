@@ -321,7 +321,12 @@ func (qos *QoS) SetReputationService(svc reputation.ReputationService) {
 // and applies them as a floor to the block consensus. This ensures that if all session
 // endpoints are behind the real chain tip, the perceived block is corrected.
 // Heights are also written to Redis so other replicas benefit.
-func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64) {
+// The gracePeriod delays applying the external floor after startup, giving suppliers
+// time to report their block heights. Use 0 for the default (60s).
+func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64, gracePeriod time.Duration) {
+	if gracePeriod > 0 && qos.blockConsensus != nil {
+		qos.blockConsensus.SetExternalBlockGracePeriod(gracePeriod)
+	}
 	go func() {
 		serviceID := qos.serviceQoSConfig.GetServiceID()
 		for {

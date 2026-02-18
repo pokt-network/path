@@ -2,6 +2,7 @@ package evm
 
 import (
 	"testing"
+	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
 	"github.com/stretchr/testify/assert"
@@ -139,6 +140,7 @@ func TestBlockHeightConsensus_ObservationCount(t *testing.T) {
 func TestExternalBlockFloor_OverridesWhenHigher(t *testing.T) {
 	logger := polyzero.NewLogger()
 	consensus := NewBlockHeightConsensus(logger, 10)
+	consensus.SetExternalBlockGracePeriod(0) // Disable grace period for test
 
 	// Establish consensus at 80
 	consensus.AddObservation("endpoint1", 80)
@@ -158,6 +160,7 @@ func TestExternalBlockFloor_OverridesWhenHigher(t *testing.T) {
 func TestExternalBlockFloor_IgnoredWhenLower(t *testing.T) {
 	logger := polyzero.NewLogger()
 	consensus := NewBlockHeightConsensus(logger, 10)
+	consensus.SetExternalBlockGracePeriod(0) // Disable grace period for test
 
 	// Establish consensus at 100
 	consensus.AddObservation("endpoint1", 100)
@@ -176,6 +179,7 @@ func TestExternalBlockFloor_IgnoredWhenLower(t *testing.T) {
 func TestExternalBlockFloor_ZeroMeansDisabled(t *testing.T) {
 	logger := polyzero.NewLogger()
 	consensus := NewBlockHeightConsensus(logger, 10)
+	consensus.SetExternalBlockGracePeriod(0) // Disable grace period for test
 
 	// Establish consensus at 50
 	consensus.AddObservation("endpoint1", 50)
@@ -190,6 +194,7 @@ func TestExternalBlockFloor_ZeroMeansDisabled(t *testing.T) {
 func TestExternalBlockFloor_MultipleUpdates(t *testing.T) {
 	logger := polyzero.NewLogger()
 	consensus := NewBlockHeightConsensus(logger, 10)
+	consensus.SetExternalBlockGracePeriod(0) // Disable grace period for test
 
 	// Establish consensus at 80
 	consensus.AddObservation("endpoint1", 80)
@@ -221,6 +226,32 @@ func TestExternalBlockFloor_MultipleUpdates(t *testing.T) {
 	// Consensus is now at 125, which is above the external floor of 120
 	perceived = consensus.GetPerceivedBlock()
 	assert.True(t, perceived >= 120, "perceived %d should be >= 120 (external floor)", perceived)
+}
+
+func TestExternalBlockFloor_GracePeriodDefersFloor(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+	// Set a short grace period — the floor should be deferred during this window
+	consensus.SetExternalBlockGracePeriod(200 * time.Millisecond)
+
+	// Establish consensus at 80
+	consensus.AddObservation("endpoint1", 80)
+	consensus.AddObservation("endpoint2", 80)
+	consensus.AddObservation("endpoint3", 80)
+
+	// Set external much higher
+	consensus.SetExternalBlockHeight(100)
+
+	// During grace period, external floor should NOT apply
+	perceived := consensus.AddObservation("endpoint4", 80)
+	assert.Equal(t, uint64(80), perceived, "external floor should be deferred during grace period")
+
+	// Wait for grace period to expire
+	time.Sleep(250 * time.Millisecond)
+
+	// After grace period, external floor should apply
+	perceived = consensus.AddObservation("endpoint5", 80)
+	assert.Equal(t, uint64(100), perceived, "external floor should apply after grace period")
 }
 
 func TestCalculateMedian(t *testing.T) {
