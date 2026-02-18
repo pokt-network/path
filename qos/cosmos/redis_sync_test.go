@@ -211,7 +211,7 @@ func TestCosmos_StartBackgroundSync_SyncsEndpointBlocks(t *testing.T) {
 	mock.endpointBlocks[serviceID] = map[protocol.EndpointAddr]uint64{
 		protocol.EndpointAddr("ep1"): 500,
 		protocol.EndpointAddr("ep2"): 200, // lower than local — should NOT overwrite
-		protocol.EndpointAddr("ep3"): 400, // not in local store — should be ignored
+		protocol.EndpointAddr("ep3"): 400, // not in local store — should be CREATED from Redis
 	}
 	mock.mu.Unlock()
 
@@ -223,18 +223,20 @@ func TestCosmos_StartBackgroundSync_SyncsEndpointBlocks(t *testing.T) {
 	// StartBackgroundSync performs an immediate sync on startup
 	qos.StartBackgroundSync(ctx, 50*time.Millisecond)
 
-	// Verify: ep1 should be updated to 500, ep2 should stay at 300
+	// Verify: ep1 should be updated to 500, ep2 should stay at 300, ep3 should be created
 	qos.endpointStore.endpointsMu.RLock()
 	ep1 := qos.endpointStore.endpoints[protocol.EndpointAddr("ep1")]
 	ep2 := qos.endpointStore.endpoints[protocol.EndpointAddr("ep2")]
-	_, ep3Exists := qos.endpointStore.endpoints[protocol.EndpointAddr("ep3")]
+	ep3, ep3Exists := qos.endpointStore.endpoints[protocol.EndpointAddr("ep3")]
 	qos.endpointStore.endpointsMu.RUnlock()
 
 	require.NotNil(t, ep1.checkCometBFTStatus.latestBlockHeight)
 	assert.Equal(t, uint64(500), *ep1.checkCometBFTStatus.latestBlockHeight, "ep1 should be updated from Redis")
 	require.NotNil(t, ep2.checkCometBFTStatus.latestBlockHeight)
 	assert.Equal(t, uint64(300), *ep2.checkCometBFTStatus.latestBlockHeight, "ep2 should NOT be downgraded")
-	assert.False(t, ep3Exists, "ep3 should not be created in local store")
+	assert.True(t, ep3Exists, "ep3 should be created in local store from Redis")
+	require.NotNil(t, ep3.checkCometBFTStatus.latestBlockHeight)
+	assert.Equal(t, uint64(400), *ep3.checkCometBFTStatus.latestBlockHeight, "ep3 block height should match Redis")
 }
 
 func TestCosmos_ConsumeExternalBlockHeight_WritesToRedis(t *testing.T) {

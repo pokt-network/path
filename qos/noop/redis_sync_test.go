@@ -200,7 +200,7 @@ func TestNoOp_StartBackgroundSync_SyncsEndpointBlocks(t *testing.T) {
 	mock.endpointBlocks[qos.serviceID] = map[protocol.EndpointAddr]uint64{
 		protocol.EndpointAddr("ep1"): 500,
 		protocol.EndpointAddr("ep2"): 200, // lower than local — should NOT overwrite
-		protocol.EndpointAddr("ep3"): 400, // not in local store — should be ignored
+		protocol.EndpointAddr("ep3"): 400, // not in local store — should be CREATED from Redis
 	}
 	mock.mu.Unlock()
 
@@ -212,16 +212,17 @@ func TestNoOp_StartBackgroundSync_SyncsEndpointBlocks(t *testing.T) {
 	// StartBackgroundSync performs an immediate sync on startup
 	qos.StartBackgroundSync(ctx, 50*time.Millisecond)
 
-	// Verify: ep1 should be updated to 500, ep2 should stay at 300
+	// Verify: ep1 should be updated to 500, ep2 should stay at 300, ep3 should be created
 	qos.endpointStore.mu.RLock()
 	ep1 := qos.endpointStore.endpoints[protocol.EndpointAddr("ep1")]
 	ep2 := qos.endpointStore.endpoints[protocol.EndpointAddr("ep2")]
-	_, ep3Exists := qos.endpointStore.endpoints[protocol.EndpointAddr("ep3")]
+	ep3, ep3Exists := qos.endpointStore.endpoints[protocol.EndpointAddr("ep3")]
 	qos.endpointStore.mu.RUnlock()
 
 	assert.Equal(t, uint64(500), ep1.blockHeight, "ep1 should be updated from Redis")
 	assert.Equal(t, uint64(300), ep2.blockHeight, "ep2 should NOT be downgraded")
-	assert.False(t, ep3Exists, "ep3 should not be created in local store")
+	assert.True(t, ep3Exists, "ep3 should be created in local store from Redis")
+	assert.Equal(t, uint64(400), ep3.blockHeight, "ep3 block height should match Redis")
 }
 
 func TestNoOp_ConsumeExternalBlockHeight_WritesToRedis(t *testing.T) {

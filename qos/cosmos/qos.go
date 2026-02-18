@@ -380,16 +380,24 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 		qos.endpointStore.endpointsMu.Lock()
 		updated := 0
 		for addr, redisHeight := range heights {
+			redisH := redisHeight // copy for pointer
 			ep, exists := qos.endpointStore.endpoints[addr]
 			if !exists {
-				continue // Only update existing entries
+				// Create a new entry with just the block height from Redis.
+				// This allows non-leader replicas to filter stale endpoints
+				// before health checks or relay responses populate the store.
+				qos.endpointStore.endpoints[addr] = endpoint{
+					checkCometBFTStatus: endpointCheckCometBFTStatus{latestBlockHeight: &redisH},
+				}
+				updated++
+				continue
 			}
 			localHeight := uint64(0)
 			if ep.checkCometBFTStatus.latestBlockHeight != nil {
 				localHeight = *ep.checkCometBFTStatus.latestBlockHeight
 			}
 			if redisHeight > localHeight {
-				ep.checkCometBFTStatus.latestBlockHeight = &redisHeight
+				ep.checkCometBFTStatus.latestBlockHeight = &redisH
 				qos.endpointStore.endpoints[addr] = ep
 				updated++
 			}

@@ -150,7 +150,7 @@ func TestEVM_StartBackgroundSync_SyncsEndpointBlocks(t *testing.T) {
 	mock.endpointBlocks[testEVMServiceID] = map[protocol.EndpointAddr]uint64{
 		protocol.EndpointAddr("ep1"):   500,
 		protocol.EndpointAddr("ep2"):   200, // lower than local — should NOT overwrite
-		protocol.EndpointAddr("ep3"):   400, // not in local store — should be ignored
+		protocol.EndpointAddr("ep3"):   400, // not in local store — should be CREATED from Redis
 		protocol.EndpointAddr("ep_nil"): 600, // nil local block — Redis > 0, should update
 	}
 	mock.mu.Unlock()
@@ -168,7 +168,7 @@ func TestEVM_StartBackgroundSync_SyncsEndpointBlocks(t *testing.T) {
 	ep1 := qos.endpointStore.endpoints[protocol.EndpointAddr("ep1")]
 	ep2 := qos.endpointStore.endpoints[protocol.EndpointAddr("ep2")]
 	epNil := qos.endpointStore.endpoints[protocol.EndpointAddr("ep_nil")]
-	_, ep3Exists := qos.endpointStore.endpoints[protocol.EndpointAddr("ep3")]
+	ep3, ep3Exists := qos.endpointStore.endpoints[protocol.EndpointAddr("ep3")]
 	qos.endpointStore.endpointsMu.RUnlock()
 
 	require.NotNil(t, ep1.checkBlockNumber.parsedBlockNumberResponse)
@@ -177,7 +177,9 @@ func TestEVM_StartBackgroundSync_SyncsEndpointBlocks(t *testing.T) {
 	assert.Equal(t, uint64(300), *ep2.checkBlockNumber.parsedBlockNumberResponse, "ep2 should NOT be downgraded")
 	require.NotNil(t, epNil.checkBlockNumber.parsedBlockNumberResponse)
 	assert.Equal(t, uint64(600), *epNil.checkBlockNumber.parsedBlockNumberResponse, "ep_nil should be updated from Redis")
-	assert.False(t, ep3Exists, "ep3 should not be created in local store")
+	assert.True(t, ep3Exists, "ep3 should be created in local store from Redis")
+	require.NotNil(t, ep3.checkBlockNumber.parsedBlockNumberResponse)
+	assert.Equal(t, uint64(400), *ep3.checkBlockNumber.parsedBlockNumberResponse, "ep3 block height should match Redis")
 }
 
 func TestEVM_StartBackgroundSync_PeriodicEndpointBlockSync(t *testing.T) {

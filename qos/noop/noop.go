@@ -325,7 +325,12 @@ func (n *NoOpQoS) StartBackgroundSync(ctx context.Context, syncInterval time.Dur
 		for addr, redisHeight := range heights {
 			ep, exists := n.endpointStore.endpoints[addr]
 			if !exists {
-				continue // Only update existing entries
+				// Create a new entry with just the block height from Redis.
+				// This allows non-leader replicas to filter stale endpoints
+				// before health checks or relay responses populate the store.
+				n.endpointStore.endpoints[addr] = endpointState{blockHeight: redisHeight}
+				updated++
+				continue
 			}
 			if redisHeight > ep.blockHeight {
 				ep.blockHeight = redisHeight
