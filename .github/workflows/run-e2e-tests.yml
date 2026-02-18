@@ -63,7 +63,13 @@ jobs:
     strategy:
       matrix:
         # DEV_NOTE: Add new services here if they should be tested as part of the Shannon E2E CI suite
-        service_id: [eth, pocket, xrplevm]
+        include:
+          - service_id: eth
+            delay: 0
+          - service_id: pocket
+            delay: 10
+          - service_id: xrplevm
+            delay: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -71,6 +77,10 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
+
+      # Stagger artifact downloads to avoid GitHub secondary rate limits
+      - name: Stagger artifact download
+        run: sleep ${{ matrix.delay }}
 
       - name: Download Docker image artifact from previous job
         uses: actions/download-artifact@v4
@@ -109,7 +119,11 @@ jobs:
     strategy:
       matrix:
         # DEV_NOTE: Add new services here if they should be tested as part of the Shannon E2E CI suite
-        service_id: [xrplevm, eth]
+        include:
+          - service_id: xrplevm
+            delay: 5
+          - service_id: eth
+            delay: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -117,6 +131,10 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
+
+      # Stagger artifact downloads to avoid GitHub secondary rate limits
+      - name: Stagger artifact download
+        run: sleep ${{ matrix.delay }}
 
       - name: Download Docker image artifact from previous job
         uses: actions/download-artifact@v4
