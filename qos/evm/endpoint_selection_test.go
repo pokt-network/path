@@ -99,6 +99,14 @@ func (m *mockReputationService) GetPerceivedBlockNumber(ctx context.Context, ser
 	return 0
 }
 
+func (m *mockReputationService) SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	return nil
+}
+
+func (m *mockReputationService) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) map[protocol.EndpointAddr]uint64 {
+	return make(map[protocol.EndpointAddr]uint64)
+}
+
 func (m *mockReputationService) GetArchivalEndpoints(ctx context.Context, serviceID protocol.ServiceID) []reputation.EndpointKey {
 	if m.archivalEndpoints == nil {
 		return nil

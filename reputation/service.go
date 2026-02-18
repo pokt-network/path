@@ -838,6 +838,35 @@ func (s *service) GetPerceivedBlockNumber(ctx context.Context, serviceID protoco
 	return blockNumber
 }
 
+// SetEndpointBlockHeight stores a single endpoint's block height for cross-replica sync.
+func (s *service) SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	if s.storage == nil {
+		return nil
+	}
+	return s.storage.SetEndpointBlockHeight(ctx, serviceID, endpointAddr, blockHeight)
+}
+
+// GetEndpointBlockHeights retrieves all endpoint block heights for a service.
+// Returns empty map on error or if storage is unavailable.
+func (s *service) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) map[protocol.EndpointAddr]uint64 {
+	if s.storage == nil {
+		return make(map[protocol.EndpointAddr]uint64)
+	}
+
+	heights, err := s.storage.GetEndpointBlockHeights(ctx, serviceID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Msg("Failed to get endpoint block heights from storage")
+		}
+		return make(map[protocol.EndpointAddr]uint64)
+	}
+
+	return heights
+}
+
 // GetArchivalEndpoints returns all endpoint keys for the given service
 // that have valid (non-expired) archival status in the local cache.
 // This enables bootstrapping the EVM archival cache at startup when the

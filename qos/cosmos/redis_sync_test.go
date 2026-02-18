@@ -16,17 +16,20 @@ import (
 )
 
 // mockReputationSvc is a minimal mock that only implements the methods used by
-// the Redis sync logic (SetPerceivedBlockNumber and GetPerceivedBlockNumber).
+// the Redis sync logic (SetPerceivedBlockNumber, GetPerceivedBlockNumber,
+// SetEndpointBlockHeight, and GetEndpointBlockHeights).
 type mockReputationSvc struct {
 	reputation.ReputationService // embed to satisfy interface; unused methods will panic
 
 	mu             sync.Mutex
 	perceivedBlock map[protocol.ServiceID]uint64
+	endpointBlocks map[protocol.ServiceID]map[protocol.EndpointAddr]uint64
 }
 
 func newMockReputationSvc() *mockReputationSvc {
 	return &mockReputationSvc{
 		perceivedBlock: make(map[protocol.ServiceID]uint64),
+		endpointBlocks: make(map[protocol.ServiceID]map[protocol.EndpointAddr]uint64),
 	}
 }
 
@@ -55,6 +58,29 @@ func (m *mockReputationSvc) setBlock(serviceID protocol.ServiceID, block uint64)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.perceivedBlock[serviceID] = block
+}
+
+func (m *mockReputationSvc) SetEndpointBlockHeight(_ context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.endpointBlocks[serviceID] == nil {
+		m.endpointBlocks[serviceID] = make(map[protocol.EndpointAddr]uint64)
+	}
+	m.endpointBlocks[serviceID][endpointAddr] = blockHeight
+	return nil
+}
+
+func (m *mockReputationSvc) GetEndpointBlockHeights(_ context.Context, serviceID protocol.ServiceID) map[protocol.EndpointAddr]uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.endpointBlocks[serviceID] == nil {
+		return make(map[protocol.EndpointAddr]uint64)
+	}
+	result := make(map[protocol.EndpointAddr]uint64, len(m.endpointBlocks[serviceID]))
+	for k, v := range m.endpointBlocks[serviceID] {
+		result[k] = v
+	}
+	return result
 }
 
 func newTestCosmosQoS() *QoS {

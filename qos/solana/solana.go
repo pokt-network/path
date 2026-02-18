@@ -151,6 +151,15 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 		}
 	}
 
+	// Write per-endpoint block height to Redis for cross-replica sync (async, non-blocking)
+	if q.reputationSvc != nil {
+		go func(addr protocol.EndpointAddr, bn uint64, svcID protocol.ServiceID) {
+			rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = q.reputationSvc.SetEndpointBlockHeight(rCtx, svcID, addr, bn)
+		}(endpointAddr, blockHeight, q.ServiceState.serviceID)
+	}
+
 	return nil
 }
 
@@ -286,8 +295,48 @@ func (q *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Duratio
 		}
 	}
 
+	// syncEndpointBlocksFromRedis fetches per-endpoint block heights from Redis
+	// and updates local endpoint store entries where Redis has a higher value.
+	// Only updates EXISTING entries (Solana's validateBasic needs health+epoch data).
+	syncEndpointBlocksFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		heights := q.reputationSvc.GetEndpointBlockHeights(fetchCtx, serviceID)
+		cancel()
+
+		if len(heights) == 0 {
+			return
+		}
+
+		q.endpointsMu.Lock()
+		updated := 0
+		for addr, redisHeight := range heights {
+			ep, exists := q.endpoints[addr]
+			if !exists {
+				continue // Only update existing entries
+			}
+			if ep.SolanaGetEpochInfoResponse == nil {
+				continue // Need epoch info to be initialized
+			}
+			if redisHeight > ep.BlockHeight {
+				ep.BlockHeight = redisHeight
+				q.endpoints[addr] = ep
+				updated++
+			}
+		}
+		q.endpointsMu.Unlock()
+
+		if updated > 0 {
+			q.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Int("updated_endpoints", updated).
+				Int("redis_endpoints", len(heights)).
+				Msg("Synced per-endpoint block heights from Redis")
+		}
+	}
+
 	// Perform immediate sync on startup to have latest data before serving requests
 	syncFromRedis()
+	syncEndpointBlocksFromRedis()
 	q.logger.Info().
 		Str("service_id", string(serviceID)).
 		Uint64("perceived_block", q.perceivedBlockHeight).
@@ -311,6 +360,7 @@ func (q *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Duratio
 				return
 			case <-ticker.C:
 				syncFromRedis()
+				syncEndpointBlocksFromRedis()
 			}
 		}
 	}()

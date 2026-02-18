@@ -51,6 +51,14 @@ type Storage interface {
 	// Returns 0 if no block number has been stored yet.
 	GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) (uint64, error)
 
+	// SetEndpointBlockHeight stores a single endpoint's block height for a service.
+	// Uses HSET on a Redis hash keyed by service ID, with endpoint address as field.
+	SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error
+
+	// GetEndpointBlockHeights retrieves all endpoint block heights for a service.
+	// Returns a map of endpoint address to block height.
+	GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) (map[protocol.EndpointAddr]uint64, error)
+
 	// Close releases any resources held by the storage.
 	Close() error
 }

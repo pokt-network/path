@@ -341,6 +341,14 @@ type ReputationService interface {
 	// Returns the maximum block number observed across all replicas.
 	// Returns 0 if no block number has been stored yet.
 	GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) uint64
+
+	// SetEndpointBlockHeight stores a single endpoint's block height for cross-replica sync.
+	// Called from UpdateFromExtractedData when a health check reports an endpoint's block height.
+	SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error
+
+	// GetEndpointBlockHeights retrieves all endpoint block heights for a service.
+	// Returns the heights stored by all replicas. Returns empty map on error.
+	GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) map[protocol.EndpointAddr]uint64
 }
 
 // Config holds configuration for the reputation system.

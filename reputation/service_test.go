@@ -150,6 +150,14 @@ func (m *mockStorage) GetPerceivedBlockNumber(_ context.Context, serviceID proto
 	return m.perceivedBlocks[string(serviceID)], nil
 }
 
+func (m *mockStorage) SetEndpointBlockHeight(_ context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	return nil
+}
+
+func (m *mockStorage) GetEndpointBlockHeights(_ context.Context, serviceID protocol.ServiceID) (map[protocol.EndpointAddr]uint64, error) {
+	return make(map[protocol.EndpointAddr]uint64), nil
+}
+
 func TestService_RecordSignal(t *testing.T) {
 	ctx := context.Background()
 	store := newMockStorage()

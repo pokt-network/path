@@ -157,6 +157,15 @@ func (n *NoOpQoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, da
 		}
 	}
 
+	// Write per-endpoint block height to Redis for cross-replica sync (async, non-blocking)
+	if n.reputationSvc != nil {
+		go func(addr protocol.EndpointAddr, bn uint64, svcID protocol.ServiceID) {
+			rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = n.reputationSvc.SetEndpointBlockHeight(rCtx, svcID, addr, bn)
+		}(endpointAddr, blockHeight, n.serviceID)
+	}
+
 	return nil
 }
 
@@ -300,8 +309,44 @@ func (n *NoOpQoS) StartBackgroundSync(ctx context.Context, syncInterval time.Dur
 		}
 	}
 
+	// syncEndpointBlocksFromRedis fetches per-endpoint block heights from Redis
+	// and updates local endpoint store entries where Redis has a higher value.
+	syncEndpointBlocksFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		heights := n.reputationSvc.GetEndpointBlockHeights(fetchCtx, serviceID)
+		cancel()
+
+		if len(heights) == 0 {
+			return
+		}
+
+		n.endpointStore.mu.Lock()
+		updated := 0
+		for addr, redisHeight := range heights {
+			ep, exists := n.endpointStore.endpoints[addr]
+			if !exists {
+				continue // Only update existing entries
+			}
+			if redisHeight > ep.blockHeight {
+				ep.blockHeight = redisHeight
+				n.endpointStore.endpoints[addr] = ep
+				updated++
+			}
+		}
+		n.endpointStore.mu.Unlock()
+
+		if updated > 0 {
+			n.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Int("updated_endpoints", updated).
+				Int("redis_endpoints", len(heights)).
+				Msg("Synced per-endpoint block heights from Redis")
+		}
+	}
+
 	// Perform immediate sync on startup to have latest data before serving requests
 	syncFromRedis()
+	syncEndpointBlocksFromRedis()
 	n.logger.Info().
 		Str("service_id", string(serviceID)).
 		Uint64("perceived_block", n.perceivedBlockHeight).
@@ -325,6 +370,7 @@ func (n *NoOpQoS) StartBackgroundSync(ctx context.Context, syncInterval time.Dur
 				return
 			case <-ticker.C:
 				syncFromRedis()
+				syncEndpointBlocksFromRedis()
 			}
 		}
 	}()

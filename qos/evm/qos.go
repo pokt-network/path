@@ -254,6 +254,15 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 		}
 	}
 
+	// Write per-endpoint block height to Redis for cross-replica sync (async, non-blocking)
+	if blockNumber > 0 && qos.reputationSvc != nil {
+		go func(addr protocol.EndpointAddr, bn uint64, svcID protocol.ServiceID) {
+			rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = qos.reputationSvc.SetEndpointBlockHeight(rCtx, svcID, addr, bn)
+		}(endpointAddr, blockNumber, qos.serviceQoSConfig.GetServiceID())
+	}
+
 	return nil
 }
 
@@ -454,8 +463,49 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 		}
 	}
 
+	// syncEndpointBlocksFromRedis fetches per-endpoint block heights from Redis
+	// and updates local endpoint store entries where Redis has a higher value.
+	// This enables non-leader replicas to filter stale suppliers.
+	syncEndpointBlocksFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		heights := qos.reputationSvc.GetEndpointBlockHeights(fetchCtx, serviceID)
+		cancel()
+
+		if len(heights) == 0 {
+			return
+		}
+
+		qos.endpointStore.endpointsMu.Lock()
+		updated := 0
+		for addr, redisHeight := range heights {
+			ep, exists := qos.endpointStore.endpoints[addr]
+			if !exists {
+				continue // Only update existing entries
+			}
+			localHeight := uint64(0)
+			if ep.checkBlockNumber.parsedBlockNumberResponse != nil {
+				localHeight = *ep.checkBlockNumber.parsedBlockNumberResponse
+			}
+			if redisHeight > localHeight {
+				ep.checkBlockNumber.parsedBlockNumberResponse = &redisHeight
+				qos.endpointStore.endpoints[addr] = ep
+				updated++
+			}
+		}
+		qos.endpointStore.endpointsMu.Unlock()
+
+		if updated > 0 {
+			qos.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Int("updated_endpoints", updated).
+				Int("redis_endpoints", len(heights)).
+				Msg("Synced per-endpoint block heights from Redis")
+		}
+	}
+
 	// Perform immediate sync on startup to have latest data before serving requests
 	syncFromRedis()
+	syncEndpointBlocksFromRedis()
 	qos.logger.Info().
 		Str("service_id", string(serviceID)).
 		Uint64("perceived_block", qos.perceivedBlockNumber.Load()).
@@ -479,6 +529,7 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 				return
 			case <-ticker.C:
 				syncFromRedis()
+				syncEndpointBlocksFromRedis()
 			}
 		}
 	}()
