@@ -1780,15 +1780,23 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 	// Try different formats
 	switch v := result.(type) {
 	case string:
-		// EVM format: "0x1940c6f5"
-		return parseHexBlockNumber(v)
+		if strings.HasPrefix(v, "0x") || strings.HasPrefix(v, "0X") {
+			// EVM hex format: "0x1940c6f5"
+			return parseHexBlockNumber(v)
+		}
+		// Decimal string format (e.g. Sui's sui_getLatestCheckpointSequenceNumber): "246404377"
+		height, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid decimal block number string: %w", err)
+		}
+		return height, nil
 
 	case float64:
 		// Already a number
 		return int64(v), nil
 
 	case map[string]interface{}:
-		// Cosmos format: {"sync_info": {"latest_block_height": "12345"}}
+		// Cosmos/NEAR format: {"sync_info": {"latest_block_height": "12345"}}
 		if syncInfo, ok := v["sync_info"].(map[string]interface{}); ok {
 			if heightStr, ok := syncInfo["latest_block_height"].(string); ok {
 				height, err := strconv.ParseInt(heightStr, 10, 64)
@@ -1796,6 +1804,10 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 					return 0, fmt.Errorf("invalid block height in sync_info: %w", err)
 				}
 				return height, nil
+			}
+			// NEAR returns latest_block_height as a number
+			if heightNum, ok := syncInfo["latest_block_height"].(float64); ok {
+				return int64(heightNum), nil
 			}
 		}
 		return 0, fmt.Errorf("unsupported response format: object without sync_info")
