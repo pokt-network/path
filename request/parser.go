@@ -90,7 +90,7 @@ func (p *Parser) GetQoSService(ctx context.Context, req *http.Request) (protocol
 		"service_id", serviceID,
 	).Warn().Msg("No matching QoS implementations found. Using NoOp QoS.")
 
-	return serviceID, noop.NoOpQoS{}, nil
+	return serviceID, noop.NewNoOpQoSService(p.Logger, serviceID), nil
 }
 
 // getServiceID extracts the authoritative service ID from the HTTP request's `Target-Service-Id` header.

@@ -42,6 +42,10 @@ type requestContext struct {
 	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
 	// Used to provide more specific error messages to clients.
 	protocolError error
+
+	// endpointSelector is the selector used for choosing endpoints.
+	// When block height tracking is active, this performs sync-allowance filtering.
+	endpointSelector protocol.EndpointSelector
 }
 
 // GetServicePayload returns the payload to be sent to a service endpoint.
@@ -114,8 +118,12 @@ func (rc *requestContext) GetObservations() qosobservations.Observations {
 	return qosobservations.Observations{}
 }
 
-// GetEndpointSelector returns an endpoint selector which simply makes a random selection among available endpoints.
+// GetEndpointSelector returns the endpoint selector for this request context.
+// When block height tracking is enabled, this returns a filtering selector.
 // Implements the gateway.RequestQoSContext interface.
 func (rc *requestContext) GetEndpointSelector() protocol.EndpointSelector {
+	if rc.endpointSelector != nil {
+		return rc.endpointSelector
+	}
 	return RandomEndpointSelector{}
 }
