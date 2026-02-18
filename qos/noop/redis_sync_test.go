@@ -163,6 +163,67 @@ func TestNoOp_UpdateFromExtractedData_WritesToRedis(t *testing.T) {
 	assert.Equal(t, uint64(200), mock.getBlock(qos.serviceID))
 }
 
+func TestNoOp_UpdateFromExtractedData_WritesEndpointBlockToRedis(t *testing.T) {
+	qos := newTestNoOpQoS()
+	mock := newMockReputationSvc()
+	qos.SetReputationService(mock)
+
+	// Write two endpoints via UpdateFromExtractedData
+	err := qos.UpdateFromExtractedData(protocol.EndpointAddr("ep1"), &qostypes.ExtractedData{BlockHeight: 100})
+	require.NoError(t, err)
+	err = qos.UpdateFromExtractedData(protocol.EndpointAddr("ep2"), &qostypes.ExtractedData{BlockHeight: 200})
+	require.NoError(t, err)
+
+	// Give async goroutines time to write
+	time.Sleep(100 * time.Millisecond)
+
+	mock.mu.Lock()
+	blocks := mock.endpointBlocks[qos.serviceID]
+	mock.mu.Unlock()
+
+	assert.Equal(t, uint64(100), blocks[protocol.EndpointAddr("ep1")])
+	assert.Equal(t, uint64(200), blocks[protocol.EndpointAddr("ep2")])
+}
+
+func TestNoOp_StartBackgroundSync_SyncsEndpointBlocks(t *testing.T) {
+	qos := newTestNoOpQoS()
+	mock := newMockReputationSvc()
+
+	// Pre-populate local endpoint store with an endpoint that has a low block height
+	qos.endpointStore.mu.Lock()
+	qos.endpointStore.endpoints[protocol.EndpointAddr("ep1")] = endpointState{blockHeight: 50}
+	qos.endpointStore.endpoints[protocol.EndpointAddr("ep2")] = endpointState{blockHeight: 300}
+	qos.endpointStore.mu.Unlock()
+
+	// Pre-populate "Redis" with higher block height for ep1
+	mock.mu.Lock()
+	mock.endpointBlocks[qos.serviceID] = map[protocol.EndpointAddr]uint64{
+		protocol.EndpointAddr("ep1"): 500,
+		protocol.EndpointAddr("ep2"): 200, // lower than local — should NOT overwrite
+		protocol.EndpointAddr("ep3"): 400, // not in local store — should be ignored
+	}
+	mock.mu.Unlock()
+
+	qos.SetReputationService(mock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// StartBackgroundSync performs an immediate sync on startup
+	qos.StartBackgroundSync(ctx, 50*time.Millisecond)
+
+	// Verify: ep1 should be updated to 500, ep2 should stay at 300
+	qos.endpointStore.mu.RLock()
+	ep1 := qos.endpointStore.endpoints[protocol.EndpointAddr("ep1")]
+	ep2 := qos.endpointStore.endpoints[protocol.EndpointAddr("ep2")]
+	_, ep3Exists := qos.endpointStore.endpoints[protocol.EndpointAddr("ep3")]
+	qos.endpointStore.mu.RUnlock()
+
+	assert.Equal(t, uint64(500), ep1.blockHeight, "ep1 should be updated from Redis")
+	assert.Equal(t, uint64(300), ep2.blockHeight, "ep2 should NOT be downgraded")
+	assert.False(t, ep3Exists, "ep3 should not be created in local store")
+}
+
 func TestNoOp_ConsumeExternalBlockHeight_WritesToRedis(t *testing.T) {
 	qos := newTestNoOpQoS()
 	mock := newMockReputationSvc()

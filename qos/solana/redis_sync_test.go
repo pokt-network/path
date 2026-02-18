@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
 	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
@@ -178,6 +179,76 @@ func TestSolana_UpdateFromExtractedData_WritesToRedis(t *testing.T) {
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, uint64(200), mock.getBlock(testSolanaServiceID))
+}
+
+func TestSolana_UpdateFromExtractedData_WritesEndpointBlockToRedis(t *testing.T) {
+	qos := newTestSolanaQoS()
+	mock := newMockReputationSvc()
+	qos.SetReputationService(mock)
+
+	// Write two endpoints via UpdateFromExtractedData
+	err := qos.UpdateFromExtractedData(protocol.EndpointAddr("ep1"), &qostypes.ExtractedData{BlockHeight: 100})
+	require.NoError(t, err)
+	err = qos.UpdateFromExtractedData(protocol.EndpointAddr("ep2"), &qostypes.ExtractedData{BlockHeight: 200})
+	require.NoError(t, err)
+
+	// Give async goroutines time to write
+	time.Sleep(100 * time.Millisecond)
+
+	mock.mu.Lock()
+	blocks := mock.endpointBlocks[testSolanaServiceID]
+	mock.mu.Unlock()
+
+	assert.Equal(t, uint64(100), blocks[protocol.EndpointAddr("ep1")])
+	assert.Equal(t, uint64(200), blocks[protocol.EndpointAddr("ep2")])
+}
+
+func TestSolana_StartBackgroundSync_SyncsEndpointBlocks(t *testing.T) {
+	qos := newTestSolanaQoS()
+	mock := newMockReputationSvc()
+
+	// Pre-populate local endpoint store with endpoints that have epoch info
+	qos.endpointsMu.Lock()
+	qos.endpoints[protocol.EndpointAddr("ep1")] = endpoint{
+		SolanaGetEpochInfoResponse: &qosobservations.SolanaGetEpochInfoResponse{BlockHeight: 50},
+	}
+	qos.endpoints[protocol.EndpointAddr("ep2")] = endpoint{
+		SolanaGetEpochInfoResponse: &qosobservations.SolanaGetEpochInfoResponse{BlockHeight: 300},
+	}
+	// ep_no_epoch has no SolanaGetEpochInfoResponse — should be skipped
+	qos.endpoints[protocol.EndpointAddr("ep_no_epoch")] = endpoint{}
+	qos.endpointsMu.Unlock()
+
+	// Pre-populate "Redis" with higher block height for ep1
+	mock.mu.Lock()
+	mock.endpointBlocks[testSolanaServiceID] = map[protocol.EndpointAddr]uint64{
+		protocol.EndpointAddr("ep1"):       500,
+		protocol.EndpointAddr("ep2"):       200, // lower than local — should NOT overwrite
+		protocol.EndpointAddr("ep3"):       400, // not in local store — should be ignored
+		protocol.EndpointAddr("ep_no_epoch"): 600, // no epoch info — should be skipped
+	}
+	mock.mu.Unlock()
+
+	qos.SetReputationService(mock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// StartBackgroundSync performs an immediate sync on startup
+	qos.StartBackgroundSync(ctx, 50*time.Millisecond)
+
+	// Verify: ep1 should be updated to 500, ep2 should stay at 300
+	qos.endpointsMu.RLock()
+	ep1 := qos.endpoints[protocol.EndpointAddr("ep1")]
+	ep2 := qos.endpoints[protocol.EndpointAddr("ep2")]
+	epNoEpoch := qos.endpoints[protocol.EndpointAddr("ep_no_epoch")]
+	_, ep3Exists := qos.endpoints[protocol.EndpointAddr("ep3")]
+	qos.endpointsMu.RUnlock()
+
+	assert.Equal(t, uint64(500), ep1.BlockHeight, "ep1 should be updated from Redis")
+	assert.Equal(t, uint64(300), ep2.BlockHeight, "ep2 should NOT be downgraded")
+	assert.Nil(t, epNoEpoch.SolanaGetEpochInfoResponse, "ep_no_epoch should not have epoch info created")
+	assert.False(t, ep3Exists, "ep3 should not be created in local store")
 }
 
 func TestSolana_ConsumeExternalBlockHeight_WritesToRedis(t *testing.T) {
