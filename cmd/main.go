@@ -136,6 +136,7 @@ func main() {
 		for _, src := range merged.ExternalBlockSources {
 			configs = append(configs, gateway.ExternalBlockSourceConfig{
 				URL:      src.URL,
+				Type:     src.Type,
 				Method:   src.Method,
 				Path:     src.Path,
 				Interval: src.Interval,

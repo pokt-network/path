@@ -23,8 +23,9 @@ const (
 // block height source. Multiple sources can be configured per service for redundancy.
 type ExternalBlockSourceConfig struct {
 	URL      string        // RPC endpoint URL
-	Method   string        // RPC method (e.g., "eth_blockNumber", "status", "getBlockHeight")
-	Path     string        // Request path (e.g., "/", "/jsonrpc"). Default: "/"
+	Type     string        // "jsonrpc" (default) or "rest". REST uses GET, JSON-RPC uses POST.
+	Method   string        // JSON-RPC method (e.g., "eth_blockNumber", "status", "getBlockHeight"). Ignored for REST.
+	Path     string        // Request path appended to URL (e.g., "/", "/jsonrpc", "/status"). Default: "/"
 	Interval time.Duration // Poll interval. Default: 30s
 	Timeout  time.Duration // HTTP timeout. Default: 5s
 }
@@ -137,29 +138,41 @@ func (f *ExternalBlockHeightFetcher) fetchMax(ctx context.Context) int64 {
 }
 
 // fetchOne queries a single external RPC endpoint for its block height.
+// Supports two modes:
+//   - "jsonrpc" (default): POST a JSON-RPC request with the configured method
+//   - "rest": GET the configured path, expecting a JSON response
 func (f *ExternalBlockHeightFetcher) fetchOne(ctx context.Context, cfg ExternalBlockSourceConfig) (int64, error) {
-	// Build JSON-RPC request body
-	reqBody, err := json.Marshal(map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  cfg.Method,
-		"params":  []interface{}{},
-	})
-	if err != nil {
-		return 0, fmt.Errorf("marshaling request: %w", err)
-	}
-
 	// Build the full URL
-	url := cfg.URL
+	fullURL := cfg.URL
 	if cfg.Path != "/" && cfg.Path != "" {
-		url = cfg.URL + cfg.Path
+		fullURL = cfg.URL + cfg.Path
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
+	var req *http.Request
+	var err error
+
+	if cfg.Type == "rest" {
+		// REST mode: simple GET request
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	} else {
+		// JSON-RPC mode (default): POST with JSON-RPC body
+		reqBody, marshalErr := json.Marshal(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  cfg.Method,
+			"params":  []interface{}{},
+		})
+		if marshalErr != nil {
+			return 0, fmt.Errorf("marshaling request: %w", marshalErr)
+		}
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(reqBody))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+	}
 	if err != nil {
 		return 0, fmt.Errorf("creating request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := f.httpClient.Do(req)
 	if err != nil {
@@ -168,7 +181,7 @@ func (f *ExternalBlockHeightFetcher) fetchOne(ctx context.Context, cfg ExternalB
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+		return 0, fmt.Errorf("HTTP %d from %s", resp.StatusCode, fullURL)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16)) // 64KB limit
@@ -180,7 +193,7 @@ func (f *ExternalBlockHeightFetcher) fetchOne(ctx context.Context, cfg ExternalB
 	// which handles EVM hex, Cosmos decimal, and Solana numeric formats.
 	height, err := extractBlockHeight(body)
 	if err != nil {
-		return 0, fmt.Errorf("parsing block height from %s: %w", url, err)
+		return 0, fmt.Errorf("parsing block height from %s: %w", fullURL, err)
 	}
 
 	return height, nil
