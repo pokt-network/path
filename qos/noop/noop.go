@@ -66,7 +66,7 @@ func NewNoOpQoSService(logger polylog.Logger, serviceID protocol.ServiceID) *NoO
 // It intentionally avoids performing any validation on the request, as is the designed behavior of the noop QoS.
 // Implements the gateway.QoSService interface.
 // Fallback logic for NoOp: header → jsonrpc (NoOp passes through requests without validation)
-func (n *NoOpQoS) ParseHTTPRequest(_ context.Context, httpRequest *http.Request, _ sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
+func (n *NoOpQoS) ParseHTTPRequest(_ context.Context, httpRequest *http.Request, detectedRPCType sharedtypes.RPCType) (gateway.RequestQoSContext, bool) {
 	// Apply size limit to prevent OOM attacks from unbounded io.ReadAll calls
 	limitedBody := http.MaxBytesReader(nil, httpRequest.Body, maxRequestBodySize)
 	bz, err := io.ReadAll(limitedBody)
@@ -82,6 +82,7 @@ func (n *NoOpQoS) ParseHTTPRequest(_ context.Context, httpRequest *http.Request,
 		httpRequestBody:   bz,
 		httpRequestMethod: httpRequest.Method,
 		httpRequestPath:   httpRequest.URL.Path,
+		detectedRPCType:   detectedRPCType,
 		endpointSelector:  n.newFilteringSelector(),
 	}, true
 }

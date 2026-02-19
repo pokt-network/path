@@ -1,11 +1,16 @@
 package noop
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/path/protocol"
@@ -274,4 +279,44 @@ func TestNoOpQoS_SelectReturnsErrorOnEmptyList(t *testing.T) {
 
 	_, err = sel.SelectMultiple(protocol.EndpointAddrList{}, 1)
 	require.Error(t, err)
+}
+
+func TestNoOpQoS_ParseHTTPRequest_PreservesDetectedRPCType(t *testing.T) {
+	tests := []struct {
+		name            string
+		detectedRPCType sharedtypes.RPCType
+	}{
+		{
+			name:            "JSON-RPC detected type is preserved",
+			detectedRPCType: sharedtypes.RPCType_JSON_RPC,
+		},
+		{
+			name:            "REST detected type is preserved",
+			detectedRPCType: sharedtypes.RPCType_REST,
+		},
+		{
+			name:            "UNKNOWN_RPC detected type is preserved",
+			detectedRPCType: sharedtypes.RPCType_UNKNOWN_RPC,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			qos := newTestQoS()
+
+			httpReq := &http.Request{
+				Method: http.MethodPost,
+				URL:    &url.URL{Path: "/"},
+				Body:   io.NopCloser(bytes.NewBufferString(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}`)),
+			}
+
+			reqCtx, ok := qos.ParseHTTPRequest(context.Background(), httpReq, tt.detectedRPCType)
+			require.True(t, ok)
+
+			payloads := reqCtx.GetServicePayloads()
+			require.Len(t, payloads, 1)
+			require.Equal(t, tt.detectedRPCType, payloads[0].RPCType,
+				"payload RPCType should match the detected type, not be hardcoded to UNKNOWN_RPC")
+		})
+	}
 }

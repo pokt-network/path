@@ -43,6 +43,10 @@ type requestContext struct {
 	// Used to provide more specific error messages to clients.
 	protocolError error
 
+	// detectedRPCType is the RPC type detected by the gateway for this request.
+	// Used to set the correct RPCType on the service payload instead of UNKNOWN_RPC.
+	detectedRPCType sharedtypes.RPCType
+
 	// endpointSelector is the selector used for choosing endpoints.
 	// When block height tracking is active, this performs sync-allowance filtering.
 	endpointSelector protocol.EndpointSelector
@@ -56,7 +60,7 @@ func (rc *requestContext) GetServicePayloads() []protocol.Payload {
 		Method:  rc.httpRequestMethod,
 		Path:    "", // set below
 		Headers: map[string]string{},
-		RPCType: sharedtypes.RPCType_UNKNOWN_RPC,
+		RPCType: rc.detectedRPCType,
 	}
 	if rc.httpRequestPath != "" {
 		payload.Path = rc.httpRequestPath
