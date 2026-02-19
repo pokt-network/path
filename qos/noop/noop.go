@@ -131,9 +131,11 @@ func (n *NoOpQoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, da
 
 	blockHeight := uint64(data.BlockHeight)
 
-	// Update endpoint store
+	// Update endpoint store (preserve existing lastSeen)
 	n.endpointStore.mu.Lock()
-	n.endpointStore.endpoints[endpointAddr] = endpointState{blockHeight: blockHeight}
+	ep := n.endpointStore.endpoints[endpointAddr]
+	ep.blockHeight = blockHeight
+	n.endpointStore.endpoints[endpointAddr] = ep
 	n.endpointStore.mu.Unlock()
 
 	// Update perceived block height (max across all endpoints)
@@ -329,7 +331,7 @@ func (n *NoOpQoS) StartBackgroundSync(ctx context.Context, syncInterval time.Dur
 				// Create a new entry with just the block height from Redis.
 				// This allows non-leader replicas to filter stale endpoints
 				// before health checks or relay responses populate the store.
-				n.endpointStore.endpoints[addr] = endpointState{blockHeight: redisHeight}
+				n.endpointStore.endpoints[addr] = endpointState{blockHeight: redisHeight, lastSeen: time.Now()}
 				updated++
 				continue
 			}

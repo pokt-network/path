@@ -388,6 +388,7 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 				// before health checks or relay responses populate the store.
 				qos.endpointStore.endpoints[addr] = endpoint{
 					checkCometBFTStatus: endpointCheckCometBFTStatus{latestBlockHeight: &redisH},
+					lastSeen:            time.Now(),
 				}
 				updated++
 				continue
