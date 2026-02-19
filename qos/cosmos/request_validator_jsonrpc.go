@@ -62,10 +62,19 @@ func (rv *requestValidator) buildJSONRPCServicePayloadsFromRequests(
 			"jsonrpc_method", method,
 		)
 
-		// Check if this RPC type is supported by the service
+		// Check if this RPC type is supported by the service.
+		// CometBFT methods (status, block, etc.) sent via JSON-RPC POST can fall
+		// back to JSON_RPC endpoints since CometBFT nodes handle both interfaces.
+		// This ensures CometBFT JSON-RPC requests work even when suppliers haven't
+		// staked comet_bft endpoints (e.g. due to stake validation constraints).
 		if _, supported := rv.supportedAPIs[rpcType]; !supported {
-			logger.Warn().Msg("Request uses unsupported RPC type")
-			return servicePayloads, errors.New("request uses unsupported RPC type")
+			if rpcType == sharedtypes.RPCType_COMET_BFT {
+				rpcType = sharedtypes.RPCType_JSON_RPC
+			}
+			if _, supported := rv.supportedAPIs[rpcType]; !supported {
+				logger.Warn().Msg("Request uses unsupported RPC type")
+				return servicePayloads, errors.New("request uses unsupported RPC type")
+			}
 		}
 
 		servicePayload, err := buildJSONRPCServicePayload(rpcType, req)
