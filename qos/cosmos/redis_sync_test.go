@@ -83,6 +83,10 @@ func (m *mockReputationSvc) GetEndpointBlockHeights(_ context.Context, serviceID
 	return result
 }
 
+func (m *mockReputationSvc) RemoveEndpointBlockHeights(_ context.Context, _ protocol.ServiceID, _ []protocol.EndpointAddr) error {
+	return nil
+}
+
 func newTestCosmosQoS() *QoS {
 	logger := polyzero.NewLogger()
 	return NewSimpleQoSInstance(logger, "cosmos-test")

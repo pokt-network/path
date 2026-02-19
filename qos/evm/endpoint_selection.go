@@ -206,6 +206,10 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 	}
 	ss.endpointStore.endpointsMu.RUnlock()
 
+	// Touch endpoints to update lastSeen for stale endpoint cleanup.
+	// Uses a separate WLock call to avoid changing the read-heavy filtering path.
+	ss.endpointStore.touchEndpoints(availableEndpoints)
+
 	// Now iterate without holding the lock
 	var filteredEndpointsAddr protocol.EndpointAddrList
 	var validationResults []*qosobservations.EndpointValidationResult

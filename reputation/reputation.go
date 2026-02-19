@@ -349,6 +349,10 @@ type ReputationService interface {
 	// GetEndpointBlockHeights retrieves all endpoint block heights for a service.
 	// Returns the heights stored by all replicas. Returns empty map on error.
 	GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) map[protocol.EndpointAddr]uint64
+
+	// RemoveEndpointBlockHeights removes stale endpoint block height entries from storage.
+	// Used by periodic stale endpoint cleanup to keep Redis and local stores in sync.
+	RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error
 }
 
 // Config holds configuration for the reputation system.

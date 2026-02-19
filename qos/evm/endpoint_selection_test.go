@@ -107,6 +107,10 @@ func (m *mockReputationService) GetEndpointBlockHeights(ctx context.Context, ser
 	return make(map[protocol.EndpointAddr]uint64)
 }
 
+func (m *mockReputationService) RemoveEndpointBlockHeights(_ context.Context, _ protocol.ServiceID, _ []protocol.EndpointAddr) error {
+	return nil
+}
+
 func (m *mockReputationService) GetArchivalEndpoints(ctx context.Context, serviceID protocol.ServiceID) []reputation.EndpointKey {
 	if m.archivalEndpoints == nil {
 		return nil

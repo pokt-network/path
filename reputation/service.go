@@ -867,6 +867,14 @@ func (s *service) GetEndpointBlockHeights(ctx context.Context, serviceID protoco
 	return heights
 }
 
+// RemoveEndpointBlockHeights removes stale endpoint block height entries from storage.
+func (s *service) RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error {
+	if s.storage == nil {
+		return nil
+	}
+	return s.storage.RemoveEndpointBlockHeights(ctx, serviceID, addrs)
+}
+
 // GetArchivalEndpoints returns all endpoint keys for the given service
 // that have valid (non-expired) archival status in the local cache.
 // This enables bootstrapping the EVM archival cache at startup when the

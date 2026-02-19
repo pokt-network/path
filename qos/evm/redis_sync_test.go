@@ -71,6 +71,17 @@ func (m *mockRedisSyncRepSvc) GetEndpointBlockHeights(_ context.Context, service
 	return result
 }
 
+func (m *mockRedisSyncRepSvc) RemoveEndpointBlockHeights(_ context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.endpointBlocks[serviceID] != nil {
+		for _, addr := range addrs {
+			delete(m.endpointBlocks[serviceID], addr)
+		}
+	}
+	return nil
+}
+
 func (m *mockRedisSyncRepSvc) SetArchivalStatus(_ context.Context, _ reputation.EndpointKey, _ bool, _ time.Duration) error {
 	return nil
 }

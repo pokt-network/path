@@ -511,6 +511,31 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 		}
 	}
 
+	// sweepStaleEndpoints removes endpoint entries that haven't been seen
+	// in any active session within the TTL, and cleans up their Redis entries.
+	sweepStaleEndpoints := func() {
+		removed := qos.endpointStore.sweepStaleEndpoints(defaultEndpointTTL)
+		if len(removed) == 0 {
+			return
+		}
+
+		qos.logger.Info().
+			Str("service_id", string(serviceID)).
+			Int("removed_endpoints", len(removed)).
+			Msg("Swept stale endpoints from local store")
+
+		// Remove from Redis too
+		sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := qos.reputationSvc.RemoveEndpointBlockHeights(sweepCtx, serviceID, removed); err != nil {
+			qos.logger.Warn().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Int("count", len(removed)).
+				Msg("Failed to remove stale endpoint block heights from Redis")
+		}
+	}
+
 	// Perform immediate sync on startup to have latest data before serving requests
 	syncFromRedis()
 	syncEndpointBlocksFromRedis()
@@ -538,6 +563,7 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 			case <-ticker.C:
 				syncFromRedis()
 				syncEndpointBlocksFromRedis()
+				sweepStaleEndpoints()
 			}
 		}
 	}()

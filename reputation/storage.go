@@ -59,6 +59,10 @@ type Storage interface {
 	// Returns a map of endpoint address to block height.
 	GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) (map[protocol.EndpointAddr]uint64, error)
 
+	// RemoveEndpointBlockHeights removes endpoint block height entries for a service.
+	// Used by stale endpoint cleanup to remove entries that are no longer in active sessions.
+	RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error
+
 	// Close releases any resources held by the storage.
 	Close() error
 }

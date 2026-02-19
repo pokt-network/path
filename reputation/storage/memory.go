@@ -282,6 +282,25 @@ func (m *MemoryStorage) SetEndpointBlockHeight(ctx context.Context, serviceID pr
 	return nil
 }
 
+// RemoveEndpointBlockHeights removes endpoint block height entries for a service.
+func (m *MemoryStorage) RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return reputation.ErrStorageClosed
+	}
+
+	blocks := m.endpointBlocks[string(serviceID)]
+	if blocks == nil {
+		return nil
+	}
+	for _, addr := range addrs {
+		delete(blocks, addr)
+	}
+	return nil
+}
+
 // GetEndpointBlockHeights retrieves all endpoint block heights for a service.
 func (m *MemoryStorage) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) (map[protocol.EndpointAddr]uint64, error) {
 	m.mu.RLock()

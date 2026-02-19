@@ -23,4 +23,8 @@ type endpoint struct {
 	checkBlockNumber endpointCheckBlockNumber
 	checkChainID     endpointCheckChainID
 	checkArchival    endpointCheckArchival
+
+	// lastSeen is updated when the endpoint appears in an active session.
+	// Used by stale endpoint cleanup to remove entries that are no longer active.
+	lastSeen time.Time
 }

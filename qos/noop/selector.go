@@ -129,7 +129,6 @@ func (fs *filteringSelector) filterValidEndpoints(endpoints protocol.EndpointAdd
 	minAllowedBlock := perceivedBlock - syncAllowance
 
 	fs.endpointStore.mu.RLock()
-	defer fs.endpointStore.mu.RUnlock()
 
 	var filtered protocol.EndpointAddrList
 	for _, addr := range endpoints {
@@ -158,6 +157,12 @@ func (fs *filteringSelector) filterValidEndpoints(endpoints protocol.EndpointAdd
 
 		filtered = append(filtered, addr)
 	}
+
+	fs.endpointStore.mu.RUnlock()
+
+	// Touch endpoints to update lastSeen for stale endpoint cleanup.
+	// Uses a separate WLock call to avoid changing the read-heavy filtering path.
+	fs.endpointStore.touchEndpoints(endpoints)
 
 	return filtered
 }

@@ -83,6 +83,10 @@ func (m *mockReputationSvc) GetEndpointBlockHeights(_ context.Context, serviceID
 	return result
 }
 
+func (m *mockReputationSvc) RemoveEndpointBlockHeights(_ context.Context, _ protocol.ServiceID, _ []protocol.EndpointAddr) error {
+	return nil
+}
+
 func newTestNoOpQoS() *NoOpQoS {
 	logger := polyzero.NewLogger()
 	return NewNoOpQoSService(logger, "noop-test")

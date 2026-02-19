@@ -26,4 +26,8 @@ type endpoint struct {
 	// *** EVM-specific checks ***
 	// Checks EVM chain ID via eth_chainId
 	checkEVMChainID endpointCheckEVMChainID
+
+	// lastSeen is updated when the endpoint appears in an active session.
+	// Used by stale endpoint cleanup to remove entries that are no longer active.
+	lastSeen time.Time
 }

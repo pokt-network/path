@@ -158,6 +158,10 @@ func (m *mockStorage) GetEndpointBlockHeights(_ context.Context, serviceID proto
 	return make(map[protocol.EndpointAddr]uint64), nil
 }
 
+func (m *mockStorage) RemoveEndpointBlockHeights(_ context.Context, _ protocol.ServiceID, _ []protocol.EndpointAddr) error {
+	return nil
+}
+
 func TestService_RecordSignal(t *testing.T) {
 	ctx := context.Background()
 	store := newMockStorage()

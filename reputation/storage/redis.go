@@ -447,6 +447,23 @@ func (s *RedisStorage) SetEndpointBlockHeight(ctx context.Context, serviceID pro
 	return nil
 }
 
+// RemoveEndpointBlockHeights removes endpoint block height entries using HDEL.
+func (s *RedisStorage) RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error {
+	if len(addrs) == 0 {
+		return nil
+	}
+	key := s.endpointBlocksKey(serviceID)
+	fields := make([]string, len(addrs))
+	for i, addr := range addrs {
+		fields[i] = string(addr)
+	}
+	err := s.client.HDel(ctx, key, fields...).Err()
+	if err != nil {
+		return fmt.Errorf("failed to remove endpoint block heights: %w", err)
+	}
+	return nil
+}
+
 // GetEndpointBlockHeights retrieves all endpoint block heights using HGETALL.
 func (s *RedisStorage) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) (map[protocol.EndpointAddr]uint64, error) {
 	key := s.endpointBlocksKey(serviceID)

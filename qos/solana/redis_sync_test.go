@@ -85,6 +85,10 @@ func (m *mockReputationSvc) GetEndpointBlockHeights(_ context.Context, serviceID
 	return result
 }
 
+func (m *mockReputationSvc) RemoveEndpointBlockHeights(_ context.Context, _ protocol.ServiceID, _ []protocol.EndpointAddr) error {
+	return nil
+}
+
 const testSolanaServiceID = protocol.ServiceID("solana-test")
 
 func newTestSolanaQoS() *QoS {
