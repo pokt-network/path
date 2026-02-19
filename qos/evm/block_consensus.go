@@ -33,7 +33,7 @@ const (
 	// before applying the external block height floor. This gives suppliers
 	// time to report their block heights so the external floor doesn't
 	// filter out all endpoints during cold start.
-	defaultExternalBlockGracePeriod = 60 * time.Second
+	defaultExternalBlockGracePeriod = 30 * time.Second
 )
 
 // blockObservation represents a single block height observation from an endpoint.

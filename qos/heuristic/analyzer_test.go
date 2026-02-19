@@ -547,6 +547,14 @@ func TestRealWorldScenarios(t *testing.T) {
 			description:   "Archival node missing state",
 		},
 		{
+			name:          "Erigon MDBX database corruption",
+			response:      `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"mdbx_txn_begin: MDBX_PANIC(-30795): Maybe free space is over on disk. Otherwise it's hardware failure."}}`,
+			httpStatus:    200,
+			rpcType:       sharedtypes.RPCType_JSON_RPC,
+			expectedRetry: true,
+			description:   "Erigon node with corrupted MDBX database",
+		},
+		{
 			name:          "Cosmos pruned block",
 			response:      `{"error":"block has been pruned"}`,
 			httpStatus:    200,

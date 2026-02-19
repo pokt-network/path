@@ -144,6 +144,7 @@ var errorPatterns = []errorPattern{
 
 	// Blockchain-Specific Errors (EVM)
 	// ONLY include errors that indicate supplier/node problems, NOT application-level errors
+	{[]byte("mdbx_panic"), CategoryBlockchainError, 0.98},                 // Erigon MDBX database corruption/disk full
 	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},          // Data corruption/sync issue
 	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95},      // Archival data not available
 	{[]byte("is pruned"), CategoryBlockchainError, 0.95},                  // Generic pruned error (e.g., "state at block #X is pruned")
