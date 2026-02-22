@@ -48,18 +48,18 @@ var (
 func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType) AnalysisResult {
 	switch rpcType {
 	case sharedtypes.RPCType_JSON_RPC:
-		return analyzeJSONRPC(prefix, fullLength)
+		return analyzeJSONRPC(prefix, fullLength, rpcType)
 
 	case sharedtypes.RPCType_REST:
 		return analyzeREST(prefix, fullLength)
 
 	case sharedtypes.RPCType_COMET_BFT:
 		// CometBFT uses JSON-RPC style responses
-		return analyzeJSONRPC(prefix, fullLength)
+		return analyzeJSONRPC(prefix, fullLength, rpcType)
 
 	case sharedtypes.RPCType_WEBSOCKET:
 		// WebSocket messages are typically JSON-RPC
-		return analyzeJSONRPC(prefix, fullLength)
+		return analyzeJSONRPC(prefix, fullLength, rpcType)
 
 	default:
 		// Unknown protocol - can't make protocol-specific assertions
@@ -79,7 +79,7 @@ func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType
 //   - "error" field (error - but still a VALID response)
 //
 // Having neither or both indicates a malformed response.
-func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
+func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType) AnalysisResult {
 	hasResult := bytes.Contains(prefix, jsonrpcResultField)
 	hasError := bytes.Contains(prefix, jsonrpcErrorField)
 	hasVersion := bytes.Contains(prefix, jsonrpcVersionField)
@@ -87,18 +87,20 @@ func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
 	// Case 1: Has "result" without "error"
 	if hasResult && !hasError {
 		// Check for empty containers in the result.
-		// "result":{} is NEVER valid for any JSON-RPC method — every method that returns
+		// For EVM/Solana (JSON_RPC): "result":{} is never valid — every method that returns
 		// an object has mandatory fields. This is a strong signal of a broken/lazy supplier.
+		// For CometBFT: "result":{} IS valid — the "health" method returns an empty object
+		// when the node is healthy. Skip the empty object check for CometBFT.
 		// "result":[] IS valid for some methods (eth_getLogs, eth_accounts, eth_getFilterChanges)
 		// but retrying is benign — the retry returns [] too and the user gets the right answer.
 		emptyType := emptyResultType(prefix)
-		if emptyType == emptyObject {
+		if emptyType == emptyObject && rpcType != sharedtypes.RPCType_COMET_BFT {
 			return AnalysisResult{
 				ShouldRetry: true,
 				Confidence:  0.95,
 				Reason:      "jsonrpc_empty_object_result",
 				Structure:   StructureValid,
-				Details:     "JSON-RPC result is an empty object — never valid for any method",
+				Details:     "JSON-RPC result is an empty object — never valid for EVM/Solana methods",
 			}
 		}
 		if emptyType == emptyArray {

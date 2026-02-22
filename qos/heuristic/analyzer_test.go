@@ -184,7 +184,7 @@ func TestProtocolAnalysis_JSONRPC(t *testing.T) {
 			minConfidence:  0.75,
 		},
 		{
-			name:           "JSON-RPC empty object result — major penalty (never valid)",
+			name:           "JSON-RPC empty object result — major penalty (never valid for EVM/Solana)",
 			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`),
 			expectedRetry:  true,
 			expectedReason: "jsonrpc_empty_object_result",
@@ -214,6 +214,44 @@ func TestProtocolAnalysis_JSONRPC(t *testing.T) {
 			if tt.minConfidence > 0 {
 				assert.GreaterOrEqual(t, result.Confidence, tt.minConfidence, "Confidence too low")
 			}
+		})
+	}
+}
+
+func TestProtocolAnalysis_CometBFT(t *testing.T) {
+	tests := []struct {
+		name           string
+		response       []byte
+		expectedRetry  bool
+		expectedReason string
+	}{
+		{
+			name:           "CometBFT health — empty object result is valid",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "CometBFT status — non-empty result is valid",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":{"sync_info":{"latest_block_height":"123"}}}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "CometBFT valid error — should NOT retry",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"method not found"}}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_valid_error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prefixLen := min(512, len(tt.response))
+			result := ProtocolAnalysis(tt.response[:prefixLen], len(tt.response), sharedtypes.RPCType_COMET_BFT)
+
+			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
+			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
 		})
 	}
 }
