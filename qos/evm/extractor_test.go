@@ -1,10 +1,13 @@
 package evm
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	qostypes "github.com/pokt-network/path/qos/types"
 )
 
 func TestEVMDataExtractor_ExtractBlockHeight(t *testing.T) {
@@ -283,6 +286,101 @@ func TestEVMDataExtractor_IsValidResponse(t *testing.T) {
 			assert.Equal(t, tt.expectedValid, isValid)
 		})
 	}
+}
+
+func TestEVMDataExtractor_InvalidBlockHeightResult(t *testing.T) {
+	extractor := NewEVMDataExtractor()
+	request := []byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}`)
+
+	tests := []struct {
+		name            string
+		response        string
+		expectSentinel  bool
+		expectError     bool
+	}{
+		{
+			name:           "result is empty array — broken supplier",
+			response:       `{"jsonrpc":"2.0","id":1,"result":[]}`,
+			expectSentinel: true,
+			expectError:    true,
+		},
+		{
+			name:           "result is empty object — broken supplier",
+			response:       `{"jsonrpc":"2.0","id":1,"result":{}}`,
+			expectSentinel: true,
+			expectError:    true,
+		},
+		{
+			name:           "result is number — broken supplier",
+			response:       `{"jsonrpc":"2.0","id":1,"result":12345}`,
+			expectSentinel: true,
+			expectError:    true,
+		},
+		{
+			name:           "result is boolean — broken supplier",
+			response:       `{"jsonrpc":"2.0","id":1,"result":true}`,
+			expectSentinel: true,
+			expectError:    true,
+		},
+		{
+			name:           "result is invalid hex string — broken supplier",
+			response:       `{"jsonrpc":"2.0","id":1,"result":"not-hex"}`,
+			expectSentinel: true,
+			expectError:    true,
+		},
+		{
+			name:           "JSON-RPC error — NOT broken, just an error response",
+			response:       `{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}`,
+			expectSentinel: false,
+			expectError:    true,
+		},
+		{
+			name:           "missing result field — no sentinel",
+			response:       `{"jsonrpc":"2.0","id":1}`,
+			expectSentinel: false,
+			expectError:    true,
+		},
+		{
+			name:           "null result — no sentinel",
+			response:       `{"jsonrpc":"2.0","id":1,"result":null}`,
+			expectSentinel: false,
+			expectError:    true,
+		},
+		{
+			name:           "valid hex result — no error",
+			response:       `{"jsonrpc":"2.0","id":1,"result":"0x12345"}`,
+			expectSentinel: false,
+			expectError:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := extractor.ExtractBlockHeight(request, []byte(tt.response))
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.expectSentinel {
+					assert.True(t, errors.Is(err, qostypes.ErrInvalidBlockHeightResult),
+						"expected ErrInvalidBlockHeightResult but got: %v", err)
+				} else {
+					assert.False(t, errors.Is(err, qostypes.ErrInvalidBlockHeightResult),
+						"did NOT expect ErrInvalidBlockHeightResult but got: %v", err)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+
+	t.Run("non-eth_blockNumber request should NOT set sentinel", func(t *testing.T) {
+		balReq := []byte(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123","latest"],"id":1}`)
+		response := []byte(`{"jsonrpc":"2.0","id":1,"result":"0xde0b6b3a7640000"}`)
+
+		_, err := extractor.ExtractBlockHeight(balReq, response)
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, qostypes.ErrInvalidBlockHeightResult),
+			"should NOT wrap with sentinel for non-eth_blockNumber request")
+	})
 }
 
 func TestEVMDataExtractor_RequestAwareness(t *testing.T) {

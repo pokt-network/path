@@ -167,6 +167,14 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 		storedEndpoint.checkBlockNumber = endpointCheckBlockNumber{
 			parsedBlockNumberResponse: &blockNumber,
 		}
+	} else if data.InvalidBlockHeight {
+		// Supplier returned a response with a result field but the block height
+		// was unparseable (e.g., "result":[] or "result":{}). Store block height 0
+		// so the filter catches this endpoint instead of treating it as "unknown".
+		blockNumber = 0
+		storedEndpoint.checkBlockNumber = endpointCheckBlockNumber{
+			parsedBlockNumberResponse: &blockNumber,
+		}
 	}
 
 	// Update archival status: Handle both setting and clearing archival capability.

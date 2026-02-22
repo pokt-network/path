@@ -84,8 +84,33 @@ func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
 	hasError := bytes.Contains(prefix, jsonrpcErrorField)
 	hasVersion := bytes.Contains(prefix, jsonrpcVersionField)
 
-	// Case 1: Has "result" without "error" - definitely success
+	// Case 1: Has "result" without "error"
 	if hasResult && !hasError {
+		// Check for empty containers in the result.
+		// "result":{} is NEVER valid for any JSON-RPC method — every method that returns
+		// an object has mandatory fields. This is a strong signal of a broken/lazy supplier.
+		// "result":[] IS valid for some methods (eth_getLogs, eth_accounts, eth_getFilterChanges)
+		// but retrying is benign — the retry returns [] too and the user gets the right answer.
+		emptyType := emptyResultType(prefix)
+		if emptyType == emptyObject {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.95,
+				Reason:      "jsonrpc_empty_object_result",
+				Structure:   StructureValid,
+				Details:     "JSON-RPC result is an empty object — never valid for any method",
+			}
+		}
+		if emptyType == emptyArray {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.75,
+				Reason:      "jsonrpc_empty_array_result",
+				Structure:   StructureValid,
+				Details:     "JSON-RPC result is an empty array — valid for some methods but suspicious",
+			}
+		}
+
 		return AnalysisResult{
 			ShouldRetry: false,
 			Confidence:  0.0,
@@ -181,6 +206,26 @@ func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
 //   - {"code": N, "message": "..."}
 //   - {"status": "error", ...}
 func analyzeREST(prefix []byte, fullLength int) AnalysisResult {
+	// Empty JSON object ({} or { }) is never a valid REST API response.
+	// Suppliers returning {} are misconfigured or broken.
+	if fullLength <= 10 {
+		stripped := bytes.Map(func(r rune) rune {
+			if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+				return -1 // drop whitespace
+			}
+			return r
+		}, prefix[:min(len(prefix), fullLength)])
+		if len(stripped) == 2 && stripped[0] == '{' && stripped[1] == '}' {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.80,
+				Reason:      "rest_empty_object",
+				Structure:   StructureValid,
+				Details:     "REST response is an empty JSON object",
+			}
+		}
+	}
+
 	hasError := bytes.Contains(prefix, restErrorField)
 	hasMessage := bytes.Contains(prefix, restMessageField)
 	hasCode := bytes.Contains(prefix, restCodeField)
@@ -224,6 +269,46 @@ func analyzeREST(prefix []byte, fullLength int) AnalysisResult {
 		Structure:   StructureValid,
 		Details:     "REST response has no obvious error indicators",
 	}
+}
+
+// emptyResultKind represents the type of empty result detected.
+type emptyResultKind int
+
+const (
+	notEmpty    emptyResultKind = iota
+	emptyArray                  // "result":[]
+	emptyObject                 // "result":{}
+)
+
+// emptyResultType checks if a JSON-RPC response has "result":[] or "result":{}.
+// Returns the specific kind to allow different confidence levels:
+//   - emptyObject: NEVER valid for any JSON-RPC method (0.95 confidence)
+//   - emptyArray: valid for some methods like eth_getLogs (0.75 confidence)
+func emptyResultType(prefix []byte) emptyResultKind {
+	idx := bytes.Index(prefix, jsonrpcResultField)
+	if idx < 0 {
+		return notEmpty
+	}
+
+	// Skip past "result" and find the colon
+	after := prefix[idx+len(jsonrpcResultField):]
+	after = bytes.TrimLeft(after, " \t\n\r")
+	if len(after) == 0 || after[0] != ':' {
+		return notEmpty
+	}
+	after = bytes.TrimLeft(after[1:], " \t\n\r")
+
+	if len(after) < 2 {
+		return notEmpty
+	}
+
+	if after[0] == '[' && after[1] == ']' {
+		return emptyArray
+	}
+	if after[0] == '{' && after[1] == '}' {
+		return emptyObject
+	}
+	return notEmpty
 }
 
 // IsJSONRPCLikeSuccess provides a quick check for JSON-RPC success.

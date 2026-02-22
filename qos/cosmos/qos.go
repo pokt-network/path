@@ -177,12 +177,22 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 		return nil
 	}
 
-	// Only update if we extracted a valid block height
-	if data.BlockHeight <= 0 {
-		return nil
+	// Determine block number to store
+	var blockNumber uint64
+	var hasBlock bool
+
+	if data.BlockHeight > 0 {
+		blockNumber = uint64(data.BlockHeight)
+		hasBlock = true
+	} else if data.InvalidBlockHeight {
+		// Supplier returned an unparseable block height result — store 0 so filter catches it
+		blockNumber = 0
+		hasBlock = true
 	}
 
-	blockNumber := uint64(data.BlockHeight)
+	if !hasBlock {
+		return nil
+	}
 
 	// Lock the endpoint store to update the endpoint observation
 	qos.endpointStore.endpointsMu.Lock()

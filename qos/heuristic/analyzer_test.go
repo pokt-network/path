@@ -177,6 +177,26 @@ func TestProtocolAnalysis_JSONRPC(t *testing.T) {
 			minConfidence:  0.80,
 		},
 		{
+			name:           "JSON-RPC empty array result",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":[]}`),
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_empty_array_result",
+			minConfidence:  0.75,
+		},
+		{
+			name:           "JSON-RPC empty object result — major penalty (never valid)",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`),
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_empty_object_result",
+			minConfidence:  0.95,
+		},
+		{
+			name:           "JSON-RPC non-empty array result",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":["0x123"]}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
 			name:           "Large response without result in prefix",
 			response:       append([]byte(`{"jsonrpc":"2.0","id":1,"data":`), make([]byte, 1000)...),
 			expectedRetry:  false,
@@ -228,6 +248,18 @@ func TestProtocolAnalysis_REST(t *testing.T) {
 			response:       []byte(`{"data":{"error_count":5,"status":"ok"}}`),
 			expectedRetry:  false,
 			expectedReason: "rest_no_error_indicator",
+		},
+		{
+			name:           "REST empty JSON object",
+			response:       []byte(`{}`),
+			expectedRetry:  true,
+			expectedReason: "rest_empty_object",
+		},
+		{
+			name:           "REST empty JSON object with whitespace",
+			response:       []byte(`{ }`),
+			expectedRetry:  true,
+			expectedReason: "rest_empty_object",
 		},
 	}
 
@@ -561,6 +593,22 @@ func TestRealWorldScenarios(t *testing.T) {
 			rpcType:       sharedtypes.RPCType_REST,
 			expectedRetry: true,
 			description:   "Cosmos REST pruned block error",
+		},
+		{
+			name:          "REST empty JSON object",
+			response:      `{}`,
+			httpStatus:    200,
+			rpcType:       sharedtypes.RPCType_REST,
+			expectedRetry: true,
+			description:   "Broken supplier returning empty REST response",
+		},
+		{
+			name:          "JSON-RPC empty array result",
+			response:      `{"jsonrpc":"2.0","id":1,"result":[]}`,
+			httpStatus:    200,
+			rpcType:       sharedtypes.RPCType_JSON_RPC,
+			expectedRetry: true,
+			description:   "Broken supplier returning empty array for eth_blockNumber",
 		},
 		{
 			name:          "Solana unhealthy node",

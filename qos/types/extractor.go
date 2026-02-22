@@ -8,10 +8,22 @@
 package types
 
 import (
+	"errors"
 	"time"
 
 	"github.com/pokt-network/path/protocol"
 )
+
+// ErrInvalidBlockHeightResult is returned by DataExtractor.ExtractBlockHeight when the
+// response contains a result field but the result cannot be parsed as a block height.
+// For example, a supplier returning {"result":[]} for eth_blockNumber.
+//
+// This is distinct from "method not relevant" errors (e.g., eth_getBalance has no block height)
+// and from JSON-RPC error responses (which are valid protocol responses).
+//
+// When this error is returned, the endpoint should be marked with block height 0 so the
+// block height filter catches it, rather than treating it as "unknown/fresh".
+var ErrInvalidBlockHeightResult = errors.New("invalid block height result")
 
 // DataExtractor defines how endpoint quality data is extracted from responses.
 // All QoS services (EVM, Cosmos, Solana, generic) implement this interface.
@@ -91,6 +103,12 @@ type ExtractedData struct {
 	// BlockHeight is the latest block number (0 if not extracted).
 	BlockHeight int64
 
+	// InvalidBlockHeight is set when block height extraction was attempted
+	// but the supplier returned an unparseable result (e.g. "result":[] or "result":{}).
+	// When true, the endpoint should be marked with block height 0 so the
+	// block height filter catches it, rather than treating it as "unknown".
+	InvalidBlockHeight bool
+
 	// ChainID is the chain identifier (empty if not extracted).
 	ChainID string
 
@@ -146,6 +164,12 @@ func (ed *ExtractedData) ExtractAll(extractor DataExtractor, request []byte) {
 		ed.BlockHeight = blockHeight
 	} else {
 		ed.ExtractionErrors["block_height"] = err.Error()
+		// If the extractor signals that the response had a result but it was unparseable,
+		// mark it so UpdateFromExtractedData stores block height 0 (filter catches it)
+		// instead of leaving the endpoint as "unknown" (filter skips it).
+		if errors.Is(err, ErrInvalidBlockHeightResult) {
+			ed.InvalidBlockHeight = true
+		}
 	}
 
 	// Extract chain ID
@@ -220,6 +244,9 @@ func (ed *ExtractedData) ExtractWithConfig(extractor DataExtractor, request []by
 			ed.BlockHeight = blockHeight
 		} else {
 			ed.ExtractionErrors["block_height"] = err.Error()
+			if errors.Is(err, ErrInvalidBlockHeightResult) {
+				ed.InvalidBlockHeight = true
+			}
 		}
 	}
 
