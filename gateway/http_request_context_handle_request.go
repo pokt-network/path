@@ -267,6 +267,15 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	// Domain-level tracking prevents retrying different endpoints behind the same broken infrastructure.
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
 	triedDomains := make(map[string]bool)
+
+	// Pre-populate triedDomains with broken domains from the cross-pod circuit breaker.
+	// This ensures retries skip domains that other pods have discovered are broken.
+	if rc.circuitBreaker != nil {
+		for domain := range rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID)) {
+			triedDomains[domain] = true
+		}
+	}
+
 	currentProtocolCtx := rc.protocolContexts[0]
 	var currentEndpointAddr protocol.EndpointAddr
 
@@ -300,6 +309,13 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			// Mark the previous endpoint and its domain as tried
 			triedEndpoints[currentEndpointAddr] = true
 			markDomainTried(triedDomains, currentEndpointAddr)
+
+			// Mark domain broken in cross-pod circuit breaker so other pods skip it too
+			if rc.circuitBreaker != nil {
+				if domain := extractDomainFromEndpoint(currentEndpointAddr); domain != "" {
+					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain)
+				}
+			}
 
 			// Get fresh endpoint list from protocol (filtered by detected RPC type)
 			availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
@@ -863,6 +879,13 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
 	triedDomains := make(map[string]bool)
 
+	// Pre-populate triedDomains with broken domains from the cross-pod circuit breaker.
+	if rc.circuitBreaker != nil {
+		for domain := range rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID)) {
+			triedDomains[domain] = true
+		}
+	}
+
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		// Get available endpoints
 		availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
@@ -963,6 +986,12 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 				lastResponse = responses[0]
 				lastResponse.RequestID = extractRequestIDFromPayload(payload)
 			}
+			// Mark domain broken in cross-pod circuit breaker
+			if rc.circuitBreaker != nil {
+				if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
+					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain)
+				}
+			}
 			logger.Warn().Err(lastErr).Int("attempt", attempt).Msg("Request failed")
 			continue
 		}
@@ -987,6 +1016,12 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		if checkResult.HeuristicResult != nil {
 			recordHeuristicErrorToReputation(rc.context, rc.protocol.GetReputationService(),
 				rc.serviceID, resp.EndpointAddr, rpcType, checkResult.HeuristicResult, logger)
+		}
+		// Mark domain broken in cross-pod circuit breaker
+		if rc.circuitBreaker != nil {
+			if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
+				rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain)
+			}
 		}
 	}
 
@@ -1127,6 +1162,14 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	// Track endpoints and domains already tried to ensure retry rotation
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
 	triedDomains := make(map[string]bool)
+
+	// Pre-populate triedDomains with broken domains from the cross-pod circuit breaker.
+	if rc.circuitBreaker != nil {
+		for domain := range rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID)) {
+			triedDomains[domain] = true
+		}
+	}
+
 	currentProtocolCtx := protocolCtx
 	var currentEndpointAddr protocol.EndpointAddr
 
@@ -1153,6 +1196,13 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			// Mark the previous endpoint and its domain as tried
 			triedEndpoints[currentEndpointAddr] = true
 			markDomainTried(triedDomains, currentEndpointAddr)
+
+			// Mark domain broken in cross-pod circuit breaker so other pods skip it too
+			if rc.circuitBreaker != nil {
+				if domain := extractDomainFromEndpoint(currentEndpointAddr); domain != "" {
+					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain)
+				}
+			}
 
 			// Get fresh endpoint list from protocol (filtered by detected RPC type)
 			availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(

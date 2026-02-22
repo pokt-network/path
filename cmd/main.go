@@ -261,6 +261,10 @@ func main() {
 		}
 	}
 
+	// Create domain circuit breaker for cross-pod broken domain tracking.
+	// Uses the same Redis client as leader election. Nil-safe (local-only mode if no Redis).
+	domainCircuitBreaker := gateway.NewDomainCircuitBreaker(redisClient)
+
 	healthCheckExecutor, leaderElector := setupHealthCheckExecutor(
 		backgroundCtx,
 		logger,
@@ -296,6 +300,7 @@ func main() {
 		MetricsReporter:            metricsReporter,
 		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
 		ObservationQueue:           observationQueue,
+		DomainCircuitBreaker:       domainCircuitBreaker,
 	}
 
 	// Until all components are ready, the `/healthz` endpoint will return a 503 Service

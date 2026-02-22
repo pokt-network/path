@@ -65,6 +65,12 @@ type Gateway struct {
 	// When enabled, sampled requests are queued for deep parsing (block height, chain ID, etc.)
 	// without blocking the hot path. This is optional - if nil, no async observation processing occurs.
 	ObservationQueue *ObservationQueue
+
+	// DomainCircuitBreaker tracks broken domains across pods via Redis.
+	// When any pod discovers a domain is returning errors, all pods skip that domain
+	// on initial attempts for a TTL window, avoiding wasted relay attempts.
+	// Optional - if nil, no cross-pod domain circuit breaking occurs.
+	DomainCircuitBreaker *DomainCircuitBreaker
 }
 
 // HandleServiceRequest implements PATH gateway's service request processing.
@@ -118,6 +124,7 @@ func (g Gateway) handleHTTPServiceRequest(
 		rpcTypeValidator:    g.RPCTypeValidator,
 		metricsReporter:     g.MetricsReporter,
 		observationQueue:    g.ObservationQueue,
+		circuitBreaker:      g.DomainCircuitBreaker,
 	}
 
 	defer func() {

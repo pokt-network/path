@@ -92,6 +92,10 @@ type requestContext struct {
 	// If nil, no async observation processing occurs.
 	observationQueue *ObservationQueue
 
+	// circuitBreaker tracks broken domains across pods via Redis.
+	// If nil, no cross-pod domain circuit breaking occurs.
+	circuitBreaker *DomainCircuitBreaker
+
 	// QoS related request context
 	serviceID  protocol.ServiceID
 	serviceQoS QoSService
@@ -459,6 +463,20 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 			Err(err).
 			Msg("no available endpoints could be found for the request")
 		return fmt.Errorf("%w: no available endpoints could be found for the request: %w", errBuildProtocolContextsFromHTTPRequest, err)
+	}
+
+	// Filter out domains known to be broken across the fleet (cross-pod circuit breaker).
+	// This prevents initial attempts from hitting domains that other pods have already
+	// discovered are returning errors, reducing wasted relay attempts.
+	if rc.circuitBreaker != nil {
+		brokenDomains := rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID))
+		if len(brokenDomains) > 0 {
+			filtered := filterEndpointsByBrokenDomains(availableEndpoints, brokenDomains)
+			if len(filtered) > 0 {
+				availableEndpoints = filtered
+			}
+			// If ALL endpoints are from broken domains, keep the original list (graceful degradation).
+		}
 	}
 
 	// Select multiple endpoints for parallel relay attempts
