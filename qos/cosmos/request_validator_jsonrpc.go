@@ -54,7 +54,8 @@ func (rv *requestValidator) buildJSONRPCServicePayloadsFromRequests(
 
 	for reqID, req := range jsonrpcReqs {
 		method := string(req.Method)
-		rpcType := detectJSONRPCServiceType(method)
+		detectedRPCType := detectJSONRPCServiceType(method)
+		rpcType := detectedRPCType
 
 		// Hydrate the logger with data extracted from the request.
 		logger := rv.logger.With(
@@ -81,6 +82,14 @@ func (rv *requestValidator) buildJSONRPCServicePayloadsFromRequests(
 		if err != nil {
 			return servicePayloads, err
 		}
+
+		// Preserve the original detected RPC type when fallback occurred.
+		// This allows downstream analysis (heuristic error detection) to make
+		// protocol-aware decisions even when routing uses the fallback type.
+		if detectedRPCType != rpcType {
+			servicePayload.OriginalRPCType = detectedRPCType
+		}
+
 		servicePayloads[reqID] = servicePayload
 	}
 

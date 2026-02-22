@@ -79,6 +79,11 @@ type requestContext struct {
 	//   - Set during relay execution and used when building observations.
 	currentRPCType sharedtypes.RPCType
 
+	// heuristicRPCType preserves the original detected RPC type before any
+	// fallback was applied. Used for heuristic response analysis so that
+	// CometBFT requests routed through JSON_RPC are still analyzed correctly.
+	heuristicRPCType sharedtypes.RPCType
+
 	// requestErrorObservation:
 	//   - Tracks any errors encountered during request processing.
 	requestErrorObservation *protocolobservations.ShannonRequestError
@@ -166,6 +171,7 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 	// This preserves the default set in BuildHTTPRequestContextForEndpoint for health checks.
 	if payloads[0].RPCType != sharedtypes.RPCType_UNKNOWN_RPC {
 		rc.currentRPCType = payloads[0].RPCType
+		rc.heuristicRPCType = payloads[0].EffectiveRPCType()
 	}
 
 	// For single payload, handle directly without additional overhead.
@@ -675,7 +681,7 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// This runs BEFORE returning to gateway to allow protocol-level retry decisions.
 	// Only analyze on HTTP 2xx status to avoid double-checking non-2xx responses.
 	if responseHTTPStatusCode >= 200 && responseHTTPStatusCode < 300 {
-		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.currentRPCType)
+		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.heuristicRPCType)
 		if heuristicResult.ShouldRetry {
 			rc.logger.Debug().
 				Str("heuristic_reason", heuristicResult.Reason).

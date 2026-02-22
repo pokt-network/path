@@ -1023,7 +1023,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 
 	// Heuristic analysis - detect bad gateway, empty responses, and other error patterns
 	// This runs BEFORE QoS validation to catch issues the basic validation might miss
-	heuristicResult := heuristic.Analyze(responseBody, httpStatusCode, servicePayload.RPCType)
+	heuristicResult := heuristic.Analyze(responseBody, httpStatusCode, servicePayload.EffectiveRPCType())
 	if heuristicResult.ShouldRetry {
 		heuristicErr := fmt.Errorf("heuristic detected error: %s - %s", heuristicResult.Reason, heuristicResult.Details)
 		e.logger.Debug().
