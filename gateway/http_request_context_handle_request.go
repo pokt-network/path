@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -262,8 +263,10 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	var lastStatusCode int
 	var lastEndpointAddr protocol.EndpointAddr
 
-	// Track endpoints already tried to ensure retry endpoint rotation
+	// Track endpoints and domains already tried to ensure retry rotation.
+	// Domain-level tracking prevents retrying different endpoints behind the same broken infrastructure.
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
+	triedDomains := make(map[string]bool)
 	currentProtocolCtx := rc.protocolContexts[0]
 	var currentEndpointAddr protocol.EndpointAddr
 
@@ -294,8 +297,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				Msg("Retrying relay request")
 
 			// CRITICAL: Retry endpoint rotation - select a NEW endpoint for retry
-			// Mark the previous endpoint as tried
+			// Mark the previous endpoint and its domain as tried
 			triedEndpoints[currentEndpointAddr] = true
+			markDomainTried(triedDomains, currentEndpointAddr)
 
 			// Get fresh endpoint list from protocol (filtered by detected RPC type)
 			availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
@@ -332,30 +336,17 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				}
 			}
 
-			// Filter out endpoints we've already tried
-			filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints)
+			// Filter out endpoints and domains we've already tried
+			filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints, triedDomains)
 
-			// If all endpoints exhausted, apply backoff and reset
+			// If all endpoints exhausted (all domains tried), stop retrying.
+			// Retrying the same broken infrastructure wastes retry budget.
 			if len(filteredEndpoints) == 0 {
 				logger.Warn().
-					Int("num_tried", len(triedEndpoints)).
-					Msg("All available endpoints tried, resetting for retry with backoff")
-
-				// Apply exponential backoff when cycling through endpoints
-				backoff := calculateRetryBackoff(attempt)
-				if backoff > 0 {
-					select {
-					case <-rc.context.Done():
-						logger.Debug().Msg("Request canceled during endpoint exhaustion backoff")
-						return rc.context.Err()
-					case <-time.After(backoff):
-						// Continue after backoff
-					}
-				}
-
-				// Reset tried endpoints to allow re-selection
-				filteredEndpoints = availableEndpoints
-				triedEndpoints = make(map[protocol.EndpointAddr]bool)
+					Int("num_tried_endpoints", len(triedEndpoints)).
+					Int("num_tried_domains", len(triedDomains)).
+					Msg("All available endpoints from tried domains, stopping retries")
+				break
 			}
 
 			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
@@ -514,10 +505,12 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 						Msg("Hedge race failed, will retry with normal path")
 				}
 
-				// Mark endpoints tried by hedge racer
+				// Mark endpoints and domains tried by hedge racer
 				triedEndpoints[primaryEndpoint] = true
+				markDomainTried(triedDomains, primaryEndpoint)
 				if racer.hedgeEndpoint != "" {
 					triedEndpoints[racer.hedgeEndpoint] = true
+					markDomainTried(triedDomains, racer.hedgeEndpoint)
 				}
 
 				// Continue to next attempt (retry)
@@ -868,6 +861,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 	var lastErr error
 	var lastResponse protocol.Response
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
+	triedDomains := make(map[string]bool)
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		// Get available endpoints
@@ -895,16 +889,15 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			}
 		}
 
-		// Filter out already tried endpoints for retries
-		var filteredEndpoints []protocol.EndpointAddr
-		for _, ep := range availableEndpoints {
-			if !triedEndpoints[ep] {
-				filteredEndpoints = append(filteredEndpoints, ep)
-			}
-		}
+		// Filter out already tried endpoints and domains for retries
+		filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints, triedDomains)
 		if len(filteredEndpoints) == 0 {
-			// All endpoints tried, use original list
-			filteredEndpoints = availableEndpoints
+			// All domains tried — stop retrying broken infrastructure
+			logger.Warn().
+				Int("num_tried_endpoints", len(triedEndpoints)).
+				Int("num_tried_domains", len(triedDomains)).
+				Msg("All available endpoints from tried domains, stopping batch item retries")
+			break
 		}
 
 		// Select endpoint
@@ -913,6 +906,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			selectedEndpoint = filteredEndpoints[0]
 		}
 		triedEndpoints[selectedEndpoint] = true
+		markDomainTried(triedDomains, selectedEndpoint)
 
 		// Build protocol context for this endpoint
 		protocolCtx, _, err := rc.protocol.BuildHTTPRequestContextForEndpoint(
@@ -947,9 +941,10 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 					recordHeuristicErrorToReputation(rc.context, rc.protocol.GetReputationService(),
 						rc.serviceID, resp.EndpointAddr, rpcType, checkResult.HeuristicResult, logger)
 				}
-				// Mark hedge endpoint as tried
+				// Mark hedge endpoint and domain as tried
 				if racer.hedgeEndpoint != "" {
 					triedEndpoints[racer.hedgeEndpoint] = true
+					markDomainTried(triedDomains, racer.hedgeEndpoint)
 				}
 				continue
 			}
@@ -1129,8 +1124,9 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	var lastResponses []protocol.Response
 	var lastEndpointAddr protocol.EndpointAddr
 
-	// Track endpoints already tried to ensure retry endpoint rotation
+	// Track endpoints and domains already tried to ensure retry rotation
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
+	triedDomains := make(map[string]bool)
 	currentProtocolCtx := protocolCtx
 	var currentEndpointAddr protocol.EndpointAddr
 
@@ -1154,8 +1150,9 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				Msg("Retrying parallel relay request")
 
 			// CRITICAL: Retry endpoint rotation - select a NEW endpoint for retry
-			// Mark the previous endpoint as tried
+			// Mark the previous endpoint and its domain as tried
 			triedEndpoints[currentEndpointAddr] = true
+			markDomainTried(triedDomains, currentEndpointAddr)
 
 			// Get fresh endpoint list from protocol (filtered by detected RPC type)
 			availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
@@ -1192,31 +1189,17 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				}
 			}
 
-			// Filter out endpoints we've already tried
-			filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints)
+			// Filter out endpoints and domains we've already tried
+			filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints, triedDomains)
 
-			// If all endpoints exhausted, apply backoff and reset
+			// If all endpoints exhausted (all domains tried), stop retrying
 			if len(filteredEndpoints) == 0 {
 				logger.Warn().
 					Int("endpoint_index", index).
-					Int("num_tried", len(triedEndpoints)).
-					Msg("All available endpoints tried in parallel path, resetting with backoff")
-
-				// Apply exponential backoff when cycling through endpoints
-				backoff := calculateRetryBackoff(attempt)
-				if backoff > 0 {
-					select {
-					case <-ctx.Done():
-						logger.Debug().Msgf("Endpoint %d canceled during backoff", index)
-						return
-					case <-time.After(backoff):
-						// Continue after backoff
-					}
-				}
-
-				// Reset tried endpoints to allow re-selection
-				filteredEndpoints = availableEndpoints
-				triedEndpoints = make(map[protocol.EndpointAddr]bool)
+					Int("num_tried_endpoints", len(triedEndpoints)).
+					Int("num_tried_domains", len(triedDomains)).
+					Msg("All available endpoints from tried domains in parallel path, stopping retries")
+				return
 			}
 
 			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
@@ -1594,15 +1577,56 @@ func (rc *requestContext) formatTimingLog(result parallelRelayResult) string {
 }
 
 // filterEndpoints removes tried endpoints from the available list.
-// Used during retry endpoint rotation to ensure we never retry the same endpoint.
-func filterEndpoints(available protocol.EndpointAddrList, tried map[protocol.EndpointAddr]bool) protocol.EndpointAddrList {
+// Filters by both exact endpoint address AND domain (host), so retries
+// never hit a different supplier endpoint behind the same broken infrastructure.
+func filterEndpoints(available protocol.EndpointAddrList, tried map[protocol.EndpointAddr]bool, triedDomains map[string]bool) protocol.EndpointAddrList {
 	filtered := make(protocol.EndpointAddrList, 0, len(available))
 	for _, ep := range available {
-		if !tried[ep] {
-			filtered = append(filtered, ep)
+		if tried[ep] {
+			continue
 		}
+		if len(triedDomains) > 0 {
+			if domain := extractDomainFromEndpoint(ep); triedDomains[domain] {
+				continue
+			}
+		}
+		filtered = append(filtered, ep)
 	}
 	return filtered
+}
+
+// markDomainTried extracts the domain (host) from an endpoint URL and adds it to the tried set.
+func markDomainTried(triedDomains map[string]bool, endpoint protocol.EndpointAddr) {
+	if domain := extractDomainFromEndpoint(endpoint); domain != "" {
+		triedDomains[domain] = true
+	}
+}
+
+// extractDomainFromEndpoint extracts the host from an endpoint address.
+// Endpoint format: "<supplier_address>-<url>" e.g. "pokt1abc-https://rel.spacebelt.xyz"
+// Returns the host part of the URL, e.g. "rel.spacebelt.xyz".
+func extractDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
+	endpointStr := string(endpoint)
+
+	// Find the URL part after the supplier address
+	idx := strings.Index(endpointStr, "-http")
+	if idx < 0 {
+		// Try websocket URLs
+		idx = strings.Index(endpointStr, "-wss")
+		if idx < 0 {
+			idx = strings.Index(endpointStr, "-ws")
+		}
+	}
+	if idx < 0 {
+		return ""
+	}
+
+	rawURL := endpointStr[idx+1:] // skip the dash
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Hostname()
 }
 
 // calculateRetryBackoff returns the backoff duration for a retry attempt.
