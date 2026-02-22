@@ -25,6 +25,12 @@ type Payload struct {
 	// make protocol-aware decisions.
 	// Zero value (UNKNOWN_RPC) means no fallback occurred — use RPCType directly.
 	OriginalRPCType sharedtypes.RPCType
+
+	// JSONRPCMethod is the JSON-RPC method name (e.g., "eth_blockNumber", "eth_getLogs").
+	// Set at QoS request parsing time. Used by the heuristic analyzer for method-aware
+	// response validation (e.g., "result":[] is valid for eth_getLogs but not eth_blockNumber).
+	// Empty for non-JSON-RPC requests (REST, WebSocket).
+	JSONRPCMethod string
 }
 
 // EffectiveRPCType returns the most specific RPC type for protocol-aware analysis.

@@ -52,6 +52,7 @@ func checkResponseSuccess(
 	statusCode int,
 	responseBytes []byte,
 	heuristicRPCType sharedtypes.RPCType,
+	jsonrpcMethod string,
 	logger polylog.Logger,
 ) responseCheckResult {
 	// Protocol error - definitely not successful
@@ -67,7 +68,7 @@ func checkResponseSuccess(
 
 	// Heuristic payload analysis - catch errors that slip through HTTP status
 	// This detects JSON-RPC errors, malformed responses, HTML error pages, empty responses, etc.
-	result := heuristic.Analyze(responseBytes, statusCode, heuristicRPCType)
+	result := heuristic.Analyze(responseBytes, statusCode, heuristicRPCType, jsonrpcMethod)
 	if result.ShouldRetry {
 		logger.Debug().
 			Str("heuristic_reason", result.Reason).
@@ -220,6 +221,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 	rpcType := payloads[0].RPCType
 	heuristicRPCType := payloads[0].EffectiveRPCType()
+	jsonrpcMethod := payloads[0].JSONRPCMethod
 	batchCount := len(payloads)
 
 	// Get retry configuration for the service
@@ -460,7 +462,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					responseBytesForHeuristic := hedgeResponses[0].Bytes
 
 					// Check if response is actually successful (HTTP status + heuristic)
-					checkResult := checkResponseSuccess(hedgeErr, statusCode, responseBytesForHeuristic, heuristicRPCType, logger)
+					checkResult := checkResponseSuccess(hedgeErr, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, logger)
 					if checkResult.Success {
 						// Success! Process the response
 						for _, endpointResponse := range hedgeResponses {
@@ -599,7 +601,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		}
 
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
-		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, logger)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, logger)
 		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
@@ -855,6 +857,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 	parentLogger polylog.Logger,
 ) (protocol.Response, error) {
 	heuristicRPCType := payload.EffectiveRPCType()
+	jsonrpcMethod := payload.JSONRPCMethod
 	logger := parentLogger.With("payload_index", index)
 
 	// Get retry configuration
@@ -951,7 +954,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 
 			if hedgeErr == nil && len(hedgeResponses) > 0 {
 				resp := hedgeResponses[0]
-				checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, logger)
+				checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, logger)
 				if checkResult.Success {
 					// Extract request ID from payload
 					resp.RequestID = extractRequestIDFromPayload(payload)
@@ -1004,7 +1007,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		resp.RequestID = extractRequestIDFromPayload(payload)
 
 		// Check response success with heuristic
-		checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, logger)
+		checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, logger)
 		if checkResult.Success {
 			logger.Debug().
 				Str("endpoint", string(resp.EndpointAddr)).
@@ -1095,6 +1098,7 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 	}
 	rpcType := payloads[0].RPCType
 	heuristicRPCType := payloads[0].EffectiveRPCType()
+	jsonrpcMethod := payloads[0].JSONRPCMethod
 	batchCount := len(payloads)
 
 	// Record batch size metric on completion (deferred)
@@ -1107,7 +1111,7 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 	ctx, cancel := context.WithTimeout(rc.context, DefaultRelayRequestTimeout)
 	defer cancel()
 
-	resultChan, qosContextMutex := rc.launchParallelRequests(ctx, logger, rpcType, heuristicRPCType)
+	resultChan, qosContextMutex := rc.launchParallelRequests(ctx, logger, rpcType, heuristicRPCType, jsonrpcMethod)
 
 	return rc.waitForFirstSuccessfulResponse(ctx, logger, resultChan, parallelMetrics, qosContextMutex, rpcType)
 }
@@ -1124,14 +1128,14 @@ func (rc *requestContext) updateParallelRequestMetrics(metrics *parallelRequestM
 }
 
 // launchParallelRequests starts all parallel relay requests and returns a result channel and mutex for QoS context operations
-func (rc *requestContext) launchParallelRequests(ctx context.Context, logger polylog.Logger, rpcType, heuristicRPCType sharedtypes.RPCType) (<-chan parallelRelayResult, *sync.Mutex) {
+func (rc *requestContext) launchParallelRequests(ctx context.Context, logger polylog.Logger, rpcType, heuristicRPCType sharedtypes.RPCType, jsonrpcMethod string) (<-chan parallelRelayResult, *sync.Mutex) {
 	resultChan := make(chan parallelRelayResult, len(rc.protocolContexts))
 
 	// Ensures thread-safety of QoS context operations.
 	qosContextMutex := &sync.Mutex{}
 
 	for protocolCtxIdx, protocolCtx := range rc.protocolContexts {
-		go rc.executeOneOfParallelRequests(ctx, logger, protocolCtx, protocolCtxIdx, resultChan, qosContextMutex, rpcType, heuristicRPCType)
+		go rc.executeOneOfParallelRequests(ctx, logger, protocolCtx, protocolCtxIdx, resultChan, qosContextMutex, rpcType, heuristicRPCType, jsonrpcMethod)
 	}
 
 	return resultChan, qosContextMutex
@@ -1147,6 +1151,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	qosContextMutex *sync.Mutex,
 	rpcType sharedtypes.RPCType,
 	heuristicRPCType sharedtypes.RPCType,
+	jsonrpcMethod string,
 ) {
 	startTime := time.Now()
 
@@ -1327,7 +1332,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		}
 
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
-		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, logger)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, logger)
 		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {

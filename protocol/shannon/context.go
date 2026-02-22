@@ -681,7 +681,10 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// This runs BEFORE returning to gateway to allow protocol-level retry decisions.
 	// Only analyze on HTTP 2xx status to avoid double-checking non-2xx responses.
 	if responseHTTPStatusCode >= 200 && responseHTTPStatusCode < 300 {
-		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.heuristicRPCType)
+		// Extract JSON-RPC method from payload for method-aware heuristic checks.
+		// Use the JSONRPCMethod field set at QoS parsing time.
+		jsonrpcMethod := payload.JSONRPCMethod
+		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.heuristicRPCType, jsonrpcMethod)
 		if heuristicResult.ShouldRetry {
 			rc.logger.Debug().
 				Str("heuristic_reason", heuristicResult.Reason).

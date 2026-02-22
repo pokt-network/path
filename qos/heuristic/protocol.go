@@ -2,9 +2,34 @@ package heuristic
 
 import (
 	"bytes"
+	"fmt"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
+
+// emptyArrayValidMethods is the whitelist of JSON-RPC methods where "result":[] is valid.
+// For all other methods, an empty array result indicates a broken/misconfigured supplier.
+var emptyArrayValidMethods = map[string]bool{
+	// Core — high-volume methods that legitimately return empty arrays
+	"eth_getLogs":          true,
+	"eth_getFilterChanges": true,
+	"eth_getFilterLogs":    true,
+	"eth_accounts":         true,
+	"eth_getBlockReceipts": true,
+	// Trace (Parity/Erigon)
+	"trace_filter":                  true,
+	"trace_block":                   true,
+	"trace_replayBlockTransactions": true,
+	"trace_callMany":                true,
+	// Debug (Geth/Reth)
+	"debug_getBadBlocks":                true,
+	"debug_traceBlockByNumber":          true,
+	"debug_traceBlockByHash":            true,
+	"debug_traceBlock":                  true,
+	"debug_getModifiedAccountsByNumber": true,
+	"debug_getModifiedAccountsByHash":   true,
+	"debug_traceCallMany":               true,
+}
 
 // Tier 2: Protocol-Specific Success Checks
 //
@@ -45,21 +70,21 @@ var (
 //
 // Cost: O(n) where n is prefix length
 // Time: ~1-3μs for 512 byte prefix
-func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType) AnalysisResult {
+func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, jsonrpcMethod string) AnalysisResult {
 	switch rpcType {
 	case sharedtypes.RPCType_JSON_RPC:
-		return analyzeJSONRPC(prefix, fullLength, rpcType)
+		return analyzeJSONRPC(prefix, fullLength, rpcType, jsonrpcMethod)
 
 	case sharedtypes.RPCType_REST:
 		return analyzeREST(prefix, fullLength)
 
 	case sharedtypes.RPCType_COMET_BFT:
 		// CometBFT uses JSON-RPC style responses
-		return analyzeJSONRPC(prefix, fullLength, rpcType)
+		return analyzeJSONRPC(prefix, fullLength, rpcType, jsonrpcMethod)
 
 	case sharedtypes.RPCType_WEBSOCKET:
 		// WebSocket messages are typically JSON-RPC
-		return analyzeJSONRPC(prefix, fullLength, rpcType)
+		return analyzeJSONRPC(prefix, fullLength, rpcType, jsonrpcMethod)
 
 	default:
 		// Unknown protocol - can't make protocol-specific assertions
@@ -79,7 +104,7 @@ func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType
 //   - "error" field (error - but still a VALID response)
 //
 // Having neither or both indicates a malformed response.
-func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType) AnalysisResult {
+func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, jsonrpcMethod string) AnalysisResult {
 	hasResult := bytes.Contains(prefix, jsonrpcResultField)
 	hasError := bytes.Contains(prefix, jsonrpcErrorField)
 	hasVersion := bytes.Contains(prefix, jsonrpcVersionField)
@@ -91,8 +116,6 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType) 
 		// an object has mandatory fields. This is a strong signal of a broken/lazy supplier.
 		// For CometBFT: "result":{} IS valid — the "health" method returns an empty object
 		// when the node is healthy. Skip the empty object check for CometBFT.
-		// "result":[] IS valid for some methods (eth_getLogs, eth_accounts, eth_getFilterChanges).
-		// Do not retry or penalize — it triggers the circuit breaker and punishes valid responses.
 		emptyType := emptyResultType(prefix)
 		if emptyType == emptyObject && rpcType != sharedtypes.RPCType_COMET_BFT {
 			return AnalysisResult{
@@ -103,6 +126,22 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType) 
 				Details:     "JSON-RPC result is an empty object — never valid for EVM/Solana methods",
 			}
 		}
+
+		// Method-aware empty array detection:
+		// "result":[] is valid for some methods (eth_getLogs, eth_accounts, etc.) but broken
+		// for most others (eth_blockNumber, eth_getBalance return scalars/objects, never arrays).
+		// Only flag when we KNOW the method AND it's not in the whitelist.
+		// When method is unknown (empty string), we conservatively do NOT flag.
+		if emptyType == emptyArray && jsonrpcMethod != "" && !emptyArrayValidMethods[jsonrpcMethod] {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.95,
+				Reason:      "jsonrpc_invalid_empty_array",
+				Structure:   StructureValid,
+				Details:     fmt.Sprintf("JSON-RPC result is [] for method %q which should never return an array", jsonrpcMethod),
+			}
+		}
+
 		return AnalysisResult{
 			ShouldRetry: false,
 			Confidence:  0.0,

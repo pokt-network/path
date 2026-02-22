@@ -35,7 +35,7 @@ func NewDefaultAnalyzer() *ResponseAnalyzer {
 //  4. Tier 3: Indicator Analysis - Error pattern matching
 //
 // Returns an AnalysisResult with retry recommendation and confidence.
-func (ra *ResponseAnalyzer) Analyze(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType) AnalysisResult {
+func (ra *ResponseAnalyzer) Analyze(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType, jsonrpcMethod string) AnalysisResult {
 	// Level 0: HTTP Status Code (free - no payload inspection)
 	// Only return early for definitive server errors (5xx) and rate limits (429)
 	// For other 4xx codes (400, 401, 403), we need to check if it's a valid JSON-RPC error
@@ -61,7 +61,7 @@ func (ra *ResponseAnalyzer) Analyze(responseBytes []byte, httpStatusCode int, rp
 	prefix := responseBytes[:prefixLen]
 
 	// Level 2: Protocol-Specific Analysis
-	protocolResult := ProtocolAnalysis(prefix, len(responseBytes), rpcType)
+	protocolResult := ProtocolAnalysis(prefix, len(responseBytes), rpcType, jsonrpcMethod)
 
 	// Special handling for HTTP 4xx: If protocol detects valid JSON-RPC response, trust it
 	// This prevents retrying valid error responses like {"jsonrpc":"2.0","error":{"code":-32600,"message":"invalid request"}}
@@ -217,8 +217,8 @@ func (ra *ResponseAnalyzer) AnalyzeQuick(responseBytes []byte, httpStatusCode in
 }
 
 // ShouldRetry is a convenience method that returns just the retry decision.
-func (ra *ResponseAnalyzer) ShouldRetry(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType) bool {
-	result := ra.Analyze(responseBytes, httpStatusCode, rpcType)
+func (ra *ResponseAnalyzer) ShouldRetry(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType, jsonrpcMethod string) bool {
+	result := ra.Analyze(responseBytes, httpStatusCode, rpcType, jsonrpcMethod)
 	return result.ShouldRetry
 }
 
@@ -227,13 +227,13 @@ func (ra *ResponseAnalyzer) ShouldRetry(responseBytes []byte, httpStatusCode int
 var defaultAnalyzer = NewDefaultAnalyzer()
 
 // Analyze performs heuristic analysis using the default analyzer.
-func Analyze(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType) AnalysisResult {
-	return defaultAnalyzer.Analyze(responseBytes, httpStatusCode, rpcType)
+func Analyze(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType, jsonrpcMethod string) AnalysisResult {
+	return defaultAnalyzer.Analyze(responseBytes, httpStatusCode, rpcType, jsonrpcMethod)
 }
 
 // ShouldRetry returns the retry recommendation using the default analyzer.
-func ShouldRetry(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType) bool {
-	return defaultAnalyzer.ShouldRetry(responseBytes, httpStatusCode, rpcType)
+func ShouldRetry(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType, jsonrpcMethod string) bool {
+	return defaultAnalyzer.ShouldRetry(responseBytes, httpStatusCode, rpcType, jsonrpcMethod)
 }
 
 // AnalyzeQuick performs a fast heuristic check using the default analyzer.

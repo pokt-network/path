@@ -206,7 +206,7 @@ func TestProtocolAnalysis_JSONRPC(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			prefixLen := min(512, len(tt.response))
-			result := ProtocolAnalysis(tt.response[:prefixLen], len(tt.response), sharedtypes.RPCType_JSON_RPC)
+			result := ProtocolAnalysis(tt.response[:prefixLen], len(tt.response), sharedtypes.RPCType_JSON_RPC, "")
 
 			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
 			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
@@ -247,7 +247,138 @@ func TestProtocolAnalysis_CometBFT(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			prefixLen := min(512, len(tt.response))
-			result := ProtocolAnalysis(tt.response[:prefixLen], len(tt.response), sharedtypes.RPCType_COMET_BFT)
+			result := ProtocolAnalysis(tt.response[:prefixLen], len(tt.response), sharedtypes.RPCType_COMET_BFT, "")
+
+			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
+			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
+		})
+	}
+}
+
+func TestProtocolAnalysis_MethodAwareEmptyArray(t *testing.T) {
+	emptyArrayResponse := []byte(`{"jsonrpc":"2.0","id":1,"result":[]}`)
+
+	tests := []struct {
+		name           string
+		method         string
+		expectedRetry  bool
+		expectedReason string
+	}{
+		{
+			name:           "eth_blockNumber + empty array = broken supplier",
+			method:         "eth_blockNumber",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "eth_getBalance + empty array = broken supplier",
+			method:         "eth_getBalance",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "eth_getLogs + empty array = valid (no matching events)",
+			method:         "eth_getLogs",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "eth_getFilterChanges + empty array = valid",
+			method:         "eth_getFilterChanges",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "eth_accounts + empty array = valid (public RPC)",
+			method:         "eth_accounts",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "trace_filter + empty array = valid",
+			method:         "trace_filter",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "debug_getBadBlocks + empty array = valid",
+			method:         "debug_getBadBlocks",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "unknown method (empty string) + empty array = conservative pass",
+			method:         "",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "eth_call + empty array = broken supplier",
+			method:         "eth_call",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "eth_getTransactionReceipt + empty array = broken supplier",
+			method:         "eth_getTransactionReceipt",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "eth_getBlockReceipts + empty array = valid (empty block)",
+			method:         "eth_getBlockReceipts",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ProtocolAnalysis(emptyArrayResponse, len(emptyArrayResponse), sharedtypes.RPCType_JSON_RPC, tt.method)
+
+			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
+			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
+			if tt.expectedRetry {
+				assert.GreaterOrEqual(t, result.Confidence, 0.95, "Confidence should be >= 0.95 for flagged empty arrays")
+				assert.Contains(t, result.Details, tt.method, "Details should mention the method name")
+			}
+		})
+	}
+}
+
+func TestFullAnalyzer_MethodAwareEmptyArray(t *testing.T) {
+	analyzer := NewDefaultAnalyzer()
+	emptyArrayResponse := []byte(`{"jsonrpc":"2.0","id":1,"result":[]}`)
+
+	tests := []struct {
+		name           string
+		method         string
+		expectedRetry  bool
+		expectedReason string
+	}{
+		{
+			name:           "eth_blockNumber with empty array via full analyzer",
+			method:         "eth_blockNumber",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "eth_getLogs with empty array via full analyzer",
+			method:         "eth_getLogs",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "unknown method with empty array via full analyzer",
+			method:         "",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyzer.Analyze(emptyArrayResponse, 200, sharedtypes.RPCType_JSON_RPC, tt.method)
 
 			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
 			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
@@ -303,7 +434,7 @@ func TestProtocolAnalysis_REST(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			prefixLen := min(512, len(tt.response))
-			result := ProtocolAnalysis(tt.response[:prefixLen], len(tt.response), sharedtypes.RPCType_REST)
+			result := ProtocolAnalysis(tt.response[:prefixLen], len(tt.response), sharedtypes.RPCType_REST, "")
 
 			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
 			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
@@ -516,7 +647,7 @@ func TestFullAnalyzer(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := analyzer.Analyze(tt.response, tt.httpStatus, tt.rpcType)
+			result := analyzer.Analyze(tt.response, tt.httpStatus, tt.rpcType, "")
 
 			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch for: %s", tt.name)
 			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch for: %s", tt.name)
@@ -577,10 +708,10 @@ func TestPackageLevelFunctions(t *testing.T) {
 	// Test that package-level functions work with default analyzer
 	response := []byte(`{"jsonrpc":"2.0","id":1,"result":"0x123"}`)
 
-	result := Analyze(response, 200, sharedtypes.RPCType_JSON_RPC)
+	result := Analyze(response, 200, sharedtypes.RPCType_JSON_RPC, "")
 	assert.False(t, result.ShouldRetry)
 
-	shouldRetry := ShouldRetry(response, 200, sharedtypes.RPCType_JSON_RPC)
+	shouldRetry := ShouldRetry(response, 200, sharedtypes.RPCType_JSON_RPC, "")
 	assert.False(t, shouldRetry)
 
 	quickResult := AnalyzeQuick(response, 200)
@@ -683,7 +814,7 @@ func TestRealWorldScenarios(t *testing.T) {
 
 	for _, tc := range realWorldCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := analyzer.Analyze([]byte(tc.response), tc.httpStatus, tc.rpcType)
+			result := analyzer.Analyze([]byte(tc.response), tc.httpStatus, tc.rpcType, "")
 			assert.Equal(t, tc.expectedRetry, result.ShouldRetry,
 				"Failed for %s: %s (got reason: %s)", tc.name, tc.description, result.Reason)
 		})
@@ -701,7 +832,7 @@ func TestCustomConfig(t *testing.T) {
 
 	// This should NOT trigger retry because confidence is too low
 	response := []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"test"}}`)
-	result := analyzer.Analyze(response, 200, sharedtypes.RPCType_JSON_RPC)
+	result := analyzer.Analyze(response, 200, sharedtypes.RPCType_JSON_RPC, "")
 
 	// The error field detection has 0.90 confidence, below 0.95 threshold
 	require.False(t, result.ShouldRetry, "Should not retry with high confidence threshold")
@@ -713,7 +844,7 @@ func BenchmarkAnalyze(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		analyzer.Analyze(response, 200, sharedtypes.RPCType_JSON_RPC)
+		analyzer.Analyze(response, 200, sharedtypes.RPCType_JSON_RPC, "eth_blockNumber")
 	}
 }
 
@@ -734,6 +865,6 @@ func BenchmarkAnalyze_LargeResponse(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		analyzer.Analyze(response, 200, sharedtypes.RPCType_JSON_RPC)
+		analyzer.Analyze(response, 200, sharedtypes.RPCType_JSON_RPC, "eth_getBlockByNumber")
 	}
 }
