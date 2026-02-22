@@ -91,8 +91,8 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType) 
 		// an object has mandatory fields. This is a strong signal of a broken/lazy supplier.
 		// For CometBFT: "result":{} IS valid — the "health" method returns an empty object
 		// when the node is healthy. Skip the empty object check for CometBFT.
-		// "result":[] IS valid for some methods (eth_getLogs, eth_accounts, eth_getFilterChanges)
-		// but retrying is benign — the retry returns [] too and the user gets the right answer.
+		// "result":[] IS valid for some methods (eth_getLogs, eth_accounts, eth_getFilterChanges).
+		// Do not retry or penalize — it triggers the circuit breaker and punishes valid responses.
 		emptyType := emptyResultType(prefix)
 		if emptyType == emptyObject && rpcType != sharedtypes.RPCType_COMET_BFT {
 			return AnalysisResult{
@@ -103,16 +103,6 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType) 
 				Details:     "JSON-RPC result is an empty object — never valid for EVM/Solana methods",
 			}
 		}
-		if emptyType == emptyArray {
-			return AnalysisResult{
-				ShouldRetry: true,
-				Confidence:  0.75,
-				Reason:      "jsonrpc_empty_array_result",
-				Structure:   StructureValid,
-				Details:     "JSON-RPC result is an empty array — valid for some methods but suspicious",
-			}
-		}
-
 		return AnalysisResult{
 			ShouldRetry: false,
 			Confidence:  0.0,

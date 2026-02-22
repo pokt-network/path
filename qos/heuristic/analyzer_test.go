@@ -177,11 +177,10 @@ func TestProtocolAnalysis_JSONRPC(t *testing.T) {
 			minConfidence:  0.80,
 		},
 		{
-			name:           "JSON-RPC empty array result",
+			name:           "JSON-RPC empty array result — valid for eth_getLogs etc",
 			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":[]}`),
-			expectedRetry:  true,
-			expectedReason: "jsonrpc_empty_array_result",
-			minConfidence:  0.75,
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
 		},
 		{
 			name:           "JSON-RPC empty object result — major penalty (never valid for EVM/Solana)",
@@ -641,12 +640,12 @@ func TestRealWorldScenarios(t *testing.T) {
 			description:   "Broken supplier returning empty REST response",
 		},
 		{
-			name:          "JSON-RPC empty array result",
+			name:          "JSON-RPC empty array result — valid for eth_getLogs",
 			response:      `{"jsonrpc":"2.0","id":1,"result":[]}`,
 			httpStatus:    200,
 			rpcType:       sharedtypes.RPCType_JSON_RPC,
-			expectedRetry: true,
-			description:   "Broken supplier returning empty array for eth_blockNumber",
+			expectedRetry: false,
+			description:   "Valid response for eth_getLogs with no matching events",
 		},
 		{
 			name:          "Solana unhealthy node",
