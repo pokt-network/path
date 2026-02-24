@@ -203,3 +203,178 @@ func TestDomainCircuitBreaker_ConcurrentAccess(t *testing.T) {
 		t.Fatal("expected domain to be broken after concurrent access")
 	}
 }
+
+func TestDomainCircuitBreaker_EscalatingTTL(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil)
+	cb.defaultTTL = 100 * time.Millisecond
+	cb.maxTTL = 3200 * time.Millisecond // cap at 32x base for testing
+	cb.cacheTTL = 1 * time.Millisecond  // fast cache refresh
+	ctx := context.Background()
+
+	domain := "repeat-offender.example.com"
+
+	// Hit 1: base TTL (100ms)
+	cb.MarkBroken(ctx, "eth", domain)
+	cb.mu.RLock()
+	state := cb.cache["eth"].domains[domain]
+	cb.mu.RUnlock()
+	if state.hitCount != 1 {
+		t.Fatalf("expected hitCount=1, got %d", state.hitCount)
+	}
+
+	// Hit 2: should escalate (200ms)
+	cb.MarkBroken(ctx, "eth", domain)
+	cb.mu.RLock()
+	state = cb.cache["eth"].domains[domain]
+	cb.mu.RUnlock()
+	if state.hitCount != 2 {
+		t.Fatalf("expected hitCount=2, got %d", state.hitCount)
+	}
+
+	// Hit 3: should escalate (400ms)
+	cb.MarkBroken(ctx, "eth", domain)
+	cb.mu.RLock()
+	state = cb.cache["eth"].domains[domain]
+	cb.mu.RUnlock()
+	if state.hitCount != 3 {
+		t.Fatalf("expected hitCount=3, got %d", state.hitCount)
+	}
+
+	// Hit 4: should escalate (800ms)
+	cb.MarkBroken(ctx, "eth", domain)
+	cb.mu.RLock()
+	state = cb.cache["eth"].domains[domain]
+	cb.mu.RUnlock()
+	if state.hitCount != 4 {
+		t.Fatalf("expected hitCount=4, got %d", state.hitCount)
+	}
+
+	// Hit 5: should escalate (1600ms)
+	cb.MarkBroken(ctx, "eth", domain)
+	cb.mu.RLock()
+	state = cb.cache["eth"].domains[domain]
+	cb.mu.RUnlock()
+	if state.hitCount != 5 {
+		t.Fatalf("expected hitCount=5, got %d", state.hitCount)
+	}
+}
+
+func TestDomainCircuitBreaker_EscalatedTTLValues(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil)
+	cb.defaultTTL = 1 * time.Minute
+	cb.maxTTL = 30 * time.Minute
+
+	// Verify the exact TTL progression
+	expected := []time.Duration{
+		1 * time.Minute,  // hit 1
+		2 * time.Minute,  // hit 2
+		4 * time.Minute,  // hit 3
+		8 * time.Minute,  // hit 4
+		16 * time.Minute, // hit 5
+		30 * time.Minute, // hit 6 (capped)
+		30 * time.Minute, // hit 7 (still capped)
+		30 * time.Minute, // hit 100 (still capped)
+	}
+	hits := []int{1, 2, 3, 4, 5, 6, 7, 100}
+
+	for i, hitCount := range hits {
+		ttl := cb.escalatedTTL(hitCount)
+		if ttl != expected[i] {
+			t.Errorf("hit %d: expected TTL=%v, got %v", hitCount, expected[i], ttl)
+		}
+	}
+}
+
+func TestDomainCircuitBreaker_TTLCapAt30Min(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil)
+	cb.defaultTTL = 1 * time.Minute
+	cb.maxTTL = 30 * time.Minute
+
+	// hit 6: 1min * 2^5 = 32min → capped at 30min
+	ttl := cb.escalatedTTL(6)
+	if ttl != 30*time.Minute {
+		t.Fatalf("expected 30min cap, got %v", ttl)
+	}
+
+	// hit 10: still capped
+	ttl = cb.escalatedTTL(10)
+	if ttl != 30*time.Minute {
+		t.Fatalf("expected 30min cap for hit 10, got %v", ttl)
+	}
+}
+
+func TestDomainCircuitBreaker_HitCountResetAfterExpiry(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil)
+	cb.defaultTTL = 50 * time.Millisecond
+	cb.maxTTL = 30 * time.Minute
+	cb.cacheTTL = 1 * time.Millisecond
+	ctx := context.Background()
+
+	domain := "reset.example.com"
+
+	// Hit 1 and 2
+	cb.MarkBroken(ctx, "eth", domain)
+	cb.MarkBroken(ctx, "eth", domain)
+	cb.mu.RLock()
+	state := cb.cache["eth"].domains[domain]
+	cb.mu.RUnlock()
+	if state.hitCount != 2 {
+		t.Fatalf("expected hitCount=2, got %d", state.hitCount)
+	}
+
+	// Wait for TTL to expire (hit 2 TTL = 100ms)
+	time.Sleep(120 * time.Millisecond)
+
+	// Hit count should reset since the previous entry expired
+	cb.MarkBroken(ctx, "eth", domain)
+	cb.mu.RLock()
+	state = cb.cache["eth"].domains[domain]
+	cb.mu.RUnlock()
+	if state.hitCount != 1 {
+		t.Fatalf("expected hitCount to reset to 1 after expiry, got %d", state.hitCount)
+	}
+}
+
+func TestParseRedisValue_NewFormat(t *testing.T) {
+	expiry, hitCount, ok := parseRedisValue("1709000000:5")
+	if !ok {
+		t.Fatal("expected parse to succeed")
+	}
+	if expiry != 1709000000 {
+		t.Fatalf("expected expiry=1709000000, got %d", expiry)
+	}
+	if hitCount != 5 {
+		t.Fatalf("expected hitCount=5, got %d", hitCount)
+	}
+}
+
+func TestParseRedisValue_LegacyFormat(t *testing.T) {
+	// Old format: just unix timestamp — should parse with hitCount=1
+	expiry, hitCount, ok := parseRedisValue("1709000000")
+	if !ok {
+		t.Fatal("expected parse to succeed for legacy format")
+	}
+	if expiry != 1709000000 {
+		t.Fatalf("expected expiry=1709000000, got %d", expiry)
+	}
+	if hitCount != 1 {
+		t.Fatalf("expected hitCount=1 for legacy format, got %d", hitCount)
+	}
+}
+
+func TestParseRedisValue_InvalidFormat(t *testing.T) {
+	_, _, ok := parseRedisValue("not-a-number")
+	if ok {
+		t.Fatal("expected parse to fail for invalid format")
+	}
+
+	_, _, ok = parseRedisValue("abc:def")
+	if ok {
+		t.Fatal("expected parse to fail for invalid new format")
+	}
+
+	_, _, ok = parseRedisValue("")
+	if ok {
+		t.Fatal("expected parse to fail for empty string")
+	}
+}

@@ -111,8 +111,16 @@ func recordHeuristicErrorToReputation(
 	// High confidence heuristic errors (JSON-RPC errors, HTML pages) are more severe
 	// Note: latency=0 for heuristic errors since this is a payload analysis, not timing
 	if heuristicResult.Confidence >= 0.95 {
-		signal = reputation.NewMajorErrorSignal("heuristic_"+heuristicResult.Reason, 0)
-		metricSignal = metrics.SignalMajorError
+		// Deceptive response patterns (empty array for scalar methods, empty object results)
+		// get CriticalErrorSignal (-25) which triggers the strike system for exponential cooldowns.
+		// Other high-confidence errors (HTML pages, server errors) stay at MajorErrorSignal (-10).
+		if isDeceptiveResponsePattern(heuristicResult.Reason) {
+			signal = reputation.NewCriticalErrorSignal("heuristic_"+heuristicResult.Reason, 0)
+			metricSignal = metrics.SignalCriticalError
+		} else {
+			signal = reputation.NewMajorErrorSignal("heuristic_"+heuristicResult.Reason, 0)
+			metricSignal = metrics.SignalMajorError
+		}
 	} else {
 		signal = reputation.NewMinorErrorSignal("heuristic_" + heuristicResult.Reason)
 		metricSignal = metrics.SignalMinorError
@@ -139,6 +147,18 @@ func recordHeuristicErrorToReputation(
 		Float64("heuristic_confidence", heuristicResult.Confidence).
 		Str("reputation_signal", metricSignal).
 		Msg("Recorded heuristic error signal to reputation")
+}
+
+// isDeceptiveResponsePattern returns true if the heuristic reason indicates a supplier
+// returning fabricated responses (empty/invalid results while passing health checks).
+// These warrant harsher penalties than generic server errors.
+func isDeceptiveResponsePattern(reason string) bool {
+	switch reason {
+	case "jsonrpc_invalid_empty_array", "jsonrpc_empty_object_result":
+		return true
+	default:
+		return false
+	}
 }
 
 // TODO_TECHDEBT(@adshmh): A single protocol context should handle both single/parallel calls to one or more endpoints.

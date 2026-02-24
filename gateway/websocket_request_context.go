@@ -62,6 +62,10 @@ type websocketRequestContext struct {
 	// gatewayObservations stores gateway related observations.
 	gatewayObservations *observation.GatewayObservations
 
+	// circuitBreaker tracks broken domains across pods via Redis.
+	// Shared with the HTTP request context to skip broken domains during endpoint selection.
+	circuitBreaker *DomainCircuitBreaker
+
 	// Channel for receiving message processing notifications from the bridge
 	messageObservationsChan chan *observation.RequestResponseObservations
 }
@@ -162,6 +166,18 @@ func (wrc *websocketRequestContext) buildProtocolContextAndStartBridge(
 		// Send connection failure observation manually since the connection observation channel is not available yet
 		wrc.handleConnectionObservation(&endpointLookupObs)
 		return nil, fmt.Errorf("no available endpoints for websocket request: %w", err)
+	}
+
+	// Filter out domains known to be broken across the fleet (cross-pod circuit breaker).
+	if wrc.circuitBreaker != nil {
+		brokenDomains := wrc.circuitBreaker.GetBrokenDomains(wrc.context, string(wrc.serviceID))
+		if len(brokenDomains) > 0 {
+			filtered := filterEndpointsByBrokenDomains(availableEndpoints, brokenDomains)
+			if len(filtered) > 0 {
+				availableEndpoints = filtered
+			}
+			// If ALL endpoints are from broken domains, keep the original list (graceful degradation).
+		}
 	}
 
 	// For websockets, select a single endpoint

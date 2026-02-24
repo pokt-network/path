@@ -10,6 +10,7 @@ import (
 // emptyArrayValidMethods is the whitelist of JSON-RPC methods where "result":[] is valid.
 // For all other methods, an empty array result indicates a broken/misconfigured supplier.
 var emptyArrayValidMethods = map[string]bool{
+	// === EVM ===
 	// Core — high-volume methods that legitimately return empty arrays
 	"eth_getLogs":          true,
 	"eth_getFilterChanges": true,
@@ -29,6 +30,17 @@ var emptyArrayValidMethods = map[string]bool{
 	"debug_getModifiedAccountsByNumber": true,
 	"debug_getModifiedAccountsByHash":   true,
 	"debug_traceCallMany":               true,
+
+	// === Solana ===
+	// Methods that return raw arrays (not wrapped in {context, value} objects)
+	"getBlocks":                         true, // array of slot numbers in range
+	"getBlocksWithLimit":                true, // array of slot numbers
+	"getConfirmedBlocks":                true, // deprecated, same as getBlocks
+	"getSignaturesForAddress":           true, // array of signature info objects
+	"getConfirmedSignaturesForAddress2": true, // deprecated, same as above
+	"getRecentPerformanceSamples":       true, // array of performance samples
+	"getClusterNodes":                   true, // array of node info
+	"getRecentPrioritizationFees":       true, // array of fee objects
 }
 
 // Tier 2: Protocol-Specific Success Checks

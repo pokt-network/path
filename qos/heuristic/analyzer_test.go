@@ -330,6 +330,118 @@ func TestProtocolAnalysis_MethodAwareEmptyArray(t *testing.T) {
 			expectedRetry:  false,
 			expectedReason: "jsonrpc_success",
 		},
+
+		// Solana — scalar-returning methods (NEVER return arrays)
+		{
+			name:           "getSlot + empty array = broken supplier",
+			method:         "getSlot",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getBlockHeight + empty array = broken supplier",
+			method:         "getBlockHeight",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getBalance + empty array = broken supplier",
+			method:         "getBalance",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getTransaction + empty array = broken supplier",
+			method:         "getTransaction",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getEpochInfo + empty array = broken supplier",
+			method:         "getEpochInfo",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getHealth + empty array = broken supplier",
+			method:         "getHealth",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getVersion + empty array = broken supplier",
+			method:         "getVersion",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getBlock + empty array = broken supplier",
+			method:         "getBlock",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getIdentity + empty array = broken supplier",
+			method:         "getIdentity",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getRecentBlockhash + empty array = broken supplier",
+			method:         "getRecentBlockhash",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getLatestBlockhash + empty array = broken supplier",
+			method:         "getLatestBlockhash",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+
+		// Solana — array-returning methods (empty array IS valid)
+		{
+			name:           "getBlocks + empty array = valid (no blocks in range)",
+			method:         "getBlocks",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getBlocksWithLimit + empty array = valid",
+			method:         "getBlocksWithLimit",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getSignaturesForAddress + empty array = valid (no signatures)",
+			method:         "getSignaturesForAddress",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getConfirmedSignaturesForAddress2 + empty array = valid",
+			method:         "getConfirmedSignaturesForAddress2",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getRecentPerformanceSamples + empty array = valid",
+			method:         "getRecentPerformanceSamples",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getClusterNodes + empty array = valid",
+			method:         "getClusterNodes",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getRecentPrioritizationFees + empty array = valid",
+			method:         "getRecentPrioritizationFees",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
 	}
 
 	for _, tt := range tests {
@@ -382,6 +494,85 @@ func TestFullAnalyzer_MethodAwareEmptyArray(t *testing.T) {
 
 			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
 			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
+		})
+	}
+}
+
+func TestFullAnalyzer_SolanaEmptyArrayDetection(t *testing.T) {
+	analyzer := NewDefaultAnalyzer()
+	emptyArrayResponse := []byte(`{"jsonrpc":"2.0","id":1,"result":[]}`)
+
+	tests := []struct {
+		name           string
+		method         string
+		expectedRetry  bool
+		expectedReason string
+	}{
+		{
+			name:           "getSlot with empty array = invalid response",
+			method:         "getSlot",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getBlockHeight with empty array = invalid response",
+			method:         "getBlockHeight",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getBalance with empty array = invalid response",
+			method:         "getBalance",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getEpochInfo with empty array = invalid response",
+			method:         "getEpochInfo",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getVersion with empty array = invalid response",
+			method:         "getVersion",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getIdentity with empty array = invalid response",
+			method:         "getIdentity",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getRecentBlockhash with empty array = invalid response",
+			method:         "getRecentBlockhash",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_invalid_empty_array",
+		},
+		{
+			name:           "getSignaturesForAddress with empty array = valid (no sigs)",
+			method:         "getSignaturesForAddress",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getBlocks with empty array = valid (empty range)",
+			method:         "getBlocks",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyzer.Analyze(emptyArrayResponse, 200, sharedtypes.RPCType_JSON_RPC, tt.method)
+
+			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
+			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
+			if tt.expectedRetry {
+				assert.GreaterOrEqual(t, result.Confidence, 0.95, "Invalid response detection should have high confidence")
+			}
 		})
 	}
 }
