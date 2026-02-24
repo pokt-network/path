@@ -71,9 +71,9 @@ type Score struct {
 	// Updated from both health checks and client requests.
 	LatencyMetrics LatencyMetrics
 
-	// CriticalStrikes counts consecutive critical/fatal errors without recovery.
+	// CriticalStrikes counts critical/fatal errors.
 	// Used by the strike system to apply extended cooldowns for persistently failing endpoints.
-	// Reset to 0 when endpoint has a successful request.
+	// Decays by 1 on each successful request (gradual recovery, not instant reset).
 	CriticalStrikes int
 
 	// CooldownUntil is when the endpoint's cooldown period ends.

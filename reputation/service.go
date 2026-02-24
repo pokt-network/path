@@ -108,8 +108,12 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 
 	if signal.IsPositive() {
 		score.SuccessCount++
-		// Reset strikes on successful request - endpoint has proven it can work
-		score.CriticalStrikes = 0
+		// Decay strikes gradually — one success reduces strikes by 1.
+		// This prevents deceptive suppliers (who pass some requests) from
+		// instantly wiping their strike history with a single success.
+		if score.CriticalStrikes > 0 {
+			score.CriticalStrikes--
+		}
 	} else if signal.IsNegative() {
 		score.ErrorCount++
 	}
