@@ -297,6 +297,7 @@ func main() {
 		Logger:                     logger,
 		HTTPRequestParser:          requestParser,
 		Protocol:                   protocol,
+		RPCTypeValidator:           gateway.NewRPCTypeValidator(unifiedServicesConfig, gateway.NewRPCTypeMapper()),
 		MetricsReporter:            metricsReporter,
 		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
 		ObservationQueue:           observationQueue,
