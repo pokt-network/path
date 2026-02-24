@@ -17,9 +17,11 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/observation"
 )
@@ -236,6 +238,16 @@ func (g Gateway) handleWebSocketRequest(
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ Error initializing websocket request context")
 		return
+	}
+
+	// Validate that the service supports websocket RPC type.
+	// This fails fast if "websocket" is not in the service's configured rpc_types.
+	if g.RPCTypeValidator != nil {
+		if err := g.RPCTypeValidator.ValidateRPCType(websocketRequestCtx.serviceID, sharedtypes.RPCType_WEBSOCKET); err != nil {
+			logger.Error().Err(err).Str("service_id", string(websocketRequestCtx.serviceID)).Msg("❌ WebSocket not supported for this service")
+			http.Error(w, fmt.Sprintf("WebSocket not supported for service %q", websocketRequestCtx.serviceID), http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Build the QoS context for the target service ID using the HTTP request.
