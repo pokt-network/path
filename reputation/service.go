@@ -124,8 +124,12 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 
 		// Apply cooldown if strikes exceed threshold
 		if score.CriticalStrikes >= DefaultStrikeThreshold {
-			// Exponential backoff: base * 2^(strikes - threshold)
+			// Exponential backoff: base * 2^(strikes - threshold), capped at max cooldown.
+			// Cap exponent to avoid int64 overflow in the shift (5min * 2^7 = 640min > 60min max).
 			exponent := score.CriticalStrikes - DefaultStrikeThreshold
+			if exponent > 7 {
+				exponent = 7
+			}
 			cooldownDuration := DefaultBaseCooldown * time.Duration(1<<exponent)
 			if cooldownDuration > DefaultMaxCooldown {
 				cooldownDuration = DefaultMaxCooldown
