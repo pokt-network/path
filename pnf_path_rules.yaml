@@ -2059,36 +2059,29 @@
 - service_id: sei
   # Block time: ~0.4s | Source: chainspect.app, seistream.app (optimized for speed)
   # Formula: 300s / 0.4s = 750 blocks for 5 minutes
+  # NOTE: Sei is a dual chain (Cosmos + EVM) but most suppliers only run EVM nodes.
+  # Using EVM health checks to avoid penalizing EVM-only suppliers with CometBFT methods.
   sync_allowance: 750
   check_interval: 30s
   enabled: true
   checks:
-    - name: health
+    - name: eth_blockNumber
       type: json_rpc
       method: POST
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"health"}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
-      timeout: 5s
-      reputation_signal: minor_error
-    - name: status
-      type: json_rpc
-      method: POST
-      path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
-      expected_status_code: 200
-      expected_response_contains: '"node_info"'
       timeout: 5s
       reputation_signal: critical_error
       sync_check: true
-    - name: syncing
-      type: rest
-      method: GET
-      path: /cosmos/base/tendermint/v1beta1/syncing
+    - name: eth_chainId
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
-      expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: shentu
   # Block time: ~6s | Source: Cosmos SDK default
