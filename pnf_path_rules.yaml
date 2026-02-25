@@ -48,7 +48,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -96,7 +96,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -142,7 +142,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -190,7 +190,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -230,7 +230,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -255,7 +255,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -294,7 +294,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -333,7 +333,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -372,7 +372,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -410,7 +410,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -435,7 +435,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -473,7 +473,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -511,7 +511,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -549,7 +549,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -574,7 +574,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -599,7 +599,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -624,7 +624,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -662,7 +662,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -700,7 +700,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -740,7 +740,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -769,7 +769,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -815,7 +815,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -861,7 +861,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -907,7 +907,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -932,7 +932,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -957,7 +957,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -982,7 +982,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1020,7 +1020,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1059,7 +1059,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1084,7 +1084,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1122,7 +1122,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1160,7 +1160,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1198,7 +1198,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1236,7 +1236,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1261,7 +1261,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1299,7 +1299,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1328,7 +1328,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1354,7 +1354,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1379,7 +1379,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1404,7 +1404,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1429,7 +1429,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1454,7 +1454,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1479,7 +1479,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1504,7 +1504,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: eth_chainId
       type: json_rpc
@@ -1521,8 +1521,8 @@
 
 - service_id: solana
   # Block time: ~0.4s | Source: chainspect.app, solscan.io
-  # Formula: 300s / 0.4s = 750 blocks for 5 minutes
-  sync_allowance: 750
+  # Formula: 300s / 0.4s = 750 blocks for 5 minutes #updated to 1500
+  sync_allowance: 1500
   check_interval: 10s
   enabled: true
   checks:
@@ -1542,7 +1542,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"getBlockHeight"}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
 
 - service_id: near
@@ -1559,7 +1559,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"status","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: block
       type: json_rpc
@@ -1584,7 +1584,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"sui_getLatestCheckpointSequenceNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     - name: sui_getTotalTransactionBlocks
       type: json_rpc
@@ -1610,7 +1610,7 @@
       body: '{}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
     
     # Node list check - verifies the node has peers and is connected to the network
@@ -1641,7 +1641,7 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
       timeout: 5s
-      reputation_signal: minor_error
+      reputation_signal: critical_error
       sync_check: true
 
 # ==========================================
@@ -1669,14 +1669,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1701,14 +1703,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1733,14 +1737,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1765,14 +1771,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1797,14 +1805,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1829,14 +1839,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1861,14 +1873,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1893,14 +1907,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1925,14 +1941,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1957,14 +1975,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -1989,14 +2009,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -2021,14 +2043,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -2053,14 +2077,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -2085,14 +2111,16 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -2117,13 +2145,15 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
+      expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
       sync_check: true
     - name: syncing
       type: rest
       method: GET
       path: /cosmos/base/tendermint/v1beta1/syncing
       expected_status_code: 200
+      expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: critical_error

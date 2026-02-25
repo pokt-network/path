@@ -154,7 +154,8 @@ func recordHeuristicErrorToReputation(
 // These warrant harsher penalties than generic server errors.
 func isDeceptiveResponsePattern(reason string) bool {
 	switch reason {
-	case "jsonrpc_invalid_empty_array", "jsonrpc_empty_object_result":
+	case "jsonrpc_invalid_empty_array", "jsonrpc_empty_object_result",
+		"rest_protocol_mismatch", "cometbft_invalid_empty_array":
 		return true
 	default:
 		return false

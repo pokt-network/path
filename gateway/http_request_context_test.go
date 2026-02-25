@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -96,6 +97,28 @@ func TestAddRelayMetadataHeaders_AlwaysPresent(t *testing.T) {
 				actual := w.Header().Get(header)
 				require.Equal(t, expected, actual, "header %s mismatch", header)
 			}
+		})
+	}
+}
+
+func TestIsDeceptiveResponsePattern(t *testing.T) {
+	tests := []struct {
+		reason   string
+		expected bool
+	}{
+		{"jsonrpc_invalid_empty_array", true},
+		{"jsonrpc_empty_object_result", true},
+		{"rest_protocol_mismatch", true},
+		{"cometbft_invalid_empty_array", true},
+		{"http_5xx", false},
+		{"jsonrpc_success", false},
+		{"rest_error_field", false},
+		{"empty_response", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.reason, func(t *testing.T) {
+			assert.Equal(t, tt.expected, isDeceptiveResponsePattern(tt.reason))
 		})
 	}
 }

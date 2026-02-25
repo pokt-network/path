@@ -145,11 +145,12 @@ func buildJSONRPCServicePayload(rpcType sharedtypes.RPCType, jsonrpcReq jsonrpc.
 	}
 
 	return protocol.Payload{
-		Data:    string(reqBz),
-		Method:  http.MethodPost, // JSONRPC always uses POST
-		Path:    "",              // JSONRPC does not use paths
-		Headers: map[string]string{},
-		RPCType: rpcType, // Add the RPCType hint the so protocol sets correct HTTP headers for the endpoint.
+		Data:          string(reqBz),
+		Method:        http.MethodPost, // JSONRPC always uses POST
+		Path:          "",              // JSONRPC does not use paths
+		Headers:       map[string]string{},
+		RPCType:       rpcType,                       // Add the RPCType hint the so protocol sets correct HTTP headers for the endpoint.
+		JSONRPCMethod: string(jsonrpcReq.Method), // Enable method-aware heuristic analysis (e.g., "result":[] detection).
 	}, nil
 }
 

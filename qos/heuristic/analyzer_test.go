@@ -223,6 +223,7 @@ func TestProtocolAnalysis_CometBFT(t *testing.T) {
 		response       []byte
 		expectedRetry  bool
 		expectedReason string
+		minConfidence  float64
 	}{
 		{
 			name:           "CometBFT health — empty object result is valid",
@@ -242,6 +243,13 @@ func TestProtocolAnalysis_CometBFT(t *testing.T) {
 			expectedRetry:  false,
 			expectedReason: "jsonrpc_valid_error",
 		},
+		{
+			name:           "CometBFT empty array result — always invalid (gaming supplier)",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":[]}`),
+			expectedRetry:  true,
+			expectedReason: "cometbft_invalid_empty_array",
+			minConfidence:  0.95,
+		},
 	}
 
 	for _, tt := range tests {
@@ -251,6 +259,9 @@ func TestProtocolAnalysis_CometBFT(t *testing.T) {
 
 			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
 			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
+			if tt.minConfidence > 0 {
+				assert.GreaterOrEqual(t, result.Confidence, tt.minConfidence, "Confidence too low")
+			}
 		})
 	}
 }
@@ -619,6 +630,18 @@ func TestProtocolAnalysis_REST(t *testing.T) {
 			response:       []byte(`{ }`),
 			expectedRetry:  true,
 			expectedReason: "rest_empty_object",
+		},
+		{
+			name:           "REST receives JSON-RPC response — protocol mismatch (gaming supplier)",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":[]}`),
+			expectedRetry:  true,
+			expectedReason: "rest_protocol_mismatch",
+		},
+		{
+			name:           "REST receives JSON-RPC success — still protocol mismatch",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":"0x123"}`),
+			expectedRetry:  true,
+			expectedReason: "rest_protocol_mismatch",
 		},
 	}
 
@@ -1000,6 +1023,24 @@ func TestRealWorldScenarios(t *testing.T) {
 			rpcType:       sharedtypes.RPCType_JSON_RPC,
 			expectedRetry: true,
 			description:   "Rate limited response",
+		},
+		// Gaming supplier scenarios — spacebelt.xyz returns canned {"jsonrpc":"2.0","id":1,"result":[]}
+		// for ALL requests regardless of protocol type
+		{
+			name:          "Gaming supplier: JSON-RPC response to REST request",
+			response:      `{"jsonrpc":"2.0","id":1,"result":[]}`,
+			httpStatus:    200,
+			rpcType:       sharedtypes.RPCType_REST,
+			expectedRetry: true,
+			description:   "Gaming supplier returning canned JSON-RPC to Cosmos REST /cosmos/base/tendermint/v1beta1/syncing",
+		},
+		{
+			name:          "Gaming supplier: empty array to CometBFT status",
+			response:      `{"jsonrpc":"2.0","id":1,"result":[]}`,
+			httpStatus:    200,
+			rpcType:       sharedtypes.RPCType_COMET_BFT,
+			expectedRetry: true,
+			description:   "Gaming supplier returning canned empty array to CometBFT /status request",
 		},
 	}
 

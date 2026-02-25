@@ -139,6 +139,19 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, 
 			}
 		}
 
+		// CometBFT: "result":[] is NEVER valid. All CometBFT methods return objects:
+		// status → {node_info, sync_info}, block → {block_id, block}, health → {}.
+		// An empty array result is a strong signal of a gaming supplier returning canned responses.
+		if emptyType == emptyArray && rpcType == sharedtypes.RPCType_COMET_BFT {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.95,
+				Reason:      "cometbft_invalid_empty_array",
+				Structure:   StructureValid,
+				Details:     "CometBFT result is [] — no CometBFT method ever returns an array",
+			}
+		}
+
 		// Method-aware empty array detection:
 		// "result":[] is valid for some methods (eth_getLogs, eth_accounts, etc.) but broken
 		// for most others (eth_blockNumber, eth_getBalance return scalars/objects, never arrays).
@@ -266,6 +279,20 @@ func analyzeREST(prefix []byte, fullLength int) AnalysisResult {
 				Structure:   StructureValid,
 				Details:     "REST response is an empty JSON object",
 			}
+		}
+	}
+
+	// Protocol mismatch: a JSON-RPC response to a REST request.
+	// Real Cosmos SDK REST endpoints never return JSON-RPC envelopes.
+	// Gaming suppliers (e.g., spacebelt.xyz) return canned {"jsonrpc":"2.0","id":1,"result":[]}
+	// for ALL requests regardless of protocol type.
+	if bytes.Contains(prefix, jsonrpcVersionField) {
+		return AnalysisResult{
+			ShouldRetry: true,
+			Confidence:  0.95,
+			Reason:      "rest_protocol_mismatch",
+			Structure:   StructureValid,
+			Details:     "REST request received a JSON-RPC formatted response — supplier is likely gaming",
 		}
 	}
 
