@@ -2071,6 +2071,7 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_status_code: 200
+      expected_response_contains: '"0x'
       timeout: 5s
       reputation_signal: critical_error
       sync_check: true
@@ -2080,6 +2081,7 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      expected_response_contains: '"0x'
       timeout: 5s
       reputation_signal: major_error
 
