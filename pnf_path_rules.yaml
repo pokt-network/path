@@ -1680,7 +1680,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: atomone
   # Block time: ~6s | Source: Cosmos SDK default (Tendermint BFT)
@@ -1714,7 +1714,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: cheqd
   # Block time: ~6s | Source: explorer.cheqd.io, Cosmos SDK default
@@ -1748,7 +1748,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: chihuahua
   # Block time: ~6s | Source: mintscan.io/chihuahua, Cosmos SDK default
@@ -1782,7 +1782,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: fetch
   # Block time: ~6s | Source: fetch.ai docs, Cosmos SDK default
@@ -1816,7 +1816,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: jackal
   # Block time: ~6s | Source: Cosmos SDK default
@@ -1850,7 +1850,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: juno
   # Block time: ~6s | Source: mintscan.io/juno, Cosmos SDK default
@@ -1884,7 +1884,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: kava
   # Block time: ~6s | Source: mintscan.io/kava, kava.io docs
@@ -1918,7 +1918,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: osmosis
   # Block time: ~6s | Source: mintscan.io/osmosis, osmosis.zone docs
@@ -1952,7 +1952,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: persistence
   # Block time: ~6s | Source: mintscan.io/persistence, Cosmos SDK default
@@ -1986,7 +1986,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: pocket
   # Block time: ~60s | Source: Shannon protocol specs (Pocket Network)
@@ -2020,7 +2020,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: seda
   # Block time: ~6s | Source: Cosmos SDK default
@@ -2054,7 +2054,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: sei
   # Block time: ~0.4s | Source: chainspect.app, seistream.app (optimized for speed)
@@ -2117,7 +2117,7 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
 
 - service_id: stargaze
   # Block time: ~6s | Source: mintscan.io/stargaze, Cosmos SDK default
@@ -2151,4 +2151,4 @@
       expected_status_code: 200
       expected_response_contains: '"syncing"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
