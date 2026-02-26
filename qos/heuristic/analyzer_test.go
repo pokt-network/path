@@ -700,6 +700,13 @@ func TestIndicatorAnalysis(t *testing.T) {
 			minConfidence:    0.90,
 		},
 		{
+			name:             "EVM fallback API failure",
+			content:          `Failed to call fallback API`,
+			expectedFound:    true,
+			expectedCategory: CategoryBlockchainError,
+			minConfidence:    0.90,
+		},
+		{
 			name:             "Solana unhealthy",
 			content:          "node is unhealthy: behind by 100 slots",
 			expectedFound:    true,
@@ -967,6 +974,14 @@ func TestRealWorldScenarios(t *testing.T) {
 			rpcType:       sharedtypes.RPCType_JSON_RPC,
 			expectedRetry: true,
 			description:   "Erigon node with corrupted MDBX database",
+		},
+		{
+			name:          "EVM fallback API failure for archival request",
+			response:      `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Failed to call fallback API"}}`,
+			httpStatus:    200,
+			rpcType:       sharedtypes.RPCType_JSON_RPC,
+			expectedRetry: true,
+			description:   "Node's internal fallback for archival data failed",
 		},
 		{
 			name:          "Cosmos pruned block",
