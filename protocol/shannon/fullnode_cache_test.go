@@ -43,41 +43,53 @@ func Test_getSessionCacheKey(t *testing.T) {
 // Test_sessionCacheKeyStability verifies that the cache key remains stable for
 // all block heights within the same session window. This is the core property
 // that the fix in https://github.com/pokt-network/path/issues/509 relies on.
+//
+// Shannon sessions are 1-based: with NumBlocksPerSession=60, sessions are
+// [1,60], [61,120], [121,180], etc.
 func Test_sessionCacheKeyStability(t *testing.T) {
 	const (
-		numBlocksPerSession int64 = 50
+		numBlocksPerSession int64 = 60
 		serviceID                 = protocol.ServiceID("pocket")
 		appAddr                   = "pokt1testaddr"
 	)
 
+	// shannonSessionStart mirrors the 1-based formula from
+	// poktroll/x/shared/types/session.go GetSessionStartHeight
+	shannonSessionStart := func(h int64) int64 {
+		if h <= 0 {
+			return 0
+		}
+		return h - ((h - 1) % numBlocksPerSession)
+	}
+
 	tests := []struct {
-		name                   string
-		heights                []int64
-		expectedSessionStart   int64
-		expectSameKey          bool
+		name                 string
+		heights              []int64
+		expectedSessionStart int64
+		expectSameKey        bool
 	}{
 		{
-			name:                 "all heights in same session produce same key",
-			heights:              []int64{100, 101, 120, 149},
-			expectedSessionStart: 100,
+			name:                 "all heights in first session produce same key",
+			heights:              []int64{1, 2, 30, 60},
+			expectedSessionStart: 1,
 			expectSameKey:        true,
 		},
 		{
-			name:                 "first block of session",
-			heights:              []int64{150, 151, 199},
-			expectedSessionStart: 150,
+			name:                 "all heights in second session produce same key",
+			heights:              []int64{61, 62, 90, 120},
+			expectedSessionStart: 61,
 			expectSameKey:        true,
 		},
 		{
 			name:                 "session boundary produces new key",
-			heights:              []int64{149, 150},
+			heights:              []int64{60, 61},
 			expectedSessionStart: 0, // not used for this test
 			expectSameKey:        false,
 		},
 		{
-			name:                 "height zero",
-			heights:              []int64{0, 1, 49},
-			expectedSessionStart: 0,
+			name:                 "large heights in same session",
+			heights:              []int64{601, 630, 660},
+			expectedSessionStart: 601,
 			expectSameKey:        true,
 		},
 	}
@@ -86,7 +98,7 @@ func Test_sessionCacheKeyStability(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var keys []string
 			for _, h := range tt.heights {
-				sessionStart := h - (h % numBlocksPerSession)
+				sessionStart := shannonSessionStart(h)
 				key := getSessionCacheKey(serviceID, appAddr, sessionStart)
 				keys = append(keys, key)
 			}
@@ -115,8 +127,11 @@ func Test_sessionCacheKeyStability(t *testing.T) {
 	}
 }
 
-// Test_sessionStartHeightComputation verifies the deterministic formula for
+// Test_sessionStartHeightComputation verifies the 1-based Shannon formula for
 // computing session start height from current height and NumBlocksPerSession.
+//
+// Shannon formula: currentHeight - ((currentHeight - 1) % numBlocksPerSession)
+// See: poktroll/x/shared/types/session.go GetSessionStartHeight
 func Test_sessionStartHeightComputation(t *testing.T) {
 	tests := []struct {
 		name                string
@@ -125,46 +140,46 @@ func Test_sessionStartHeightComputation(t *testing.T) {
 		expectedStart       int64
 	}{
 		{
-			name:                "exact session boundary",
-			currentHeight:       100,
-			numBlocksPerSession: 50,
-			expectedStart:       100,
+			name:                "first block is session start",
+			currentHeight:       1,
+			numBlocksPerSession: 60,
+			expectedStart:       1,
 		},
 		{
 			name:                "mid-session",
-			currentHeight:       125,
-			numBlocksPerSession: 50,
-			expectedStart:       100,
+			currentHeight:       30,
+			numBlocksPerSession: 60,
+			expectedStart:       1,
 		},
 		{
-			name:                "last block of session",
-			currentHeight:       149,
-			numBlocksPerSession: 50,
-			expectedStart:       100,
+			name:                "last block of first session",
+			currentHeight:       60,
+			numBlocksPerSession: 60,
+			expectedStart:       1,
 		},
 		{
-			name:                "first block after boundary",
-			currentHeight:       150,
-			numBlocksPerSession: 50,
-			expectedStart:       150,
+			name:                "first block of second session",
+			currentHeight:       61,
+			numBlocksPerSession: 60,
+			expectedStart:       61,
 		},
 		{
-			name:                "height zero",
-			currentHeight:       0,
-			numBlocksPerSession: 50,
-			expectedStart:       0,
+			name:                "last block of second session",
+			currentHeight:       120,
+			numBlocksPerSession: 60,
+			expectedStart:       61,
 		},
 		{
-			name:                "height 1",
-			currentHeight:       1,
-			numBlocksPerSession: 50,
-			expectedStart:       0,
+			name:                "first block of third session",
+			currentHeight:       121,
+			numBlocksPerSession: 60,
+			expectedStart:       121,
 		},
 		{
 			name:                "large height",
 			currentHeight:       653615,
-			numBlocksPerSession: 50,
-			expectedStart:       653600,
+			numBlocksPerSession: 60,
+			expectedStart:       653581,
 		},
 		{
 			name:                "numBlocksPerSession = 1 (every block is a session)",
@@ -176,7 +191,7 @@ func Test_sessionStartHeightComputation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tt.currentHeight - (tt.currentHeight % tt.numBlocksPerSession)
+			got := tt.currentHeight - ((tt.currentHeight - 1) % tt.numBlocksPerSession)
 			if got != tt.expectedStart {
 				t.Errorf("sessionStartHeight(%d, %d) = %d, want %d",
 					tt.currentHeight, tt.numBlocksPerSession, got, tt.expectedStart)

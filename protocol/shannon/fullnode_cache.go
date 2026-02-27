@@ -378,15 +378,24 @@ func getSessionCacheKey(serviceID protocol.ServiceID, appAddr string, height int
 // block height and the on-chain NumBlocksPerSession parameter. This is used to
 // derive a stable cache key that doesn't change within a session window.
 //
-// Formula: sessionStartHeight = currentHeight - (currentHeight % numBlocksPerSession)
+// Uses Shannon's 1-based session formula (sessions start at block 1, not 0):
+//   sessionStartHeight = currentHeight - ((currentHeight - 1) % numBlocksPerSession)
 //
-// For example, with NumBlocksPerSession=50:
+// For example, with NumBlocksPerSession=60:
 //
-//	height 100 → sessionStart 100
-//	height 120 → sessionStart 100
-//	height 149 → sessionStart 100
-//	height 150 → sessionStart 150
+//	height 1   → sessionStart 1
+//	height 30  → sessionStart 1
+//	height 60  → sessionStart 1
+//	height 61  → sessionStart 61
+//	height 120 → sessionStart 61
+//	height 121 → sessionStart 121
+//
+// See: poktroll/x/shared/types/session.go GetSessionStartHeight
 func (cfn *cachingFullNode) getSessionStartHeight(ctx context.Context, currentHeight int64) (int64, error) {
+	if currentHeight <= 0 {
+		return currentHeight, nil
+	}
+
 	params, err := cfn.GetSharedParams(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get shared params for session start height: %w", err)
@@ -397,7 +406,7 @@ func (cfn *cachingFullNode) getSessionStartHeight(ctx context.Context, currentHe
 		return currentHeight, nil
 	}
 
-	return currentHeight - (currentHeight % numBlocksPerSession), nil
+	return currentHeight - ((currentHeight - 1) % numBlocksPerSession), nil
 }
 
 // ValidateRelayResponse:
