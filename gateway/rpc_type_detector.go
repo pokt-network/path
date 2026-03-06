@@ -74,7 +74,7 @@ func (d *RPCTypeDetector) DetectRPCType(
 	}
 
 	// Step 3: Process of elimination (optimize for common case)
-	if rpcType, ok := d.processOfElimination(serviceRPCTypes); ok {
+	if rpcType, ok := d.processOfElimination(httpReq, serviceRPCTypes); ok {
 		// Successfully eliminated to single HTTP type
 		return rpcType, nil
 	}
@@ -141,7 +141,7 @@ func (d *RPCTypeDetector) easyDetection(httpReq *http.Request) (sharedtypes.RPCT
 // This is optimized for the most common case: services with ["json_rpc", "websocket"].
 // Returns (rpcType, true) if successfully eliminated to single HTTP type.
 // Returns (_, false) if multiple HTTP types remain (need payload inspection).
-func (d *RPCTypeDetector) processOfElimination(serviceRPCTypes []string) (sharedtypes.RPCType, bool) {
+func (d *RPCTypeDetector) processOfElimination(httpReq *http.Request, serviceRPCTypes []string) (sharedtypes.RPCType, bool) {
 	// Filter to only HTTP-based types (exclude websocket, grpc already checked in step 2)
 	httpTypes := make([]string, 0, len(serviceRPCTypes))
 	for _, rpcTypeStr := range serviceRPCTypes {
@@ -159,6 +159,15 @@ func (d *RPCTypeDetector) processOfElimination(serviceRPCTypes []string) (shared
 			// Should never happen - service config already validated
 			return sharedtypes.RPCType_UNKNOWN_RPC, false
 		}
+
+		// JSON-RPC requires POST — GET/HEAD/etc. requests cannot be JSON-RPC.
+		// Without this check, GET requests to json_rpc-only services (e.g., NEAR, Solana)
+		// are auto-typed as JSON_RPC and forwarded, causing backend rejections and
+		// circuit breaker lockouts.
+		if rpcType == sharedtypes.RPCType_JSON_RPC && httpReq.Method != http.MethodPost {
+			return sharedtypes.RPCType_UNKNOWN_RPC, false
+		}
+
 		return rpcType, true
 	}
 
