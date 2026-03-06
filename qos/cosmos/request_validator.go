@@ -72,6 +72,14 @@ func (rv *requestValidator) validateHTTPRequest(req *http.Request, detectedRPCTy
 			logger.Debug().Msg("Routing to JSONRPC validator (gateway-detected)")
 			return rv.validateJSONRPCRequest(body)
 		case sharedtypes.RPCType_REST, sharedtypes.RPCType_COMET_BFT:
+			// CometBFT requests sent as JSON-RPC POST (e.g., {"jsonrpc":"2.0","method":"status"})
+			// should go through the JSON-RPC validator, which correctly preserves the
+			// OriginalRPCType for heuristic analysis. Only REST-style CometBFT requests
+			// (GET /status, etc.) should go through the REST validator.
+			if detectedRPCType == sharedtypes.RPCType_COMET_BFT && isJSONRPCRequest(req.Method, body) {
+				logger.Debug().Msg("Routing CometBFT JSON-RPC POST to JSONRPC validator")
+				return rv.validateJSONRPCRequest(body)
+			}
 			logger.Debug().Msg("Routing to REST validator (gateway-detected)")
 			return rv.validateRESTRequest(req.URL, req.Method, body)
 		default:
