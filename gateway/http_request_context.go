@@ -338,8 +338,23 @@ func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
 	detector := NewRPCTypeDetector()
 	rpcType, err := detector.DetectRPCType(httpReq, string(rc.serviceID), serviceRPCTypes)
 	if err != nil {
+		// Log request details at error level for diagnosing bad traffic patterns.
+		// Read up to 512 bytes of the body for diagnostics, then restore it.
+		bodySnippet := ""
+		if httpReq.Body != nil {
+			bodyBytes, readErr := readBodySafely(httpReq, 512)
+			if readErr == nil {
+				bodySnippet = string(bodyBytes)
+				httpReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			}
+		}
 		rc.logger.Error().
 			Str("method", "ValidateRPCType").
+			Str("http_method", httpReq.Method).
+			Str("url_path", httpReq.URL.Path).
+			Str("content_type", httpReq.Header.Get("Content-Type")).
+			Str("user_agent", httpReq.Header.Get("User-Agent")).
+			Str("body_snippet", bodySnippet).
 			Err(err).
 			Msg("RPC type detection failed")
 
