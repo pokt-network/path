@@ -127,60 +127,78 @@ func TestIsDeceptiveResponsePattern(t *testing.T) {
 
 func TestShouldCircuitBreak(t *testing.T) {
 	tests := []struct {
-		name     string
-		result   *heuristic.AnalysisResult
-		expected bool
+		name           string
+		result         *heuristic.AnalysisResult
+		httpStatusCode int
+		expected       bool
 	}{
 		// Nil heuristic result (transport errors, etc.) should circuit break
-		{"nil_result", nil, true},
+		{"nil_result", nil, 500, true},
+
+		// HTTP 4xx (client errors) should NOT circuit break — domain is healthy
+		{"400_bad_request", nil, 400, false},
+		{"400_with_heuristic", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "parse error",
+		}, 400, false},
+		{"401_unauthorized", nil, 401, false},
+		{"404_not_found", nil, 404, false},
+		{"429_rate_limited", nil, 429, false},
+
+		// HTTP 5xx should circuit break
+		{"500_server_error", nil, 500, true},
+		{"502_bad_gateway", nil, 502, true},
+		{"503_unavailable", nil, 503, true},
+
+		// Transport error (status 0) should circuit break
+		{"transport_error", nil, 0, true},
 
 		// Archival-related errors should NOT circuit break
 		{"historical_state", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "historical state",
-		}, false},
+		}, 200, false},
 		{"state_pruned", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "state has been pruned",
-		}, false},
+		}, 200, false},
 		{"is_pruned", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "is pruned",
-		}, false},
+		}, 200, false},
 		{"state_not_available", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "state not available",
-		}, false},
+		}, 200, false},
 		{"not_indexed", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "haven't been fully indexed",
-		}, false},
+		}, 200, false},
 		{"missing_trie_node", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "missing trie node",
-		}, false},
+		}, 200, false},
 		{"block_pruned", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "block has been pruned",
-		}, false},
+		}, 200, false},
 		{"height_not_available", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "height is not available",
-		}, false},
+		}, 200, false},
 
 		// Non-archival errors SHOULD circuit break
 		{"failed_fallback", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "failed to call fallback",
-		}, true},
+		}, 200, true},
 		{"mdbx_panic", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "mdbx_panic",
-		}, true},
+		}, 200, true},
 		{"bad_gateway", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "bad gateway",
-		}, true},
+		}, 200, true},
 		{"connection_refused", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "connection refused",
-		}, true},
+		}, 200, true},
 		{"empty_pattern", &heuristic.AnalysisResult{
 			ShouldRetry: true, Reason: "html_error_page",
-		}, true},
+		}, 200, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, shouldCircuitBreak(tt.result))
+			assert.Equal(t, tt.expected, shouldCircuitBreak(tt.result, tt.httpStatusCode))
 		})
 	}
 }
