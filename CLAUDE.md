@@ -217,6 +217,26 @@ curl http://localhost:3069/ready
 curl "http://localhost:3069/ready?detailed=true"
 ```
 
+### Admin Endpoints
+
+**Circuit Breaker Clear** (`POST /admin/circuit-breaker/clear/{serviceId}`)
+Clears all circuit breaker state (in-memory + Redis) for a specific service. This is the only reliable way to reset circuit breaker state — Redis DEL alone is insufficient because `refreshFromRedis` merges local in-memory entries back.
+
+Must be called on each pod individually since in-memory state is per-pod.
+```bash
+# Port-forward to a pod first
+kubectl --context pnf -n <namespace> port-forward <pod> 13069:3069 &
+
+# Clear circuit breaker state for a service
+curl -X POST http://localhost:13069/admin/circuit-breaker/clear/near
+# Response: {"service_id":"near","cleared_domains":3,"message":"circuit breaker state cleared (in-memory + Redis)"}
+```
+
+**When to use:**
+- After deploying a fix for a bug that caused false positive circuit breaker lockouts
+- When a domain is stuck in circuit breaker state due to a transient issue that has resolved
+- Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis
+
 ## Testing Strategy
 
 - **Unit Tests** - Standard Go tests with `-short` flag
