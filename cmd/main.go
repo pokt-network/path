@@ -263,7 +263,7 @@ func main() {
 
 	// Create domain circuit breaker for cross-pod broken domain tracking.
 	// Uses the same Redis client as leader election. Nil-safe (local-only mode if no Redis).
-	domainCircuitBreaker := gateway.NewDomainCircuitBreaker(redisClient)
+	domainCircuitBreaker := gateway.NewDomainCircuitBreaker(redisClient, logger)
 
 	healthCheckExecutor, leaderElector := setupHealthCheckExecutor(
 		backgroundCtx,

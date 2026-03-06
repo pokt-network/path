@@ -69,6 +69,10 @@ type AnalysisResult struct {
 
 	// Details provides additional human-readable context for debugging.
 	Details string
+
+	// MatchedPattern is the specific error pattern that matched (from Tier 3 indicator analysis).
+	// Empty for non-indicator results.
+	MatchedPattern string
 }
 
 // AnalyzerConfig holds configuration options for the response analyzer.

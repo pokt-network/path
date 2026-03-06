@@ -237,11 +237,34 @@ func IndicatorAnalysisToResult(ir IndicatorResult) AnalysisResult {
 	}
 
 	return AnalysisResult{
-		ShouldRetry: true,
-		Confidence:  ir.Confidence,
-		Reason:      "error_indicator_" + ir.Category.String(),
-		Structure:   StructureValid,
-		Details:     "Detected error pattern: " + ir.Pattern,
+		ShouldRetry:    true,
+		Confidence:     ir.Confidence,
+		Reason:         "error_indicator_" + ir.Category.String(),
+		Structure:      StructureValid,
+		Details:        "Detected error pattern: " + ir.Pattern,
+		MatchedPattern: ir.Pattern,
+	}
+}
+
+// IsArchivalRelatedError returns true if the indicator pattern is an archival/pruning error.
+// These errors are expected from non-archival nodes and should NOT trigger domain-level
+// circuit breaking — the domain isn't broken, it just doesn't have historical state.
+// Retrying on a different (archival-capable) supplier is correct, but punishing the
+// domain for a capability mismatch causes death spirals where all domains get locked out.
+func IsArchivalRelatedError(pattern string) bool {
+	switch pattern {
+	case "historical state",
+		"state has been pruned",
+		"is pruned",
+		"state not available",
+		"haven't been fully indexed",
+		"not been fully indexed",
+		"missing trie node",
+		"block has been pruned",
+		"height is not available":
+		return true
+	default:
+		return false
 	}
 }
 

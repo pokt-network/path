@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/pokt-network/path/protocol"
@@ -25,11 +26,12 @@ const defaultMaxTTL = 30 * time.Minute
 // Hot path cost: zero Redis calls (reads from local cache).
 // Cache is lazily refreshed from Redis every cacheTTL (5s default).
 type DomainCircuitBreaker struct {
-	redisClient *redis.Client // nil = local-only mode (no cross-pod sharing)
-	keyPrefix   string        // "path:gw:circuit:"
-	defaultTTL  time.Duration // base TTL for first break (1m default)
-	maxTTL      time.Duration // maximum TTL cap (30m default)
-	cacheTTL    time.Duration // how often to refresh local cache from Redis (5s default)
+	redisClient *redis.Client  // nil = local-only mode (no cross-pod sharing)
+	logger      polylog.Logger // logger for circuit break events
+	keyPrefix   string         // "path:gw:circuit:"
+	defaultTTL  time.Duration  // base TTL for first break (1m default)
+	maxTTL      time.Duration  // maximum TTL cap (30m default)
+	cacheTTL    time.Duration  // how often to refresh local cache from Redis (5s default)
 	mu          sync.RWMutex
 	cache       map[string]*circuitCacheEntry
 }
@@ -37,7 +39,8 @@ type DomainCircuitBreaker struct {
 // brokenDomainState tracks break state for a single domain.
 type brokenDomainState struct {
 	expiry   time.Time
-	hitCount int // number of times this domain has been marked broken
+	hitCount int    // number of times this domain has been marked broken
+	reason   string // why the domain was last marked broken (for diagnostics)
 }
 
 // circuitCacheEntry holds the cached broken domains for a single service.
@@ -51,9 +54,10 @@ type circuitCacheEntry struct {
 
 // NewDomainCircuitBreaker creates a new circuit breaker.
 // Pass nil for redisClient to run in local-only mode (no cross-pod sharing).
-func NewDomainCircuitBreaker(redisClient *redis.Client) *DomainCircuitBreaker {
+func NewDomainCircuitBreaker(redisClient *redis.Client, logger polylog.Logger) *DomainCircuitBreaker {
 	return &DomainCircuitBreaker{
 		redisClient: redisClient,
+		logger:      logger,
 		keyPrefix:   "path:gw:circuit:",
 		defaultTTL:  1 * time.Minute,
 		maxTTL:      defaultMaxTTL,
@@ -82,7 +86,8 @@ func (cb *DomainCircuitBreaker) escalatedTTL(hitCount int) time.Duration {
 // MarkBroken marks a domain as broken for the given service.
 // If the domain is already broken, the hit count is incremented and the TTL escalates.
 // Updates local cache immediately and writes to Redis fire-and-forget.
-func (cb *DomainCircuitBreaker) MarkBroken(ctx context.Context, serviceID, domain string) {
+// The reason parameter is logged to help diagnose why domains are being circuit-broken.
+func (cb *DomainCircuitBreaker) MarkBroken(ctx context.Context, serviceID, domain, reason string) {
 	now := time.Now()
 
 	// Update local cache immediately
@@ -104,12 +109,28 @@ func (cb *DomainCircuitBreaker) MarkBroken(ctx context.Context, serviceID, domai
 
 	ttl := cb.escalatedTTL(hitCount)
 	expiry := now.Add(ttl)
-	entry.domains[domain] = brokenDomainState{expiry: expiry, hitCount: hitCount}
+	entry.domains[domain] = brokenDomainState{expiry: expiry, hitCount: hitCount, reason: reason}
 	cb.mu.Unlock()
 
-	// Write to Redis (fire-and-forget) — format: "unixSeconds:hitCount"
+	// Always log circuit break events at error level for production visibility.
+	// This is critical for diagnosing why domains get locked out.
+	cb.logger.Error().
+		Str("service_id", serviceID).
+		Str("domain", domain).
+		Str("reason", reason).
+		Int("hit_count", hitCount).
+		Dur("ttl", ttl).
+		Time("expiry", expiry).
+		Msg("Circuit breaker: domain marked broken")
+
+	// Write to Redis (fire-and-forget) — format: "unixSeconds:hitCount:reason"
+	// The reason is truncated to 200 chars to keep Redis values manageable.
 	if cb.redisClient != nil {
-		val := fmt.Sprintf("%d:%d", expiry.Unix(), hitCount)
+		truncatedReason := reason
+		if len(truncatedReason) > 200 {
+			truncatedReason = truncatedReason[:200]
+		}
+		val := fmt.Sprintf("%d:%d:%s", expiry.Unix(), hitCount, truncatedReason)
 		cb.redisClient.HSet(ctx, cb.keyPrefix+serviceID, domain, val)
 	}
 }
@@ -173,24 +194,37 @@ func (cb *DomainCircuitBreaker) refreshLocal(serviceID string) map[string]bool {
 	return result
 }
 
-// parseRedisValue parses a Redis value in either the new "expiry:hitCount" format
-// or the legacy "expiry" format (backward compatible).
-func parseRedisValue(val string) (expiryUnix int64, hitCount int, ok bool) {
-	if parts := strings.SplitN(val, ":", 2); len(parts) == 2 {
-		// New format: "unixSeconds:hitCount"
+// parseRedisValue parses a Redis value in one of three formats (backward compatible):
+//   - "unixSeconds:hitCount:reason" (current format with diagnostics)
+//   - "unixSeconds:hitCount" (legacy format without reason)
+//   - "unixSeconds" (oldest format, hitCount defaults to 1)
+func parseRedisValue(val string) (expiryUnix int64, hitCount int, reason string, ok bool) {
+	parts := strings.SplitN(val, ":", 3)
+	switch len(parts) {
+	case 3:
+		// Current format: "unixSeconds:hitCount:reason"
 		expiry, err1 := strconv.ParseInt(parts[0], 10, 64)
 		hits, err2 := strconv.Atoi(parts[1])
 		if err1 != nil || err2 != nil {
-			return 0, 0, false
+			return 0, 0, "", false
 		}
-		return expiry, hits, true
+		return expiry, hits, parts[2], true
+	case 2:
+		// Legacy format: "unixSeconds:hitCount"
+		expiry, err1 := strconv.ParseInt(parts[0], 10, 64)
+		hits, err2 := strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil {
+			return 0, 0, "", false
+		}
+		return expiry, hits, "", true
+	default:
+		// Oldest format: just "unixSeconds"
+		expiry, err := strconv.ParseInt(val, 10, 64)
+		if err != nil {
+			return 0, 0, "", false
+		}
+		return expiry, 1, "", true
 	}
-	// Legacy format: just "unixSeconds"
-	expiry, err := strconv.ParseInt(val, 10, 64)
-	if err != nil {
-		return 0, 0, false
-	}
-	return expiry, 1, true
 }
 
 // refreshFromRedis fetches broken domains from Redis and updates local cache.
@@ -208,7 +242,7 @@ func (cb *DomainCircuitBreaker) refreshFromRedis(ctx context.Context, serviceID 
 	var expiredFields []string
 
 	for domain, redisVal := range vals {
-		expiryUnix, hitCount, parseOk := parseRedisValue(redisVal)
+		expiryUnix, hitCount, reason, parseOk := parseRedisValue(redisVal)
 		if !parseOk {
 			expiredFields = append(expiredFields, domain)
 			continue
@@ -217,6 +251,7 @@ func (cb *DomainCircuitBreaker) refreshFromRedis(ctx context.Context, serviceID 
 			domains[domain] = brokenDomainState{
 				expiry:   time.Unix(expiryUnix, 0),
 				hitCount: hitCount,
+				reason:   reason,
 			}
 		} else {
 			expiredFields = append(expiredFields, domain)

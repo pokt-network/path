@@ -8,6 +8,8 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/pokt-network/path/qos/heuristic"
 )
 
 func TestAddRelayMetadataHeaders_AlwaysPresent(t *testing.T) {
@@ -119,6 +121,66 @@ func TestIsDeceptiveResponsePattern(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.reason, func(t *testing.T) {
 			assert.Equal(t, tt.expected, isDeceptiveResponsePattern(tt.reason))
+		})
+	}
+}
+
+func TestShouldCircuitBreak(t *testing.T) {
+	tests := []struct {
+		name     string
+		result   *heuristic.AnalysisResult
+		expected bool
+	}{
+		// Nil heuristic result (transport errors, etc.) should circuit break
+		{"nil_result", nil, true},
+
+		// Archival-related errors should NOT circuit break
+		{"historical_state", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "historical state",
+		}, false},
+		{"state_pruned", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "state has been pruned",
+		}, false},
+		{"is_pruned", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "is pruned",
+		}, false},
+		{"state_not_available", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "state not available",
+		}, false},
+		{"not_indexed", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "haven't been fully indexed",
+		}, false},
+		{"missing_trie_node", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "missing trie node",
+		}, false},
+		{"block_pruned", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "block has been pruned",
+		}, false},
+		{"height_not_available", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "height is not available",
+		}, false},
+
+		// Non-archival errors SHOULD circuit break
+		{"failed_fallback", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "failed to call fallback",
+		}, true},
+		{"mdbx_panic", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "mdbx_panic",
+		}, true},
+		{"bad_gateway", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "bad gateway",
+		}, true},
+		{"connection_refused", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "connection refused",
+		}, true},
+		{"empty_pattern", &heuristic.AnalysisResult{
+			ShouldRetry: true, Reason: "html_error_page",
+		}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, shouldCircuitBreak(tt.result))
 		})
 	}
 }

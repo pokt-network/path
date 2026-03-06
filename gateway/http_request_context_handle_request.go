@@ -149,6 +149,23 @@ func recordHeuristicErrorToReputation(
 		Msg("Recorded heuristic error signal to reputation")
 }
 
+// shouldCircuitBreak returns true if the failure should trigger a domain-level circuit break.
+// Archival-related errors (pruned state, historical state not available) should NOT trigger
+// circuit breaks — the domain is working correctly, it just doesn't have archival data.
+// Retrying on a different supplier is correct, but marking the whole domain as broken
+// causes death spirals where ALL domains get locked out by archival request volume.
+func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult) bool {
+	if heuristicResult == nil {
+		// Non-heuristic failures (transport errors, HTTP errors) should circuit break
+		return true
+	}
+	// Archival-related errors are expected from non-archival nodes — don't circuit break
+	if heuristicResult.MatchedPattern != "" && heuristic.IsArchivalRelatedError(heuristicResult.MatchedPattern) {
+		return false
+	}
+	return true
+}
+
 // isDeceptiveResponsePattern returns true if the heuristic reason indicates a supplier
 // returning fabricated responses (empty/invalid results while passing health checks).
 // These warrant harsher penalties than generic server errors.
@@ -288,6 +305,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	var lastErr error
 	var lastStatusCode int
 	var lastEndpointAddr protocol.EndpointAddr
+	var lastCircuitBreakReason string              // reason for circuit breaking the previous endpoint's domain
+	var lastResponseSnippet string                 // truncated response that triggered the break
+	var lastHeuristicResult *heuristic.AnalysisResult // heuristic result from the last failed attempt
 
 	// Track endpoints and domains already tried to ensure retry rotation.
 	// Domain-level tracking prevents retrying different endpoints behind the same broken infrastructure.
@@ -336,10 +356,20 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			triedEndpoints[currentEndpointAddr] = true
 			markDomainTried(triedDomains, currentEndpointAddr)
 
-			// Mark domain broken in cross-pod circuit breaker so other pods skip it too
+			// Mark domain broken in cross-pod circuit breaker so other pods skip it too.
+			// Skip circuit breaking for archival-related errors — the domain is working
+			// correctly, it just doesn't have historical state data.
 			if rc.circuitBreaker != nil {
 				if domain := extractDomainFromEndpoint(currentEndpointAddr); domain != "" {
-					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain)
+					if shouldCircuitBreak(lastHeuristicResult) {
+						reason := fmt.Sprintf("retry: %s | status=%d | response=%s", lastCircuitBreakReason, lastStatusCode, lastResponseSnippet)
+						rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain, reason)
+					} else {
+						logger.Warn().
+							Str("domain", domain).
+							Str("reason", lastCircuitBreakReason).
+							Msg("Skipped circuit break for archival-related error (retrying on different supplier)")
+					}
 				}
 			}
 
@@ -525,6 +555,11 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					lastStatusCode = statusCode
 					lastEndpointAddr = endpointAddr
 					currentEndpointAddr = endpointAddr
+					lastHeuristicResult = checkResult.HeuristicResult
+					if checkResult.HeuristicResult != nil {
+						lastCircuitBreakReason = fmt.Sprintf("heuristic: %s (confidence=%.2f)", checkResult.HeuristicResult.Reason, checkResult.HeuristicResult.Confidence)
+					}
+					lastResponseSnippet = truncateResponse(responseBytesForHeuristic, 512)
 
 					logger.Warn().
 						Str("endpoint", string(endpointAddr)).
@@ -689,6 +724,17 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		lastErr = err
 		lastStatusCode = statusCode
 		lastEndpointAddr = endpointAddr
+
+		// Capture circuit break reason and response for diagnostics
+		lastHeuristicResult = checkResult.HeuristicResult
+		if err != nil {
+			lastCircuitBreakReason = fmt.Sprintf("transport_error: %v", err)
+		} else if checkResult.HeuristicResult != nil {
+			lastCircuitBreakReason = fmt.Sprintf("heuristic: %s (confidence=%.2f)", checkResult.HeuristicResult.Reason, checkResult.HeuristicResult.Confidence)
+		} else {
+			lastCircuitBreakReason = fmt.Sprintf("http_status_%d", statusCode)
+		}
+		lastResponseSnippet = truncateResponse(responseBytesForHeuristic, 512)
 
 		// Log the error/failure
 		if err != nil {
@@ -1017,7 +1063,8 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			// Mark domain broken in cross-pod circuit breaker
 			if rc.circuitBreaker != nil {
 				if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
-					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain)
+					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain,
+						fmt.Sprintf("batch_transport_error: %v", lastErr))
 				}
 			}
 			logger.Warn().Err(lastErr).Int("attempt", attempt).Msg("Request failed")
@@ -1045,10 +1092,24 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			recordHeuristicErrorToReputation(rc.context, rc.protocol.GetReputationService(),
 				rc.serviceID, resp.EndpointAddr, rpcType, checkResult.HeuristicResult, logger)
 		}
-		// Mark domain broken in cross-pod circuit breaker
+		// Mark domain broken in cross-pod circuit breaker.
+		// Skip circuit breaking for archival-related errors — the domain isn't broken.
 		if rc.circuitBreaker != nil {
 			if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
-				rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain)
+				if shouldCircuitBreak(checkResult.HeuristicResult) {
+					heuristicReason := "unknown"
+					if checkResult.HeuristicResult != nil {
+						heuristicReason = checkResult.HeuristicResult.Reason
+					}
+					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain,
+						fmt.Sprintf("batch_heuristic: %s | status=%d | response=%s",
+							heuristicReason, resp.HTTPStatusCode, truncateResponse(resp.Bytes, 512)))
+				} else {
+					logger.Warn().
+						Str("domain", domain).
+						Str("reason", checkResult.HeuristicResult.Reason).
+						Msg("Skipped circuit break for archival-related error (retrying on different supplier)")
+				}
 			}
 		}
 	}
@@ -1190,6 +1251,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	var lastErr error
 	var lastResponses []protocol.Response
 	var lastEndpointAddr protocol.EndpointAddr
+	var lastHeuristicResult *heuristic.AnalysisResult
 
 	// Track endpoints and domains already tried to ensure retry rotation
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
@@ -1229,10 +1291,18 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			triedEndpoints[currentEndpointAddr] = true
 			markDomainTried(triedDomains, currentEndpointAddr)
 
-			// Mark domain broken in cross-pod circuit breaker so other pods skip it too
+			// Mark domain broken in cross-pod circuit breaker so other pods skip it too.
+			// Skip circuit breaking for archival-related errors — the domain isn't broken.
 			if rc.circuitBreaker != nil {
 				if domain := extractDomainFromEndpoint(currentEndpointAddr); domain != "" {
-					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain)
+					if shouldCircuitBreak(lastHeuristicResult) {
+						rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain, fmt.Sprintf("parallel_retry: %v", lastErr))
+					} else {
+						logger.Warn().
+							Str("domain", domain).
+							Err(lastErr).
+							Msg("Skipped circuit break for archival-related error (retrying on different supplier)")
+					}
 				}
 			}
 
@@ -1411,6 +1481,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		lastErr = err
 		lastResponses = responses
 		lastEndpointAddr = endpointAddr
+		lastHeuristicResult = checkResult.HeuristicResult
 
 		// Log the error/failure
 		if err != nil {
@@ -1687,6 +1758,17 @@ func markDomainTried(triedDomains map[string]bool, endpoint protocol.EndpointAdd
 // extractDomainFromEndpoint extracts the host from an endpoint address.
 // Endpoint format: "<supplier_address>-<url>" e.g. "pokt1abc-https://rel.spacebelt.xyz"
 // Returns the host part of the URL, e.g. "rel.spacebelt.xyz".
+// truncateResponse returns a string-safe truncation of response bytes for logging.
+func truncateResponse(b []byte, maxLen int) string {
+	if len(b) == 0 {
+		return "<empty>"
+	}
+	if len(b) <= maxLen {
+		return string(b)
+	}
+	return string(b[:maxLen]) + "...(truncated)"
+}
+
 func extractDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 	endpointStr := string(endpoint)
 
