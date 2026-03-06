@@ -289,6 +289,31 @@ func (cb *DomainCircuitBreaker) refreshFromRedis(ctx context.Context, serviceID 
 	return result
 }
 
+// ClearService clears all circuit breaker state for a service, both in-memory and Redis.
+// This is the only reliable way to reset circuit breaker state because refreshFromRedis
+// merges local entries back, so a Redis DEL alone is insufficient.
+func (cb *DomainCircuitBreaker) ClearService(ctx context.Context, serviceID string) int {
+	cb.mu.Lock()
+	entry, ok := cb.cache[serviceID]
+	count := 0
+	if ok {
+		count = len(entry.domains)
+		delete(cb.cache, serviceID)
+	}
+	cb.mu.Unlock()
+
+	if cb.redisClient != nil {
+		cb.redisClient.Del(ctx, cb.keyPrefix+serviceID)
+	}
+
+	cb.logger.Info().
+		Str("service_id", serviceID).
+		Int("cleared_domains", count).
+		Msg("Circuit breaker: cleared all domains for service")
+
+	return count
+}
+
 // filterEndpointsByBrokenDomains removes endpoints whose domain is in the broken set.
 func filterEndpointsByBrokenDomains(endpoints protocol.EndpointAddrList, brokenDomains map[string]bool) protocol.EndpointAddrList {
 	filtered := make(protocol.EndpointAddrList, 0, len(endpoints))

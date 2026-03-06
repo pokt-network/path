@@ -336,6 +336,7 @@ func main() {
 		disqualifiedEndpointsReporter,
 		healthChecker,
 		config.GetRouterConfig(),
+		gtw.DomainCircuitBreaker,
 	)
 
 	// -------------------- Start PATH API Router --------------------

@@ -37,7 +37,7 @@
 - service_id: eth
   # Block time: ~12s | Source: chainspect.app, etherscan.io
   # Formula: 300s / 12s = 25 blocks for 5 minutes
-  sync_allowance: 25
+  sync_allowance: 2
   check_interval: 10s
   enabled: true
   checks:
@@ -85,7 +85,7 @@
 - service_id: poly
   # Block time: ~2s | Source: chainspect.app, polygonscan.com
   # Formula: 300s / 2s = 150 blocks for 5 minutes
-  sync_allowance: 150
+  sync_allowance: 20
   check_interval: 10s
   enabled: true
   checks:
@@ -758,7 +758,7 @@
 - service_id: arb-one
   # Block time: ~0.25s | Source: chainspect.app, arbiscan.io
   # Formula: 300s / 0.25s = 1200 blocks for 5 minutes
-  sync_allowance: 1200
+  sync_allowance: 20
   check_interval: 10s
   enabled: true
   checks:
@@ -850,7 +850,7 @@
 - service_id: base
   # Block time: ~2s | Source: chainspect.app, basescan.org
   # Formula: 300s / 2s = 150 blocks for 5 minutes
-  sync_allowance: 150
+  sync_allowance: 20
   check_interval: 10s
   enabled: true
   checks:
@@ -1612,7 +1612,7 @@
       timeout: 5s
       reputation_signal: critical_error
       sync_check: true
-    
+
     # Node list check - verifies the node has peers and is connected to the network
     - name: listNodes
       type: rest
@@ -1621,7 +1621,7 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
-    
+
     # Chain parameters check - verifies the node is on the correct chain
     # and can serve governance/config data
     - name: getChainParameters
@@ -1631,7 +1631,7 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
-    
+
     # JSON-RPC sync check - for suppliers that expose /jsonrpc
     # Validates EVM-compatible interface is also functional
     - name: eth_blockNumber

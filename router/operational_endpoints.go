@@ -251,3 +251,28 @@ func (r *router) configReporter() (ConfigReporter, bool) {
 	reporter, ok := r.healthChecker.ServiceIDReporter.(ConfigReporter)
 	return reporter, ok
 }
+
+// handleCircuitBreakerClear handles POST /admin/circuit-breaker/clear/{serviceId}
+// Clears both in-memory and Redis circuit breaker state for the given service.
+func (r *router) handleCircuitBreakerClear(w http.ResponseWriter, req *http.Request) {
+	if r.circuitBreakerAdmin == nil {
+		http.Error(w, `{"error":"circuit breaker not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	serviceID := strings.TrimPrefix(req.URL.Path, "/admin/circuit-breaker/clear/")
+	if serviceID == "" {
+		http.Error(w, `{"error":"service ID required: POST /admin/circuit-breaker/clear/{serviceId}"}`, http.StatusBadRequest)
+		return
+	}
+
+	count := r.circuitBreakerAdmin.ClearService(req.Context(), serviceID)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service_id":      serviceID,
+		"cleared_domains": count,
+		"message":         "circuit breaker state cleared (in-memory + Redis)",
+	})
+}
