@@ -212,8 +212,27 @@ func (e *HealthCheckExecutor) ShouldRunChecks() bool {
 
 // SetQoSInstances sets the QoS instances for sync check validation.
 // This should be called after QoS instances are created in the main application.
+// It also applies sync_allowance from any already-loaded external configs,
+// since InitExternalConfig may run before QoS instances are registered.
 func (e *HealthCheckExecutor) SetQoSInstances(instances map[protocol.ServiceID]QoSService) {
 	e.qosInstances = instances
+
+	// Apply sync_allowance from already-loaded external configs.
+	// InitExternalConfig runs before SetQoSInstances, so the initial
+	// SetSyncAllowance calls in refreshExternalConfig find an empty map.
+	e.externalConfigMu.RLock()
+	configs := e.externalConfigs
+	e.externalConfigMu.RUnlock()
+
+	for _, cfg := range configs {
+		if cfg.SyncAllowance != nil && *cfg.SyncAllowance > 0 {
+			if qosInstance, ok := instances[cfg.ServiceID]; ok {
+				if setter, ok := qosInstance.(interface{ SetSyncAllowance(uint64) }); ok {
+					setter.SetSyncAllowance(uint64(*cfg.SyncAllowance))
+				}
+			}
+		}
+	}
 }
 
 // GetServiceConfigs returns the merged health check configurations for all services.
