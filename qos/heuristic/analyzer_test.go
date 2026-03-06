@@ -656,6 +656,63 @@ func TestProtocolAnalysis_REST(t *testing.T) {
 	}
 }
 
+func TestRESTEmptyObjectPathWhitelist(t *testing.T) {
+	emptyObject := []byte(`{}`)
+
+	tests := []struct {
+		name          string
+		path          string
+		expectedRetry bool
+		expectedReason string
+	}{
+		{
+			name:          "No path — still flagged",
+			path:          "",
+			expectedRetry: true,
+			expectedReason: "rest_empty_object",
+		},
+		{
+			name:          "Tron /wallet/getaccount — whitelisted",
+			path:          "/wallet/getaccount",
+			expectedRetry: false,
+			expectedReason: "rest_no_error_indicator",
+		},
+		{
+			name:          "Tron /wallet/gettransactionbyid — whitelisted",
+			path:          "/wallet/gettransactionbyid",
+			expectedRetry: false,
+			expectedReason: "rest_no_error_indicator",
+		},
+		{
+			name:          "Tron /walletsolidity/getaccount — whitelisted",
+			path:          "/walletsolidity/getaccount",
+			expectedRetry: false,
+			expectedReason: "rest_no_error_indicator",
+		},
+		{
+			name:          "Cosmos REST path — not whitelisted",
+			path:          "/cosmos/base/tendermint/v1beta1/blocks/latest",
+			expectedRetry: true,
+			expectedReason: "rest_empty_object",
+		},
+		{
+			name:          "Root path — not whitelisted",
+			path:          "/",
+			expectedRetry: true,
+			expectedReason: "rest_empty_object",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ProtocolAnalysis(emptyObject, len(emptyObject), sharedtypes.RPCType_REST, tt.path)
+
+			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
+			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
+		})
+	}
+}
+
 func TestIndicatorAnalysis(t *testing.T) {
 	tests := []struct {
 		name             string

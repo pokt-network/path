@@ -3,9 +3,22 @@ package heuristic
 import (
 	"bytes"
 	"fmt"
+	"strings"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
+
+// restEmptyObjectValidPathPrefixes is the whitelist of REST path prefixes where a {} response
+// is valid. Tron's HTTP API returns {} for query endpoints when the entity doesn't exist
+// (e.g., /wallet/getaccount for unactivated accounts, /wallet/gettransactionbyid for
+// unknown tx hashes). Without this whitelist, the heuristic flags these as errors and the
+// circuit breaker locks out the domain.
+var restEmptyObjectValidPathPrefixes = []string{
+	// Tron full node HTTP API — query endpoints return {} when entity not found
+	"/wallet/",
+	// Tron solidity node HTTP API — same behavior as full node
+	"/walletsolidity/",
+}
 
 // emptyArrayValidMethods is the whitelist of JSON-RPC methods where "result":[] is valid.
 // For all other methods, an empty array result indicates a broken/misconfigured supplier.
@@ -88,7 +101,7 @@ func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType
 		return analyzeJSONRPC(prefix, fullLength, rpcType, jsonrpcMethod)
 
 	case sharedtypes.RPCType_REST:
-		return analyzeREST(prefix, fullLength)
+		return analyzeREST(prefix, fullLength, jsonrpcMethod)
 
 	case sharedtypes.RPCType_COMET_BFT:
 		// CometBFT uses JSON-RPC style responses
@@ -261,9 +274,13 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, 
 //   - {"error": "..."} or {"error": {...}}
 //   - {"code": N, "message": "..."}
 //   - {"status": "error", ...}
-func analyzeREST(prefix []byte, fullLength int) AnalysisResult {
-	// Empty JSON object ({} or { }) is never a valid REST API response.
-	// Suppliers returning {} are misconfigured or broken.
+//
+// The requestPath parameter carries the original HTTP request path (e.g., "/wallet/getaccount")
+// for path-aware validation. It may be empty if not available.
+func analyzeREST(prefix []byte, fullLength int, requestPath string) AnalysisResult {
+	// Empty JSON object ({} or { }) is usually a broken supplier returning canned responses.
+	// However, some APIs legitimately return {} (e.g., Tron's /wallet/getaccount for
+	// non-existent accounts). Check the path whitelist before flagging.
 	if fullLength <= 10 {
 		stripped := bytes.Map(func(r rune) rune {
 			if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
@@ -272,12 +289,14 @@ func analyzeREST(prefix []byte, fullLength int) AnalysisResult {
 			return r
 		}, prefix[:min(len(prefix), fullLength)])
 		if len(stripped) == 2 && stripped[0] == '{' && stripped[1] == '}' {
-			return AnalysisResult{
-				ShouldRetry: true,
-				Confidence:  0.80,
-				Reason:      "rest_empty_object",
-				Structure:   StructureValid,
-				Details:     "REST response is an empty JSON object",
+			if !isRESTEmptyObjectValid(requestPath) {
+				return AnalysisResult{
+					ShouldRetry: true,
+					Confidence:  0.80,
+					Reason:      "rest_empty_object",
+					Structure:   StructureValid,
+					Details:     "REST response is an empty JSON object",
+				}
 			}
 		}
 	}
@@ -339,6 +358,21 @@ func analyzeREST(prefix []byte, fullLength int) AnalysisResult {
 		Structure:   StructureValid,
 		Details:     "REST response has no obvious error indicators",
 	}
+}
+
+// isRESTEmptyObjectValid checks if the request path is whitelisted for empty object responses.
+// Returns true if {} is a valid response for this path (e.g., Tron /wallet/* query endpoints).
+func isRESTEmptyObjectValid(requestPath string) bool {
+	if requestPath == "" {
+		return false
+	}
+	lowerPath := strings.ToLower(requestPath)
+	for _, prefix := range restEmptyObjectValidPathPrefixes {
+		if strings.HasPrefix(lowerPath, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // emptyResultKind represents the type of empty result detected.

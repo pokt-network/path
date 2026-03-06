@@ -265,6 +265,9 @@ func (hr *hedgeRacer) isResponseHeuristicallyValid(result *hedgeResult) bool {
 	responseBytes := result.responses[0].Bytes
 	heuristicRPCType := hr.payload.EffectiveRPCType()
 	jsonrpcMethod := hr.payload.JSONRPCMethod
+	if jsonrpcMethod == "" {
+		jsonrpcMethod = hr.payload.Path
+	}
 
 	analysisResult := heuristic.Analyze(responseBytes, statusCode, heuristicRPCType, jsonrpcMethod)
 	if analysisResult.ShouldRetry {

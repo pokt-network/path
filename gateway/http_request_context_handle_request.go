@@ -260,6 +260,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	rpcType := payloads[0].RPCType
 	heuristicRPCType := payloads[0].EffectiveRPCType()
 	jsonrpcMethod := payloads[0].JSONRPCMethod
+	if jsonrpcMethod == "" {
+		jsonrpcMethod = payloads[0].Path
+	}
 	batchCount := len(payloads)
 
 	// Get retry configuration for the service
@@ -927,6 +930,9 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 ) (protocol.Response, error) {
 	heuristicRPCType := payload.EffectiveRPCType()
 	jsonrpcMethod := payload.JSONRPCMethod
+	if jsonrpcMethod == "" {
+		jsonrpcMethod = payload.Path
+	}
 	logger := parentLogger.With("payload_index", index)
 
 	// Get retry configuration
@@ -1183,6 +1189,9 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 	rpcType := payloads[0].RPCType
 	heuristicRPCType := payloads[0].EffectiveRPCType()
 	jsonrpcMethod := payloads[0].JSONRPCMethod
+	if jsonrpcMethod == "" {
+		jsonrpcMethod = payloads[0].Path
+	}
 	batchCount := len(payloads)
 
 	// Record batch size metric on completion (deferred)
