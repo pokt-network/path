@@ -683,7 +683,12 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	if responseHTTPStatusCode >= 200 && responseHTTPStatusCode < 300 {
 		// Extract JSON-RPC method from payload for method-aware heuristic checks.
 		// Use the JSONRPCMethod field set at QoS parsing time.
+		// For REST requests, JSONRPCMethod is empty — fall back to Path so that
+		// path-aware validation (e.g., Tron /wallet/ whitelist) works correctly.
 		jsonrpcMethod := payload.JSONRPCMethod
+		if jsonrpcMethod == "" {
+			jsonrpcMethod = payload.Path
+		}
 		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.heuristicRPCType, jsonrpcMethod)
 		if heuristicResult.ShouldRetry {
 			rc.logger.Debug().
