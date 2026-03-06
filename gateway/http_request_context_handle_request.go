@@ -575,7 +575,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 						lastStatusCode = hedgeResponses[0].HTTPStatusCode
 						lastEndpointAddr = hedgeResponses[0].EndpointAddr
 						currentEndpointAddr = hedgeResponses[0].EndpointAddr
+						lastResponseSnippet = truncateResponse(hedgeResponses[0].Bytes, 512)
 					}
+					lastCircuitBreakReason = fmt.Sprintf("hedge_failed: %v", hedgeErr)
 
 					logger.Warn().Err(hedgeErr).
 						Str("hedge_result", rc.hedgeResult).
