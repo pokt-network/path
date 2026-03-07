@@ -124,11 +124,12 @@ func (cb *DomainCircuitBreaker) MarkBroken(ctx context.Context, serviceID, domai
 		Msg("Circuit breaker: domain marked broken")
 
 	// Write to Redis (fire-and-forget) — format: "unixSeconds:hitCount:reason"
-	// The reason is truncated to 200 chars to keep Redis values manageable.
+	// The reason is truncated to 500 chars to keep Redis values manageable
+	// while preserving diagnostic info like method names.
 	if cb.redisClient != nil {
 		truncatedReason := reason
-		if len(truncatedReason) > 200 {
-			truncatedReason = truncatedReason[:200]
+		if len(truncatedReason) > 500 {
+			truncatedReason = truncatedReason[:500]
 		}
 		val := fmt.Sprintf("%d:%d:%s", expiry.Unix(), hitCount, truncatedReason)
 		cb.redisClient.HSet(ctx, cb.keyPrefix+serviceID, domain, val)

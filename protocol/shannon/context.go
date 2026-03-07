@@ -691,10 +691,12 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		}
 		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.heuristicRPCType, jsonrpcMethod)
 		if heuristicResult.ShouldRetry {
-			rc.logger.Debug().
+			rc.logger.Error().
 				Str("heuristic_reason", heuristicResult.Reason).
 				Float64("heuristic_confidence", heuristicResult.Confidence).
 				Str("heuristic_details", heuristicResult.Details).
+				Str("jsonrpc_method", jsonrpcMethod).
+				Str("request_path", payload.Path).
 				Int("response_size", len(deserializedResponse.Bytes)).
 				Int("http_status_code", responseHTTPStatusCode).
 				Msg("Heuristic analysis detected error in backend response - triggering retry")
@@ -709,8 +711,8 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 			// Wrap in raw_payload: format to allow proper error classification and reputation penalty.
 			// Use errHeuristicDetectedBackendError instead of errMalformedEndpointPayload because
 			// the response is valid JSON-RPC, it just indicates a backend issue (pruned state, etc.).
-			return defaultResponse, fmt.Errorf("raw_payload: %s: heuristic detected %s: %w",
-				string(deserializedResponse.Bytes), heuristicResult.Reason, errHeuristicDetectedBackendError)
+			return defaultResponse, fmt.Errorf("raw_payload: %s: heuristic detected %s (method=%s): %w",
+				string(deserializedResponse.Bytes), heuristicResult.Reason, jsonrpcMethod, errHeuristicDetectedBackendError)
 		}
 	}
 
