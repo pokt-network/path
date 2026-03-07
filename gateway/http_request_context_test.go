@@ -179,6 +179,11 @@ func TestShouldCircuitBreak(t *testing.T) {
 			ShouldRetry: true, MatchedPattern: "height is not available",
 		}, 200, false},
 
+		// Capability limitation errors should NOT circuit break (node works for other requests)
+		{"capability_limitation", &heuristic.AnalysisResult{
+			ShouldRetry: true, MatchedPattern: "capability_limitation",
+		}, 200, false},
+
 		// Non-archival errors SHOULD circuit break
 		{"failed_fallback", &heuristic.AnalysisResult{
 			ShouldRetry: true, MatchedPattern: "failed to call fallback",
@@ -203,7 +208,7 @@ func TestShouldCircuitBreak(t *testing.T) {
 		})
 	}
 
-	// Test error string fallback for archival patterns (hedge_failed path where heuristicResult is nil)
+	// Test error string fallback for archival/capability patterns (hedge_failed path where heuristicResult is nil)
 	archivalErrorTests := []struct {
 		name     string
 		err      error
@@ -212,6 +217,8 @@ func TestShouldCircuitBreak(t *testing.T) {
 		{"nil_result_with_archival_error", fmt.Errorf("raw_payload: historical state is not available"), false},
 		{"nil_result_with_missing_trie_node", fmt.Errorf("hedge_failed: missing trie node abc123"), false},
 		{"nil_result_with_state_pruned", fmt.Errorf("relay error: state has been pruned"), false},
+		{"nil_result_with_lite_fullnode", fmt.Errorf("raw_payload: this API is closed because this node is a lite fullnode"), false},
+		{"nil_result_with_api_not_supported", fmt.Errorf("raw_payload: api is not supported on this node"), false},
 		{"nil_result_with_non_archival_error", fmt.Errorf("connection refused"), true},
 		{"nil_result_with_nil_error", nil, true},
 	}

@@ -152,31 +152,34 @@ func recordHeuristicErrorToReputation(
 // shouldCircuitBreak returns true if the failure should trigger a domain-level circuit break.
 //
 // The following cases should NOT trigger circuit breaks:
-//   - Archival-related errors: domain is healthy, just doesn't have historical data
+//   - Capability limitation errors: domain is healthy, just can't serve this request type.
+//     This includes archival errors (missing historical data) and node type limitations
+//     (e.g., Tron lite fullnodes that can't serve certain API calls).
 //   - HTTP 4xx responses: client sent a bad request, domain correctly rejected it
 //
 // Only 5xx errors, transport failures, and heuristic-detected supplier errors should
 // circuit break, as those indicate the domain itself is broken.
 //
-// The lastErr parameter allows checking for archival patterns in the error string
-// when the heuristic result was lost during protocol-layer error propagation
-// (e.g., hedge_failed path where the protocol detected an archival error but
-// the heuristicResult is nil by the time it reaches the circuit breaker).
+// The lastErr parameter allows checking for capability limitation patterns in the error
+// string when the heuristic result was lost during protocol-layer error propagation
+// (e.g., hedge_failed path where the protocol detected an error but the heuristicResult
+// is nil by the time it reaches the circuit breaker).
 func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCode int, lastErr error) bool {
 	// HTTP 4xx = client error. The domain correctly rejected a bad request.
 	// Don't punish domains for clients sending malformed requests.
 	if httpStatusCode >= 400 && httpStatusCode < 500 {
 		return false
 	}
-	// Archival-related errors are expected from non-archival nodes — don't circuit break
+	// Capability limitation errors (archival, lite fullnode, etc.) are expected from
+	// nodes that can't serve certain request types — don't circuit break the domain.
 	if heuristicResult != nil {
-		if heuristicResult.MatchedPattern != "" && heuristic.IsArchivalRelatedError(heuristicResult.MatchedPattern) {
+		if heuristicResult.MatchedPattern != "" && heuristic.IsCapabilityLimitationError(heuristicResult.MatchedPattern) {
 			return false
 		}
 	} else if lastErr != nil {
 		// Heuristic result was lost during error propagation (e.g., protocol layer
-		// detected archival error → returned error → hedge_failed path → heuristicResult is nil).
-		// Fall back to checking the error string for archival patterns.
+		// detected error → returned error → hedge_failed path → heuristicResult is nil).
+		// Fall back to checking the error string for capability limitation patterns.
 		if heuristic.ErrorContainsArchivalPattern(lastErr.Error()) {
 			return false
 		}

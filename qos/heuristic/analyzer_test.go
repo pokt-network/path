@@ -74,6 +74,14 @@ func TestStructuralAnalysis(t *testing.T) {
 			minConfidence:  0.90,
 		},
 		{
+			name:           "plain text - Tron lite fullnode capability limitation",
+			response:       []byte("this API is closed because this node is a lite fullnode"),
+			expectedRetry:  true,
+			expectedStruct: StructureNonJSON,
+			expectedReason: "non_json_capability_limitation",
+			minConfidence:  0.90,
+		},
+		{
 			name:           "malformed JSON - unclosed object",
 			response:       []byte("{\"error\": \"test"),
 			expectedRetry:  true,

@@ -269,10 +269,28 @@ func IsArchivalRelatedError(pattern string) bool {
 	}
 }
 
-// archivalPatternSubstrings are the patterns to search for in error strings.
-// These correspond to the same patterns in IsArchivalRelatedError but are used
+// IsCapabilityLimitationError returns true if the pattern indicates a node capability
+// limitation rather than a broken domain. These include archival errors AND other
+// capability mismatches like Tron lite fullnodes that can't serve certain API calls.
+// The request should retry on a different supplier but should NOT circuit-break the domain.
+func IsCapabilityLimitationError(pattern string) bool {
+	if IsArchivalRelatedError(pattern) {
+		return true
+	}
+	switch pattern {
+	case "capability_limitation": // Tron lite fullnode, "api not supported" plain text responses
+		return true
+	default:
+		return false
+	}
+}
+
+// capabilityLimitationSubstrings are the patterns to search for in error strings.
+// These correspond to the same patterns in IsCapabilityLimitationError but are used
 // for substring matching when the structured AnalysisResult is not available.
-var archivalPatternSubstrings = []string{
+// Includes archival patterns AND capability limitation patterns (e.g., lite fullnode).
+var capabilityLimitationSubstrings = []string{
+	// Archival-related
 	"historical state",
 	"state has been pruned",
 	"is pruned",
@@ -282,14 +300,18 @@ var archivalPatternSubstrings = []string{
 	"missing trie node",
 	"block has been pruned",
 	"height is not available",
+	// Capability limitation (e.g., Tron lite fullnodes)
+	"lite fullnode",
+	"api is not supported",
 }
 
 // ErrorContainsArchivalPattern checks if an error string contains any archival-related
-// pattern. This is a fallback for when the structured heuristic AnalysisResult is not
-// available (e.g., protocol-layer errors propagated through the hedge_failed path).
+// or capability-limitation pattern. This is a fallback for when the structured heuristic
+// AnalysisResult is not available (e.g., protocol-layer errors propagated through the
+// hedge_failed path).
 func ErrorContainsArchivalPattern(errStr string) bool {
 	lower := strings.ToLower(errStr)
-	for _, pattern := range archivalPatternSubstrings {
+	for _, pattern := range capabilityLimitationSubstrings {
 		if strings.Contains(lower, pattern) {
 			return true
 		}
