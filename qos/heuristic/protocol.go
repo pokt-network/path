@@ -18,6 +18,10 @@ var restEmptyObjectValidPathPrefixes = []string{
 	"/wallet/",
 	// Tron solidity node HTTP API — same behavior as full node
 	"/walletsolidity/",
+	// Cosmos SDK gRPC-gateway REST API — many query endpoints return {} when the
+	// entity doesn't exist (e.g., /cosmos/slashing/v1beta1/signing_infos/{addr}
+	// returns {} for validators with no slashing record). This is valid behavior.
+	"/cosmos/",
 }
 
 // emptyArrayValidMethods is the whitelist of JSON-RPC methods where "result":[] is valid.
@@ -43,6 +47,13 @@ var emptyArrayValidMethods = map[string]bool{
 	"debug_getModifiedAccountsByNumber": true,
 	"debug_getModifiedAccountsByHash":   true,
 	"debug_traceCallMany":               true,
+
+	// === Sei (EVM-compatible aliases) ===
+	// Sei exposes eth_* methods with a sei_ prefix that behave identically
+	"sei_getLogs":          true,
+	"sei_getFilterChanges": true,
+	"sei_getFilterLogs":    true,
+	"sei_getBlockReceipts": true,
 
 	// === Solana ===
 	// Methods that return raw arrays (not wrapped in {context, value} objects)

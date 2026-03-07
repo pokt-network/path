@@ -690,10 +690,10 @@ func TestRESTEmptyObjectPathWhitelist(t *testing.T) {
 			expectedReason: "rest_no_error_indicator",
 		},
 		{
-			name:          "Cosmos REST path — not whitelisted",
+			name:          "Cosmos REST path — whitelisted",
 			path:          "/cosmos/base/tendermint/v1beta1/blocks/latest",
-			expectedRetry: true,
-			expectedReason: "rest_empty_object",
+			expectedRetry: false,
+			expectedReason: "rest_no_error_indicator",
 		},
 		{
 			name:          "Root path — not whitelisted",
