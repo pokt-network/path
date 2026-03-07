@@ -274,6 +274,135 @@ func TestProtocolAnalysis_CometBFT(t *testing.T) {
 	}
 }
 
+// TestProtocolAnalysis_CometBFTViaJSONRPC tests that CometBFT responses are correctly
+// identified even when rpcType is JSON_RPC (due to rpc_type_fallbacks routing).
+// CometBFT's "health" method returns {"result":{}} which is valid — but when routed
+// through JSON_RPC endpoints, the rpcType may arrive as JSON_RPC instead of COMET_BFT.
+// The method name must be used as a safety net.
+func TestProtocolAnalysis_CometBFTViaJSONRPC(t *testing.T) {
+	emptyObjectResponse := []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+
+	tests := []struct {
+		name           string
+		rpcType        sharedtypes.RPCType
+		method         string
+		expectedRetry  bool
+		expectedReason string
+	}{
+		{
+			name:           "health via COMET_BFT type — valid (existing behavior)",
+			rpcType:        sharedtypes.RPCType_COMET_BFT,
+			method:         "health",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "health via JSON_RPC type — valid (method-based detection)",
+			rpcType:        sharedtypes.RPCType_JSON_RPC,
+			method:         "health",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "health via path /health — valid (path-based detection)",
+			rpcType:        sharedtypes.RPCType_JSON_RPC,
+			method:         "/health",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "status via JSON_RPC type — valid (CometBFT method)",
+			rpcType:        sharedtypes.RPCType_JSON_RPC,
+			method:         "status",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "eth_blockNumber via JSON_RPC — still invalid (not CometBFT)",
+			rpcType:        sharedtypes.RPCType_JSON_RPC,
+			method:         "eth_blockNumber",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_empty_object_result",
+		},
+		{
+			name:           "unknown method via JSON_RPC — still invalid",
+			rpcType:        sharedtypes.RPCType_JSON_RPC,
+			method:         "",
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_empty_object_result",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ProtocolAnalysis(emptyObjectResponse, len(emptyObjectResponse), tt.rpcType, tt.method)
+			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
+			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
+		})
+	}
+}
+
+// TestProtocolAnalysis_RESTCometBFTPath tests that CometBFT GET responses
+// are not flagged as rest_protocol_mismatch. CometBFT endpoints always return
+// JSON-RPC formatted responses even for REST-style GET requests.
+func TestProtocolAnalysis_RESTCometBFTPath(t *testing.T) {
+	healthResponse := []byte(`{"jsonrpc":"2.0","id":-1,"result":{}}`)
+	statusResponse := []byte(`{"jsonrpc":"2.0","id":-1,"result":{"sync_info":{"latest_block_height":"123"}}}`)
+	gamingResponse := []byte(`{"jsonrpc":"2.0","id":1,"result":[]}`)
+
+	tests := []struct {
+		name           string
+		response       []byte
+		path           string
+		expectedRetry  bool
+		expectedReason string
+	}{
+		{
+			name:           "GET /health — JSON-RPC response is expected",
+			response:       healthResponse,
+			path:           "/health",
+			expectedRetry:  false,
+			expectedReason: "rest_no_error_indicator",
+		},
+		{
+			name:           "GET /status — JSON-RPC response is expected",
+			response:       statusResponse,
+			path:           "/status",
+			expectedRetry:  false,
+			expectedReason: "rest_no_error_indicator",
+		},
+		{
+			name:           "GET /block — JSON-RPC response is expected",
+			response:       gamingResponse,
+			path:           "/block",
+			expectedRetry:  false,
+			expectedReason: "rest_no_error_indicator",
+		},
+		{
+			name:           "GET /cosmos/staking — JSON-RPC response IS protocol mismatch",
+			response:       healthResponse,
+			path:           "/cosmos/staking/v1beta1/validators",
+			expectedRetry:  true,
+			expectedReason: "rest_protocol_mismatch",
+		},
+		{
+			name:           "GET / — JSON-RPC response IS protocol mismatch",
+			response:       healthResponse,
+			path:           "/",
+			expectedRetry:  true,
+			expectedReason: "rest_protocol_mismatch",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ProtocolAnalysis(tt.response, len(tt.response), sharedtypes.RPCType_REST, tt.path)
+			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
+			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
+		})
+	}
+}
+
 func TestProtocolAnalysis_MethodAwareEmptyArray(t *testing.T) {
 	emptyArrayResponse := []byte(`{"jsonrpc":"2.0","id":1,"result":[]}`)
 

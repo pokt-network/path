@@ -24,6 +24,86 @@ var restEmptyObjectValidPathPrefixes = []string{
 	"/cosmos/",
 }
 
+// cometBFTPathPrefixes are REST-style paths that correspond to CometBFT RPC endpoints.
+// CometBFT nodes ALWAYS return JSON-RPC formatted responses (e.g., {"jsonrpc":"2.0","id":-1,"result":{}})
+// even for GET requests. This is NOT a protocol mismatch — it's the expected CometBFT behavior.
+// Without this list, analyzeREST flags these valid responses as "rest_protocol_mismatch".
+var cometBFTPathPrefixes = []string{
+	"/health",
+	"/status",
+	"/block",
+	"/commit",
+	"/validators",
+	"/genesis",
+	"/net_info",
+	"/consensus_state",
+	"/dump_consensus_state",
+	"/num_unconfirmed_txs",
+	"/tx",
+	"/tx_search",
+	"/block_search",
+	"/block_results",
+	"/header",
+	"/abci_info",
+	"/abci_query",
+	"/broadcast_tx",
+	"/subscribe",
+	"/unsubscribe",
+}
+
+// cometBFTMethods are JSON-RPC method names used by CometBFT.
+// When the heuristic sees one of these methods, it knows the response will be
+// CometBFT-formatted (JSON-RPC envelope) regardless of the detected rpcType.
+var cometBFTMethods = map[string]bool{
+	"health":               true,
+	"status":               true,
+	"block":                true,
+	"commit":               true,
+	"validators":           true,
+	"genesis":              true,
+	"net_info":             true,
+	"consensus_state":      true,
+	"dump_consensus_state": true,
+	"num_unconfirmed_txs":  true,
+	"tx":                   true,
+	"tx_search":            true,
+	"block_search":         true,
+	"block_results":        true,
+	"header":               true,
+	"header_by_hash":       true,
+	"abci_info":            true,
+	"abci_query":           true,
+	"broadcast_tx_sync":    true,
+	"broadcast_tx_async":   true,
+	"broadcast_tx_commit":  true,
+	"subscribe":            true,
+	"unsubscribe":          true,
+	"unsubscribe_all":      true,
+}
+
+// isCometBFTPath checks if a request path corresponds to a CometBFT RPC endpoint.
+func isCometBFTPath(path string) bool {
+	for _, prefix := range cometBFTPathPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// isCometBFTMethod checks if a JSON-RPC method name or path is a CometBFT method.
+// Handles both direct method names ("health") and path-based methods ("/health").
+func isCometBFTMethod(method string) bool {
+	if cometBFTMethods[method] {
+		return true
+	}
+	// Also check path-style (e.g., "/health" → "health")
+	if strings.HasPrefix(method, "/") {
+		return cometBFTMethods[strings.TrimPrefix(method, "/")]
+	}
+	return false
+}
+
 // emptyArrayValidMethods is the whitelist of JSON-RPC methods where "result":[] is valid.
 // For all other methods, an empty array result indicates a broken/misconfigured supplier.
 var emptyArrayValidMethods = map[string]bool{
@@ -152,8 +232,11 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, 
 		// an object has mandatory fields. This is a strong signal of a broken/lazy supplier.
 		// For CometBFT: "result":{} IS valid — the "health" method returns an empty object
 		// when the node is healthy. Skip the empty object check for CometBFT.
+		// Also skip if the method is a known CometBFT method — CometBFT can be routed
+		// through JSON_RPC endpoints (via rpc_type_fallbacks), so rpcType may be JSON_RPC
+		// even though the response is a valid CometBFT response.
 		emptyType := emptyResultType(prefix)
-		if emptyType == emptyObject && rpcType != sharedtypes.RPCType_COMET_BFT {
+		if emptyType == emptyObject && rpcType != sharedtypes.RPCType_COMET_BFT && !isCometBFTMethod(jsonrpcMethod) {
 			return AnalysisResult{
 				ShouldRetry: true,
 				Confidence:  0.95,
@@ -316,7 +399,11 @@ func analyzeREST(prefix []byte, fullLength int, requestPath string) AnalysisResu
 	// Real Cosmos SDK REST endpoints never return JSON-RPC envelopes.
 	// Gaming suppliers (e.g., spacebelt.xyz) return canned {"jsonrpc":"2.0","id":1,"result":[]}
 	// for ALL requests regardless of protocol type.
-	if bytes.Contains(prefix, jsonrpcVersionField) {
+	//
+	// EXCEPTION: CometBFT endpoints (e.g., /health, /status, /block) ALWAYS return
+	// JSON-RPC formatted responses even for GET requests. This is expected CometBFT
+	// behavior, not a protocol mismatch. Skip the check for CometBFT paths.
+	if bytes.Contains(prefix, jsonrpcVersionField) && !isCometBFTPath(requestPath) {
 		return AnalysisResult{
 			ShouldRetry: true,
 			Confidence:  0.95,
