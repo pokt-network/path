@@ -1129,19 +1129,19 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		// Skip circuit breaking for archival-related errors — the domain isn't broken.
 		if rc.circuitBreaker != nil {
 			if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
+				heuristicReason := "unknown"
+				if checkResult.HeuristicResult != nil {
+					heuristicReason = checkResult.HeuristicResult.Reason
+				}
 				if shouldCircuitBreak(checkResult.HeuristicResult, resp.HTTPStatusCode, nil) {
-					heuristicReason := "unknown"
-					if checkResult.HeuristicResult != nil {
-						heuristicReason = checkResult.HeuristicResult.Reason
-					}
 					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain,
 						fmt.Sprintf("batch_heuristic: %s | status=%d | response=%s",
 							heuristicReason, resp.HTTPStatusCode, truncateResponse(resp.Bytes, 512)))
 				} else {
 					logger.Warn().
 						Str("domain", domain).
-						Str("reason", checkResult.HeuristicResult.Reason).
-						Msg("Skipped circuit break for archival-related error (retrying on different supplier)")
+						Str("reason", heuristicReason).
+						Msg("Skipped circuit break for capability limitation error (retrying on different supplier)")
 				}
 			}
 		}
