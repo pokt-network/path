@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"testing"
 
@@ -198,7 +199,26 @@ func TestShouldCircuitBreak(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, shouldCircuitBreak(tt.result, tt.httpStatusCode))
+			assert.Equal(t, tt.expected, shouldCircuitBreak(tt.result, tt.httpStatusCode, nil))
+		})
+	}
+
+	// Test error string fallback for archival patterns (hedge_failed path where heuristicResult is nil)
+	archivalErrorTests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{"nil_result_with_archival_error", fmt.Errorf("raw_payload: historical state is not available"), false},
+		{"nil_result_with_missing_trie_node", fmt.Errorf("hedge_failed: missing trie node abc123"), false},
+		{"nil_result_with_state_pruned", fmt.Errorf("relay error: state has been pruned"), false},
+		{"nil_result_with_non_archival_error", fmt.Errorf("connection refused"), true},
+		{"nil_result_with_nil_error", nil, true},
+	}
+
+	for _, tt := range archivalErrorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, shouldCircuitBreak(nil, 200, tt.err))
 		})
 	}
 }

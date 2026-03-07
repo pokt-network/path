@@ -157,19 +157,33 @@ func recordHeuristicErrorToReputation(
 //
 // Only 5xx errors, transport failures, and heuristic-detected supplier errors should
 // circuit break, as those indicate the domain itself is broken.
-func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCode int) bool {
+//
+// The lastErr parameter allows checking for archival patterns in the error string
+// when the heuristic result was lost during protocol-layer error propagation
+// (e.g., hedge_failed path where the protocol detected an archival error but
+// the heuristicResult is nil by the time it reaches the circuit breaker).
+func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCode int, lastErr error) bool {
 	// HTTP 4xx = client error. The domain correctly rejected a bad request.
 	// Don't punish domains for clients sending malformed requests.
 	if httpStatusCode >= 400 && httpStatusCode < 500 {
 		return false
 	}
-	if heuristicResult == nil {
-		// Non-heuristic failures (transport errors, HTTP errors) should circuit break
-		return true
-	}
 	// Archival-related errors are expected from non-archival nodes — don't circuit break
-	if heuristicResult.MatchedPattern != "" && heuristic.IsArchivalRelatedError(heuristicResult.MatchedPattern) {
-		return false
+	if heuristicResult != nil {
+		if heuristicResult.MatchedPattern != "" && heuristic.IsArchivalRelatedError(heuristicResult.MatchedPattern) {
+			return false
+		}
+	} else if lastErr != nil {
+		// Heuristic result was lost during error propagation (e.g., protocol layer
+		// detected archival error → returned error → hedge_failed path → heuristicResult is nil).
+		// Fall back to checking the error string for archival patterns.
+		if heuristic.ErrorContainsArchivalPattern(lastErr.Error()) {
+			return false
+		}
+	}
+	if heuristicResult == nil && lastErr == nil {
+		// No heuristic and no error context — transport failure, should circuit break
+		return true
 	}
 	return true
 }
@@ -372,7 +386,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			// correctly, it just doesn't have historical state data.
 			if rc.circuitBreaker != nil {
 				if domain := extractDomainFromEndpoint(currentEndpointAddr); domain != "" {
-					if shouldCircuitBreak(lastHeuristicResult, lastStatusCode) {
+					if shouldCircuitBreak(lastHeuristicResult, lastStatusCode, lastErr) {
 						reason := fmt.Sprintf("retry: %s | status=%d | response=%s", lastCircuitBreakReason, lastStatusCode, lastResponseSnippet)
 						rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain, reason)
 					} else {
@@ -1112,7 +1126,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		// Skip circuit breaking for archival-related errors — the domain isn't broken.
 		if rc.circuitBreaker != nil {
 			if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
-				if shouldCircuitBreak(checkResult.HeuristicResult, resp.HTTPStatusCode) {
+				if shouldCircuitBreak(checkResult.HeuristicResult, resp.HTTPStatusCode, nil) {
 					heuristicReason := "unknown"
 					if checkResult.HeuristicResult != nil {
 						heuristicReason = checkResult.HeuristicResult.Reason
@@ -1315,7 +1329,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			// Skip circuit breaking for archival-related errors — the domain isn't broken.
 			if rc.circuitBreaker != nil {
 				if domain := extractDomainFromEndpoint(currentEndpointAddr); domain != "" {
-					if shouldCircuitBreak(lastHeuristicResult, lastStatusCode) {
+					if shouldCircuitBreak(lastHeuristicResult, lastStatusCode, lastErr) {
 						rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain, fmt.Sprintf("parallel_retry: %v", lastErr))
 					} else {
 						logger.Warn().

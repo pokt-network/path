@@ -2,6 +2,7 @@ package heuristic
 
 import (
 	"bytes"
+	"strings"
 )
 
 // Tier 3: Error Indicator Pattern Detection
@@ -266,6 +267,34 @@ func IsArchivalRelatedError(pattern string) bool {
 	default:
 		return false
 	}
+}
+
+// archivalPatternSubstrings are the patterns to search for in error strings.
+// These correspond to the same patterns in IsArchivalRelatedError but are used
+// for substring matching when the structured AnalysisResult is not available.
+var archivalPatternSubstrings = []string{
+	"historical state",
+	"state has been pruned",
+	"is pruned",
+	"state not available",
+	"haven't been fully indexed",
+	"not been fully indexed",
+	"missing trie node",
+	"block has been pruned",
+	"height is not available",
+}
+
+// ErrorContainsArchivalPattern checks if an error string contains any archival-related
+// pattern. This is a fallback for when the structured heuristic AnalysisResult is not
+// available (e.g., protocol-layer errors propagated through the hedge_failed path).
+func ErrorContainsArchivalPattern(errStr string) bool {
+	lower := strings.ToLower(errStr)
+	for _, pattern := range archivalPatternSubstrings {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // QuickErrorCheck performs a fast check for obvious error indicators.
