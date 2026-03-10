@@ -323,6 +323,20 @@ func (n *NoOpQoS) StartBackgroundSync(ctx context.Context, syncInterval time.Dur
 			return
 		}
 
+		// Build a URL-only lookup for block heights.
+		// Multiple suppliers can share the same relay miner URL, and supplier addresses
+		// rotate across sessions. The block height is a property of the URL (the backend),
+		// not the supplier address, so we use URL as a fallback key when the full
+		// supplierAddr-URL key doesn't match the current session's endpoints.
+		urlHeights := make(map[string]uint64, len(heights))
+		for addr, h := range heights {
+			if url, err := addr.GetURL(); err == nil {
+				if existing, ok := urlHeights[url]; !ok || h > existing {
+					urlHeights[url] = h
+				}
+			}
+		}
+
 		n.endpointStore.mu.Lock()
 		updated := 0
 		for addr, redisHeight := range heights {
@@ -341,6 +355,25 @@ func (n *NoOpQoS) StartBackgroundSync(ctx context.Context, syncInterval time.Dur
 				updated++
 			}
 		}
+
+		// Second pass: populate session endpoints that weren't in Redis by URL fallback.
+		// This handles the case where a session has new supplier addresses for the same
+		// relay miner URL — the block height from the previous session's supplier applies.
+		for addr, ep := range n.endpointStore.endpoints {
+			if ep.blockHeight != 0 {
+				continue // already has a block height
+			}
+			url, err := addr.GetURL()
+			if err != nil {
+				continue
+			}
+			if h, ok := urlHeights[url]; ok {
+				ep.blockHeight = h
+				n.endpointStore.endpoints[addr] = ep
+				updated++
+			}
+		}
+
 		n.endpointStore.mu.Unlock()
 
 		if updated > 0 {
