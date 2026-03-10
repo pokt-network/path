@@ -442,17 +442,26 @@ func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, e
 }
 
 // selectHedgeEndpoint selects the best endpoint for hedge request.
-// Uses TOP-ranked endpoint excluding the primary.
+// Uses TOP-ranked endpoint excluding the primary and any endpoints from the same domain.
+// Domain-level exclusion prevents racing two endpoints behind the same infrastructure
+// (e.g., multiple suppliers staked against the same backend).
 func (hr *hedgeRacer) selectHedgeEndpoint(
 	endpoints protocol.EndpointAddrList,
 	excludePrimary protocol.EndpointAddr,
 ) protocol.EndpointAddr {
-	// Filter out primary endpoint
+	// Filter out primary endpoint AND any endpoints from the same domain
+	primaryDomain := extractDomainFromEndpoint(excludePrimary)
 	filtered := make(protocol.EndpointAddrList, 0, len(endpoints)-1)
 	for _, ep := range endpoints {
-		if ep != excludePrimary {
-			filtered = append(filtered, ep)
+		if ep == excludePrimary {
+			continue
 		}
+		if primaryDomain != "" {
+			if domain := extractDomainFromEndpoint(ep); domain == primaryDomain {
+				continue
+			}
+		}
+		filtered = append(filtered, ep)
 	}
 
 	if len(filtered) == 0 {
