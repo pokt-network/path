@@ -609,12 +609,21 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 // from the endpoint store. Used by fallback paths to avoid selecting stale infrastructure
 // when all endpoints fail normal validation.
 func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrList) protocol.EndpointAddrList {
+	serviceID := string(ss.serviceQoSConfig.GetServiceID())
 	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
 	if syncAllowance == 0 {
+		ss.logger.Warn().
+			Str("service_id", serviceID).
+			Int("endpoint_count", len(endpoints)).
+			Msg("filterStaleURLEndpoints: sync_allowance is 0, skipping stale URL filtering")
 		return endpoints
 	}
 	perceivedBlock := ss.perceivedBlockNumber.Load()
 	if perceivedBlock == 0 {
+		ss.logger.Warn().
+			Str("service_id", serviceID).
+			Int("endpoint_count", len(endpoints)).
+			Msg("filterStaleURLEndpoints: perceived_block is 0, skipping stale URL filtering")
 		return endpoints
 	}
 	minAllowed := perceivedBlock - syncAllowance
@@ -635,14 +644,30 @@ func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrL
 	ss.endpointStore.endpointsMu.RUnlock()
 
 	if len(urlBlockHeights) == 0 {
+		ss.logger.Warn().
+			Str("service_id", serviceID).
+			Int("endpoint_count", len(endpoints)).
+			Uint64("perceived_block", perceivedBlock).
+			Msg("filterStaleURLEndpoints: no block height data in endpoint store — health check pipeline may not be populating block heights")
 		return endpoints
 	}
 
 	filtered := make(protocol.EndpointAddrList, 0, len(endpoints))
+	removedCount := 0
 	for _, ep := range endpoints {
 		if url, err := ep.GetURL(); err == nil {
 			if urlBlock, ok := urlBlockHeights[url]; ok && urlBlock < minAllowed {
-				continue // skip stale URL
+				ss.logger.Warn().
+					Str("service_id", serviceID).
+					Str("url", url).
+					Uint64("url_block", urlBlock).
+					Uint64("min_allowed", minAllowed).
+					Uint64("perceived_block", perceivedBlock).
+					Uint64("sync_allowance", syncAllowance).
+					Uint64("blocks_behind", perceivedBlock-urlBlock).
+					Msg("filterStaleURLEndpoints: removed stale URL from fallback pool")
+				removedCount++
+				continue
 			}
 		}
 		filtered = append(filtered, ep)
@@ -650,8 +675,26 @@ func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrL
 
 	// If filtering removed everything, return original to avoid total failure
 	if len(filtered) == 0 {
+		ss.logger.Error().
+			Str("service_id", serviceID).
+			Int("total_endpoints", len(endpoints)).
+			Int("removed_count", removedCount).
+			Uint64("perceived_block", perceivedBlock).
+			Uint64("sync_allowance", syncAllowance).
+			Int("url_block_heights_count", len(urlBlockHeights)).
+			Msg("filterStaleURLEndpoints: ALL endpoints are stale — returning unfiltered to avoid total failure")
 		return endpoints
 	}
+
+	if removedCount > 0 {
+		ss.logger.Warn().
+			Str("service_id", serviceID).
+			Int("removed_count", removedCount).
+			Int("remaining_count", len(filtered)).
+			Int("total_count", len(endpoints)).
+			Msg("filterStaleURLEndpoints: removed stale URLs from fallback pool")
+	}
+
 	return filtered
 }
 
