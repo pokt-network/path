@@ -69,6 +69,10 @@ type AnalysisResult struct {
 
 	// Details provides additional human-readable context for debugging.
 	Details string
+
+	// MatchedPattern is the specific error pattern that matched (from Tier 3 indicator analysis).
+	// Empty for non-indicator results.
+	MatchedPattern string
 }
 
 // AnalyzerConfig holds configuration options for the response analyzer.
@@ -102,7 +106,9 @@ type Analyzer interface {
 	//   - responseBytes: The raw response payload
 	//   - httpStatusCode: The HTTP status code from the endpoint
 	//   - rpcType: The RPC type for protocol-specific analysis
+	//   - jsonrpcMethod: The JSON-RPC method name for method-aware checks (e.g., "eth_blockNumber").
+	//     Empty string means unknown/non-JSON-RPC — method-aware checks are skipped.
 	//
 	// Returns an AnalysisResult with retry recommendation and confidence level.
-	Analyze(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType) AnalysisResult
+	Analyze(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType, jsonrpcMethod string) AnalysisResult
 }

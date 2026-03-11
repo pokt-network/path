@@ -11,6 +11,10 @@ import (
 	"github.com/pokt-network/path/protocol"
 )
 
+// defaultEndpointTTL is how long an endpoint entry is kept without being seen
+// in an active session. Sessions last ~1 hour, so 2x gives buffer.
+const defaultEndpointTTL = 2 * time.Hour
+
 // endpointStore maintains QoS data on the set of available endpoints
 // for an EVM-based blockchain service.
 //
@@ -22,6 +26,40 @@ type endpointStore struct {
 
 	endpointsMu sync.RWMutex
 	endpoints   map[protocol.EndpointAddr]endpoint
+}
+
+// touchEndpoints updates the lastSeen timestamp for each endpoint address present in the store.
+// Called after filtering to mark endpoints that appeared in an active session.
+func (es *endpointStore) touchEndpoints(addrs protocol.EndpointAddrList) {
+	now := time.Now()
+	es.endpointsMu.Lock()
+	defer es.endpointsMu.Unlock()
+	for _, addr := range addrs {
+		if ep, found := es.endpoints[addr]; found {
+			ep.lastSeen = now
+			es.endpoints[addr] = ep
+		}
+	}
+}
+
+// sweepStaleEndpoints removes endpoints whose lastSeen is older than ttl (and non-zero).
+// Returns the list of removed endpoint addresses for Redis cleanup.
+func (es *endpointStore) sweepStaleEndpoints(ttl time.Duration) []protocol.EndpointAddr {
+	cutoff := time.Now().Add(-ttl)
+	es.endpointsMu.Lock()
+	defer es.endpointsMu.Unlock()
+
+	var removed []protocol.EndpointAddr
+	for addr, ep := range es.endpoints {
+		if ep.lastSeen.IsZero() {
+			continue // Never seen via filtering — skip (e.g., just created from Redis sync)
+		}
+		if ep.lastSeen.Before(cutoff) {
+			delete(es.endpoints, addr)
+			removed = append(removed, addr)
+		}
+	}
+	return removed
 }
 
 // updateEndpointsFromObservations creates/updates endpoint entries in the store based

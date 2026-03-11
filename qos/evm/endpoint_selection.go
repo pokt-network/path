@@ -100,11 +100,13 @@ func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.E
 				Msg("no archival-capable endpoints available for archival request")
 			return nil, fmt.Errorf("no archival-capable endpoints available for archival request")
 		}
-		// CODE_PATH: Standard fallback - random selection from all endpoints
+		// CODE_PATH: Standard fallback - random selection, but still exclude known-stale URLs
+		fallbackEndpoints := ss.filterStaleURLEndpoints(availableEndpoints)
 		logger.Warn().Str("code_path", "STANDARD_FALLBACK_RANDOM").
 			Int("total_endpoints", len(availableEndpoints)).
+			Int("fallback_endpoints", len(fallbackEndpoints)).
 			Msgf("selecting random endpoints because all endpoints failed validation from: %s", availableEndpoints.String())
-		return selector.RandomSelectMultiple(availableEndpoints, numEndpoints), nil
+		return selector.RandomSelectMultiple(fallbackEndpoints, numEndpoints), nil
 	}
 
 	// CODE_PATH: Selection success - using diversity-aware selection
@@ -140,8 +142,12 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 	validCount := len(filteredEndpointsAddr)
 	// Handle case where all endpoints failed validation
 	if validCount == 0 {
-		logger.Warn().Msgf("SELECTING A RANDOM ENDPOINT because all endpoints failed validation from: %s", availableEndpoints.String())
-		randomAvailableEndpointAddr := availableEndpoints[rand.Intn(availableCount)]
+		// Still exclude known-stale URLs from the fallback pool
+		fallbackEndpoints := ss.filterStaleURLEndpoints(availableEndpoints)
+		logger.Warn().
+			Int("fallback_endpoints", len(fallbackEndpoints)).
+			Msgf("SELECTING A RANDOM ENDPOINT because all endpoints failed validation from: %s", availableEndpoints.String())
+		randomAvailableEndpointAddr := fallbackEndpoints[rand.Intn(len(fallbackEndpoints))]
 		return EndpointSelectionResult{
 			SelectedEndpoint: randomAvailableEndpointAddr,
 			Metadata: EndpointSelectionMetadata{
@@ -199,12 +205,42 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 	}
 	endpointsCopy := make([]endpointData, len(availableEndpoints))
 
+	// Build a URL→blockHeight lookup from ALL store entries (not just available endpoints).
+	// This lets us validate fresh endpoints against known block heights for the same URL
+	// (different supplier addresses staked against the same backend infrastructure).
+	urlBlockHeights := make(map[string]uint64)
+
 	ss.endpointStore.endpointsMu.RLock()
+	for addr, ep := range ss.endpointStore.endpoints {
+		if ep.checkBlockNumber.parsedBlockNumberResponse != nil {
+			if url, err := addr.GetURL(); err == nil {
+				h := *ep.checkBlockNumber.parsedBlockNumberResponse
+				if existing, ok := urlBlockHeights[url]; !ok || h > existing {
+					urlBlockHeights[url] = h
+				}
+			}
+		}
+	}
 	for i, addr := range availableEndpoints {
 		ep, found := ss.endpointStore.endpoints[addr]
 		endpointsCopy[i] = endpointData{addr: addr, endpoint: ep, found: found}
 	}
 	ss.endpointStore.endpointsMu.RUnlock()
+
+	// Merge cached Redis URL block heights as fallback.
+	// This catches stale URLs that aren't in the local store yet
+	// (e.g., new supplier addresses after session rotation).
+	if cached := ss.redisURLBlockHeights.Load(); cached != nil {
+		for url, h := range *cached {
+			if existing, ok := urlBlockHeights[url]; !ok || h > existing {
+				urlBlockHeights[url] = h
+			}
+		}
+	}
+
+	// Touch endpoints to update lastSeen for stale endpoint cleanup.
+	// Uses a separate WLock call to avoid changing the read-heavy filtering path.
+	ss.endpointStore.touchEndpoints(availableEndpoints)
 
 	// Now iterate without holding the lock
 	var filteredEndpointsAddr protocol.EndpointAddrList
@@ -254,13 +290,45 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 				}
 			}
 
-			// Non-archival requests OR archival-confirmed fresh endpoints: allow through.
-			// It is valid for an endpoint to not be in the store yet (e.g., first request,
-			// no observations collected). It will be added to the store once observations are collected.
-			logger.Warn().
+			// Fresh endpoint: not in the store yet. Before allowing, check if another
+			// supplier's entry for the same URL has a known block height. This prevents
+			// new supplier addresses behind stale infrastructure from getting a "free pass".
+			syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
+			perceivedBlock := ss.perceivedBlockNumber.Load()
+			if syncAllowance > 0 && perceivedBlock > 0 {
+				if url, err := data.addr.GetURL(); err == nil {
+					if urlBlock, ok := urlBlockHeights[url]; ok {
+						minAllowed := perceivedBlock - syncAllowance
+						if urlBlock < minAllowed {
+							blocksBehind := int64(perceivedBlock) - int64(urlBlock)
+							invalidCount++
+							logger.Warn().
+								Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+								Str("url", url).
+								Uint64("url_block", urlBlock).
+								Uint64("perceived_block", perceivedBlock).
+								Uint64("sync_allowance", syncAllowance).
+								Int64("blocks_behind", blocksBehind).
+								Msg("⛔ Fresh endpoint filtered: URL has known stale block height from another supplier")
+
+							failureReason := qosobservations.EndpointValidationFailureReason_ENDPOINT_VALIDATION_FAILURE_REASON_BLOCK_NUMBER_BEHIND
+							failureDetails := fmt.Sprintf("fresh endpoint URL block height %d is %d blocks behind perceived %d", urlBlock, blocksBehind, perceivedBlock)
+							validationResults = append(validationResults, &qosobservations.EndpointValidationResult{
+								EndpointAddr:   string(data.addr),
+								Success:        false,
+								FailureReason:  &failureReason,
+								FailureDetails: &failureDetails,
+							})
+							continue
+						}
+					}
+				}
+			}
+
+			logger.Debug().
 				Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 				Uint64("sync_allowance", ss.serviceQoSConfig.getSyncAllowance()).
-				Msg("🔍 Sync allowance check SKIPPED (endpoint not yet in store - fresh endpoint)")
+				Msg("Fresh endpoint allowed (not yet in store)")
 
 			result := &qosobservations.EndpointValidationResult{
 				EndpointAddr: string(data.addr),
@@ -268,7 +336,6 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 			}
 			validationResults = append(validationResults, result)
 			filteredEndpointsAddr = append(filteredEndpointsAddr, data.addr)
-			logger.Debug().Msg("endpoint not in store - allowing as fresh endpoint")
 			continue
 		}
 
@@ -465,11 +532,12 @@ func (ss *serviceState) basicEndpointValidation(endpointAddr protocol.EndpointAd
 
 // isBlockNumberValid returns an error if:
 //   - The endpoint's block height is less than the perceived block height minus the sync allowance.
+//   - The endpoint has no block number observation but we have chain state (unknown block height
+//     is treated as potentially stale to prevent serving data from severely behind endpoints).
 //
 // Returns nil (passes) if:
 //   - sync_allowance is 0 (check disabled)
 //   - No perceived block number yet (no chain data to compare against)
-//   - Endpoint has no block number observation (no endpoint data to validate)
 //
 // Note: This function is lock-free - perceivedBlockNumber uses atomic operations.
 func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error {
@@ -492,14 +560,18 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 		return nil
 	}
 
-	// If endpoint has no block number observation, skip the check (no endpoint data to validate)
+	// If endpoint has no block number observation but we have chain state, filter it out.
+	// An endpoint with unknown block height could be severely behind (e.g., 58K blocks)
+	// and would serve stale data to clients. It's safer to skip it and use endpoints
+	// with known, validated block heights. The endpoint will become eligible once its
+	// block height is observed via health checks, Redis sync, or relay observations.
 	if check.parsedBlockNumberResponse == nil {
 		ss.logger.Warn().
 			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 			Uint64("perceived_block", perceivedBlock).
 			Uint64("sync_allowance", syncAllowance).
-			Msg("🔍 Sync allowance check SKIPPED (endpoint has no block number observation)")
-		return nil
+			Msg("⛔ Endpoint filtered: no block number observation (unknown block height treated as potentially stale)")
+		return fmt.Errorf("no block number observation with perceived block %d: %w", perceivedBlock, errNoBlockNumberObs)
 	}
 
 	// Dereference pointer to show actual block number instead of memory address in error logs
@@ -544,11 +616,119 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 	return nil
 }
 
+// filterStaleURLEndpoints removes endpoints whose URL has a known stale block height
+// from the endpoint store. Used by fallback paths to avoid selecting stale infrastructure
+// when all endpoints fail normal validation.
+func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrList) protocol.EndpointAddrList {
+	serviceID := string(ss.serviceQoSConfig.GetServiceID())
+	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
+	if syncAllowance == 0 {
+		ss.logger.Warn().
+			Str("service_id", serviceID).
+			Int("endpoint_count", len(endpoints)).
+			Msg("filterStaleURLEndpoints: sync_allowance is 0, skipping stale URL filtering")
+		return endpoints
+	}
+	perceivedBlock := ss.perceivedBlockNumber.Load()
+	if perceivedBlock == 0 {
+		ss.logger.Warn().
+			Str("service_id", serviceID).
+			Int("endpoint_count", len(endpoints)).
+			Msg("filterStaleURLEndpoints: perceived_block is 0, skipping stale URL filtering")
+		return endpoints
+	}
+	minAllowed := perceivedBlock - syncAllowance
+
+	// Build URL→blockHeight map from store
+	urlBlockHeights := make(map[string]uint64)
+	ss.endpointStore.endpointsMu.RLock()
+	for addr, ep := range ss.endpointStore.endpoints {
+		if ep.checkBlockNumber.parsedBlockNumberResponse != nil {
+			if url, err := addr.GetURL(); err == nil {
+				h := *ep.checkBlockNumber.parsedBlockNumberResponse
+				if existing, ok := urlBlockHeights[url]; !ok || h > existing {
+					urlBlockHeights[url] = h
+				}
+			}
+		}
+	}
+	ss.endpointStore.endpointsMu.RUnlock()
+
+	// Merge cached Redis URL block heights as fallback.
+	if cached := ss.redisURLBlockHeights.Load(); cached != nil {
+		for url, h := range *cached {
+			if existing, ok := urlBlockHeights[url]; !ok || h > existing {
+				urlBlockHeights[url] = h
+			}
+		}
+	}
+
+	if len(urlBlockHeights) == 0 {
+		ss.logger.Warn().
+			Str("service_id", serviceID).
+			Int("endpoint_count", len(endpoints)).
+			Uint64("perceived_block", perceivedBlock).
+			Msg("filterStaleURLEndpoints: no block height data in endpoint store — health check pipeline may not be populating block heights")
+		return endpoints
+	}
+
+	filtered := make(protocol.EndpointAddrList, 0, len(endpoints))
+	removedCount := 0
+	for _, ep := range endpoints {
+		if url, err := ep.GetURL(); err == nil {
+			if urlBlock, ok := urlBlockHeights[url]; ok && urlBlock < minAllowed {
+				ss.logger.Warn().
+					Str("service_id", serviceID).
+					Str("url", url).
+					Uint64("url_block", urlBlock).
+					Uint64("min_allowed", minAllowed).
+					Uint64("perceived_block", perceivedBlock).
+					Uint64("sync_allowance", syncAllowance).
+					Uint64("blocks_behind", perceivedBlock-urlBlock).
+					Msg("filterStaleURLEndpoints: removed stale URL from fallback pool")
+				removedCount++
+				continue
+			}
+		}
+		filtered = append(filtered, ep)
+	}
+
+	// If filtering removed everything, return original to avoid total failure
+	if len(filtered) == 0 {
+		ss.logger.Error().
+			Str("service_id", serviceID).
+			Int("total_endpoints", len(endpoints)).
+			Int("removed_count", removedCount).
+			Uint64("perceived_block", perceivedBlock).
+			Uint64("sync_allowance", syncAllowance).
+			Int("url_block_heights_count", len(urlBlockHeights)).
+			Msg("filterStaleURLEndpoints: ALL endpoints are stale — returning unfiltered to avoid total failure")
+		return endpoints
+	}
+
+	if removedCount > 0 {
+		ss.logger.Warn().
+			Str("service_id", serviceID).
+			Int("removed_count", removedCount).
+			Int("remaining_count", len(filtered)).
+			Int("total_count", len(endpoints)).
+			Msg("filterStaleURLEndpoints: removed stale URLs from fallback pool")
+	}
+
+	return filtered
+}
+
 // isChainIDValid returns an error if:
 //   - The endpoint has not had an observation of its response to a `eth_chainId` request.
 //   - The endpoint's chain ID does not match the expected chain ID in the service state.
 func (ss *serviceState) isChainIDValid(check endpointCheckChainID) error {
 	expectedChainID := ss.serviceQoSConfig.getEVMChainID()
+
+	// When no expected chain ID is configured (e.g., NewSimpleQoSInstance),
+	// chain ID validation is delegated to active health checks. Skip it here.
+	if expectedChainID == "" {
+		return nil
+	}
 
 	if check.chainID == nil {
 		ss.logger.Debug().

@@ -87,11 +87,12 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 	}
 
 	payload := protocol.Payload{
-		Data:    string(reqBz),
-		Method:  http.MethodPost, // Method is alway POST for Solana.
-		Path:    "",              // Path field is not used for Solana.
-		Headers: map[string]string{},
-		RPCType: sharedtypes.RPCType_JSON_RPC,
+		Data:          string(reqBz),
+		Method:        http.MethodPost, // Method is alway POST for Solana.
+		Path:          "",              // Path field is not used for Solana.
+		Headers:       map[string]string{},
+		RPCType:       sharedtypes.RPCType_JSON_RPC,
+		JSONRPCMethod: string(rc.JSONRPCReq.Method),
 	}
 
 	return []protocol.Payload{payload}

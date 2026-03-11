@@ -17,9 +17,11 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/observation"
 )
@@ -65,6 +67,12 @@ type Gateway struct {
 	// When enabled, sampled requests are queued for deep parsing (block height, chain ID, etc.)
 	// without blocking the hot path. This is optional - if nil, no async observation processing occurs.
 	ObservationQueue *ObservationQueue
+
+	// DomainCircuitBreaker tracks broken domains across pods via Redis.
+	// When any pod discovers a domain is returning errors, all pods skip that domain
+	// on initial attempts for a TTL window, avoiding wasted relay attempts.
+	// Optional - if nil, no cross-pod domain circuit breaking occurs.
+	DomainCircuitBreaker *DomainCircuitBreaker
 }
 
 // HandleServiceRequest implements PATH gateway's service request processing.
@@ -118,6 +126,7 @@ func (g Gateway) handleHTTPServiceRequest(
 		rpcTypeValidator:    g.RPCTypeValidator,
 		metricsReporter:     g.MetricsReporter,
 		observationQueue:    g.ObservationQueue,
+		circuitBreaker:      g.DomainCircuitBreaker,
 	}
 
 	defer func() {
@@ -218,6 +227,7 @@ func (g Gateway) handleWebSocketRequest(
 		protocol:            g.Protocol,
 		httpRequestParser:   g.HTTPRequestParser,
 		metricsReporter:     g.MetricsReporter,
+		circuitBreaker:      g.DomainCircuitBreaker,
 		// Note: We do NOT close messageObservationsChan here because Websocket connections
 		// outlive the HTTP handler. The channel will be closed when the Websocket actually disconnects.
 		messageObservationsChan: make(chan *observation.RequestResponseObservations, websocketBufferSize),
@@ -228,6 +238,16 @@ func (g Gateway) handleWebSocketRequest(
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ Error initializing websocket request context")
 		return
+	}
+
+	// Validate that the service supports websocket RPC type.
+	// This fails fast if "websocket" is not in the service's configured rpc_types.
+	if g.RPCTypeValidator != nil {
+		if err := g.RPCTypeValidator.ValidateRPCType(websocketRequestCtx.serviceID, sharedtypes.RPCType_WEBSOCKET); err != nil {
+			logger.Error().Err(err).Str("service_id", string(websocketRequestCtx.serviceID)).Msg("❌ WebSocket not supported for this service")
+			http.Error(w, fmt.Sprintf("WebSocket not supported for service %q", websocketRequestCtx.serviceID), http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Build the QoS context for the target service ID using the HTTP request.

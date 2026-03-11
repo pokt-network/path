@@ -2,6 +2,7 @@ package evm
 
 import (
 	"testing"
+	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
 	"github.com/stretchr/testify/assert"
@@ -134,6 +135,123 @@ func TestBlockHeightConsensus_ObservationCount(t *testing.T) {
 
 	count := consensus.GetObservationCount()
 	require.Equal(t, 3, count)
+}
+
+func TestExternalBlockFloor_OverridesWhenHigher(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+	consensus.SetExternalBlockGracePeriod(0) // Disable grace period for test
+
+	// Establish consensus at 80
+	consensus.AddObservation("endpoint1", 80)
+	consensus.AddObservation("endpoint2", 80)
+	consensus.AddObservation("endpoint3", 80)
+	assert.Equal(t, uint64(80), consensus.GetPerceivedBlock())
+
+	// Set external block height higher than consensus
+	consensus.SetExternalBlockHeight(100)
+	assert.Equal(t, uint64(100), consensus.GetExternalBlockHeight())
+
+	// Next observation should use external as floor
+	perceived := consensus.AddObservation("endpoint4", 80)
+	assert.Equal(t, uint64(100), perceived)
+}
+
+func TestExternalBlockFloor_IgnoredWhenLower(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+	consensus.SetExternalBlockGracePeriod(0) // Disable grace period for test
+
+	// Establish consensus at 100
+	consensus.AddObservation("endpoint1", 100)
+	consensus.AddObservation("endpoint2", 100)
+	consensus.AddObservation("endpoint3", 100)
+	assert.Equal(t, uint64(100), consensus.GetPerceivedBlock())
+
+	// Set external block height lower than consensus
+	consensus.SetExternalBlockHeight(80)
+
+	// Consensus should still be 100
+	perceived := consensus.AddObservation("endpoint4", 100)
+	assert.Equal(t, uint64(100), perceived)
+}
+
+func TestExternalBlockFloor_ZeroMeansDisabled(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+	consensus.SetExternalBlockGracePeriod(0) // Disable grace period for test
+
+	// Establish consensus at 50
+	consensus.AddObservation("endpoint1", 50)
+	consensus.AddObservation("endpoint2", 50)
+	consensus.AddObservation("endpoint3", 50)
+
+	// External block height is 0 (default / not set) — should have no effect
+	assert.Equal(t, uint64(0), consensus.GetExternalBlockHeight())
+	assert.Equal(t, uint64(50), consensus.GetPerceivedBlock())
+}
+
+func TestExternalBlockFloor_MultipleUpdates(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+	consensus.SetExternalBlockGracePeriod(0) // Disable grace period for test
+
+	// Establish consensus at 80
+	consensus.AddObservation("endpoint1", 80)
+	consensus.AddObservation("endpoint2", 80)
+	consensus.AddObservation("endpoint3", 80)
+
+	// Set external floor at 100, verify it's used as floor
+	consensus.SetExternalBlockHeight(100)
+	perceived := consensus.AddObservation("endpoint4", 80)
+	assert.Equal(t, uint64(100), perceived)
+
+	// Update external floor higher to 120
+	consensus.SetExternalBlockHeight(120)
+	perceived = consensus.AddObservation("endpoint5", 80)
+	assert.Equal(t, uint64(120), perceived)
+
+	// Internal consensus catches up to external floor — external no longer used.
+	// We need to gradually increase within sync_allowance to avoid outlier rejection.
+	// sync_allowance=10, multiplier=3, so max deviation from median is 30 blocks.
+	// Add enough observations at 110 (within 30 of median ~80) to shift the median.
+	for i := 0; i < 10; i++ {
+		consensus.AddObservation(protocol.EndpointAddr("fast"), 110)
+	}
+	// Now the median has shifted up, add observations at 125 (within 30 of new median)
+	for i := 0; i < 10; i++ {
+		consensus.AddObservation(protocol.EndpointAddr("faster"), 125)
+	}
+
+	// Consensus is now at 125, which is above the external floor of 120
+	perceived = consensus.GetPerceivedBlock()
+	assert.True(t, perceived >= 120, "perceived %d should be >= 120 (external floor)", perceived)
+}
+
+func TestExternalBlockFloor_GracePeriodDefersFloor(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+	// Set a short grace period — the floor should be deferred during this window
+	consensus.SetExternalBlockGracePeriod(200 * time.Millisecond)
+
+	// Establish consensus at 80
+	consensus.AddObservation("endpoint1", 80)
+	consensus.AddObservation("endpoint2", 80)
+	consensus.AddObservation("endpoint3", 80)
+
+	// Set external much higher
+	consensus.SetExternalBlockHeight(100)
+
+	// During grace period, external floor should NOT apply
+	perceived := consensus.AddObservation("endpoint4", 80)
+	assert.Equal(t, uint64(80), perceived, "external floor should be deferred during grace period")
+
+	// Wait for grace period to expire
+	time.Sleep(250 * time.Millisecond)
+
+	// After grace period, external floor should apply
+	perceived = consensus.AddObservation("endpoint5", 80)
+	assert.Equal(t, uint64(100), perceived, "external floor should apply after grace period")
 }
 
 func TestCalculateMedian(t *testing.T) {

@@ -234,17 +234,41 @@ func (p *Protocol) filterToHighestTier(
 	// Check if this request should be routed to probation endpoints
 	shouldRouteToProbation := selector.ShouldRouteToProbation()
 
-	// If probation routing is active, and we have probation endpoints, route to them
+	// If probation routing is active, and we have probation endpoints, include them
+	// alongside the highest-tier endpoints. This allows QoS to validate both:
+	// - Probation endpoints that pass validation get traffic (recovery works)
+	// - If all probation endpoints fail validation (e.g., stale block height),
+	//   QoS falls back to the healthy tier endpoints instead of serving stale data
 	if shouldRouteToProbation && probationCount > 0 {
 		logger.Debug().
 			Int("probation_count", probationCount).
 			Float64("traffic_percent", selector.Config().Probation.TrafficPercent).
-			Msg("Routing request to probation endpoints for recovery")
+			Msg("Routing request to probation endpoints for recovery (with tier fallback)")
 
-		// Build result map with only probation endpoints
-		// Use keyToEndpoints mapping to get full endpoint addresses from domain keys
+		// Start with probation endpoints
 		result := make(map[protocol.EndpointAddr]endpoint)
 		for _, key := range probationEndpoints {
+			for _, fullAddr := range keyToEndpoints[key.EndpointAddr] {
+				if ep, exists := endpoints[fullAddr]; exists {
+					result[fullAddr] = ep
+				}
+			}
+		}
+
+		// Also include highest-tier endpoints as fallback.
+		// QoS validation will prefer healthy endpoints over stale ones,
+		// so probation endpoints only get traffic if they pass validation.
+		tier1, tier2, tier3 := selector.GroupByTier(endpointScores)
+		var fallbackKeys []reputation.EndpointKey
+		switch {
+		case len(tier1) > 0:
+			fallbackKeys = tier1
+		case len(tier2) > 0:
+			fallbackKeys = tier2
+		case len(tier3) > 0:
+			fallbackKeys = tier3
+		}
+		for _, key := range fallbackKeys {
 			for _, fullAddr := range keyToEndpoints[key.EndpointAddr] {
 				if ep, exists := endpoints[fullAddr]; exists {
 					result[fullAddr] = ep

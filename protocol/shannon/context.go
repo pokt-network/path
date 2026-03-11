@@ -79,6 +79,11 @@ type requestContext struct {
 	//   - Set during relay execution and used when building observations.
 	currentRPCType sharedtypes.RPCType
 
+	// heuristicRPCType preserves the original detected RPC type before any
+	// fallback was applied. Used for heuristic response analysis so that
+	// CometBFT requests routed through JSON_RPC are still analyzed correctly.
+	heuristicRPCType sharedtypes.RPCType
+
 	// requestErrorObservation:
 	//   - Tracks any errors encountered during request processing.
 	requestErrorObservation *protocolobservations.ShannonRequestError
@@ -166,6 +171,7 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 	// This preserves the default set in BuildHTTPRequestContextForEndpoint for health checks.
 	if payloads[0].RPCType != sharedtypes.RPCType_UNKNOWN_RPC {
 		rc.currentRPCType = payloads[0].RPCType
+		rc.heuristicRPCType = payloads[0].EffectiveRPCType()
 	}
 
 	// For single payload, handle directly without additional overhead.
@@ -675,12 +681,22 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// This runs BEFORE returning to gateway to allow protocol-level retry decisions.
 	// Only analyze on HTTP 2xx status to avoid double-checking non-2xx responses.
 	if responseHTTPStatusCode >= 200 && responseHTTPStatusCode < 300 {
-		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.currentRPCType)
+		// Extract JSON-RPC method from payload for method-aware heuristic checks.
+		// Use the JSONRPCMethod field set at QoS parsing time.
+		// For REST requests, JSONRPCMethod is empty — fall back to Path so that
+		// path-aware validation (e.g., Tron /wallet/ whitelist) works correctly.
+		jsonrpcMethod := payload.JSONRPCMethod
+		if jsonrpcMethod == "" {
+			jsonrpcMethod = payload.Path
+		}
+		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.heuristicRPCType, jsonrpcMethod)
 		if heuristicResult.ShouldRetry {
-			rc.logger.Debug().
+			rc.logger.Error().
 				Str("heuristic_reason", heuristicResult.Reason).
 				Float64("heuristic_confidence", heuristicResult.Confidence).
 				Str("heuristic_details", heuristicResult.Details).
+				Str("jsonrpc_method", jsonrpcMethod).
+				Str("request_path", payload.Path).
 				Int("response_size", len(deserializedResponse.Bytes)).
 				Int("http_status_code", responseHTTPStatusCode).
 				Msg("Heuristic analysis detected error in backend response - triggering retry")
@@ -695,8 +711,8 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 			// Wrap in raw_payload: format to allow proper error classification and reputation penalty.
 			// Use errHeuristicDetectedBackendError instead of errMalformedEndpointPayload because
 			// the response is valid JSON-RPC, it just indicates a backend issue (pruned state, etc.).
-			return defaultResponse, fmt.Errorf("raw_payload: %s: heuristic detected %s: %w",
-				string(deserializedResponse.Bytes), heuristicResult.Reason, errHeuristicDetectedBackendError)
+			return defaultResponse, fmt.Errorf("raw_payload: %s: heuristic detected %s (method=%s): %w",
+				string(deserializedResponse.Bytes), heuristicResult.Reason, jsonrpcMethod, errHeuristicDetectedBackendError)
 		}
 	}
 

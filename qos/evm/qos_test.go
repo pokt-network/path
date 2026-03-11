@@ -137,6 +137,66 @@ func TestUpdateFromExtractedData_BlockNumber(t *testing.T) {
 	require.Equal(t, uint64(12345), *storedEndpoint.checkBlockNumber.parsedBlockNumberResponse)
 }
 
+// TestUpdateFromExtractedData_InvalidBlockHeight verifies that InvalidBlockHeight
+// stores block 0 so the filter catches the broken endpoint.
+func TestUpdateFromExtractedData_InvalidBlockHeight(t *testing.T) {
+	logger := polyzero.NewLogger()
+	qos := NewSimpleQoSInstance(logger, "eth")
+
+	endpointAddr := protocol.EndpointAddr("pokt1supplier-https://broken.example.com")
+
+	// Initialize endpoint in store (no block observation yet)
+	qos.endpointStore.endpointsMu.Lock()
+	qos.endpointStore.endpoints[endpointAddr] = endpoint{}
+	qos.endpointStore.endpointsMu.Unlock()
+
+	// Create extracted data with InvalidBlockHeight flag (simulates "result":[] for eth_blockNumber)
+	data := &qostypes.ExtractedData{
+		BlockHeight:        0, // Extraction failed
+		InvalidBlockHeight: true,
+	}
+
+	err := qos.UpdateFromExtractedData(endpointAddr, data)
+	require.NoError(t, err)
+
+	// Verify block number is stored as &0 (not nil)
+	qos.endpointStore.endpointsMu.RLock()
+	storedEndpoint := qos.endpointStore.endpoints[endpointAddr]
+	qos.endpointStore.endpointsMu.RUnlock()
+
+	require.NotNil(t, storedEndpoint.checkBlockNumber.parsedBlockNumberResponse,
+		"parsedBlockNumberResponse should be &0 (not nil) so the filter catches it")
+	require.Equal(t, uint64(0), *storedEndpoint.checkBlockNumber.parsedBlockNumberResponse,
+		"block number should be 0 for broken supplier")
+}
+
+// TestUpdateFromExtractedData_InvalidBlockHeight_DoesNotAffectPerceived verifies that
+// an invalid block height (0) does not lower the perceived block number.
+func TestUpdateFromExtractedData_InvalidBlockHeight_DoesNotAffectPerceived(t *testing.T) {
+	logger := polyzero.NewLogger()
+	qos := NewSimpleQoSInstance(logger, "eth")
+
+	// Set a perceived block number
+	qos.perceivedBlockNumber.Store(100000)
+
+	endpointAddr := protocol.EndpointAddr("pokt1supplier-https://broken.example.com")
+	qos.endpointStore.endpointsMu.Lock()
+	qos.endpointStore.endpoints[endpointAddr] = endpoint{}
+	qos.endpointStore.endpointsMu.Unlock()
+
+	data := &qostypes.ExtractedData{
+		BlockHeight:        0,
+		InvalidBlockHeight: true,
+	}
+
+	err := qos.UpdateFromExtractedData(endpointAddr, data)
+	require.NoError(t, err)
+
+	// Perceived block should NOT change (0 is not added to consensus)
+	require.Equal(t, uint64(100000), qos.perceivedBlockNumber.Load(),
+		"perceived block should remain unchanged when InvalidBlockHeight is set")
+}
+
 // TestUpdateFromExtractedData_NilData verifies that nil data is handled gracefully.
 func TestUpdateFromExtractedData_NilData(t *testing.T) {
 	logger := polyzero.NewLogger()

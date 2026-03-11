@@ -65,6 +65,11 @@ type serviceState struct {
 	// Populated by UpdateFromExtractedData and background refresh worker.
 	// Replaces synchronous Redis calls in the hot path.
 	archivalCache *ArchivalCache
+
+	// redisURLBlockHeights caches URL→blockHeight from Redis, updated every 5s
+	// by syncEndpointBlocksFromRedis. Used as fallback when the local endpointStore
+	// doesn't have block height data for a URL (e.g., during session rotation).
+	redisURLBlockHeights atomic.Pointer[map[string]uint64]
 }
 
 /* -------------------- QoS Endpoint Check Generator -------------------- */
@@ -98,7 +103,8 @@ func (ss *serviceState) GetRequiredQualityChecks(endpointAddr protocol.EndpointA
 	}
 
 	// Chain ID check runs infrequently as an endpoint's EVM chain ID is very unlikely to change regularly.
-	if ss.shouldChainIDCheckRun(endpoint.checkChainID) {
+	// Skip entirely when no expected chain ID is configured (validation delegated to health checks).
+	if ss.serviceQoSConfig.getEVMChainID() != "" && ss.shouldChainIDCheckRun(endpoint.checkChainID) {
 		checks = append(checks, ss.getEndpointCheck(endpoint.checkChainID.getRequestID(), endpoint.checkChainID.getServicePayload()))
 	}
 

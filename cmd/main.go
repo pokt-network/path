@@ -122,6 +122,54 @@ func main() {
 		logger.Info().Msg("Reputation service wired to QoS instances for shared state (archival, block height)")
 	}
 
+	// Start external block height fetchers for services that have external_block_sources configured.
+	// These fetchers periodically query external RPC endpoints for ground-truth block heights,
+	// which act as a floor for perceivedBlockNumber to detect when all session endpoints are stale.
+	for serviceID, qosInstance := range qosInstances {
+		merged := unifiedServicesConfig.GetMergedServiceConfig(serviceID)
+		if merged == nil || len(merged.ExternalBlockSources) == 0 {
+			continue
+		}
+
+		// Build config list from the merged service config
+		var configs []gateway.ExternalBlockSourceConfig
+		for _, src := range merged.ExternalBlockSources {
+			configs = append(configs, gateway.ExternalBlockSourceConfig{
+				URL:      src.URL,
+				Type:     src.Type,
+				Method:   src.Method,
+				Path:     src.Path,
+				Interval: src.Interval,
+				Timeout:  src.Timeout,
+			})
+		}
+
+		fetcher := gateway.NewExternalBlockHeightFetcher(logger, configs)
+		heightsCh := fetcher.Start(backgroundCtx)
+
+		// Determine grace period from config (first source with a value wins, else default)
+		var gracePeriod time.Duration
+		for _, src := range merged.ExternalBlockSources {
+			if src.GracePeriod > 0 {
+				gracePeriod = src.GracePeriod
+				break
+			}
+		}
+
+		// Connect fetcher output to QoS consumer
+		if consumer, ok := qosInstance.(interface {
+			ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64, gracePeriod time.Duration)
+		}); ok {
+			consumer.ConsumeExternalBlockHeight(backgroundCtx, heightsCh, gracePeriod)
+
+			logger.Info().
+				Str("service_id", string(serviceID)).
+				Int("source_count", len(configs)).
+				Dur("grace_period", gracePeriod).
+				Msg("Started external block height fetcher")
+		}
+	}
+
 	// Setup metrics reporter, to be used by Gateway and Health Checks
 	metricsReporter, err := setupMetricsServer(logger, config.Metrics.PrometheusAddr)
 	if err != nil {
@@ -213,6 +261,10 @@ func main() {
 		}
 	}
 
+	// Create domain circuit breaker for cross-pod broken domain tracking.
+	// Uses the same Redis client as leader election. Nil-safe (local-only mode if no Redis).
+	domainCircuitBreaker := gateway.NewDomainCircuitBreaker(redisClient, logger)
+
 	healthCheckExecutor, leaderElector := setupHealthCheckExecutor(
 		backgroundCtx,
 		logger,
@@ -245,9 +297,11 @@ func main() {
 		Logger:                     logger,
 		HTTPRequestParser:          requestParser,
 		Protocol:                   protocol,
+		RPCTypeValidator:           gateway.NewRPCTypeValidator(unifiedServicesConfig, gateway.NewRPCTypeMapper()),
 		MetricsReporter:            metricsReporter,
 		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
 		ObservationQueue:           observationQueue,
+		DomainCircuitBreaker:       domainCircuitBreaker,
 	}
 
 	// Until all components are ready, the `/healthz` endpoint will return a 503 Service
@@ -282,6 +336,7 @@ func main() {
 		disqualifiedEndpointsReporter,
 		healthChecker,
 		config.GetRouterConfig(),
+		gtw.DomainCircuitBreaker,
 	)
 
 	// -------------------- Start PATH API Router --------------------

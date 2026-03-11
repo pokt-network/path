@@ -212,8 +212,27 @@ func (e *HealthCheckExecutor) ShouldRunChecks() bool {
 
 // SetQoSInstances sets the QoS instances for sync check validation.
 // This should be called after QoS instances are created in the main application.
+// It also applies sync_allowance from any already-loaded external configs,
+// since InitExternalConfig may run before QoS instances are registered.
 func (e *HealthCheckExecutor) SetQoSInstances(instances map[protocol.ServiceID]QoSService) {
 	e.qosInstances = instances
+
+	// Apply sync_allowance from already-loaded external configs.
+	// InitExternalConfig runs before SetQoSInstances, so the initial
+	// SetSyncAllowance calls in refreshExternalConfig find an empty map.
+	e.externalConfigMu.RLock()
+	configs := e.externalConfigs
+	e.externalConfigMu.RUnlock()
+
+	for _, cfg := range configs {
+		if cfg.SyncAllowance != nil && *cfg.SyncAllowance > 0 {
+			if qosInstance, ok := instances[cfg.ServiceID]; ok {
+				if setter, ok := qosInstance.(interface{ SetSyncAllowance(uint64) }); ok {
+					setter.SetSyncAllowance(uint64(*cfg.SyncAllowance))
+				}
+			}
+		}
+	}
 }
 
 // GetServiceConfigs returns the merged health check configurations for all services.
@@ -501,6 +520,16 @@ func (e *HealthCheckExecutor) refreshExternalConfig(ctx context.Context) {
 			if cfg.SyncAllowance != nil && *cfg.SyncAllowance > 0 {
 				e.unifiedServicesConfig.SetServiceSyncAllowance(cfg.ServiceID, *cfg.SyncAllowance)
 				syncAllowanceCount++
+
+				// Also propagate to the QoS instance so it uses the updated value
+				// for endpoint selection. QoS instances are created at startup before
+				// external rules are loaded, so they start with syncAllowance=0.
+				if qosInstance, ok := e.qosInstances[cfg.ServiceID]; ok {
+					if setter, ok := qosInstance.(interface{ SetSyncAllowance(uint64) }); ok {
+						setter.SetSyncAllowance(uint64(*cfg.SyncAllowance))
+					}
+				}
+
 				e.logger.Info().
 					Str("service_id", string(cfg.ServiceID)).
 					Int("sync_allowance", *cfg.SyncAllowance).
@@ -1013,7 +1042,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 
 	// Heuristic analysis - detect bad gateway, empty responses, and other error patterns
 	// This runs BEFORE QoS validation to catch issues the basic validation might miss
-	heuristicResult := heuristic.Analyze(responseBody, httpStatusCode, servicePayload.RPCType)
+	heuristicResult := heuristic.Analyze(responseBody, httpStatusCode, servicePayload.EffectiveRPCType(), "")
 	if heuristicResult.ShouldRetry {
 		heuristicErr := fmt.Errorf("heuristic detected error: %s - %s", heuristicResult.Reason, heuristicResult.Details)
 		e.logger.Debug().
@@ -1770,15 +1799,23 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 	// Try different formats
 	switch v := result.(type) {
 	case string:
-		// EVM format: "0x1940c6f5"
-		return parseHexBlockNumber(v)
+		if strings.HasPrefix(v, "0x") || strings.HasPrefix(v, "0X") {
+			// EVM hex format: "0x1940c6f5"
+			return parseHexBlockNumber(v)
+		}
+		// Decimal string format (e.g. Sui's sui_getLatestCheckpointSequenceNumber): "246404377"
+		height, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid decimal block number string: %w", err)
+		}
+		return height, nil
 
 	case float64:
 		// Already a number
 		return int64(v), nil
 
 	case map[string]interface{}:
-		// Cosmos format: {"sync_info": {"latest_block_height": "12345"}}
+		// Cosmos/NEAR format: {"sync_info": {"latest_block_height": "12345"}}
 		if syncInfo, ok := v["sync_info"].(map[string]interface{}); ok {
 			if heightStr, ok := syncInfo["latest_block_height"].(string); ok {
 				height, err := strconv.ParseInt(heightStr, 10, 64)
@@ -1786,6 +1823,10 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 					return 0, fmt.Errorf("invalid block height in sync_info: %w", err)
 				}
 				return height, nil
+			}
+			// NEAR returns latest_block_height as a number
+			if heightNum, ok := syncInfo["latest_block_height"].(float64); ok {
+				return int64(heightNum), nil
 			}
 		}
 		return 0, fmt.Errorf("unsupported response format: object without sync_info")

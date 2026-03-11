@@ -22,6 +22,27 @@ import (
 	qostypes "github.com/pokt-network/path/qos/types"
 )
 
+// jsonrpcEmptyResultType checks if a JSON-RPC response has "result":{} or "result":[].
+// Only checks responses that look like JSON-RPC (have "jsonrpc" field).
+// Returns "" if not applicable, "object" for {}, "array" for [].
+func jsonrpcEmptyResultType(response []byte) string {
+	if !gjson.GetBytes(response, "jsonrpc").Exists() {
+		return "" // Not JSON-RPC, skip (e.g., Cosmos REST)
+	}
+	result := gjson.GetBytes(response, "result")
+	if !result.Exists() || result.Type == gjson.Null {
+		return "" // No result or null result
+	}
+	raw := result.Raw
+	if raw == "[]" {
+		return "array"
+	}
+	if raw == "{}" {
+		return "object"
+	}
+	return ""
+}
+
 // Verify CosmosDataExtractor implements the DataExtractor interface at compile time.
 var _ qostypes.DataExtractor = (*CosmosDataExtractor)(nil)
 
@@ -62,6 +83,15 @@ func (e *CosmosDataExtractor) ExtractBlockHeight(request []byte, response []byte
 	// Try Cosmos SDK REST format
 	if height, err := e.extractCosmosRESTBlockHeight(response); err == nil {
 		return height, nil
+	}
+
+	// Both extractors failed. If this is a JSON-RPC response with an empty container
+	// result ("result":{} or "result":[]), the supplier is returning garbage.
+	// This catches broken CometBFT suppliers without false-positiving on REST queries
+	// (which don't have a "jsonrpc" field) or valid CometBFT responses with non-empty results.
+	if emptyType := jsonrpcEmptyResultType(response); emptyType != "" {
+		return 0, fmt.Errorf("%w: CometBFT response has empty %s result",
+			qostypes.ErrInvalidBlockHeightResult, emptyType)
 	}
 
 	return 0, fmt.Errorf("could not extract block height from response")

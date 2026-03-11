@@ -88,11 +88,11 @@ func (ss *serviceState) SelectMultipleWithArchival(allAvailableEndpoints protoco
 // according to previously processed observations.
 func (ss *serviceState) filterValidEndpoints(availableEndpoints protocol.EndpointAddrList) (protocol.EndpointAddrList, error) {
 	ss.endpointStore.endpointsMu.RLock()
-	defer ss.endpointStore.endpointsMu.RUnlock()
 
 	logger := ss.logger.With("method", "filterValidEndpoints").With("qos_instance", "cosmossdk")
 
 	if len(availableEndpoints) == 0 {
+		ss.endpointStore.endpointsMu.RUnlock()
 		return nil, errEmptyEndpointListObs
 	}
 
@@ -126,6 +126,12 @@ func (ss *serviceState) filterValidEndpoints(availableEndpoints protocol.Endpoin
 		filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
 		logger.Debug().Msgf("endpoint %s passed validation", availableEndpointAddr)
 	}
+
+	ss.endpointStore.endpointsMu.RUnlock()
+
+	// Touch endpoints to update lastSeen for stale endpoint cleanup.
+	// Uses a separate WLock call to avoid changing the read-heavy filtering path.
+	ss.endpointStore.touchEndpoints(availableEndpoints)
 
 	return filteredEndpointsAddr, nil
 }

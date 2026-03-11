@@ -2,6 +2,7 @@ package heuristic
 
 import (
 	"bytes"
+	"strings"
 )
 
 // Tier 1: Structural Response Checks
@@ -112,6 +113,26 @@ func classifyJSONLike(data []byte) ResponseStructure {
 	return StructureValid
 }
 
+// capabilityLimitationPatterns are plain-text response patterns that indicate
+// a node capability limitation rather than a broken domain.
+// These nodes can serve other requests fine, just not the specific one asked.
+var capabilityLimitationPatterns = []string{
+	"lite fullnode",     // Tron lite fullnodes: "this API is closed because this node is a lite fullnode"
+	"api is not supported", // Generic API not supported messages
+}
+
+// isCapabilityLimitationText checks if a plain-text (non-JSON) response
+// indicates a node capability limitation rather than a broken domain.
+func isCapabilityLimitationText(content []byte) bool {
+	lower := strings.ToLower(string(content))
+	for _, pattern := range capabilityLimitationPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // isWhitespace checks if a byte is JSON whitespace.
 func isWhitespace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
@@ -151,6 +172,19 @@ func StructuralAnalysis(responseBytes []byte) AnalysisResult {
 		}
 
 	case StructureNonJSON:
+		// Check if the plain text response indicates a capability limitation
+		// (e.g., Tron lite fullnodes returning "this API is closed because this node is a lite fullnode").
+		// These should still retry on a different supplier but NOT circuit-break the domain.
+		if isCapabilityLimitationText(responseBytes) {
+			return AnalysisResult{
+				ShouldRetry:    true,
+				Confidence:     0.95,
+				Reason:         "non_json_capability_limitation",
+				Structure:      structure,
+				MatchedPattern: "capability_limitation",
+				Details:        "Response is plain text indicating node capability limitation",
+			}
+		}
 		return AnalysisResult{
 			ShouldRetry: true,
 			Confidence:  0.95,

@@ -431,3 +431,56 @@ func (s *RedisStorage) GetPerceivedBlockNumber(ctx context.Context, serviceID pr
 
 	return blockNumber, nil
 }
+
+// endpointBlocksKey returns the Redis key for storing per-endpoint block heights.
+func (s *RedisStorage) endpointBlocksKey(serviceID protocol.ServiceID) string {
+	return fmt.Sprintf("%schain_state:%s:endpoint_blocks", s.keyPrefix, serviceID)
+}
+
+// SetEndpointBlockHeight stores a single endpoint's block height using HSET.
+func (s *RedisStorage) SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	key := s.endpointBlocksKey(serviceID)
+	err := s.client.HSet(ctx, key, string(endpointAddr), strconv.FormatUint(blockHeight, 10)).Err()
+	if err != nil {
+		return fmt.Errorf("failed to set endpoint block height: %w", err)
+	}
+	return nil
+}
+
+// RemoveEndpointBlockHeights removes endpoint block height entries using HDEL.
+func (s *RedisStorage) RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error {
+	if len(addrs) == 0 {
+		return nil
+	}
+	key := s.endpointBlocksKey(serviceID)
+	fields := make([]string, len(addrs))
+	for i, addr := range addrs {
+		fields[i] = string(addr)
+	}
+	err := s.client.HDel(ctx, key, fields...).Err()
+	if err != nil {
+		return fmt.Errorf("failed to remove endpoint block heights: %w", err)
+	}
+	return nil
+}
+
+// GetEndpointBlockHeights retrieves all endpoint block heights using HGETALL.
+func (s *RedisStorage) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) (map[protocol.EndpointAddr]uint64, error) {
+	key := s.endpointBlocksKey(serviceID)
+
+	result, err := s.client.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get endpoint block heights: %w", err)
+	}
+
+	heights := make(map[protocol.EndpointAddr]uint64, len(result))
+	for addr, val := range result {
+		h, err := strconv.ParseUint(val, 10, 64)
+		if err != nil {
+			continue // skip malformed entries
+		}
+		heights[protocol.EndpointAddr(addr)] = h
+	}
+
+	return heights, nil
+}

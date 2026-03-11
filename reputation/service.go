@@ -108,8 +108,12 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 
 	if signal.IsPositive() {
 		score.SuccessCount++
-		// Reset strikes on successful request - endpoint has proven it can work
-		score.CriticalStrikes = 0
+		// Decay strikes gradually — one success reduces strikes by 1.
+		// This prevents deceptive suppliers (who pass some requests) from
+		// instantly wiping their strike history with a single success.
+		if score.CriticalStrikes > 0 {
+			score.CriticalStrikes--
+		}
 	} else if signal.IsNegative() {
 		score.ErrorCount++
 	}
@@ -120,8 +124,12 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 
 		// Apply cooldown if strikes exceed threshold
 		if score.CriticalStrikes >= DefaultStrikeThreshold {
-			// Exponential backoff: base * 2^(strikes - threshold)
+			// Exponential backoff: base * 2^(strikes - threshold), capped at max cooldown.
+			// Cap exponent to avoid int64 overflow in the shift (5min * 2^7 = 640min > 60min max).
 			exponent := score.CriticalStrikes - DefaultStrikeThreshold
+			if exponent > 7 {
+				exponent = 7
+			}
 			cooldownDuration := DefaultBaseCooldown * time.Duration(1<<exponent)
 			if cooldownDuration > DefaultMaxCooldown {
 				cooldownDuration = DefaultMaxCooldown
@@ -836,6 +844,43 @@ func (s *service) GetPerceivedBlockNumber(ctx context.Context, serviceID protoco
 	}
 
 	return blockNumber
+}
+
+// SetEndpointBlockHeight stores a single endpoint's block height for cross-replica sync.
+func (s *service) SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	if s.storage == nil {
+		return nil
+	}
+	return s.storage.SetEndpointBlockHeight(ctx, serviceID, endpointAddr, blockHeight)
+}
+
+// GetEndpointBlockHeights retrieves all endpoint block heights for a service.
+// Returns empty map on error or if storage is unavailable.
+func (s *service) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) map[protocol.EndpointAddr]uint64 {
+	if s.storage == nil {
+		return make(map[protocol.EndpointAddr]uint64)
+	}
+
+	heights, err := s.storage.GetEndpointBlockHeights(ctx, serviceID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Msg("Failed to get endpoint block heights from storage")
+		}
+		return make(map[protocol.EndpointAddr]uint64)
+	}
+
+	return heights
+}
+
+// RemoveEndpointBlockHeights removes stale endpoint block height entries from storage.
+func (s *service) RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error {
+	if s.storage == nil {
+		return nil
+	}
+	return s.storage.RemoveEndpointBlockHeights(ctx, serviceID, addrs)
 }
 
 // GetArchivalEndpoints returns all endpoint keys for the given service

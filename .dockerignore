@@ -4,3 +4,12 @@ bin
 *.log
 *.tmp
 **/.cache
+docusaurus
+docs
+research
+portal-db
+data
+.idea
+.claude
+.qodo
+.serena

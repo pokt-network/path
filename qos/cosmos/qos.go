@@ -3,6 +3,8 @@ package cosmos
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
@@ -11,6 +13,7 @@ import (
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
 	qostypes "github.com/pokt-network/path/qos/types"
+	"github.com/pokt-network/path/reputation"
 )
 
 // QoS implements gateway.QoSService by providing:
@@ -31,6 +34,10 @@ type QoS struct {
 	logger polylog.Logger
 	*serviceState
 	*requestValidator
+
+	// reputationSvc provides shared perceived block number across replicas via Redis.
+	// Set via SetReputationService; nil when reputation is disabled.
+	reputationSvc reputation.ReputationService
 }
 
 // NewSimpleQoSInstance creates a minimal CosmosSDK QoS instance without chain-specific validation.
@@ -70,9 +77,9 @@ func NewSimpleQoSInstanceWithAPIs(logger polylog.Logger, serviceID protocol.Serv
 	// Create a minimal config wrapper
 	minimalConfig := &simpleCosmosConfig{
 		serviceID:     serviceID,
-		syncAllowance: syncAllowance,
 		supportedAPIs: supportedAPIs,
 	}
+	minimalConfig.syncAllowance.Store(syncAllowance)
 
 	serviceState := &serviceState{
 		logger:           logger,
@@ -99,7 +106,7 @@ func NewSimpleQoSInstanceWithAPIs(logger polylog.Logger, serviceID protocol.Serv
 // simpleCosmosConfig is a minimal config for services without chain-specific params.
 type simpleCosmosConfig struct {
 	serviceID     protocol.ServiceID
-	syncAllowance uint64                           // If 0, uses default
+	syncAllowance atomic.Uint64                    // If 0, uses default. Updated dynamically when external health check rules are loaded.
 	supportedAPIs map[sharedtypes.RPCType]struct{} // Supported RPC types
 }
 
@@ -108,10 +115,19 @@ func (c *simpleCosmosConfig) GetServiceQoSType() string        { return QoSType 
 func (c *simpleCosmosConfig) getCosmosSDKChainID() string      { return "" }
 func (c *simpleCosmosConfig) getEVMChainID() string            { return "" }
 func (c *simpleCosmosConfig) getSyncAllowance() uint64 {
-	if c.syncAllowance == 0 {
-		return defaultCosmosSDKBlockNumberSyncAllowance
+	if v := c.syncAllowance.Load(); v > 0 {
+		return v
 	}
-	return c.syncAllowance
+	return defaultCosmosSDKBlockNumberSyncAllowance
+}
+
+// SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
+// This is called when external health check rules are loaded/refreshed, since those
+// rules may specify a sync_allowance that wasn't available at QoS creation time.
+func (qos *QoS) SetSyncAllowance(syncAllowance uint64) {
+	if cfg, ok := qos.serviceState.serviceQoSConfig.(*simpleCosmosConfig); ok {
+		cfg.syncAllowance.Store(syncAllowance)
+	}
 }
 func (c *simpleCosmosConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
 	if c.supportedAPIs != nil {
@@ -161,12 +177,22 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 		return nil
 	}
 
-	// Only update if we extracted a valid block height
-	if data.BlockHeight <= 0 {
-		return nil
+	// Determine block number to store
+	var blockNumber uint64
+	var hasBlock bool
+
+	if data.BlockHeight > 0 {
+		blockNumber = uint64(data.BlockHeight)
+		hasBlock = true
+	} else if data.InvalidBlockHeight {
+		// Supplier returned an unparseable block height result — store 0 so filter catches it
+		blockNumber = 0
+		hasBlock = true
 	}
 
-	blockNumber := uint64(data.BlockHeight)
+	if !hasBlock {
+		return nil
+	}
 
 	// Lock the endpoint store to update the endpoint observation
 	qos.endpointStore.endpointsMu.Lock()
@@ -191,6 +217,24 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 			Uint64("new_block", blockNumber).
 			Msg("Updating perceived block number from observation pipeline")
 		qos.perceivedBlockNumber = blockNumber
+
+		// Write to Redis for cross-replica sync (async, non-blocking)
+		if qos.reputationSvc != nil {
+			go func(bn uint64, svcID protocol.ServiceID) {
+				rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = qos.reputationSvc.SetPerceivedBlockNumber(rCtx, svcID, bn)
+			}(blockNumber, qos.serviceQoSConfig.GetServiceID())
+		}
+	}
+
+	// Write per-endpoint block height to Redis for cross-replica sync (async, non-blocking)
+	if qos.reputationSvc != nil {
+		go func(addr protocol.EndpointAddr, bn uint64, svcID protocol.ServiceID) {
+			rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = qos.reputationSvc.SetEndpointBlockHeight(rCtx, svcID, addr, bn)
+		}(endpointAddr, blockNumber, qos.serviceQoSConfig.GetServiceID())
 	}
 
 	return nil
@@ -205,4 +249,268 @@ func (qos *QoS) GetPerceivedBlockNumber() uint64 {
 	qos.serviceStateLock.RLock()
 	defer qos.serviceStateLock.RUnlock()
 	return qos.perceivedBlockNumber
+}
+
+// ConsumeExternalBlockHeight consumes block heights from an external fetcher channel
+// and uses them as a floor for perceivedBlockNumber. This ensures that if all session
+// endpoints are behind the real chain tip, the perceived block is corrected.
+// The gracePeriod delays applying the external floor after startup, giving suppliers
+// time to report their block heights. Use 0 for the default (60s).
+func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64, gracePeriod time.Duration) {
+	const defaultGracePeriod = 60 * time.Second
+	effectiveGrace := defaultGracePeriod
+	if gracePeriod > 0 {
+		effectiveGrace = gracePeriod
+	}
+	startedAt := time.Now()
+
+	go func() {
+		serviceID := qos.serviceQoSConfig.GetServiceID()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case height, ok := <-heights:
+				if !ok {
+					return
+				}
+				if height <= 0 {
+					continue
+				}
+
+				// Skip during grace period to let suppliers report first
+				if time.Since(startedAt) < effectiveGrace {
+					qos.logger.Debug().
+						Str("service_id", string(serviceID)).
+						Int64("external_block", height).
+						Dur("grace_remaining", effectiveGrace-time.Since(startedAt)).
+						Msg("External block floor deferred — grace period active")
+					continue
+				}
+
+				h := uint64(height)
+				qos.serviceStateLock.Lock()
+				// Only apply external floor if suppliers have already reported.
+				// If perceivedBlockNumber is still 0, no supplier has reported yet
+				// and applying the floor would filter ALL endpoints.
+				if qos.perceivedBlockNumber == 0 {
+					qos.serviceStateLock.Unlock()
+					qos.logger.Debug().
+						Str("service_id", string(serviceID)).
+						Uint64("external_block", h).
+						Msg("External block floor skipped — no suppliers have reported yet")
+					continue
+				}
+				if h > qos.perceivedBlockNumber {
+					qos.logger.Info().
+						Str("service_id", string(serviceID)).
+						Uint64("old_perceived", qos.perceivedBlockNumber).
+						Uint64("external_block", h).
+						Msg("External block floor applied — raising perceived block")
+					qos.perceivedBlockNumber = h
+
+					// Write to Redis so other replicas benefit from the external source.
+					if qos.reputationSvc != nil {
+						go func(bn uint64, svcID protocol.ServiceID) {
+							rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+							defer cancel()
+							_ = qos.reputationSvc.SetPerceivedBlockNumber(rCtx, svcID, bn)
+						}(h, serviceID)
+					}
+				}
+				qos.serviceStateLock.Unlock()
+			}
+		}
+	}()
+}
+
+// SetReputationService sets the reputation service for shared state across replicas.
+// The reputation service provides perceived block number via Redis, enabling
+// all replicas to converge on the same chain tip for sync_allowance validation.
+func (qos *QoS) SetReputationService(svc reputation.ReputationService) {
+	qos.reputationSvc = svc
+}
+
+// StartBackgroundSync starts a background goroutine that periodically syncs
+// perceived block number from Redis. This ensures all replicas converge to
+// the same max block number for sync_allowance validation.
+//
+// The syncInterval determines how often to check Redis (e.g., 5 seconds).
+// Call this after SetReputationService to enable cross-replica sync.
+//
+// IMPORTANT: This performs an immediate sync on startup to ensure the replica
+// has the latest perceived block number before serving requests.
+func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Duration) {
+	if qos.reputationSvc == nil {
+		qos.logger.Warn().Msg("Cannot start background sync: reputation service not set")
+		return
+	}
+
+	serviceID := qos.serviceQoSConfig.GetServiceID()
+
+	// syncFromRedis fetches perceived block number from Redis and updates local
+	// state if the Redis value is higher (simple max semantics).
+	syncFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		redisBlockNumber := qos.reputationSvc.GetPerceivedBlockNumber(fetchCtx, serviceID)
+		cancel()
+
+		if redisBlockNumber == 0 {
+			return // No data in Redis yet
+		}
+
+		qos.serviceStateLock.Lock()
+		oldBlock := qos.perceivedBlockNumber
+		if redisBlockNumber > qos.perceivedBlockNumber {
+			qos.perceivedBlockNumber = redisBlockNumber
+		}
+		qos.serviceStateLock.Unlock()
+
+		if redisBlockNumber > oldBlock {
+			qos.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Uint64("redis_block", redisBlockNumber).
+				Uint64("old_perceived", oldBlock).
+				Uint64("new_perceived", redisBlockNumber).
+				Msg("Updated perceived block number from Redis sync")
+		}
+	}
+
+	// syncEndpointBlocksFromRedis fetches per-endpoint block heights from Redis
+	// and updates local endpoint store entries where Redis has a higher value.
+	syncEndpointBlocksFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		heights := qos.reputationSvc.GetEndpointBlockHeights(fetchCtx, serviceID)
+		cancel()
+
+		if len(heights) == 0 {
+			return
+		}
+
+		// Build a URL-only lookup for block heights.
+		// Multiple suppliers can share the same relay miner URL, and supplier addresses
+		// rotate across sessions. The block height is a property of the URL (the backend),
+		// not the supplier address, so we use URL as a fallback key when the full
+		// supplierAddr-URL key doesn't match the current session's endpoints.
+		urlHeights := make(map[string]uint64, len(heights))
+		for addr, h := range heights {
+			if url, err := addr.GetURL(); err == nil {
+				if existing, ok := urlHeights[url]; !ok || h > existing {
+					urlHeights[url] = h
+				}
+			}
+		}
+
+		qos.endpointStore.endpointsMu.Lock()
+		updated := 0
+		for addr, redisHeight := range heights {
+			redisH := redisHeight // copy for pointer
+			ep, exists := qos.endpointStore.endpoints[addr]
+			if !exists {
+				// Create a new entry with just the block height from Redis.
+				// This allows non-leader replicas to filter stale endpoints
+				// before health checks or relay responses populate the store.
+				qos.endpointStore.endpoints[addr] = endpoint{
+					checkCometBFTStatus: endpointCheckCometBFTStatus{latestBlockHeight: &redisH},
+					lastSeen:            time.Now(),
+				}
+				updated++
+				continue
+			}
+			localHeight := uint64(0)
+			if ep.checkCometBFTStatus.latestBlockHeight != nil {
+				localHeight = *ep.checkCometBFTStatus.latestBlockHeight
+			}
+			if redisHeight > localHeight {
+				ep.checkCometBFTStatus.latestBlockHeight = &redisH
+				qos.endpointStore.endpoints[addr] = ep
+				updated++
+			}
+		}
+
+		// Second pass: populate session endpoints that weren't in Redis by URL fallback.
+		// This handles the case where a session has new supplier addresses for the same
+		// relay miner URL — the block height from the previous session's supplier applies.
+		for addr, ep := range qos.endpointStore.endpoints {
+			if ep.checkCometBFTStatus.latestBlockHeight != nil {
+				continue // already has a block height
+			}
+			url, err := addr.GetURL()
+			if err != nil {
+				continue
+			}
+			if h, ok := urlHeights[url]; ok {
+				hCopy := h
+				ep.checkCometBFTStatus.latestBlockHeight = &hCopy
+				qos.endpointStore.endpoints[addr] = ep
+				updated++
+			}
+		}
+
+		qos.endpointStore.endpointsMu.Unlock()
+
+		if updated > 0 {
+			qos.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Int("updated_endpoints", updated).
+				Int("redis_endpoints", len(heights)).
+				Msg("Synced per-endpoint block heights from Redis")
+		}
+	}
+
+	// sweepStaleEndpoints removes endpoint entries that haven't been seen
+	// in any active session within the TTL, and cleans up their Redis entries.
+	sweepStaleEndpoints := func() {
+		removed := qos.endpointStore.sweepStaleEndpoints(defaultEndpointTTL)
+		if len(removed) == 0 {
+			return
+		}
+
+		qos.logger.Info().
+			Str("service_id", string(serviceID)).
+			Int("removed_endpoints", len(removed)).
+			Msg("Swept stale endpoints from local store")
+
+		sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := qos.reputationSvc.RemoveEndpointBlockHeights(sweepCtx, serviceID, removed); err != nil {
+			qos.logger.Warn().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Int("count", len(removed)).
+				Msg("Failed to remove stale endpoint block heights from Redis")
+		}
+	}
+
+	// Perform immediate sync on startup to have latest data before serving requests
+	syncFromRedis()
+	syncEndpointBlocksFromRedis()
+	qos.logger.Info().
+		Str("service_id", string(serviceID)).
+		Uint64("perceived_block", qos.perceivedBlockNumber).
+		Msg("Completed initial perceived block number sync from Redis")
+
+	go func() {
+		ticker := time.NewTicker(syncInterval)
+		defer ticker.Stop()
+
+		qos.logger.Info().
+			Str("service_id", string(serviceID)).
+			Dur("sync_interval", syncInterval).
+			Msg("Started background sync for perceived block number")
+
+		for {
+			select {
+			case <-ctx.Done():
+				qos.logger.Debug().
+					Str("service_id", string(serviceID)).
+					Msg("Stopping background sync for perceived block number")
+				return
+			case <-ticker.C:
+				syncFromRedis()
+				syncEndpointBlocksFromRedis()
+				sweepStaleEndpoints()
+			}
+		}
+	}()
 }

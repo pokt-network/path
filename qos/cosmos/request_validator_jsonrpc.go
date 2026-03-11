@@ -54,7 +54,8 @@ func (rv *requestValidator) buildJSONRPCServicePayloadsFromRequests(
 
 	for reqID, req := range jsonrpcReqs {
 		method := string(req.Method)
-		rpcType := detectJSONRPCServiceType(method)
+		detectedRPCType := detectJSONRPCServiceType(method)
+		rpcType := detectedRPCType
 
 		// Hydrate the logger with data extracted from the request.
 		logger := rv.logger.With(
@@ -62,16 +63,33 @@ func (rv *requestValidator) buildJSONRPCServicePayloadsFromRequests(
 			"jsonrpc_method", method,
 		)
 
-		// Check if this RPC type is supported by the service
+		// Check if this RPC type is supported by the service.
+		// CometBFT methods (status, block, etc.) sent via JSON-RPC POST can fall
+		// back to JSON_RPC endpoints since CometBFT nodes handle both interfaces.
+		// This ensures CometBFT JSON-RPC requests work even when suppliers haven't
+		// staked comet_bft endpoints (e.g. due to stake validation constraints).
 		if _, supported := rv.supportedAPIs[rpcType]; !supported {
-			logger.Warn().Msg("Request uses unsupported RPC type")
-			return servicePayloads, errors.New("request uses unsupported RPC type")
+			if rpcType == sharedtypes.RPCType_COMET_BFT {
+				rpcType = sharedtypes.RPCType_JSON_RPC
+			}
+			if _, supported := rv.supportedAPIs[rpcType]; !supported {
+				logger.Warn().Msg("Request uses unsupported RPC type")
+				return servicePayloads, errors.New("request uses unsupported RPC type")
+			}
 		}
 
 		servicePayload, err := buildJSONRPCServicePayload(rpcType, req)
 		if err != nil {
 			return servicePayloads, err
 		}
+
+		// Preserve the original detected RPC type when fallback occurred.
+		// This allows downstream analysis (heuristic error detection) to make
+		// protocol-aware decisions even when routing uses the fallback type.
+		if detectedRPCType != rpcType {
+			servicePayload.OriginalRPCType = detectedRPCType
+		}
+
 		servicePayloads[reqID] = servicePayload
 	}
 
@@ -127,11 +145,12 @@ func buildJSONRPCServicePayload(rpcType sharedtypes.RPCType, jsonrpcReq jsonrpc.
 	}
 
 	return protocol.Payload{
-		Data:    string(reqBz),
-		Method:  http.MethodPost, // JSONRPC always uses POST
-		Path:    "",              // JSONRPC does not use paths
-		Headers: map[string]string{},
-		RPCType: rpcType, // Add the RPCType hint the so protocol sets correct HTTP headers for the endpoint.
+		Data:          string(reqBz),
+		Method:        http.MethodPost, // JSONRPC always uses POST
+		Path:          "",              // JSONRPC does not use paths
+		Headers:       map[string]string{},
+		RPCType:       rpcType,                       // Add the RPCType hint the so protocol sets correct HTTP headers for the endpoint.
+		JSONRPCMethod: string(jsonrpcReq.Method), // Enable method-aware heuristic analysis (e.g., "result":[] detection).
 	}, nil
 }
 

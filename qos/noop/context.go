@@ -42,6 +42,14 @@ type requestContext struct {
 	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
 	// Used to provide more specific error messages to clients.
 	protocolError error
+
+	// detectedRPCType is the RPC type detected by the gateway for this request.
+	// Used to set the correct RPCType on the service payload instead of UNKNOWN_RPC.
+	detectedRPCType sharedtypes.RPCType
+
+	// endpointSelector is the selector used for choosing endpoints.
+	// When block height tracking is active, this performs sync-allowance filtering.
+	endpointSelector protocol.EndpointSelector
 }
 
 // GetServicePayload returns the payload to be sent to a service endpoint.
@@ -52,7 +60,7 @@ func (rc *requestContext) GetServicePayloads() []protocol.Payload {
 		Method:  rc.httpRequestMethod,
 		Path:    "", // set below
 		Headers: map[string]string{},
-		RPCType: sharedtypes.RPCType_UNKNOWN_RPC,
+		RPCType: rc.detectedRPCType,
 	}
 	if rc.httpRequestPath != "" {
 		payload.Path = rc.httpRequestPath
@@ -114,8 +122,12 @@ func (rc *requestContext) GetObservations() qosobservations.Observations {
 	return qosobservations.Observations{}
 }
 
-// GetEndpointSelector returns an endpoint selector which simply makes a random selection among available endpoints.
+// GetEndpointSelector returns the endpoint selector for this request context.
+// When block height tracking is enabled, this returns a filtering selector.
 // Implements the gateway.RequestQoSContext interface.
 func (rc *requestContext) GetEndpointSelector() protocol.EndpointSelector {
+	if rc.endpointSelector != nil {
+		return rc.endpointSelector
+	}
 	return RandomEndpointSelector{}
 }

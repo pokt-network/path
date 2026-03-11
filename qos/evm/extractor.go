@@ -50,15 +50,29 @@ func (e *EVMDataExtractor) ExtractBlockHeight(request []byte, response []byte) (
 
 	result, err := e.extractStringResult(response)
 	if err != nil {
+		// If the response has a non-null result field but it's not a string,
+		// the supplier returned garbage (e.g., "result":[] or "result":{}).
+		// Wrap with ErrInvalidBlockHeightResult so the filter catches this endpoint.
+		if responseHasNonNullResult(response) {
+			return 0, fmt.Errorf("%w: %s", qostypes.ErrInvalidBlockHeightResult, err)
+		}
 		return 0, fmt.Errorf("extract block height: %w", err)
 	}
 
 	blockHeight, err := parseHexToInt64(result)
 	if err != nil {
-		return 0, fmt.Errorf("parse block height hex %q: %w", result, err)
+		// Result is a string but not valid hex — broken supplier
+		return 0, fmt.Errorf("%w: parse block height hex %q: %s", qostypes.ErrInvalidBlockHeightResult, result, err)
 	}
 
 	return blockHeight, nil
+}
+
+// responseHasNonNullResult checks if a JSON-RPC response has a non-null "result" field.
+// Used to distinguish "supplier returned garbage result" from "no result / JSON-RPC error".
+func responseHasNonNullResult(response []byte) bool {
+	result := gjson.GetBytes(response, "result")
+	return result.Exists() && result.Type != gjson.Null
 }
 
 // ExtractChainID extracts the chain identifier from an eth_chainId response.

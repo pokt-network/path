@@ -92,6 +92,10 @@ type requestContext struct {
 	// If nil, no async observation processing occurs.
 	observationQueue *ObservationQueue
 
+	// circuitBreaker tracks broken domains across pods via Redis.
+	// If nil, no cross-pod domain circuit breaking occurs.
+	circuitBreaker *DomainCircuitBreaker
+
 	// QoS related request context
 	serviceID  protocol.ServiceID
 	serviceQoS QoSService
@@ -334,8 +338,23 @@ func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
 	detector := NewRPCTypeDetector()
 	rpcType, err := detector.DetectRPCType(httpReq, string(rc.serviceID), serviceRPCTypes)
 	if err != nil {
+		// Log request details at error level for diagnosing bad traffic patterns.
+		// Read up to 512 bytes of the body for diagnostics, then restore it.
+		bodySnippet := ""
+		if httpReq.Body != nil {
+			bodyBytes, readErr := readBodySafely(httpReq, 512)
+			if readErr == nil {
+				bodySnippet = string(bodyBytes)
+				httpReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			}
+		}
 		rc.logger.Error().
 			Str("method", "ValidateRPCType").
+			Str("http_method", httpReq.Method).
+			Str("url_path", httpReq.URL.Path).
+			Str("content_type", httpReq.Header.Get("Content-Type")).
+			Str("user_agent", httpReq.Header.Get("User-Agent")).
+			Str("body_snippet", bodySnippet).
 			Err(err).
 			Msg("RPC type detection failed")
 
@@ -459,6 +478,20 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 			Err(err).
 			Msg("no available endpoints could be found for the request")
 		return fmt.Errorf("%w: no available endpoints could be found for the request: %w", errBuildProtocolContextsFromHTTPRequest, err)
+	}
+
+	// Filter out domains known to be broken across the fleet (cross-pod circuit breaker).
+	// This prevents initial attempts from hitting domains that other pods have already
+	// discovered are returning errors, reducing wasted relay attempts.
+	if rc.circuitBreaker != nil {
+		brokenDomains := rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID))
+		if len(brokenDomains) > 0 {
+			filtered := filterEndpointsByBrokenDomains(availableEndpoints, brokenDomains)
+			if len(filtered) > 0 {
+				availableEndpoints = filtered
+			}
+			// If ALL endpoints are from broken domains, keep the original list (graceful degradation).
+		}
 	}
 
 	// Select multiple endpoints for parallel relay attempts

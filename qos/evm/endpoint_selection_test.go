@@ -99,6 +99,18 @@ func (m *mockReputationService) GetPerceivedBlockNumber(ctx context.Context, ser
 	return 0
 }
 
+func (m *mockReputationService) SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	return nil
+}
+
+func (m *mockReputationService) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) map[protocol.EndpointAddr]uint64 {
+	return make(map[protocol.EndpointAddr]uint64)
+}
+
+func (m *mockReputationService) RemoveEndpointBlockHeights(_ context.Context, _ protocol.ServiceID, _ []protocol.EndpointAddr) error {
+	return nil
+}
+
 func (m *mockReputationService) GetArchivalEndpoints(ctx context.Context, serviceID protocol.ServiceID) []reputation.EndpointKey {
 	if m.archivalEndpoints == nil {
 		return nil
@@ -631,4 +643,281 @@ func TestFreshEndpoint_ArchivalFiltering(t *testing.T) {
 func archivalCacheHas(cache *ArchivalCache, key string) bool {
 	isArchival, ok := cache.Get(key)
 	return ok && isArchival
+}
+
+// TestSelectMultipleWithArchival_FiltersStaleEndpoints verifies that SelectMultipleWithArchival
+// (used by hedge race, retry, and batch paths) filters out endpoints that are behind
+// the perceived block height by more than sync_allowance.
+//
+// This is a regression test for the root cause of stale responses being served:
+// the hedge race, retry, and batch code paths previously used raw protocol endpoints
+// without QoS block height validation. The fix routes all three paths through
+// SelectMultipleWithArchival which calls filterValidEndpointsWithDetails → isBlockNumberValid.
+func TestSelectMultipleWithArchival_FiltersStaleEndpoints(t *testing.T) {
+	logger := polylog.Ctx(context.Background())
+
+	perceivedBlock := uint64(43224462)
+	syncAllowance := uint64(5) // 5 blocks tolerance
+
+	tests := []struct {
+		name            string
+		endpoints       map[protocol.EndpointAddr]uint64 // addr -> block height
+		expectFiltered  []protocol.EndpointAddr          // expected to pass
+		expectExcluded  []protocol.EndpointAddr          // expected to be filtered out
+		expectFallback  bool                             // if all filtered, should fall back
+	}{
+		{
+			name: "stale endpoint filtered, fresh endpoint kept",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"fresh-supplier:https://good-node.com":  perceivedBlock - 1, // 1 block behind = OK
+				"stale-supplier:https://stale-node.com": perceivedBlock - 65000, // 65K behind = stale
+			},
+			expectFiltered: []protocol.EndpointAddr{"fresh-supplier:https://good-node.com"},
+			expectExcluded: []protocol.EndpointAddr{"stale-supplier:https://stale-node.com"},
+		},
+		{
+			name: "all endpoints within sync allowance",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"ep1:https://node1.com": perceivedBlock - 2,
+				"ep2:https://node2.com": perceivedBlock - 4,
+				"ep3:https://node3.com": perceivedBlock, // at perceived block
+			},
+			expectFiltered: []protocol.EndpointAddr{
+				"ep1:https://node1.com",
+				"ep2:https://node2.com",
+				"ep3:https://node3.com",
+			},
+		},
+		{
+			name: "endpoint exactly at sync allowance boundary passes",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"boundary:https://edge.com": perceivedBlock - syncAllowance, // exactly at boundary
+			},
+			expectFiltered: []protocol.EndpointAddr{"boundary:https://edge.com"},
+		},
+		{
+			name: "endpoint one block past sync allowance filtered",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"past-boundary:https://slow.com": perceivedBlock - syncAllowance - 1, // 1 past boundary
+			},
+			expectExcluded: []protocol.EndpointAddr{"past-boundary:https://slow.com"},
+			expectFallback: true, // all filtered = fallback
+		},
+		{
+			name: "mix of valid and stale - only valid returned",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"good1:https://fast1.com":    perceivedBlock,
+				"good2:https://fast2.com":    perceivedBlock - 3,
+				"stale1:https://behind1.com": perceivedBlock - 100,
+				"stale2:https://behind2.com": perceivedBlock - 37000,
+			},
+			expectFiltered: []protocol.EndpointAddr{
+				"good1:https://fast1.com",
+				"good2:https://fast2.com",
+			},
+			expectExcluded: []protocol.EndpointAddr{
+				"stale1:https://behind1.com",
+				"stale2:https://behind2.com",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockRepSvc := &mockReputationService{
+				archivalEndpoints: make(map[string]bool),
+			}
+
+			// Build endpoint store with block heights and valid chain ID
+			chainID := "1"
+			endpoints := make(map[protocol.EndpointAddr]endpoint)
+			for addr, blockHeight := range tt.endpoints {
+				bh := blockHeight // copy for pointer
+				endpoints[addr] = endpoint{
+					checkBlockNumber: endpointCheckBlockNumber{
+						parsedBlockNumberResponse: &bh,
+					},
+					checkChainID: endpointCheckChainID{
+						chainID:   &chainID,
+						expiresAt: time.Now().Add(1 * time.Hour),
+					},
+				}
+			}
+
+			ss := &serviceState{
+				logger: logger,
+				serviceQoSConfig: NewEVMServiceQoSConfigWithSyncAllowance(
+					"test-service", "1", nil, syncAllowance,
+				),
+				endpointStore: &endpointStore{
+					logger:    logger,
+					endpoints: endpoints,
+				},
+				reputationSvc:  mockRepSvc,
+				blockConsensus: NewBlockHeightConsensus(logger, 128),
+				archivalCache:  NewArchivalCache(),
+			}
+
+			// Set perceived block number
+			ss.perceivedBlockNumber.Store(perceivedBlock)
+
+			// Build available endpoints list
+			availableEndpoints := make(protocol.EndpointAddrList, 0, len(tt.endpoints))
+			for addr := range tt.endpoints {
+				availableEndpoints = append(availableEndpoints, addr)
+			}
+
+			// Call SelectMultipleWithArchival (non-archival) — this is exactly what
+			// the hedge race, retry, and batch paths now call after the fix
+			selected, err := ss.SelectMultipleWithArchival(
+				availableEndpoints, uint(len(availableEndpoints)), false, "test-req")
+
+			if tt.expectFallback {
+				// When ALL endpoints are stale, SelectMultipleWithArchival falls back to
+				// random selection (STANDARD_FALLBACK_RANDOM). This is a known behavior:
+				// it returns endpoints rather than erroring to avoid total service failure.
+				require.NoError(t, err)
+				require.NotEmpty(t, selected, "fallback should still return endpoints")
+				return
+			}
+
+			require.NoError(t, err)
+
+			// Verify expected endpoints are in the result
+			selectedSet := make(map[protocol.EndpointAddr]bool)
+			for _, addr := range selected {
+				selectedSet[addr] = true
+			}
+
+			for _, addr := range tt.expectFiltered {
+				require.True(t, selectedSet[addr],
+					"expected endpoint %s to pass QoS validation but it was filtered out", addr)
+			}
+
+			for _, addr := range tt.expectExcluded {
+				require.False(t, selectedSet[addr],
+					"expected stale endpoint %s to be filtered out but it passed QoS validation", addr)
+			}
+		})
+	}
+}
+
+// TestRedisURLBlockHeightsCache_FiltersFreshStaleEndpoints verifies that fresh endpoints
+// (not in endpointStore) are filtered using cached Redis URL block heights.
+//
+// This is a regression test for stale responses during session rotation:
+// when sessions rotate, new supplier addresses appear for the same stale infrastructure.
+// These endpoints aren't in the local store yet, but their URLs have known stale block
+// heights in Redis. The cached Redis URL block heights provide a fallback to catch them.
+func TestRedisURLBlockHeightsCache_FiltersFreshStaleEndpoints(t *testing.T) {
+	logger := polylog.Ctx(context.Background())
+
+	perceivedBlock := uint64(43228834)
+	staleBlock := uint64(43188889) // 39K behind
+	syncAllowance := uint64(5)
+
+	mockRepSvc := &mockReputationService{
+		archivalEndpoints: make(map[string]bool),
+	}
+
+	// Create serviceState with NO local entries — simulates a fresh session
+	// where endpoints haven't been synced to the store yet
+	ss := &serviceState{
+		logger: logger,
+		serviceQoSConfig: NewEVMServiceQoSConfigWithSyncAllowance(
+			"test-service", "1", nil, syncAllowance,
+		),
+		endpointStore: &endpointStore{
+			logger:    logger,
+			endpoints: make(map[protocol.EndpointAddr]endpoint),
+		},
+		reputationSvc:  mockRepSvc,
+		blockConsensus: NewBlockHeightConsensus(logger, 128),
+		archivalCache:  NewArchivalCache(),
+	}
+	ss.perceivedBlockNumber.Store(perceivedBlock)
+
+	// Simulate Redis cache populated by syncEndpointBlocksFromRedis —
+	// contains stale block height for the qspider URL
+	redisCache := map[string]uint64{
+		"https://relayminer03.portal.qspider.com": staleBlock,
+		"https://good.node.com":                   perceivedBlock - 1,
+	}
+	ss.redisURLBlockHeights.Store(&redisCache)
+
+	// Fresh endpoints: new supplier addresses not in local store,
+	// backed by the same stale/good infrastructure.
+	// Uses pokt1...-https://... format so GetURL() (SplitN on first dash) works correctly.
+	availableEndpoints := protocol.EndpointAddrList{
+		"pokt1stalesupplier-https://relayminer03.portal.qspider.com", // stale URL
+		"pokt1goodsupplier-https://good.node.com",                   // good URL
+	}
+
+	// filterValidEndpointsWithDetails should use Redis cache to reject the stale one
+	filtered, _, err := ss.filterValidEndpointsWithDetails(availableEndpoints, false, "test-req")
+	require.NoError(t, err)
+	require.Len(t, filtered, 1, "should filter out fresh endpoint with stale URL from Redis cache")
+	require.Equal(t, protocol.EndpointAddr("pokt1goodsupplier-https://good.node.com"), filtered[0])
+
+	// Also verify filterStaleURLEndpoints uses Redis cache
+	staleFiltered := ss.filterStaleURLEndpoints(availableEndpoints)
+	require.Len(t, staleFiltered, 1, "filterStaleURLEndpoints should use Redis cache to remove stale URL")
+	require.Equal(t, protocol.EndpointAddr("pokt1goodsupplier-https://good.node.com"), staleFiltered[0])
+}
+
+// TestRedisURLBlockHeightsCache_NotUsedWhenLocalStoreHasData verifies that
+// the Redis cache doesn't override higher local block heights.
+func TestRedisURLBlockHeightsCache_NotUsedWhenLocalStoreHasData(t *testing.T) {
+	logger := polylog.Ctx(context.Background())
+
+	perceivedBlock := uint64(43228834)
+	syncAllowance := uint64(5)
+	chainID := "1"
+
+	mockRepSvc := &mockReputationService{
+		archivalEndpoints: make(map[string]bool),
+	}
+
+	// Local store has current block height for the endpoint
+	localBlock := perceivedBlock - 2
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"supplier1:https://node.com": {
+			checkBlockNumber: endpointCheckBlockNumber{
+				parsedBlockNumberResponse: &localBlock,
+			},
+			checkChainID: endpointCheckChainID{
+				chainID:   &chainID,
+				expiresAt: time.Now().Add(1 * time.Hour),
+			},
+		},
+	}
+
+	ss := &serviceState{
+		logger: logger,
+		serviceQoSConfig: NewEVMServiceQoSConfigWithSyncAllowance(
+			"test-service", "1", nil, syncAllowance,
+		),
+		endpointStore: &endpointStore{
+			logger:    logger,
+			endpoints: endpoints,
+		},
+		reputationSvc:  mockRepSvc,
+		blockConsensus: NewBlockHeightConsensus(logger, 128),
+		archivalCache:  NewArchivalCache(),
+	}
+	ss.perceivedBlockNumber.Store(perceivedBlock)
+
+	// Redis cache has OLDER block (shouldn't override local)
+	staleRedisBlock := perceivedBlock - 100
+	redisCache := map[string]uint64{
+		"https://node.com": staleRedisBlock,
+	}
+	ss.redisURLBlockHeights.Store(&redisCache)
+
+	availableEndpoints := protocol.EndpointAddrList{"supplier1:https://node.com"}
+
+	// Should pass — local store has current block, Redis stale value shouldn't override
+	selected, err := ss.SelectMultipleWithArchival(availableEndpoints, 1, false, "test-req")
+	require.NoError(t, err)
+	require.Len(t, selected, 1, "endpoint with current local block should pass even with stale Redis cache")
 }

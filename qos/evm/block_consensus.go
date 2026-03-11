@@ -3,6 +3,7 @@ package evm
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -27,6 +28,12 @@ const (
 	// we allow above the median before rejecting as outlier.
 	// e.g., with sync_allowance=10 and multiplier=3, we accept up to median+30.
 	defaultMaxDeviationMultiplier = 3
+
+	// defaultExternalBlockGracePeriod is how long to wait after startup
+	// before applying the external block height floor. This gives suppliers
+	// time to report their block heights so the external floor doesn't
+	// filter out all endpoints during cold start.
+	defaultExternalBlockGracePeriod = 30 * time.Second
 )
 
 // blockObservation represents a single block height observation from an endpoint.
@@ -72,6 +79,23 @@ type BlockHeightConsensus struct {
 	// cachedPerceived is the last calculated perceived block
 	// Updated on each AddObservation call
 	cachedPerceived uint64
+
+	// externalBlockHeight is an optional floor from an external RPC source.
+	// When set (> 0), the perceived block height will never be lower than
+	// this value, ensuring behind-on-block suppliers are correctly filtered
+	// even when all session endpoints are equally stale.
+	// Lock-free via atomic for zero contention on the hot path.
+	externalBlockHeight atomic.Uint64
+
+	// createdAt tracks when this consensus was created.
+	// Used with externalBlockGracePeriod to delay applying the external floor
+	// until suppliers have had time to report their block heights.
+	createdAt time.Time
+
+	// externalBlockGracePeriod is how long after creation to wait before
+	// applying the external block height floor. During this period, only
+	// internal consensus is used. Default: 60s.
+	externalBlockGracePeriod time.Duration
 }
 
 // NewBlockHeightConsensus creates a new consensus calculator.
@@ -81,12 +105,14 @@ func NewBlockHeightConsensus(logger polylog.Logger, syncAllowance uint64) *Block
 	}
 
 	return &BlockHeightConsensus{
-		logger:                 logger,
-		observations:           make([]blockObservation, 0, 100),
-		observationWindow:      defaultObservationWindow,
-		maxObservations:        defaultMaxObservations,
-		syncAllowance:          syncAllowance,
-		maxDeviationMultiplier: defaultMaxDeviationMultiplier,
+		logger:                   logger,
+		observations:             make([]blockObservation, 0, 100),
+		observationWindow:        defaultObservationWindow,
+		maxObservations:          defaultMaxObservations,
+		syncAllowance:            syncAllowance,
+		maxDeviationMultiplier:   defaultMaxDeviationMultiplier,
+		createdAt:                time.Now(),
+		externalBlockGracePeriod: defaultExternalBlockGracePeriod,
 	}
 }
 
@@ -128,6 +154,26 @@ func (c *BlockHeightConsensus) GetObservationCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.observations)
+}
+
+// SetExternalBlockHeight sets the external block height floor.
+// If the external source reports a higher block than internal consensus,
+// the perceived block is raised to match.
+func (c *BlockHeightConsensus) SetExternalBlockHeight(height uint64) {
+	c.externalBlockHeight.Store(height)
+}
+
+// GetExternalBlockHeight returns the current external block height floor.
+func (c *BlockHeightConsensus) GetExternalBlockHeight() uint64 {
+	return c.externalBlockHeight.Load()
+}
+
+// SetExternalBlockGracePeriod configures how long after creation to wait
+// before the external block floor takes effect.
+func (c *BlockHeightConsensus) SetExternalBlockGracePeriod(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.externalBlockGracePeriod = d
 }
 
 // GetMedianBlock returns the current median block height.
@@ -214,7 +260,28 @@ func (c *BlockHeightConsensus) calculatePerceivedLocked() uint64 {
 
 	// If all observations were outliers (shouldn't happen), fall back to median
 	if maxValid == 0 {
-		return median
+		maxValid = median
+	}
+
+	// External block height acts as a floor — if all session endpoints are behind
+	// the real chain tip, the external source corrects the perceived block.
+	// The floor is only applied after the grace period, giving suppliers time
+	// to report their block heights during cold start.
+	if ext := c.externalBlockHeight.Load(); ext > 0 && ext > maxValid {
+		if time.Since(c.createdAt) >= c.externalBlockGracePeriod {
+			c.logger.Warn().
+				Uint64("consensus_block", maxValid).
+				Uint64("external_block", ext).
+				Int("observation_count", len(c.observations)).
+				Msg("Session endpoints behind external source — using external block as floor")
+			maxValid = ext
+		} else {
+			c.logger.Debug().
+				Uint64("consensus_block", maxValid).
+				Uint64("external_block", ext).
+				Dur("grace_remaining", c.externalBlockGracePeriod-time.Since(c.createdAt)).
+				Msg("External block floor deferred — grace period active")
+		}
 	}
 
 	return maxValid

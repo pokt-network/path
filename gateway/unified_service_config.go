@@ -186,6 +186,21 @@ type ServiceHealthCheckOverride struct {
 	Local         []HealthCheckConfig   `yaml:"local,omitempty"`
 }
 
+// ExternalBlockSource configures an optional external RPC endpoint
+// for ground-truth block height validation. When configured, the
+// external block height acts as a floor for perceivedBlockNumber,
+// ensuring behind-on-block suppliers are correctly filtered even when
+// all session endpoints are equally stale.
+type ExternalBlockSource struct {
+	URL         string        `yaml:"url"`                  // RPC endpoint URL
+	Type        string        `yaml:"type,omitempty"`       // "jsonrpc" (default) or "rest". REST uses GET, JSON-RPC uses POST.
+	Method      string        `yaml:"method,omitempty"`     // JSON-RPC method. Default: "eth_blockNumber". Use "status" for Cosmos, "getBlockHeight" for Solana.
+	Path        string        `yaml:"path,omitempty"`       // Request path appended to URL. Default: "/"
+	Interval    time.Duration `yaml:"interval,omitempty"`   // Poll interval. Default: 30s
+	Timeout     time.Duration `yaml:"timeout,omitempty"`    // HTTP timeout. Default: 5s
+	GracePeriod time.Duration `yaml:"grace_period,omitempty"` // Wait after startup before applying external floor. Default: 60s
+}
+
 // ServiceFallbackConfig holds per-service fallback endpoint configuration.
 type ServiceFallbackConfig struct {
 	Enabled        bool                `yaml:"enabled,omitempty"`
@@ -206,7 +221,8 @@ type ServiceDefaults struct {
 	ObservationPipeline ServiceObservationConfig     `yaml:"observation_pipeline,omitempty"`
 	ConcurrencyConfig   ServiceConcurrencyConfig     `yaml:"concurrency_config,omitempty"`
 	TimeoutConfig       ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
-	ActiveHealthChecks  ServiceHealthCheckOverride   `yaml:"active_health_checks,omitempty"`
+	ActiveHealthChecks   ServiceHealthCheckOverride `yaml:"active_health_checks,omitempty"`
+	ExternalBlockSources []ExternalBlockSource      `yaml:"external_block_sources,omitempty"`
 }
 
 // ServiceConfig defines configuration for a single service.
@@ -224,8 +240,9 @@ type ServiceConfig struct {
 	ObservationPipeline *ServiceObservationConfig     `yaml:"observation_pipeline,omitempty"`
 	ConcurrencyConfig   *ServiceConcurrencyConfig     `yaml:"concurrency_config,omitempty"`
 	TimeoutConfig       *ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
-	Fallback            *ServiceFallbackConfig        `yaml:"fallback,omitempty"`
-	HealthChecks        *ServiceHealthCheckOverride   `yaml:"health_checks,omitempty"`
+	Fallback             *ServiceFallbackConfig        `yaml:"fallback,omitempty"`
+	HealthChecks         *ServiceHealthCheckOverride   `yaml:"health_checks,omitempty"`
+	ExternalBlockSources []ExternalBlockSource         `yaml:"external_block_sources,omitempty"`
 }
 
 // UnifiedServicesConfig is the top-level configuration for the unified service system.
@@ -735,6 +752,11 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 
 	// Note: Fallback is service-specific only, no merge with defaults needed
 	// (ServiceDefaults doesn't have a Fallback field)
+
+	// Merge external block sources: service-level sources override defaults entirely
+	if len(merged.ExternalBlockSources) == 0 && len(c.Defaults.ExternalBlockSources) > 0 {
+		merged.ExternalBlockSources = c.Defaults.ExternalBlockSources
+	}
 
 	return &merged
 }
