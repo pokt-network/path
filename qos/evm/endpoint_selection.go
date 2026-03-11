@@ -469,11 +469,12 @@ func (ss *serviceState) basicEndpointValidation(endpointAddr protocol.EndpointAd
 
 // isBlockNumberValid returns an error if:
 //   - The endpoint's block height is less than the perceived block height minus the sync allowance.
+//   - The endpoint has no block number observation but we have chain state (unknown block height
+//     is treated as potentially stale to prevent serving data from severely behind endpoints).
 //
 // Returns nil (passes) if:
 //   - sync_allowance is 0 (check disabled)
 //   - No perceived block number yet (no chain data to compare against)
-//   - Endpoint has no block number observation (no endpoint data to validate)
 //
 // Note: This function is lock-free - perceivedBlockNumber uses atomic operations.
 func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error {
@@ -496,14 +497,18 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 		return nil
 	}
 
-	// If endpoint has no block number observation, skip the check (no endpoint data to validate)
+	// If endpoint has no block number observation but we have chain state, filter it out.
+	// An endpoint with unknown block height could be severely behind (e.g., 58K blocks)
+	// and would serve stale data to clients. It's safer to skip it and use endpoints
+	// with known, validated block heights. The endpoint will become eligible once its
+	// block height is observed via health checks, Redis sync, or relay observations.
 	if check.parsedBlockNumberResponse == nil {
 		ss.logger.Warn().
 			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 			Uint64("perceived_block", perceivedBlock).
 			Uint64("sync_allowance", syncAllowance).
-			Msg("🔍 Sync allowance check SKIPPED (endpoint has no block number observation)")
-		return nil
+			Msg("⛔ Endpoint filtered: no block number observation (unknown block height treated as potentially stale)")
+		return fmt.Errorf("no block number observation with perceived block %d: %w", perceivedBlock, errNoBlockNumberObs)
 	}
 
 	// Dereference pointer to show actual block number instead of memory address in error logs
