@@ -100,11 +100,13 @@ func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.E
 				Msg("no archival-capable endpoints available for archival request")
 			return nil, fmt.Errorf("no archival-capable endpoints available for archival request")
 		}
-		// CODE_PATH: Standard fallback - random selection from all endpoints
+		// CODE_PATH: Standard fallback - random selection, but still exclude known-stale URLs
+		fallbackEndpoints := ss.filterStaleURLEndpoints(availableEndpoints)
 		logger.Warn().Str("code_path", "STANDARD_FALLBACK_RANDOM").
 			Int("total_endpoints", len(availableEndpoints)).
+			Int("fallback_endpoints", len(fallbackEndpoints)).
 			Msgf("selecting random endpoints because all endpoints failed validation from: %s", availableEndpoints.String())
-		return selector.RandomSelectMultiple(availableEndpoints, numEndpoints), nil
+		return selector.RandomSelectMultiple(fallbackEndpoints, numEndpoints), nil
 	}
 
 	// CODE_PATH: Selection success - using diversity-aware selection
@@ -140,8 +142,12 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 	validCount := len(filteredEndpointsAddr)
 	// Handle case where all endpoints failed validation
 	if validCount == 0 {
-		logger.Warn().Msgf("SELECTING A RANDOM ENDPOINT because all endpoints failed validation from: %s", availableEndpoints.String())
-		randomAvailableEndpointAddr := availableEndpoints[rand.Intn(availableCount)]
+		// Still exclude known-stale URLs from the fallback pool
+		fallbackEndpoints := ss.filterStaleURLEndpoints(availableEndpoints)
+		logger.Warn().
+			Int("fallback_endpoints", len(fallbackEndpoints)).
+			Msgf("SELECTING A RANDOM ENDPOINT because all endpoints failed validation from: %s", availableEndpoints.String())
+		randomAvailableEndpointAddr := fallbackEndpoints[rand.Intn(len(fallbackEndpoints))]
 		return EndpointSelectionResult{
 			SelectedEndpoint: randomAvailableEndpointAddr,
 			Metadata: EndpointSelectionMetadata{
@@ -597,6 +603,56 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 		Msg("🔍 Sync allowance validation")
 
 	return nil
+}
+
+// filterStaleURLEndpoints removes endpoints whose URL has a known stale block height
+// from the endpoint store. Used by fallback paths to avoid selecting stale infrastructure
+// when all endpoints fail normal validation.
+func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrList) protocol.EndpointAddrList {
+	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
+	if syncAllowance == 0 {
+		return endpoints
+	}
+	perceivedBlock := ss.perceivedBlockNumber.Load()
+	if perceivedBlock == 0 {
+		return endpoints
+	}
+	minAllowed := perceivedBlock - syncAllowance
+
+	// Build URL→blockHeight map from store
+	urlBlockHeights := make(map[string]uint64)
+	ss.endpointStore.endpointsMu.RLock()
+	for addr, ep := range ss.endpointStore.endpoints {
+		if ep.checkBlockNumber.parsedBlockNumberResponse != nil {
+			if url, err := addr.GetURL(); err == nil {
+				h := *ep.checkBlockNumber.parsedBlockNumberResponse
+				if existing, ok := urlBlockHeights[url]; !ok || h > existing {
+					urlBlockHeights[url] = h
+				}
+			}
+		}
+	}
+	ss.endpointStore.endpointsMu.RUnlock()
+
+	if len(urlBlockHeights) == 0 {
+		return endpoints
+	}
+
+	filtered := make(protocol.EndpointAddrList, 0, len(endpoints))
+	for _, ep := range endpoints {
+		if url, err := ep.GetURL(); err == nil {
+			if urlBlock, ok := urlBlockHeights[url]; ok && urlBlock < minAllowed {
+				continue // skip stale URL
+			}
+		}
+		filtered = append(filtered, ep)
+	}
+
+	// If filtering removed everything, return original to avoid total failure
+	if len(filtered) == 0 {
+		return endpoints
+	}
+	return filtered
 }
 
 // isChainIDValid returns an error if:
