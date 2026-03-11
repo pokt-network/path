@@ -9,21 +9,6 @@ import (
 	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
-const (
-	// errCodeUnmarshaling is set as the JSONRPC response's error code if the endpoint returns a malformed response.
-	// `jsonrpc.ResponseCodeBackendServerErr`, i.e. code -31002, will result in returning a 500 HTTP Status Code to the client.
-	errCodeUnmarshaling = jsonrpc.ResponseCodeBackendServerErr
-
-	// errMsgUnmarshaling is the generic message returned to the user if the endpoint returns a malformed response.
-	errMsgUnmarshaling = "the response returned by the endpoint is not a valid JSONRPC response"
-
-	// errDataFieldRawBytes is the key of the entry in the JSONRPC error response's "data" map which holds the endpoint's original response.
-	errDataFieldRawBytes = "endpoint_response"
-
-	// errDataFieldUnmarshalingErr is the key of the entry in the JSONRPC error response's "data" map which holds the unmarshaling error.
-	errDataFieldUnmarshalingErr = "unmarshaling_error"
-)
-
 // responseGeneric represents the standard response structure for EVM-based blockchain requests.
 // Used as a fallback when:
 // - No validation/observation is needed for the JSON-RPC method
@@ -107,42 +92,6 @@ func (r responseGeneric) getHTTPStatusCode() int {
 	return r.jsonrpcResponse.GetRecommendedHTTPStatusCode()
 }
 
-// responseUnmarshallerGenericFromResponse processes an already unmarshaled JSON-RPC response into a responseGeneric struct.
-// This avoids double unmarshaling when the response has already been parsed.
-func responseUnmarshallerGenericFromResponse(logger polylog.Logger, jsonrpcReq jsonrpc.Request, jsonrpcResponse jsonrpc.Response) (response, error) {
-	httpStatus := jsonrpcResponse.GetRecommendedHTTPStatusCode()
-	logger.With(
-		"jsonrpc_response", jsonrpcResponse,
-		"jsonrpc_request", jsonrpcReq,
-		"http_status", httpStatus,
-	).Debug().Msg("Processing EVM generic response")
-
-	// Response successfully parsed into JSONRPC format.
-	return responseGeneric{
-		logger:          logger,
-		jsonrpcResponse: jsonrpcResponse,
-		validationError: nil, // Intentionally set to nil to indicate a valid JSONRPC response.
-	}, nil
-}
-
-// getGenericJSONRPCErrResponse creates a generic response containing:
-// - JSON-RPC error with supplied ID
-// - Error details
-// - Invalid payload in the "data" field
-// Sets validation error to UNMARSHAL to trigger endpoint disqualification.
-func getGenericJSONRPCErrResponse(_ polylog.Logger, id jsonrpc.ID, malformedResponsePayload []byte, err error) responseGeneric {
-	errData := map[string]string{
-		errDataFieldRawBytes:        string(malformedResponsePayload),
-		errDataFieldUnmarshalingErr: err.Error(),
-	}
-
-	validationError := qosobservations.EVMResponseValidationError_EVM_RESPONSE_VALIDATION_ERROR_UNMARSHAL
-	return responseGeneric{
-		jsonrpcResponse: jsonrpc.GetErrorResponse(id, errCodeUnmarshaling, errMsgUnmarshaling, errData),
-		validationError: &validationError, // Set validation error to trigger endpoint disqualification
-	}
-}
-
 // getGenericJSONRPCErrResponseBatchMarshalFailure creates a generic response for batch marshaling failures.
 // This occurs when individual responses are valid but combining them into a JSON array fails.
 // Uses null ID per JSON-RPC spec for batch-level errors that cannot be correlated to specific requests.
@@ -174,26 +123,3 @@ func getGenericResponseBatchEmpty(logger polylog.Logger) responseGeneric {
 		validationError: nil,                // No validation error - this is valid JSON-RPC behavior
 	}
 }
-
-// getGenericResponseNoEndpointResponse creates a responseGeneric instance for the error case
-// where no endpoint responses are available. This should never happen in normal operation
-// and indicates an internal error in the request processing pipeline.
-func getGenericResponseNoEndpointResponse(logger polylog.Logger) responseGeneric {
-	logger.Error().Msg("No endpoint responses available - this indicates an internal error")
-
-	return responseGeneric{
-		logger: logger,
-		jsonrpcResponse: jsonrpc.Response{
-			Error: &jsonrpc.ResponseError{
-				Code:    -32603, // JSON-RPC internal error code
-				Message: "internal error: no endpoint response available",
-			},
-		},
-		validationError: nil,
-	}
-}
-
-// TODO_INCOMPLETE: Handle the string `null`, as it could be returned
-// when an object is expected.
-// See the following link for more details:
-// https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_gettransactionbyhash

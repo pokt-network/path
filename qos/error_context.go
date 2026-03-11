@@ -130,3 +130,12 @@ func (ets errorTrackingSelector) SelectMultiple(endpoints protocol.EndpointAddrL
 
 	return nil, errInvalidSelectorUsage
 }
+
+// SelectMultipleWithArchival method of an errorTrackingSelector should never be called.
+// It logs a warning and returns an invalid usage error.
+// Implements the protocol.EndpointSelector interface.
+func (ets errorTrackingSelector) SelectMultipleWithArchival(endpoints protocol.EndpointAddrList, numEndpoints uint, _ bool) (protocol.EndpointAddrList, error) {
+	ets.logger.Warn().Msg("SHOULD NEVER HAPPEN: errorTrackingSelector.SelectMultipleWithArchival() should never be called.")
+
+	return nil, errInvalidSelectorUsage
+}

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"time"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
@@ -157,4 +158,40 @@ type QoSService interface {
 	// HydrateDisqualifiedEndpointsResponse:
 	// - Fills the disqualified endpoint response with QoS-specific data.
 	HydrateDisqualifiedEndpointsResponse(protocol.ServiceID, *devtools.DisqualifiedEndpointResponse)
+}
+
+// QoSArchivalReporter is an optional interface that QoS services can implement
+// to report archival capability status for endpoints.
+// Used by the /ready endpoint to include archival information in endpoint details.
+type QoSArchivalReporter interface {
+	// GetEndpointArchivalStatus returns the archival status for a specific endpoint.
+	// Returns (isArchival, expiresAt) if the endpoint has been checked for archival capability.
+	// Returns (false, zero time) if the endpoint has not been checked or is not archival-capable.
+	GetEndpointArchivalStatus(endpointAddr protocol.EndpointAddr) (isArchival bool, expiresAt time.Time)
+}
+
+// QoSBlockConsensusReporter is an optional interface that QoS services can implement
+// to report block consensus statistics for observability.
+// Used by the /ready endpoint to include block consensus info.
+type QoSBlockConsensusReporter interface {
+	// GetBlockConsensusStats returns the median block and observation count.
+	// Used for observability to understand how block consensus is calculated.
+	GetBlockConsensusStats() (medianBlock uint64, observationCount int)
+}
+
+// ArchivalRequirementChecker is an optional interface that RequestQoSContext can implement
+// to indicate whether the current request requires archival data.
+// Used by endpoint selection to filter for archival-capable endpoints.
+type ArchivalRequirementChecker interface {
+	// RequiresArchival returns true if the request requires archival data
+	// (e.g., querying historical blockchain state).
+	RequiresArchival() bool
+}
+
+// QoSServiceRegistry provides access to QoS services by service ID.
+// Used by the protocol to query endpoint-specific QoS data like archival status.
+type QoSServiceRegistry interface {
+	// GetQoSServiceForServiceID returns the QoS service for a given service ID.
+	// Returns nil if no QoS service is registered for the service ID.
+	GetQoSServiceForServiceID(serviceID protocol.ServiceID) QoSService
 }

@@ -9,6 +9,8 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
 	"github.com/stretchr/testify/require"
+
+	"github.com/pokt-network/path/protocol"
 )
 
 // TestExternalConfigFetching tests that external config is fetched and parsed correctly.
@@ -238,6 +240,79 @@ func TestConfigMergingSyncAllowance(t *testing.T) {
 	require.Equal(t, externalSyncAllowance, *ethCfg.SyncAllowance, "Expected external sync_allowance (50) when no local override")
 
 	t.Log("SyncAllowance merging test passed")
+}
+
+// mockQoSServiceWithSyncAllowance is a minimal mock that tracks SetSyncAllowance calls.
+type mockQoSServiceWithSyncAllowance struct {
+	QoSService // embed interface — only SetSyncAllowance is used
+	syncAllowance uint64
+	called        bool
+}
+
+func (m *mockQoSServiceWithSyncAllowance) SetSyncAllowance(v uint64) {
+	m.syncAllowance = v
+	m.called = true
+}
+
+// TestSetQoSInstancesAppliesSyncAllowanceFromExternalConfigs verifies that
+// SetQoSInstances propagates sync_allowance from already-loaded external configs.
+// This reproduces a bug where InitExternalConfig runs before SetQoSInstances,
+// so the initial SetSyncAllowance calls find an empty qosInstances map.
+func TestSetQoSInstancesAppliesSyncAllowanceFromExternalConfigs(t *testing.T) {
+	syncAllowance20 := 20
+	syncAllowance1200 := 1200
+
+	executor := &HealthCheckExecutor{
+		config:       &ActiveHealthChecksConfig{},
+		logger:       polyzero.NewLogger(),
+		qosInstances: make(map[protocol.ServiceID]QoSService),
+	}
+
+	// Simulate external configs already loaded (as if InitExternalConfig ran first)
+	executor.externalConfigs = []ServiceHealthCheckConfig{
+		{
+			ServiceID:     "base",
+			SyncAllowance: &syncAllowance20,
+		},
+		{
+			ServiceID:     "arb-one",
+			SyncAllowance: &syncAllowance1200,
+		},
+	}
+
+	// Create mock QoS instances (as if cmd/qos.go created them with syncAllowance=0)
+	baseMock := &mockQoSServiceWithSyncAllowance{}
+	arbMock := &mockQoSServiceWithSyncAllowance{}
+
+	// This is the call that happens in cmd/main.go AFTER InitExternalConfig
+	executor.SetQoSInstances(map[protocol.ServiceID]QoSService{
+		"base":    baseMock,
+		"arb-one": arbMock,
+	})
+
+	// Verify sync_allowance was applied from external configs
+	require.True(t, baseMock.called, "SetSyncAllowance should have been called on base")
+	require.Equal(t, uint64(20), baseMock.syncAllowance, "base should have sync_allowance=20 from external config")
+
+	require.True(t, arbMock.called, "SetSyncAllowance should have been called on arb-one")
+	require.Equal(t, uint64(1200), arbMock.syncAllowance, "arb-one should have sync_allowance=1200 from external config")
+}
+
+// TestSetQoSInstancesNoExternalConfigs verifies SetQoSInstances works when no external configs are loaded.
+func TestSetQoSInstancesNoExternalConfigs(t *testing.T) {
+	executor := &HealthCheckExecutor{
+		config:       &ActiveHealthChecksConfig{},
+		logger:       polyzero.NewLogger(),
+		qosInstances: make(map[protocol.ServiceID]QoSService),
+	}
+
+	// No external configs loaded
+	baseMock := &mockQoSServiceWithSyncAllowance{}
+	executor.SetQoSInstances(map[protocol.ServiceID]QoSService{
+		"base": baseMock,
+	})
+
+	require.False(t, baseMock.called, "SetSyncAllowance should NOT have been called when no external configs")
 }
 
 // TestMapSignalType tests the mapping of signal type strings to reputation signals.

@@ -172,6 +172,71 @@ curl -X POST http://localhost:3069/v1 \
   -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
 ```
 
+### Operational Endpoints
+
+**Health Check** (`/health`)
+Returns overall gateway health status. Note: `/healthz` is deprecated, use `/health` instead.
+```bash
+curl http://localhost:3069/health
+```
+
+**Service Readiness** (`/ready/<service>`)
+Check if a specific service is ready to handle requests.
+```bash
+# Basic readiness check
+curl http://localhost:3069/ready/eth
+# Response: {"ready":true,"endpoint_count":49,"has_session":true}
+
+# Detailed endpoint information (includes reputation, archival status, latency)
+curl "http://localhost:3069/ready/eth?detailed=true"
+```
+
+**Detailed Response Fields:**
+- `endpoints[]` - Array of endpoint details:
+  - `address` - Unique endpoint identifier (supplier-url format)
+  - `supplier_address` - Supplier's POKT address
+  - `url` - Backend endpoint URL
+  - `is_fallback` - Whether this is a fallback endpoint
+  - `reputation` - Reputation metrics:
+    - `score` - Current reputation score (0-100)
+    - `success_count` / `error_count` - Request counters
+    - `latency` - Latency metrics (avg, min, max, last in ms)
+    - `critical_strikes` - Number of critical failures
+  - `archival` - Archival capability (EVM services only):
+    - `is_archival` - Whether endpoint can serve historical data
+    - `expires_at` - When archival status expires (needs re-validation)
+  - `tier` - Reputation tier (1=best, 2=good, 3=probation)
+  - `in_cooldown` - Whether endpoint is in cooldown period
+  - `cooldown_remaining` - Time remaining in cooldown
+
+**All Services Readiness** (`/ready`)
+Check readiness of all configured services.
+```bash
+curl http://localhost:3069/ready
+# With detailed endpoint info for all services
+curl "http://localhost:3069/ready?detailed=true"
+```
+
+### Admin Endpoints
+
+**Circuit Breaker Clear** (`POST /admin/circuit-breaker/clear/{serviceId}`)
+Clears all circuit breaker state (in-memory + Redis) for a specific service. This is the only reliable way to reset circuit breaker state — Redis DEL alone is insufficient because `refreshFromRedis` merges local in-memory entries back.
+
+Must be called on each pod individually since in-memory state is per-pod.
+```bash
+# Port-forward to a pod first
+kubectl --context pnf -n <namespace> port-forward <pod> 13069:3069 &
+
+# Clear circuit breaker state for a service
+curl -X POST http://localhost:13069/admin/circuit-breaker/clear/near
+# Response: {"service_id":"near","cleared_domains":3,"message":"circuit breaker state cleared (in-memory + Redis)"}
+```
+
+**When to use:**
+- After deploying a fix for a bug that caused false positive circuit breaker lockouts
+- When a domain is stuck in circuit breaker state due to a transient issue that has resolved
+- Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis
+
 ## Testing Strategy
 
 - **Unit Tests** - Standard Go tests with `-short` flag

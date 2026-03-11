@@ -106,6 +106,10 @@ type QueuedObservation struct {
 	// Source indicates where this observation came from.
 	Source ObservationSource
 
+	// IsArchivalCheck indicates this is from a health check with archival: true.
+	// When true and the check passes, the endpoint should be marked as archival-capable.
+	IsArchivalCheck bool
+
 	// Timestamp when the response was received.
 	Timestamp time.Time
 
@@ -327,6 +331,17 @@ func (q *ObservationQueue) processObservation(obs *QueuedObservation) {
 
 	// Run all extractions (this is the heavy parsing work)
 	data.ExtractAll(extractor, obs.RequestBody)
+
+	// NOTE: Archival marking is NOT done here, even when obs.IsArchivalCheck is true.
+	// This is because processObservationSync() is called BEFORE error_detection in health checks.
+	// If the archival check detects a "false success" (like "0x0" response), we don't want to
+	// mark the endpoint as archival-capable.
+	//
+	// Archival marking happens explicitly in HealthCheckExecutor.markEndpointArchival() which is
+	// called ONLY after all health check validations pass (including error_detection).
+	//
+	// The IsArchivalCheck flag in QueuedObservation is currently unused but reserved for
+	// future use (e.g., logging, metrics).
 
 	// Call handler if set
 	if q.handler != nil {

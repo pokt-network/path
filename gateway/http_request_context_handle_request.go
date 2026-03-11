@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,7 +41,9 @@ type responseCheckResult struct {
 //   - err: Any error returned from the protocol layer
 //   - statusCode: HTTP status code from the endpoint
 //   - responseBytes: Response payload bytes
-//   - rpcType: RPC type for protocol-specific heuristic analysis
+//   - heuristicRPCType: RPC type for protocol-specific heuristic analysis.
+//     Use Payload.EffectiveRPCType() to preserve the original detected type
+//     (e.g., COMET_BFT) even when routing fell back to JSON_RPC.
 //   - logger: Logger for debugging
 //
 // Returns responseCheckResult with success status and optional heuristic result.
@@ -48,7 +51,8 @@ func checkResponseSuccess(
 	err error,
 	statusCode int,
 	responseBytes []byte,
-	rpcType sharedtypes.RPCType,
+	heuristicRPCType sharedtypes.RPCType,
+	jsonrpcMethod string,
 	logger polylog.Logger,
 ) responseCheckResult {
 	// Protocol error - definitely not successful
@@ -64,7 +68,7 @@ func checkResponseSuccess(
 
 	// Heuristic payload analysis - catch errors that slip through HTTP status
 	// This detects JSON-RPC errors, malformed responses, HTML error pages, empty responses, etc.
-	result := heuristic.Analyze(responseBytes, statusCode, rpcType)
+	result := heuristic.Analyze(responseBytes, statusCode, heuristicRPCType, jsonrpcMethod)
 	if result.ShouldRetry {
 		logger.Debug().
 			Str("heuristic_reason", result.Reason).
@@ -107,8 +111,16 @@ func recordHeuristicErrorToReputation(
 	// High confidence heuristic errors (JSON-RPC errors, HTML pages) are more severe
 	// Note: latency=0 for heuristic errors since this is a payload analysis, not timing
 	if heuristicResult.Confidence >= 0.95 {
-		signal = reputation.NewMajorErrorSignal("heuristic_"+heuristicResult.Reason, 0)
-		metricSignal = metrics.SignalMajorError
+		// Deceptive response patterns (empty array for scalar methods, empty object results)
+		// get CriticalErrorSignal (-25) which triggers the strike system for exponential cooldowns.
+		// Other high-confidence errors (HTML pages, server errors) stay at MajorErrorSignal (-10).
+		if isDeceptiveResponsePattern(heuristicResult.Reason) {
+			signal = reputation.NewCriticalErrorSignal("heuristic_"+heuristicResult.Reason, 0)
+			metricSignal = metrics.SignalCriticalError
+		} else {
+			signal = reputation.NewMajorErrorSignal("heuristic_"+heuristicResult.Reason, 0)
+			metricSignal = metrics.SignalMajorError
+		}
 	} else {
 		signal = reputation.NewMinorErrorSignal("heuristic_" + heuristicResult.Reason)
 		metricSignal = metrics.SignalMinorError
@@ -135,6 +147,61 @@ func recordHeuristicErrorToReputation(
 		Float64("heuristic_confidence", heuristicResult.Confidence).
 		Str("reputation_signal", metricSignal).
 		Msg("Recorded heuristic error signal to reputation")
+}
+
+// shouldCircuitBreak returns true if the failure should trigger a domain-level circuit break.
+//
+// The following cases should NOT trigger circuit breaks:
+//   - Capability limitation errors: domain is healthy, just can't serve this request type.
+//     This includes archival errors (missing historical data) and node type limitations
+//     (e.g., Tron lite fullnodes that can't serve certain API calls).
+//   - HTTP 4xx responses: client sent a bad request, domain correctly rejected it
+//
+// Only 5xx errors, transport failures, and heuristic-detected supplier errors should
+// circuit break, as those indicate the domain itself is broken.
+//
+// The lastErr parameter allows checking for capability limitation patterns in the error
+// string when the heuristic result was lost during protocol-layer error propagation
+// (e.g., hedge_failed path where the protocol detected an error but the heuristicResult
+// is nil by the time it reaches the circuit breaker).
+func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCode int, lastErr error) bool {
+	// HTTP 4xx = client error. The domain correctly rejected a bad request.
+	// Don't punish domains for clients sending malformed requests.
+	if httpStatusCode >= 400 && httpStatusCode < 500 {
+		return false
+	}
+	// Capability limitation errors (archival, lite fullnode, etc.) are expected from
+	// nodes that can't serve certain request types — don't circuit break the domain.
+	if heuristicResult != nil {
+		if heuristicResult.MatchedPattern != "" && heuristic.IsCapabilityLimitationError(heuristicResult.MatchedPattern) {
+			return false
+		}
+	} else if lastErr != nil {
+		// Heuristic result was lost during error propagation (e.g., protocol layer
+		// detected error → returned error → hedge_failed path → heuristicResult is nil).
+		// Fall back to checking the error string for capability limitation patterns.
+		if heuristic.ErrorContainsArchivalPattern(lastErr.Error()) {
+			return false
+		}
+	}
+	if heuristicResult == nil && lastErr == nil {
+		// No heuristic and no error context — transport failure, should circuit break
+		return true
+	}
+	return true
+}
+
+// isDeceptiveResponsePattern returns true if the heuristic reason indicates a supplier
+// returning fabricated responses (empty/invalid results while passing health checks).
+// These warrant harsher penalties than generic server errors.
+func isDeceptiveResponsePattern(reason string) bool {
+	switch reason {
+	case "jsonrpc_invalid_empty_array", "jsonrpc_empty_object_result",
+		"rest_protocol_mismatch", "cometbft_invalid_empty_array":
+		return true
+	default:
+		return false
+	}
 }
 
 // TODO_TECHDEBT(@adshmh): A single protocol context should handle both single/parallel calls to one or more endpoints.
@@ -216,6 +283,11 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	}
 
 	rpcType := payloads[0].RPCType
+	heuristicRPCType := payloads[0].EffectiveRPCType()
+	jsonrpcMethod := payloads[0].JSONRPCMethod
+	if jsonrpcMethod == "" {
+		jsonrpcMethod = payloads[0].Path
+	}
 	batchCount := len(payloads)
 
 	// Get retry configuration for the service
@@ -261,9 +333,23 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	var lastErr error
 	var lastStatusCode int
 	var lastEndpointAddr protocol.EndpointAddr
+	var lastCircuitBreakReason string              // reason for circuit breaking the previous endpoint's domain
+	var lastResponseSnippet string                 // truncated response that triggered the break
+	var lastHeuristicResult *heuristic.AnalysisResult // heuristic result from the last failed attempt
 
-	// Track endpoints already tried to ensure retry endpoint rotation
+	// Track endpoints and domains already tried to ensure retry rotation.
+	// Domain-level tracking prevents retrying different endpoints behind the same broken infrastructure.
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
+	triedDomains := make(map[string]bool)
+
+	// Pre-populate triedDomains with broken domains from the cross-pod circuit breaker.
+	// This ensures retries skip domains that other pods have discovered are broken.
+	if rc.circuitBreaker != nil {
+		for domain := range rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID)) {
+			triedDomains[domain] = true
+		}
+	}
+
 	currentProtocolCtx := rc.protocolContexts[0]
 	var currentEndpointAddr protocol.EndpointAddr
 
@@ -294,8 +380,26 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				Msg("Retrying relay request")
 
 			// CRITICAL: Retry endpoint rotation - select a NEW endpoint for retry
-			// Mark the previous endpoint as tried
+			// Mark the previous endpoint and its domain as tried
 			triedEndpoints[currentEndpointAddr] = true
+			markDomainTried(triedDomains, currentEndpointAddr)
+
+			// Mark domain broken in cross-pod circuit breaker so other pods skip it too.
+			// Skip circuit breaking for archival-related errors — the domain is working
+			// correctly, it just doesn't have historical state data.
+			if rc.circuitBreaker != nil {
+				if domain := extractDomainFromEndpoint(currentEndpointAddr); domain != "" {
+					if shouldCircuitBreak(lastHeuristicResult, lastStatusCode, lastErr) {
+						reason := fmt.Sprintf("retry: %s | status=%d | response=%s", lastCircuitBreakReason, lastStatusCode, lastResponseSnippet)
+						rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain, reason)
+					} else {
+						logger.Warn().
+							Str("domain", domain).
+							Str("reason", lastCircuitBreakReason).
+							Msg("Skipped circuit break for archival-related error (retrying on different supplier)")
+					}
+				}
+			}
 
 			// Get fresh endpoint list from protocol (filtered by detected RPC type)
 			availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
@@ -312,30 +416,34 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				lastErr = fmt.Errorf("no endpoints available for retry")
 				break
 			}
-			// Filter out endpoints we've already tried
-			filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints)
 
-			// If all endpoints exhausted, apply backoff and reset
+			// Filter endpoints through QoS validation (block height, chain ID, etc.)
+			// This prevents stale endpoints from being selected for retries.
+			requiresArchival := false
+			if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+				requiresArchival = archivalChecker.RequiresArchival()
+			}
+			validatedEndpoints, validateErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+				availableEndpoints, uint(len(availableEndpoints)), requiresArchival)
+			if validateErr == nil && len(validatedEndpoints) > 0 {
+				availableEndpoints = validatedEndpoints
+				logger.Debug().
+					Int("validated_endpoints", len(validatedEndpoints)).
+					Bool("requires_archival", requiresArchival).
+					Msg("Filtered endpoints through QoS validation for retry")
+			}
+
+			// Filter out endpoints and domains we've already tried
+			filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints, triedDomains)
+
+			// If all endpoints exhausted (all domains tried), stop retrying.
+			// Retrying the same broken infrastructure wastes retry budget.
 			if len(filteredEndpoints) == 0 {
 				logger.Warn().
-					Int("num_tried", len(triedEndpoints)).
-					Msg("All available endpoints tried, resetting for retry with backoff")
-
-				// Apply exponential backoff when cycling through endpoints
-				backoff := calculateRetryBackoff(attempt)
-				if backoff > 0 {
-					select {
-					case <-rc.context.Done():
-						logger.Debug().Msg("Request canceled during endpoint exhaustion backoff")
-						return rc.context.Err()
-					case <-time.After(backoff):
-						// Continue after backoff
-					}
-				}
-
-				// Reset tried endpoints to allow re-selection
-				filteredEndpoints = availableEndpoints
-				triedEndpoints = make(map[protocol.EndpointAddr]bool)
+					Int("num_tried_endpoints", len(triedEndpoints)).
+					Int("num_tried_domains", len(triedDomains)).
+					Msg("All available endpoints from tried domains, stopping retries")
+				break
 			}
 
 			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
@@ -386,6 +494,21 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				logger.Warn().Err(err).Msg("Failed to get endpoints for hedge racing, falling back to normal request")
 				// Fall through to normal request
 			} else if len(availableEndpoints) > 0 {
+				// Filter endpoints through QoS validation (block height, chain ID, etc.)
+				// This prevents stale endpoints from being selected as hedge targets.
+				requiresArchival := false
+				if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+					requiresArchival = archivalChecker.RequiresArchival()
+				}
+				filteredForHedge, filterErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+					availableEndpoints, uint(len(availableEndpoints)), requiresArchival)
+				if filterErr == nil && len(filteredForHedge) > 0 {
+					availableEndpoints = filteredForHedge
+					logger.Debug().
+						Int("filtered_endpoints", len(filteredForHedge)).
+						Bool("requires_archival", requiresArchival).
+						Msg("Filtered endpoints through QoS validation for hedge racing")
+				}
 				// Select primary endpoint (first one, which is already reputation-sorted)
 				primaryEndpoint := availableEndpoints[0]
 
@@ -402,7 +525,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					Bool("hedge_started", racer.hedgeStarted).
 					Str("primary_endpoint", string(primaryEndpoint)).
 					Str("hedge_endpoint", string(racer.hedgeEndpoint)).
-					Int("suppliers_tracked", len(rc.suppliersTried)).
+					Int("suppliers_tracked", rc.getSuppliersTriedCount()).
 					Err(hedgeErr).
 					Msg("🔍 Hedge race completed")
 
@@ -414,7 +537,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					responseBytesForHeuristic := hedgeResponses[0].Bytes
 
 					// Check if response is actually successful (HTTP status + heuristic)
-					checkResult := checkResponseSuccess(hedgeErr, statusCode, responseBytesForHeuristic, rpcType, logger)
+					checkResult := checkResponseSuccess(hedgeErr, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, logger)
 					if checkResult.Success {
 						// Success! Process the response
 						for _, endpointResponse := range hedgeResponses {
@@ -456,12 +579,17 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					lastStatusCode = statusCode
 					lastEndpointAddr = endpointAddr
 					currentEndpointAddr = endpointAddr
+					lastHeuristicResult = checkResult.HeuristicResult
+					if checkResult.HeuristicResult != nil {
+						lastCircuitBreakReason = fmt.Sprintf("heuristic: %s (confidence=%.2f)", checkResult.HeuristicResult.Reason, checkResult.HeuristicResult.Confidence)
+					}
+					lastResponseSnippet = truncateResponse(responseBytesForHeuristic, 512)
 
 					logger.Warn().
 						Str("endpoint", string(endpointAddr)).
 						Int("status_code", statusCode).
 						Str("hedge_result", rc.hedgeResult).
-						Int("suppliers_tracked", len(rc.suppliersTried)).
+						Int("suppliers_tracked", rc.getSuppliersTriedCount()).
 						Int("retry_count", rc.retryCount).
 						Msg("🔍 Hedge race response failed heuristic check, will retry")
 				} else {
@@ -471,17 +599,21 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 						lastStatusCode = hedgeResponses[0].HTTPStatusCode
 						lastEndpointAddr = hedgeResponses[0].EndpointAddr
 						currentEndpointAddr = hedgeResponses[0].EndpointAddr
+						lastResponseSnippet = truncateResponse(hedgeResponses[0].Bytes, 512)
 					}
+					lastCircuitBreakReason = fmt.Sprintf("hedge_failed: %v", hedgeErr)
 
 					logger.Warn().Err(hedgeErr).
 						Str("hedge_result", rc.hedgeResult).
 						Msg("Hedge race failed, will retry with normal path")
 				}
 
-				// Mark endpoints tried by hedge racer
+				// Mark endpoints and domains tried by hedge racer
 				triedEndpoints[primaryEndpoint] = true
+				markDomainTried(triedDomains, primaryEndpoint)
 				if racer.hedgeEndpoint != "" {
 					triedEndpoints[racer.hedgeEndpoint] = true
+					markDomainTried(triedDomains, racer.hedgeEndpoint)
 				}
 
 				// Continue to next attempt (retry)
@@ -532,26 +664,16 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		}
 
 		// Track supplier tried for response headers (up to 10) - track ALL attempts including failures
-		if supplierForTracking != "" && len(rc.suppliersTried) < 10 {
-			// Only add if not already tracked (avoid duplicates on retry to same supplier)
-			alreadyTracked := false
-			for _, s := range rc.suppliersTried {
-				if s == supplierForTracking {
-					alreadyTracked = true
-					break
-				}
-			}
-			if !alreadyTracked {
-				rc.suppliersTried = append(rc.suppliersTried, supplierForTracking)
-				logger.Debug().
-					Str("supplier", supplierForTracking).
-					Int("attempt", attempt).
-					Int("retry_count", rc.retryCount).
-					Int("status_code", statusCode).
-					Str("source", "handleSingleRelayRequest").
-					Int("total_suppliers_tried", len(rc.suppliersTried)).
-					Msg("🔍 TRACKED supplier in suppliersTried (normal/retry path)")
-			}
+		// Use thread-safe method for consistency with batch request code path
+		if added := rc.addSupplierTried(supplierForTracking); added {
+			logger.Debug().
+				Str("supplier", supplierForTracking).
+				Int("attempt", attempt).
+				Int("retry_count", rc.retryCount).
+				Int("status_code", statusCode).
+				Str("source", "handleSingleRelayRequest").
+				Int("total_suppliers_tried", rc.getSuppliersTriedCount()).
+				Msg("🔍 TRACKED supplier in suppliersTried (normal/retry path)")
 		}
 
 		// Extract response bytes for heuristic analysis
@@ -561,7 +683,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		}
 
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
-		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, rpcType, logger)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, logger)
 		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
@@ -628,6 +750,17 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		lastErr = err
 		lastStatusCode = statusCode
 		lastEndpointAddr = endpointAddr
+
+		// Capture circuit break reason and response for diagnostics
+		lastHeuristicResult = checkResult.HeuristicResult
+		if err != nil {
+			lastCircuitBreakReason = fmt.Sprintf("transport_error: %v", err)
+		} else if checkResult.HeuristicResult != nil {
+			lastCircuitBreakReason = fmt.Sprintf("heuristic: %s (confidence=%.2f)", checkResult.HeuristicResult.Reason, checkResult.HeuristicResult.Confidence)
+		} else {
+			lastCircuitBreakReason = fmt.Sprintf("http_status_%d", statusCode)
+		}
+		lastResponseSnippet = truncateResponse(responseBytesForHeuristic, 512)
 
 		// Log the error/failure
 		if err != nil {
@@ -816,6 +949,11 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 	rpcType sharedtypes.RPCType,
 	parentLogger polylog.Logger,
 ) (protocol.Response, error) {
+	heuristicRPCType := payload.EffectiveRPCType()
+	jsonrpcMethod := payload.JSONRPCMethod
+	if jsonrpcMethod == "" {
+		jsonrpcMethod = payload.Path
+	}
 	logger := parentLogger.With("payload_index", index)
 
 	// Get retry configuration
@@ -842,6 +980,14 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 	var lastErr error
 	var lastResponse protocol.Response
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
+	triedDomains := make(map[string]bool)
+
+	// Pre-populate triedDomains with broken domains from the cross-pod circuit breaker.
+	if rc.circuitBreaker != nil {
+		for domain := range rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID)) {
+			triedDomains[domain] = true
+		}
+	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		// Get available endpoints
@@ -853,16 +999,31 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			continue
 		}
 
-		// Filter out already tried endpoints for retries
-		var filteredEndpoints []protocol.EndpointAddr
-		for _, ep := range availableEndpoints {
-			if !triedEndpoints[ep] {
-				filteredEndpoints = append(filteredEndpoints, ep)
-			}
+		// Filter endpoints through QoS validation (block height, chain ID, etc.)
+		// This prevents stale endpoints from being selected for batch items.
+		requiresArchival := false
+		if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+			requiresArchival = archivalChecker.RequiresArchival()
 		}
+		validatedEndpoints, validateErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+			availableEndpoints, uint(len(availableEndpoints)), requiresArchival)
+		if validateErr == nil && len(validatedEndpoints) > 0 {
+			availableEndpoints = validatedEndpoints
+			logger.Debug().
+				Int("validated_endpoints", len(validatedEndpoints)).
+				Bool("requires_archival", requiresArchival).
+				Msg("Filtered endpoints through QoS validation for batch item")
+		}
+
+		// Filter out already tried endpoints and domains for retries
+		filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints, triedDomains)
 		if len(filteredEndpoints) == 0 {
-			// All endpoints tried, use original list
-			filteredEndpoints = availableEndpoints
+			// All domains tried — stop retrying broken infrastructure
+			logger.Warn().
+				Int("num_tried_endpoints", len(triedEndpoints)).
+				Int("num_tried_domains", len(triedDomains)).
+				Msg("All available endpoints from tried domains, stopping batch item retries")
+			break
 		}
 
 		// Select endpoint
@@ -871,6 +1032,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			selectedEndpoint = filteredEndpoints[0]
 		}
 		triedEndpoints[selectedEndpoint] = true
+		markDomainTried(triedDomains, selectedEndpoint)
 
 		// Build protocol context for this endpoint
 		protocolCtx, _, err := rc.protocol.BuildHTTPRequestContextForEndpoint(
@@ -888,7 +1050,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 
 			if hedgeErr == nil && len(hedgeResponses) > 0 {
 				resp := hedgeResponses[0]
-				checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, rpcType, logger)
+				checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, logger)
 				if checkResult.Success {
 					// Extract request ID from payload
 					resp.RequestID = extractRequestIDFromPayload(payload)
@@ -905,9 +1067,10 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 					recordHeuristicErrorToReputation(rc.context, rc.protocol.GetReputationService(),
 						rc.serviceID, resp.EndpointAddr, rpcType, checkResult.HeuristicResult, logger)
 				}
-				// Mark hedge endpoint as tried
+				// Mark hedge endpoint and domain as tried
 				if racer.hedgeEndpoint != "" {
 					triedEndpoints[racer.hedgeEndpoint] = true
+					markDomainTried(triedDomains, racer.hedgeEndpoint)
 				}
 				continue
 			}
@@ -926,6 +1089,13 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 				lastResponse = responses[0]
 				lastResponse.RequestID = extractRequestIDFromPayload(payload)
 			}
+			// Mark domain broken in cross-pod circuit breaker
+			if rc.circuitBreaker != nil {
+				if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
+					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain,
+						fmt.Sprintf("batch_transport_error: %v", lastErr))
+				}
+			}
 			logger.Warn().Err(lastErr).Int("attempt", attempt).Msg("Request failed")
 			continue
 		}
@@ -934,7 +1104,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		resp.RequestID = extractRequestIDFromPayload(payload)
 
 		// Check response success with heuristic
-		checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, rpcType, logger)
+		checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, logger)
 		if checkResult.Success {
 			logger.Debug().
 				Str("endpoint", string(resp.EndpointAddr)).
@@ -950,6 +1120,26 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		if checkResult.HeuristicResult != nil {
 			recordHeuristicErrorToReputation(rc.context, rc.protocol.GetReputationService(),
 				rc.serviceID, resp.EndpointAddr, rpcType, checkResult.HeuristicResult, logger)
+		}
+		// Mark domain broken in cross-pod circuit breaker.
+		// Skip circuit breaking for archival-related errors — the domain isn't broken.
+		if rc.circuitBreaker != nil {
+			if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
+				heuristicReason := "unknown"
+				if checkResult.HeuristicResult != nil {
+					heuristicReason = checkResult.HeuristicResult.Reason
+				}
+				if shouldCircuitBreak(checkResult.HeuristicResult, resp.HTTPStatusCode, nil) {
+					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain,
+						fmt.Sprintf("batch_heuristic: %s | status=%d | response=%s",
+							heuristicReason, resp.HTTPStatusCode, truncateResponse(resp.Bytes, 512)))
+				} else {
+					logger.Warn().
+						Str("domain", domain).
+						Str("reason", heuristicReason).
+						Msg("Skipped circuit break for capability limitation error (retrying on different supplier)")
+				}
+			}
 		}
 	}
 
@@ -1018,6 +1208,11 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 		return fmt.Errorf("no payloads available from QoS context")
 	}
 	rpcType := payloads[0].RPCType
+	heuristicRPCType := payloads[0].EffectiveRPCType()
+	jsonrpcMethod := payloads[0].JSONRPCMethod
+	if jsonrpcMethod == "" {
+		jsonrpcMethod = payloads[0].Path
+	}
 	batchCount := len(payloads)
 
 	// Record batch size metric on completion (deferred)
@@ -1030,7 +1225,7 @@ func (rc *requestContext) handleParallelRelayRequests() error {
 	ctx, cancel := context.WithTimeout(rc.context, DefaultRelayRequestTimeout)
 	defer cancel()
 
-	resultChan, qosContextMutex := rc.launchParallelRequests(ctx, logger, rpcType)
+	resultChan, qosContextMutex := rc.launchParallelRequests(ctx, logger, rpcType, heuristicRPCType, jsonrpcMethod)
 
 	return rc.waitForFirstSuccessfulResponse(ctx, logger, resultChan, parallelMetrics, qosContextMutex, rpcType)
 }
@@ -1047,14 +1242,14 @@ func (rc *requestContext) updateParallelRequestMetrics(metrics *parallelRequestM
 }
 
 // launchParallelRequests starts all parallel relay requests and returns a result channel and mutex for QoS context operations
-func (rc *requestContext) launchParallelRequests(ctx context.Context, logger polylog.Logger, rpcType sharedtypes.RPCType) (<-chan parallelRelayResult, *sync.Mutex) {
+func (rc *requestContext) launchParallelRequests(ctx context.Context, logger polylog.Logger, rpcType, heuristicRPCType sharedtypes.RPCType, jsonrpcMethod string) (<-chan parallelRelayResult, *sync.Mutex) {
 	resultChan := make(chan parallelRelayResult, len(rc.protocolContexts))
 
 	// Ensures thread-safety of QoS context operations.
 	qosContextMutex := &sync.Mutex{}
 
 	for protocolCtxIdx, protocolCtx := range rc.protocolContexts {
-		go rc.executeOneOfParallelRequests(ctx, logger, protocolCtx, protocolCtxIdx, resultChan, qosContextMutex, rpcType)
+		go rc.executeOneOfParallelRequests(ctx, logger, protocolCtx, protocolCtxIdx, resultChan, qosContextMutex, rpcType, heuristicRPCType, jsonrpcMethod)
 	}
 
 	return resultChan, qosContextMutex
@@ -1069,6 +1264,8 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	resultChan chan<- parallelRelayResult,
 	qosContextMutex *sync.Mutex,
 	rpcType sharedtypes.RPCType,
+	heuristicRPCType sharedtypes.RPCType,
+	jsonrpcMethod string,
 ) {
 	startTime := time.Now()
 
@@ -1086,9 +1283,20 @@ func (rc *requestContext) executeOneOfParallelRequests(
 	var lastErr error
 	var lastResponses []protocol.Response
 	var lastEndpointAddr protocol.EndpointAddr
+	var lastHeuristicResult *heuristic.AnalysisResult
+	var lastStatusCode int
 
-	// Track endpoints already tried to ensure retry endpoint rotation
+	// Track endpoints and domains already tried to ensure retry rotation
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
+	triedDomains := make(map[string]bool)
+
+	// Pre-populate triedDomains with broken domains from the cross-pod circuit breaker.
+	if rc.circuitBreaker != nil {
+		for domain := range rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID)) {
+			triedDomains[domain] = true
+		}
+	}
+
 	currentProtocolCtx := protocolCtx
 	var currentEndpointAddr protocol.EndpointAddr
 
@@ -1112,8 +1320,24 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				Msg("Retrying parallel relay request")
 
 			// CRITICAL: Retry endpoint rotation - select a NEW endpoint for retry
-			// Mark the previous endpoint as tried
+			// Mark the previous endpoint and its domain as tried
 			triedEndpoints[currentEndpointAddr] = true
+			markDomainTried(triedDomains, currentEndpointAddr)
+
+			// Mark domain broken in cross-pod circuit breaker so other pods skip it too.
+			// Skip circuit breaking for archival-related errors — the domain isn't broken.
+			if rc.circuitBreaker != nil {
+				if domain := extractDomainFromEndpoint(currentEndpointAddr); domain != "" {
+					if shouldCircuitBreak(lastHeuristicResult, lastStatusCode, lastErr) {
+						rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain, fmt.Sprintf("parallel_retry: %v", lastErr))
+					} else {
+						logger.Warn().
+							Str("domain", domain).
+							Err(lastErr).
+							Msg("Skipped circuit break for archival-related error (retrying on different supplier)")
+					}
+				}
+			}
 
 			// Get fresh endpoint list from protocol (filtered by detected RPC type)
 			availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
@@ -1131,31 +1355,36 @@ func (rc *requestContext) executeOneOfParallelRequests(
 				return
 			}
 
-			// Filter out endpoints we've already tried
-			filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints)
+			// Check if the request requires archival data and filter endpoints accordingly
+			// This ensures retries also respect archival requirements
+			requiresArchival := false
+			if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+				requiresArchival = archivalChecker.RequiresArchival()
+			}
+			if requiresArchival {
+				// Filter available endpoints using archival-aware selection
+				archivalEndpoints, archivalErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+					availableEndpoints, uint(len(availableEndpoints)), true)
+				if archivalErr == nil && len(archivalEndpoints) > 0 {
+					availableEndpoints = archivalEndpoints
+					logger.Debug().
+						Int("endpoint_index", index).
+						Int("archival_endpoints", len(archivalEndpoints)).
+						Msg("Filtered to archival-capable endpoints for parallel retry")
+				}
+			}
 
-			// If all endpoints exhausted, apply backoff and reset
+			// Filter out endpoints and domains we've already tried
+			filteredEndpoints := filterEndpoints(availableEndpoints, triedEndpoints, triedDomains)
+
+			// If all endpoints exhausted (all domains tried), stop retrying
 			if len(filteredEndpoints) == 0 {
 				logger.Warn().
 					Int("endpoint_index", index).
-					Int("num_tried", len(triedEndpoints)).
-					Msg("All available endpoints tried in parallel path, resetting with backoff")
-
-				// Apply exponential backoff when cycling through endpoints
-				backoff := calculateRetryBackoff(attempt)
-				if backoff > 0 {
-					select {
-					case <-ctx.Done():
-						logger.Debug().Msgf("Endpoint %d canceled during backoff", index)
-						return
-					case <-time.After(backoff):
-						// Continue after backoff
-					}
-				}
-
-				// Reset tried endpoints to allow re-selection
-				filteredEndpoints = availableEndpoints
-				triedEndpoints = make(map[protocol.EndpointAddr]bool)
+					Int("num_tried_endpoints", len(triedEndpoints)).
+					Int("num_tried_domains", len(triedDomains)).
+					Msg("All available endpoints from tried domains in parallel path, stopping retries")
+				return
 			}
 
 			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
@@ -1227,7 +1456,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		}
 
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
-		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, rpcType, logger)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, logger)
 		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
@@ -1285,6 +1514,8 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		lastErr = err
 		lastResponses = responses
 		lastEndpointAddr = endpointAddr
+		lastHeuristicResult = checkResult.HeuristicResult
+		lastStatusCode = statusCode
 
 		// Log the error/failure
 		if err != nil {
@@ -1435,27 +1666,15 @@ func (rc *requestContext) handleSuccessfulResponse(
 		}
 
 		// Track supplier tried for response headers (up to 10)
-		if len(rc.suppliersTried) < 10 {
-			supplierAddr := response.Metadata.SupplierAddress
-			if supplierAddr != "" {
-				// Only add if not already tracked (avoid duplicates)
-				alreadyTracked := false
-				for _, s := range rc.suppliersTried {
-					if s == supplierAddr {
-						alreadyTracked = true
-						break
-					}
-				}
-				if !alreadyTracked {
-					rc.suppliersTried = append(rc.suppliersTried, supplierAddr)
-					logger.Debug().
-						Str("supplier", supplierAddr).
-						Int("result_index", result.index).
-						Str("source", "handleSuccessfulResponse-parallel").
-						Int("total_suppliers_tried", len(rc.suppliersTried)).
-						Msg("🔍 TRACKED supplier in suppliersTried (parallel path)")
-				}
-			}
+		// Use thread-safe method since parallel requests may run concurrently
+		supplierAddr := response.Metadata.SupplierAddress
+		if added := rc.addSupplierTried(supplierAddr); added {
+			logger.Debug().
+				Str("supplier", supplierAddr).
+				Int("result_index", result.index).
+				Str("source", "handleSuccessfulResponse-parallel").
+				Int("total_suppliers_tried", rc.getSuppliersTriedCount()).
+				Msg("🔍 TRACKED supplier in suppliersTried (parallel path)")
 		}
 	}
 
@@ -1545,15 +1764,67 @@ func (rc *requestContext) formatTimingLog(result parallelRelayResult) string {
 }
 
 // filterEndpoints removes tried endpoints from the available list.
-// Used during retry endpoint rotation to ensure we never retry the same endpoint.
-func filterEndpoints(available protocol.EndpointAddrList, tried map[protocol.EndpointAddr]bool) protocol.EndpointAddrList {
+// Filters by both exact endpoint address AND domain (host), so retries
+// never hit a different supplier endpoint behind the same broken infrastructure.
+func filterEndpoints(available protocol.EndpointAddrList, tried map[protocol.EndpointAddr]bool, triedDomains map[string]bool) protocol.EndpointAddrList {
 	filtered := make(protocol.EndpointAddrList, 0, len(available))
 	for _, ep := range available {
-		if !tried[ep] {
-			filtered = append(filtered, ep)
+		if tried[ep] {
+			continue
 		}
+		if len(triedDomains) > 0 {
+			if domain := extractDomainFromEndpoint(ep); triedDomains[domain] {
+				continue
+			}
+		}
+		filtered = append(filtered, ep)
 	}
 	return filtered
+}
+
+// markDomainTried extracts the domain (host) from an endpoint URL and adds it to the tried set.
+func markDomainTried(triedDomains map[string]bool, endpoint protocol.EndpointAddr) {
+	if domain := extractDomainFromEndpoint(endpoint); domain != "" {
+		triedDomains[domain] = true
+	}
+}
+
+// extractDomainFromEndpoint extracts the host from an endpoint address.
+// Endpoint format: "<supplier_address>-<url>" e.g. "pokt1abc-https://rel.spacebelt.xyz"
+// Returns the host part of the URL, e.g. "rel.spacebelt.xyz".
+// truncateResponse returns a string-safe truncation of response bytes for logging.
+func truncateResponse(b []byte, maxLen int) string {
+	if len(b) == 0 {
+		return "<empty>"
+	}
+	if len(b) <= maxLen {
+		return string(b)
+	}
+	return string(b[:maxLen]) + "...(truncated)"
+}
+
+func extractDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
+	endpointStr := string(endpoint)
+
+	// Find the URL part after the supplier address
+	idx := strings.Index(endpointStr, "-http")
+	if idx < 0 {
+		// Try websocket URLs
+		idx = strings.Index(endpointStr, "-wss")
+		if idx < 0 {
+			idx = strings.Index(endpointStr, "-ws")
+		}
+	}
+	if idx < 0 {
+		return ""
+	}
+
+	rawURL := endpointStr[idx+1:] // skip the dash
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Hostname()
 }
 
 // calculateRetryBackoff returns the backoff duration for a retry attempt.

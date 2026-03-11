@@ -2,9 +2,150 @@ package heuristic
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
+
+// restEmptyObjectValidPathPrefixes is the whitelist of REST path prefixes where a {} response
+// is valid. Tron's HTTP API returns {} for query endpoints when the entity doesn't exist
+// (e.g., /wallet/getaccount for unactivated accounts, /wallet/gettransactionbyid for
+// unknown tx hashes). Without this whitelist, the heuristic flags these as errors and the
+// circuit breaker locks out the domain.
+var restEmptyObjectValidPathPrefixes = []string{
+	// Tron full node HTTP API — query endpoints return {} when entity not found
+	"/wallet/",
+	// Tron solidity node HTTP API — same behavior as full node
+	"/walletsolidity/",
+	// Cosmos SDK gRPC-gateway REST API — many query endpoints return {} when the
+	// entity doesn't exist (e.g., /cosmos/slashing/v1beta1/signing_infos/{addr}
+	// returns {} for validators with no slashing record). This is valid behavior.
+	"/cosmos/",
+}
+
+// cometBFTPathPrefixes are REST-style paths that correspond to CometBFT RPC endpoints.
+// CometBFT nodes ALWAYS return JSON-RPC formatted responses (e.g., {"jsonrpc":"2.0","id":-1,"result":{}})
+// even for GET requests. This is NOT a protocol mismatch — it's the expected CometBFT behavior.
+// Without this list, analyzeREST flags these valid responses as "rest_protocol_mismatch".
+var cometBFTPathPrefixes = []string{
+	"/health",
+	"/status",
+	"/block",
+	"/commit",
+	"/validators",
+	"/genesis",
+	"/net_info",
+	"/consensus_state",
+	"/dump_consensus_state",
+	"/num_unconfirmed_txs",
+	"/tx",
+	"/tx_search",
+	"/block_search",
+	"/block_results",
+	"/header",
+	"/abci_info",
+	"/abci_query",
+	"/broadcast_tx",
+	"/subscribe",
+	"/unsubscribe",
+}
+
+// cometBFTMethods are JSON-RPC method names used by CometBFT.
+// When the heuristic sees one of these methods, it knows the response will be
+// CometBFT-formatted (JSON-RPC envelope) regardless of the detected rpcType.
+var cometBFTMethods = map[string]bool{
+	"health":               true,
+	"status":               true,
+	"block":                true,
+	"commit":               true,
+	"validators":           true,
+	"genesis":              true,
+	"net_info":             true,
+	"consensus_state":      true,
+	"dump_consensus_state": true,
+	"num_unconfirmed_txs":  true,
+	"tx":                   true,
+	"tx_search":            true,
+	"block_search":         true,
+	"block_results":        true,
+	"header":               true,
+	"header_by_hash":       true,
+	"abci_info":            true,
+	"abci_query":           true,
+	"broadcast_tx_sync":    true,
+	"broadcast_tx_async":   true,
+	"broadcast_tx_commit":  true,
+	"subscribe":            true,
+	"unsubscribe":          true,
+	"unsubscribe_all":      true,
+}
+
+// isCometBFTPath checks if a request path corresponds to a CometBFT RPC endpoint.
+func isCometBFTPath(path string) bool {
+	for _, prefix := range cometBFTPathPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// isCometBFTMethod checks if a JSON-RPC method name or path is a CometBFT method.
+// Handles both direct method names ("health") and path-based methods ("/health").
+func isCometBFTMethod(method string) bool {
+	if cometBFTMethods[method] {
+		return true
+	}
+	// Also check path-style (e.g., "/health" → "health")
+	if strings.HasPrefix(method, "/") {
+		return cometBFTMethods[strings.TrimPrefix(method, "/")]
+	}
+	return false
+}
+
+// emptyArrayValidMethods is the whitelist of JSON-RPC methods where "result":[] is valid.
+// For all other methods, an empty array result indicates a broken/misconfigured supplier.
+var emptyArrayValidMethods = map[string]bool{
+	// === EVM ===
+	// Core — high-volume methods that legitimately return empty arrays
+	"eth_getLogs":          true,
+	"eth_getFilterChanges": true,
+	"eth_getFilterLogs":    true,
+	"eth_accounts":         true,
+	"eth_getBlockReceipts": true,
+	// Trace (Parity/Erigon)
+	"trace_filter":                  true,
+	"trace_block":                   true,
+	"trace_replayBlockTransactions": true,
+	"trace_callMany":                true,
+	// Debug (Geth/Reth)
+	"debug_getBadBlocks":                true,
+	"debug_traceBlockByNumber":          true,
+	"debug_traceBlockByHash":            true,
+	"debug_traceBlock":                  true,
+	"debug_getModifiedAccountsByNumber": true,
+	"debug_getModifiedAccountsByHash":   true,
+	"debug_traceCallMany":               true,
+
+	// === Sei (EVM-compatible aliases) ===
+	// Sei exposes eth_* methods with a sei_ prefix that behave identically
+	"sei_getLogs":          true,
+	"sei_getFilterChanges": true,
+	"sei_getFilterLogs":    true,
+	"sei_getBlockReceipts": true,
+
+	// === Solana ===
+	// Methods that return raw arrays (not wrapped in {context, value} objects)
+	"getBlocks":                         true, // array of slot numbers in range
+	"getBlocksWithLimit":                true, // array of slot numbers
+	"getConfirmedBlocks":                true, // deprecated, same as getBlocks
+	"getSignaturesForAddress":           true, // array of signature info objects
+	"getConfirmedSignaturesForAddress2": true, // deprecated, same as above
+	"getRecentPerformanceSamples":       true, // array of performance samples
+	"getClusterNodes":                   true, // array of node info
+	"getRecentPrioritizationFees":       true, // array of fee objects
+}
 
 // Tier 2: Protocol-Specific Success Checks
 //
@@ -45,21 +186,21 @@ var (
 //
 // Cost: O(n) where n is prefix length
 // Time: ~1-3μs for 512 byte prefix
-func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType) AnalysisResult {
+func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, jsonrpcMethod string) AnalysisResult {
 	switch rpcType {
 	case sharedtypes.RPCType_JSON_RPC:
-		return analyzeJSONRPC(prefix, fullLength)
+		return analyzeJSONRPC(prefix, fullLength, rpcType, jsonrpcMethod)
 
 	case sharedtypes.RPCType_REST:
-		return analyzeREST(prefix, fullLength)
+		return analyzeREST(prefix, fullLength, jsonrpcMethod)
 
 	case sharedtypes.RPCType_COMET_BFT:
 		// CometBFT uses JSON-RPC style responses
-		return analyzeJSONRPC(prefix, fullLength)
+		return analyzeJSONRPC(prefix, fullLength, rpcType, jsonrpcMethod)
 
 	case sharedtypes.RPCType_WEBSOCKET:
 		// WebSocket messages are typically JSON-RPC
-		return analyzeJSONRPC(prefix, fullLength)
+		return analyzeJSONRPC(prefix, fullLength, rpcType, jsonrpcMethod)
 
 	default:
 		// Unknown protocol - can't make protocol-specific assertions
@@ -79,13 +220,60 @@ func ProtocolAnalysis(prefix []byte, fullLength int, rpcType sharedtypes.RPCType
 //   - "error" field (error - but still a VALID response)
 //
 // Having neither or both indicates a malformed response.
-func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
+func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, jsonrpcMethod string) AnalysisResult {
 	hasResult := bytes.Contains(prefix, jsonrpcResultField)
 	hasError := bytes.Contains(prefix, jsonrpcErrorField)
 	hasVersion := bytes.Contains(prefix, jsonrpcVersionField)
 
-	// Case 1: Has "result" without "error" - definitely success
+	// Case 1: Has "result" without "error"
 	if hasResult && !hasError {
+		// Check for empty containers in the result.
+		// For EVM/Solana (JSON_RPC): "result":{} is never valid — every method that returns
+		// an object has mandatory fields. This is a strong signal of a broken/lazy supplier.
+		// For CometBFT: "result":{} IS valid — the "health" method returns an empty object
+		// when the node is healthy. Skip the empty object check for CometBFT.
+		// Also skip if the method is a known CometBFT method — CometBFT can be routed
+		// through JSON_RPC endpoints (via rpc_type_fallbacks), so rpcType may be JSON_RPC
+		// even though the response is a valid CometBFT response.
+		emptyType := emptyResultType(prefix)
+		if emptyType == emptyObject && rpcType != sharedtypes.RPCType_COMET_BFT && !isCometBFTMethod(jsonrpcMethod) {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.95,
+				Reason:      "jsonrpc_empty_object_result",
+				Structure:   StructureValid,
+				Details:     "JSON-RPC result is an empty object — never valid for EVM/Solana methods",
+			}
+		}
+
+		// CometBFT: "result":[] is NEVER valid. All CometBFT methods return objects:
+		// status → {node_info, sync_info}, block → {block_id, block}, health → {}.
+		// An empty array result is a strong signal of a gaming supplier returning canned responses.
+		if emptyType == emptyArray && rpcType == sharedtypes.RPCType_COMET_BFT {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.95,
+				Reason:      "cometbft_invalid_empty_array",
+				Structure:   StructureValid,
+				Details:     "CometBFT result is [] — no CometBFT method ever returns an array",
+			}
+		}
+
+		// Method-aware empty array detection:
+		// "result":[] is valid for some methods (eth_getLogs, eth_accounts, etc.) but broken
+		// for most others (eth_blockNumber, eth_getBalance return scalars/objects, never arrays).
+		// Only flag when we KNOW the method AND it's not in the whitelist.
+		// When method is unknown (empty string), we conservatively do NOT flag.
+		if emptyType == emptyArray && jsonrpcMethod != "" && !emptyArrayValidMethods[jsonrpcMethod] {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.95,
+				Reason:      "jsonrpc_invalid_empty_array",
+				Structure:   StructureValid,
+				Details:     fmt.Sprintf("JSON-RPC result is [] for method %q which should never return an array", jsonrpcMethod),
+			}
+		}
+
 		return AnalysisResult{
 			ShouldRetry: false,
 			Confidence:  0.0,
@@ -180,7 +368,51 @@ func analyzeJSONRPC(prefix []byte, fullLength int) AnalysisResult {
 //   - {"error": "..."} or {"error": {...}}
 //   - {"code": N, "message": "..."}
 //   - {"status": "error", ...}
-func analyzeREST(prefix []byte, fullLength int) AnalysisResult {
+//
+// The requestPath parameter carries the original HTTP request path (e.g., "/wallet/getaccount")
+// for path-aware validation. It may be empty if not available.
+func analyzeREST(prefix []byte, fullLength int, requestPath string) AnalysisResult {
+	// Empty JSON object ({} or { }) is usually a broken supplier returning canned responses.
+	// However, some APIs legitimately return {} (e.g., Tron's /wallet/getaccount for
+	// non-existent accounts). Check the path whitelist before flagging.
+	if fullLength <= 10 {
+		stripped := bytes.Map(func(r rune) rune {
+			if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+				return -1 // drop whitespace
+			}
+			return r
+		}, prefix[:min(len(prefix), fullLength)])
+		if len(stripped) == 2 && stripped[0] == '{' && stripped[1] == '}' {
+			if !isRESTEmptyObjectValid(requestPath) {
+				return AnalysisResult{
+					ShouldRetry: true,
+					Confidence:  0.80,
+					Reason:      "rest_empty_object",
+					Structure:   StructureValid,
+					Details:     "REST response is an empty JSON object",
+				}
+			}
+		}
+	}
+
+	// Protocol mismatch: a JSON-RPC response to a REST request.
+	// Real Cosmos SDK REST endpoints never return JSON-RPC envelopes.
+	// Gaming suppliers (e.g., spacebelt.xyz) return canned {"jsonrpc":"2.0","id":1,"result":[]}
+	// for ALL requests regardless of protocol type.
+	//
+	// EXCEPTION: CometBFT endpoints (e.g., /health, /status, /block) ALWAYS return
+	// JSON-RPC formatted responses even for GET requests. This is expected CometBFT
+	// behavior, not a protocol mismatch. Skip the check for CometBFT paths.
+	if bytes.Contains(prefix, jsonrpcVersionField) && !isCometBFTPath(requestPath) {
+		return AnalysisResult{
+			ShouldRetry: true,
+			Confidence:  0.95,
+			Reason:      "rest_protocol_mismatch",
+			Structure:   StructureValid,
+			Details:     "REST request received a JSON-RPC formatted response — supplier is likely gaming",
+		}
+	}
+
 	hasError := bytes.Contains(prefix, restErrorField)
 	hasMessage := bytes.Contains(prefix, restMessageField)
 	hasCode := bytes.Contains(prefix, restCodeField)
@@ -224,6 +456,61 @@ func analyzeREST(prefix []byte, fullLength int) AnalysisResult {
 		Structure:   StructureValid,
 		Details:     "REST response has no obvious error indicators",
 	}
+}
+
+// isRESTEmptyObjectValid checks if the request path is whitelisted for empty object responses.
+// Returns true if {} is a valid response for this path (e.g., Tron /wallet/* query endpoints).
+func isRESTEmptyObjectValid(requestPath string) bool {
+	if requestPath == "" {
+		return false
+	}
+	lowerPath := strings.ToLower(requestPath)
+	for _, prefix := range restEmptyObjectValidPathPrefixes {
+		if strings.HasPrefix(lowerPath, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// emptyResultKind represents the type of empty result detected.
+type emptyResultKind int
+
+const (
+	notEmpty    emptyResultKind = iota
+	emptyArray                  // "result":[]
+	emptyObject                 // "result":{}
+)
+
+// emptyResultType checks if a JSON-RPC response has "result":[] or "result":{}.
+// Returns the specific kind to allow different confidence levels:
+//   - emptyObject: NEVER valid for any JSON-RPC method (0.95 confidence)
+//   - emptyArray: valid for some methods like eth_getLogs (0.75 confidence)
+func emptyResultType(prefix []byte) emptyResultKind {
+	idx := bytes.Index(prefix, jsonrpcResultField)
+	if idx < 0 {
+		return notEmpty
+	}
+
+	// Skip past "result" and find the colon
+	after := prefix[idx+len(jsonrpcResultField):]
+	after = bytes.TrimLeft(after, " \t\n\r")
+	if len(after) == 0 || after[0] != ':' {
+		return notEmpty
+	}
+	after = bytes.TrimLeft(after[1:], " \t\n\r")
+
+	if len(after) < 2 {
+		return notEmpty
+	}
+
+	if after[0] == '[' && after[1] == ']' {
+		return emptyArray
+	}
+	if after[0] == '{' && after[1] == '}' {
+		return emptyObject
+	}
+	return notEmpty
 }
 
 // IsJSONRPCLikeSuccess provides a quick check for JSON-RPC success.

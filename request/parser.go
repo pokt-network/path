@@ -90,7 +90,7 @@ func (p *Parser) GetQoSService(ctx context.Context, req *http.Request) (protocol
 		"service_id", serviceID,
 	).Warn().Msg("No matching QoS implementations found. Using NoOp QoS.")
 
-	return serviceID, noop.NoOpQoS{}, nil
+	return serviceID, noop.NewNoOpQoSService(p.Logger, serviceID), nil
 }
 
 // getServiceID extracts the authoritative service ID from the HTTP request's `Target-Service-Id` header.
@@ -110,4 +110,14 @@ func (p *Parser) GetHTTPErrorResponse(ctx context.Context, err error) pathhttp.H
 		return &parserErrorResponse{err: err.Error(), code: http.StatusBadRequest}
 	}
 	return &parserErrorResponse{err: err.Error(), code: http.StatusNotFound}
+}
+
+// GetQoSServiceForServiceID returns the QoS service for a given service ID.
+// Returns nil if no QoS service is registered for the service ID.
+// Implements the gateway.QoSServiceRegistry interface.
+func (p *Parser) GetQoSServiceForServiceID(serviceID protocol.ServiceID) gateway.QoSService {
+	if qosService, ok := p.QoSServices[serviceID]; ok {
+		return qosService
+	}
+	return nil
 }

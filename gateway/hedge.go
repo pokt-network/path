@@ -10,6 +10,7 @@ import (
 
 	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/heuristic"
 )
 
 // hedgeResult contains the result from a hedged request attempt.
@@ -126,7 +127,7 @@ func (hr *hedgeRacer) race(
 			Str("primary_supplier", primarySupplier).
 			Dur("latency", result.duration).
 			Bool("success", result.err == nil).
-			Int("suppliers_tracked_before", len(hr.rc.suppliersTried)).
+			Int("suppliers_tracked_before", hr.rc.getSuppliersTriedCount()).
 			Msg("⚡ Primary responded before hedge delay (no hedge needed)")
 
 		// Record metric: primary_only (no hedge was started)
@@ -157,7 +158,7 @@ func (hr *hedgeRacer) race(
 
 			// Pre-register both suppliers for X-Suppliers-Tried header
 			// This ensures both are tracked even if one is cancelled before responding
-			hr.rc.suppliersTried = append(hr.rc.suppliersTried, primarySupplier, hedgeSupplier)
+			hr.rc.addSuppliersTried(primarySupplier, hedgeSupplier)
 
 			// Build protocol context for hedge endpoint
 			hedgeCtx, _, err := hr.rc.protocol.BuildHTTPRequestContextForEndpoint(
@@ -252,6 +253,36 @@ func (hr *hedgeRacer) executeRequest(
 	}
 }
 
+// isResponseHeuristicallyValid checks if a hedgeResult's response passes heuristic analysis.
+// This prevents gaming suppliers from winning the hedge race with fast canned responses
+// that would later be rejected by the heuristic in handleSingleRelayRequest.
+func (hr *hedgeRacer) isResponseHeuristicallyValid(result *hedgeResult) bool {
+	if len(result.responses) == 0 || len(result.responses[0].Bytes) == 0 {
+		return false
+	}
+
+	statusCode := result.responses[0].HTTPStatusCode
+	responseBytes := result.responses[0].Bytes
+	heuristicRPCType := hr.payload.EffectiveRPCType()
+	jsonrpcMethod := hr.payload.JSONRPCMethod
+	if jsonrpcMethod == "" {
+		jsonrpcMethod = hr.payload.Path
+	}
+
+	analysisResult := heuristic.Analyze(responseBytes, statusCode, heuristicRPCType, jsonrpcMethod)
+	if analysisResult.ShouldRetry {
+		hr.logger.Warn().
+			Str("service_id", hr.serviceID).
+			Str("supplier", result.supplierAddr).
+			Str("heuristic_reason", analysisResult.Reason).
+			Float64("heuristic_confidence", analysisResult.Confidence).
+			Bool("is_hedge", result.isHedge).
+			Msg("Hedge response failed heuristic check - treating as failure")
+		return false
+	}
+	return true
+}
+
 // waitForWinner waits for the first response after hedge was started.
 func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, error) {
 	var firstResult, secondResult *hedgeResult
@@ -265,8 +296,10 @@ func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, e
 		return nil, ctx.Err()
 	}
 
-	// Check if first response is successful
-	if firstResult.err == nil && len(firstResult.responses) > 0 {
+	// Check if first response is successful (transport + heuristic)
+	// The heuristic check prevents gaming suppliers from winning with fast canned responses
+	// (e.g., {"result":[]}) that would later be rejected by handleSingleRelayRequest.
+	if firstResult.err == nil && len(firstResult.responses) > 0 && hr.isResponseHeuristicallyValid(firstResult) {
 		// First response is good - use it
 		hr.recordWinner(*firstResult)
 
@@ -346,8 +379,8 @@ func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, e
 		return nil, ctx.Err()
 	}
 
-	// Choose the better result
-	if secondResult.err == nil && len(secondResult.responses) > 0 {
+	// Choose the better result (transport + heuristic)
+	if secondResult.err == nil && len(secondResult.responses) > 0 && hr.isResponseHeuristicallyValid(secondResult) {
 		hr.recordWinner(*secondResult)
 		hr.recordLoser(*firstResult)
 
@@ -409,17 +442,26 @@ func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, e
 }
 
 // selectHedgeEndpoint selects the best endpoint for hedge request.
-// Uses TOP-ranked endpoint excluding the primary.
+// Uses TOP-ranked endpoint excluding the primary and any endpoints from the same domain.
+// Domain-level exclusion prevents racing two endpoints behind the same infrastructure
+// (e.g., multiple suppliers staked against the same backend).
 func (hr *hedgeRacer) selectHedgeEndpoint(
 	endpoints protocol.EndpointAddrList,
 	excludePrimary protocol.EndpointAddr,
 ) protocol.EndpointAddr {
-	// Filter out primary endpoint
+	// Filter out primary endpoint AND any endpoints from the same domain
+	primaryDomain := extractDomainFromEndpoint(excludePrimary)
 	filtered := make(protocol.EndpointAddrList, 0, len(endpoints)-1)
 	for _, ep := range endpoints {
-		if ep != excludePrimary {
-			filtered = append(filtered, ep)
+		if ep == excludePrimary {
+			continue
 		}
+		if primaryDomain != "" {
+			if domain := extractDomainFromEndpoint(ep); domain == primaryDomain {
+				continue
+			}
+		}
+		filtered = append(filtered, ep)
 	}
 
 	if len(filtered) == 0 {
@@ -433,24 +475,15 @@ func (hr *hedgeRacer) selectHedgeEndpoint(
 
 // handleResult extracts response data and tracks suppliers.
 func (hr *hedgeRacer) handleResult(result hedgeResult) ([]protocol.Response, error) {
-	// Track supplier tried
-	if result.supplierAddr != "" && len(hr.rc.suppliersTried) < 10 {
-		alreadyTracked := false
-		for _, s := range hr.rc.suppliersTried {
-			if s == result.supplierAddr {
-				alreadyTracked = true
-				break
-			}
-		}
-		if !alreadyTracked {
-			hr.rc.suppliersTried = append(hr.rc.suppliersTried, result.supplierAddr)
-			hr.logger.Debug().
-				Str("supplier", result.supplierAddr).
-				Bool("is_hedge", result.isHedge).
-				Str("source", "handleResult").
-				Int("total_suppliers_tried", len(hr.rc.suppliersTried)).
-				Msg("🔍 TRACKED supplier in suppliersTried (winner)")
-		}
+	// Track supplier tried using thread-safe method
+	// This is critical for batch requests where multiple goroutines share the requestContext
+	if added := hr.rc.addSupplierTried(result.supplierAddr); added {
+		hr.logger.Debug().
+			Str("supplier", result.supplierAddr).
+			Bool("is_hedge", result.isHedge).
+			Str("source", "handleResult").
+			Int("total_suppliers_tried", hr.rc.getSuppliersTriedCount()).
+			Msg("🔍 TRACKED supplier in suppliersTried (winner)")
 	}
 
 	return result.responses, result.err
@@ -476,24 +509,15 @@ func (hr *hedgeRacer) recordWinner(result hedgeResult) {
 
 // recordLoser records the losing request for reputation tracking.
 func (hr *hedgeRacer) recordLoser(result hedgeResult) {
-	// Track loser's supplier for X-Suppliers-Tried header
-	if result.supplierAddr != "" && len(hr.rc.suppliersTried) < 10 {
-		alreadyTracked := false
-		for _, s := range hr.rc.suppliersTried {
-			if s == result.supplierAddr {
-				alreadyTracked = true
-				break
-			}
-		}
-		if !alreadyTracked {
-			hr.rc.suppliersTried = append(hr.rc.suppliersTried, result.supplierAddr)
-			hr.logger.Debug().
-				Str("supplier", result.supplierAddr).
-				Bool("is_hedge", result.isHedge).
-				Str("source", "recordLoser").
-				Int("total_suppliers_tried", len(hr.rc.suppliersTried)).
-				Msg("🔍 TRACKED supplier in suppliersTried (loser)")
-		}
+	// Track loser's supplier for X-Suppliers-Tried header using thread-safe method
+	// This is critical for batch requests where multiple goroutines share the requestContext
+	if added := hr.rc.addSupplierTried(result.supplierAddr); added {
+		hr.logger.Debug().
+			Str("supplier", result.supplierAddr).
+			Bool("is_hedge", result.isHedge).
+			Str("source", "recordLoser").
+			Int("total_suppliers_tried", hr.rc.getSuppliersTriedCount()).
+			Msg("🔍 TRACKED supplier in suppliersTried (loser)")
 	}
 
 	requestType := "primary"

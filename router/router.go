@@ -35,12 +35,17 @@ type (
 		gateway                       gatewayHandler
 		disqualifiedEndpointsReporter disqualifiedEndpointsReporter
 		healthChecker                 *health.Checker
+		circuitBreakerAdmin           CircuitBreakerAdmin
 	}
 	gatewayHandler interface {
 		HandleServiceRequest(context.Context, *http.Request, http.ResponseWriter)
 	}
 	disqualifiedEndpointsReporter interface {
 		ReportEndpointStatus(protocol.ServiceID, *http.Request) (devtools.DisqualifiedEndpointResponse, error)
+	}
+	// CircuitBreakerAdmin allows clearing circuit breaker state via admin endpoints.
+	CircuitBreakerAdmin interface {
+		ClearService(ctx context.Context, serviceID string) int
 	}
 )
 
@@ -53,6 +58,7 @@ func NewRouter(
 	disqualifiedEndpointsReporter disqualifiedEndpointsReporter,
 	healthChecker *health.Checker,
 	config config.RouterConfig,
+	circuitBreakerAdmin CircuitBreakerAdmin,
 ) *router {
 	r := &router{
 		logger: logger.With("package", "router"),
@@ -63,6 +69,7 @@ func NewRouter(
 		gateway:                       gateway,
 		disqualifiedEndpointsReporter: disqualifiedEndpointsReporter,
 		healthChecker:                 healthChecker,
+		circuitBreakerAdmin:           circuitBreakerAdmin,
 	}
 	r.handleRoutes()
 	return r
@@ -93,6 +100,9 @@ func (r *router) handleRoutes() {
 
 	// GET /v1/disqualified_endpoints/{service_id} - returns a JSON list of disqualified endpoints for a given service ID
 	r.mux.HandleFunc("GET /disqualified_endpoints", methodCheckMiddleware(r.handleDisqualifiedEndpoints))
+
+	// POST /admin/circuit-breaker/clear/{serviceId} - clears circuit breaker state (in-memory + Redis)
+	r.mux.HandleFunc("POST /admin/circuit-breaker/clear/", r.handleCircuitBreakerClear)
 
 	// requestHandlerFn defines the middleware chain for all service requests
 	requestHandlerFn := r.corsMiddleware(r.removeGrovePortalPrefixMiddleware(r.handleServiceRequest))

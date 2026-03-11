@@ -1,6 +1,6 @@
 # TODO_TECHDEBT: Consolidate Dockerfile.local and Dockerfile
 # Builder stage
-FROM golang:1.24-alpine3.20 AS builder
+FROM golang:1.25-alpine AS builder
 
 # Install necessary build dependencies
 RUN apk add --no-cache git make build-base

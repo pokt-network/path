@@ -258,6 +258,7 @@ gateway_config:
   # - observation_pipeline: Per-service sample rate
   # - fallback: Fallback endpoints (no defaults - must be explicitly configured)
   # - health_checks: Per-service health check rules
+  # - external_block_sources: External RPC endpoints for ground-truth block height validation
 
   services:
     # -------------------------------------------------------------------------
@@ -276,6 +277,17 @@ gateway_config:
       retry_config:
         max_retries: 2
         hedge_delay: 300ms
+      # External block sources for ground-truth validation (optional)
+      # Multiple sources provide redundancy — the max height across all is used.
+      # If all session endpoints are behind the real chain tip, these correct it.
+      # external_block_sources:
+      #   - url: "https://ethereum-rpc.publicnode.com"
+      #     interval: 30s
+      #     timeout: 5s
+      #     # method defaults to "eth_blockNumber" for EVM chains
+      #   - url: "https://rpc.ankr.com/eth"
+      #     interval: 30s
+      #     timeout: 5s
 
     - id: poly
       type: "evm"
@@ -328,6 +340,12 @@ gateway_config:
       latency_profile: "standard"
       timeout_config:
         relay_timeout: 15s
+      # Solana external block source — uses "getBlockHeight" method (numeric result)
+      # external_block_sources:
+      #   - url: "https://api.mainnet-beta.solana.com"
+      #     method: "getBlockHeight"
+      #     interval: 15s
+      #     timeout: 5s
 
     # -------------------------------------------------------------------------
     # Cosmos SDK Services
@@ -354,6 +372,19 @@ gateway_config:
       rpc_type_fallbacks:
         comet_bft: json_rpc
         rest: json_rpc
+      # Cosmos external block source — CometBFT supports both JSON-RPC and REST.
+      # type: "jsonrpc" (default) sends POST with JSON-RPC body.
+      # type: "rest" sends GET to the path appended to the URL.
+      # external_block_sources:
+      #   - url: "https://rpc.osmosis.zone"
+      #     method: "status"          # JSON-RPC POST (default type)
+      #     interval: 30s
+      #     timeout: 5s
+      #   - url: "https://rpc.osmosis.zone"
+      #     type: "rest"              # REST GET mode
+      #     path: "/status"
+      #     interval: 30s
+      #     timeout: 5s
 
     # Cosmos chain with EVM support
     - id: xrplevm

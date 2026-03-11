@@ -157,6 +157,11 @@ type Protocol struct {
 	// redundant AllEndpoints() calls and endpoint map construction on every request.
 	// Key: sessionId (string), Value: map[protocol.EndpointAddr]endpoint
 	sessionEndpointsCache sync.Map
+
+	// qosServiceRegistry provides access to QoS services by service ID.
+	// Used by GetServiceEndpointDetails to query archival status for endpoints.
+	// Set via SetQoSServiceRegistry after initialization.
+	qosServiceRegistry gateway.QoSServiceRegistry
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -738,9 +743,9 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 	// This ensures QoS checks are performed on the selected endpoint.
 	selectedEndpoint, ok := endpoints[selectedEndpointAddr]
 	if !ok {
-		// Wrap the context setup error.
-		// Used to generate the observation.
-		err := fmt.Errorf("%w: service %s endpoint %s", errRequestContextSetupInvalidEndpointSelected, serviceID, selectedEndpointAddr)
+		// Wrap the context setup error with the protocol package's error.
+		// This allows the gateway package to detect and handle this specific case.
+		err := fmt.Errorf("%w: service %s endpoint %s", protocol.ErrEndpointUnavailable, serviceID, selectedEndpointAddr)
 		// Log at DEBUG level - this is expected during session rollover when:
 		// - Health check was scheduled with an endpoint from an old session
 		// - Session has since rolled over and the endpoint is no longer in the new session
@@ -1625,6 +1630,13 @@ func (p *Protocol) getRPCTypeFallback(serviceID protocol.ServiceID, requestedRPC
 // This is used by components that need to respect concurrency limits.
 func (p *Protocol) GetConcurrencyConfig() gateway.ConcurrencyConfig {
 	return p.concurrencyConfig
+}
+
+// SetQoSServiceRegistry sets the QoS service registry for the protocol.
+// This is called after initialization to provide access to QoS services
+// for querying endpoint-specific data like archival status.
+func (p *Protocol) SetQoSServiceRegistry(registry gateway.QoSServiceRegistry) {
+	p.qosServiceRegistry = registry
 }
 
 // UnblacklistSupplier removes a supplier from the blacklist.

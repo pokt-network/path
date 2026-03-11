@@ -79,6 +79,11 @@ type requestContext struct {
 	//   - Set during relay execution and used when building observations.
 	currentRPCType sharedtypes.RPCType
 
+	// heuristicRPCType preserves the original detected RPC type before any
+	// fallback was applied. Used for heuristic response analysis so that
+	// CometBFT requests routed through JSON_RPC are still analyzed correctly.
+	heuristicRPCType sharedtypes.RPCType
+
 	// requestErrorObservation:
 	//   - Tracks any errors encountered during request processing.
 	requestErrorObservation *protocolobservations.ShannonRequestError
@@ -166,6 +171,7 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 	// This preserves the default set in BuildHTTPRequestContextForEndpoint for health checks.
 	if payloads[0].RPCType != sharedtypes.RPCType_UNKNOWN_RPC {
 		rc.currentRPCType = payloads[0].RPCType
+		rc.heuristicRPCType = payloads[0].EffectiveRPCType()
 	}
 
 	// For single payload, handle directly without additional overhead.
@@ -204,9 +210,9 @@ func (rc *requestContext) sendSingleRelay(payload protocol.Payload) (protocol.Re
 	// Execute relay request using the appropriate strategy based on endpoint type and network conditions
 	relayResponse, err := rc.executeRelayRequestStrategy(payload)
 
-	// Failure: Pass the response (which may contain RelayMinerError data) to error handler.
+	// Failure: Pass the response (which may contain response bytes for fallback) to error handler.
 	if err != nil {
-		return rc.handleEndpointError(endpointQueryTime, err)
+		return rc.handleEndpointError(endpointQueryTime, relayResponse, err)
 	}
 
 	// Success:
@@ -675,20 +681,38 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// This runs BEFORE returning to gateway to allow protocol-level retry decisions.
 	// Only analyze on HTTP 2xx status to avoid double-checking non-2xx responses.
 	if responseHTTPStatusCode >= 200 && responseHTTPStatusCode < 300 {
-		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.currentRPCType)
+		// Extract JSON-RPC method from payload for method-aware heuristic checks.
+		// Use the JSONRPCMethod field set at QoS parsing time.
+		// For REST requests, JSONRPCMethod is empty — fall back to Path so that
+		// path-aware validation (e.g., Tron /wallet/ whitelist) works correctly.
+		jsonrpcMethod := payload.JSONRPCMethod
+		if jsonrpcMethod == "" {
+			jsonrpcMethod = payload.Path
+		}
+		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.heuristicRPCType, jsonrpcMethod)
 		if heuristicResult.ShouldRetry {
-			rc.logger.Debug().
+			rc.logger.Error().
 				Str("heuristic_reason", heuristicResult.Reason).
 				Float64("heuristic_confidence", heuristicResult.Confidence).
 				Str("heuristic_details", heuristicResult.Details).
+				Str("jsonrpc_method", jsonrpcMethod).
+				Str("request_path", payload.Path).
 				Int("response_size", len(deserializedResponse.Bytes)).
 				Int("http_status_code", responseHTTPStatusCode).
 				Msg("Heuristic analysis detected error in backend response - triggering retry")
 
+			// Include the actual response bytes in the returned response.
+			// This ensures if all retries fail, the actual backend error (e.g., "state is pruned")
+			// can be returned to the user instead of a generic error wrapper.
+			defaultResponse.Bytes = deserializedResponse.Bytes
+			defaultResponse.HTTPStatusCode = responseHTTPStatusCode
+
 			// Return an error to trigger retry at protocol level.
 			// Wrap in raw_payload: format to allow proper error classification and reputation penalty.
-			return defaultResponse, fmt.Errorf("raw_payload: %s: heuristic detected %s: %w",
-				string(deserializedResponse.Bytes), heuristicResult.Reason, errMalformedEndpointPayload)
+			// Use errHeuristicDetectedBackendError instead of errMalformedEndpointPayload because
+			// the response is valid JSON-RPC, it just indicates a backend issue (pruned state, etc.).
+			return defaultResponse, fmt.Errorf("raw_payload: %s: heuristic detected %s (method=%s): %w",
+				string(deserializedResponse.Bytes), heuristicResult.Reason, jsonrpcMethod, errHeuristicDetectedBackendError)
 		}
 	}
 
@@ -1043,8 +1067,11 @@ func (rc *requestContext) handleInternalError(internalErr error) (protocol.Respo
 //   - Records endpoint error observation with enhanced classification and returns the response.
 //   - Tracks endpoint error in observations with detailed categorization for metrics.
 //   - Includes any RelayMinerError data that was captured via trackRelayMinerError.
+//   - Preserves response bytes from the original response so they can be returned to the user
+//     if all retries fail (e.g., "state is pruned" error should be returned as-is).
 func (rc *requestContext) handleEndpointError(
 	endpointQueryTime time.Time,
+	originalResponse protocol.Response,
 	endpointErr error,
 ) (protocol.Response, error) {
 	// PERF: Removed hydrateLogger() call to avoid logger allocation
@@ -1127,8 +1154,11 @@ func (rc *requestContext) handleEndpointError(
 	relayType := metrics.RelayTypeNormal
 	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
-	// Return error.
-	return protocol.Response{EndpointAddr: selectedEndpointAddr},
+	// Return the original response (preserving any response bytes) with the error.
+	// This allows the gateway to return the actual backend response to the user
+	// if all retries fail (e.g., "state is pruned" should be returned as-is).
+	originalResponse.EndpointAddr = selectedEndpointAddr
+	return originalResponse,
 		fmt.Errorf("relay: error sending relay for service %s endpoint %s: %w",
 			rc.serviceID, selectedEndpointAddr, endpointErr,
 		)

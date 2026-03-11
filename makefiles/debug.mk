@@ -20,6 +20,6 @@ check_graphviz:
 debug_goroutines: check_docker
 	@docker run --rm \
 		--network=host \
-		golang:1.24.3-alpine3.20 \
+		golang:1.25-alpine \
 		apk add --no-cache graphviz && \
 		go tool pprof -http="0.0.0.0:8081" http://localhost:6060/debug/pprof/goroutine

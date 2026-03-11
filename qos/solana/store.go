@@ -4,12 +4,17 @@ import (
 	"errors"
 	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/selector"
 )
+
+// defaultEndpointTTL is how long an endpoint entry is kept without being seen
+// in an active session. Sessions last ~1 hour, so 2x gives buffer.
+const defaultEndpointTTL = 2 * time.Hour
 
 // EndpointStore provides the endpoint selection capability required
 // by the protocol package for handling a service request.
@@ -65,9 +70,20 @@ func (es *EndpointStore) SelectMultiple(
 	allAvailableEndpoints protocol.EndpointAddrList,
 	numEndpoints uint,
 ) (protocol.EndpointAddrList, error) {
+	return es.SelectMultipleWithArchival(allAvailableEndpoints, numEndpoints, false)
+}
+
+// SelectMultipleWithArchival returns multiple endpoint addresses with optional archival filtering.
+// Solana does not have an archival concept, so the requiresArchival parameter is ignored
+// and this method delegates to the standard endpoint selection logic.
+func (es *EndpointStore) SelectMultipleWithArchival(
+	allAvailableEndpoints protocol.EndpointAddrList,
+	numEndpoints uint,
+	_ bool,
+) (protocol.EndpointAddrList, error) {
 	logger := es.logger.With(
 		"qos", "Solana",
-		"method", "SelectMultiple",
+		"method", "SelectMultipleWithArchival",
 		"num_endpoints_available", len(allAvailableEndpoints),
 		"num_endpoints", numEndpoints,
 	)
@@ -91,10 +107,43 @@ func (es *EndpointStore) SelectMultiple(
 	return selector.SelectEndpointsWithDiversity(logger, filteredEndpointsAddr, numEndpoints), nil
 }
 
+// touchEndpoints updates the lastSeen timestamp for each endpoint address present in the store.
+// Called after filtering to mark endpoints that appeared in an active session.
+func (es *EndpointStore) touchEndpoints(addrs protocol.EndpointAddrList) {
+	now := time.Now()
+	es.endpointsMu.Lock()
+	defer es.endpointsMu.Unlock()
+	for _, addr := range addrs {
+		if ep, found := es.endpoints[addr]; found {
+			ep.lastSeen = now
+			es.endpoints[addr] = ep
+		}
+	}
+}
+
+// sweepStaleEndpoints removes endpoints whose lastSeen is older than ttl (and non-zero).
+// Returns the list of removed endpoint addresses for Redis cleanup.
+func (es *EndpointStore) sweepStaleEndpoints(ttl time.Duration) []protocol.EndpointAddr {
+	cutoff := time.Now().Add(-ttl)
+	es.endpointsMu.Lock()
+	defer es.endpointsMu.Unlock()
+
+	var removed []protocol.EndpointAddr
+	for addr, ep := range es.endpoints {
+		if ep.lastSeen.IsZero() {
+			continue
+		}
+		if ep.lastSeen.Before(cutoff) {
+			delete(es.endpoints, addr)
+			removed = append(removed, addr)
+		}
+	}
+	return removed
+}
+
 // filterValidEndpoints returns the subset of available endpoints that are valid according to previously processed observations.
 func (es *EndpointStore) filterValidEndpoints(allAvailableEndpoints protocol.EndpointAddrList) (protocol.EndpointAddrList, error) {
 	es.endpointsMu.RLock()
-	defer es.endpointsMu.RUnlock()
 
 	logger := es.logger.With(
 		"method", "filterEndpoints",
@@ -103,6 +152,7 @@ func (es *EndpointStore) filterValidEndpoints(allAvailableEndpoints protocol.End
 	)
 
 	if len(allAvailableEndpoints) == 0 {
+		es.endpointsMu.RUnlock()
 		return nil, errors.New("received empty list of endpoints to select from")
 	}
 
@@ -134,6 +184,12 @@ func (es *EndpointStore) filterValidEndpoints(allAvailableEndpoints protocol.End
 		filteredEndpointsAddr = append(filteredEndpointsAddr, availableEndpointAddr)
 		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msgf("✅ endpoint passed validation: %s", availableEndpointAddr)
 	}
+
+	es.endpointsMu.RUnlock()
+
+	// Touch endpoints to update lastSeen for stale endpoint cleanup.
+	// Uses a separate WLock call to avoid changing the read-heavy filtering path.
+	es.touchEndpoints(allAvailableEndpoints)
 
 	return filteredEndpointsAddr, nil
 }

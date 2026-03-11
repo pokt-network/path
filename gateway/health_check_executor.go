@@ -36,6 +36,7 @@ import (
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/heuristic"
+	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
@@ -74,6 +75,9 @@ type HealthCheckExecutor struct {
 	// pool is the worker pool for concurrent health check execution.
 	pool pond.Pool
 
+	// maxWorkers is the configured/calculated worker pool size for logging.
+	maxWorkers int
+
 	// External config caching (global)
 	externalConfigMu    sync.RWMutex
 	externalConfigs     []ServiceHealthCheckConfig
@@ -107,20 +111,34 @@ type HealthCheckExecutorConfig struct {
 // NewHealthCheckExecutor creates a new HealthCheckExecutor.
 func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor {
 	maxWorkers := cfg.MaxWorkers
+
+	// Calculate optimal worker count if not explicitly configured
+	serviceCount, checksPerService := countServicesAndChecks(cfg.Config)
+	estimatedTotalJobs := serviceCount * DefaultEndpointsPerServiceEstimate * checksPerService
+
 	if maxWorkers <= 0 {
-		maxWorkers = 10 // Default number of concurrent workers
+		// Workers = max(DefaultMinHealthCheckWorkers, estimatedJobs * HealthCheckWorkerMultiplier)
+		// This ensures all health checks can run in parallel with headroom.
+		// Example: 5 services × 50 endpoints × 3 checks = 750 jobs → 1500 workers
+		calculatedWorkers := estimatedTotalJobs * HealthCheckWorkerMultiplier
+		if calculatedWorkers > DefaultMinHealthCheckWorkers {
+			maxWorkers = calculatedWorkers
+		} else {
+			maxWorkers = DefaultMinHealthCheckWorkers
+		}
 	}
 
 	// Create worker pool for concurrent health check execution
 	pool := pond.NewPool(maxWorkers)
 
-	return &HealthCheckExecutor{
+	executor := &HealthCheckExecutor{
 		config:          cfg.Config,
 		reputationSvc:   cfg.ReputationSvc,
 		logger:          cfg.Logger,
 		protocol:        cfg.Protocol,
 		metricsReporter: cfg.MetricsReporter,
 		pool:            pool,
+		maxWorkers:      maxWorkers,
 		// HTTP client for external config fetching only
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -136,6 +154,39 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 		unifiedServicesConfig:     cfg.UnifiedServicesConfig,
 		perServiceExternalConfigs: make(map[protocol.ServiceID][]HealthCheckConfig),
 	}
+
+	if cfg.Logger != nil {
+		cfg.Logger.Info().
+			Int("max_workers", maxWorkers).
+			Int("service_count", serviceCount).
+			Int("checks_per_service", checksPerService).
+			Int("endpoints_per_service_estimate", DefaultEndpointsPerServiceEstimate).
+			Int("estimated_total_jobs", estimatedTotalJobs).
+			Int("worker_multiplier", HealthCheckWorkerMultiplier).
+			Msg("🏊 Health check worker pool initialized")
+	}
+
+	return executor
+}
+
+// countServicesAndChecks counts the number of services and average checks per service from config.
+// Returns (serviceCount, avgChecksPerService) used to estimate total jobs.
+func countServicesAndChecks(config *ActiveHealthChecksConfig) (int, int) {
+	if config == nil || len(config.Local) == 0 {
+		return 0, 0
+	}
+
+	totalChecks := 0
+	for _, svcConfig := range config.Local {
+		totalChecks += len(svcConfig.Checks)
+	}
+
+	serviceCount := len(config.Local)
+	avgChecks := totalChecks / serviceCount
+	if avgChecks == 0 && totalChecks > 0 {
+		avgChecks = 1
+	}
+	return serviceCount, avgChecks
 }
 
 // IsEnabled returns true if the health check executor is enabled.
@@ -161,8 +212,27 @@ func (e *HealthCheckExecutor) ShouldRunChecks() bool {
 
 // SetQoSInstances sets the QoS instances for sync check validation.
 // This should be called after QoS instances are created in the main application.
+// It also applies sync_allowance from any already-loaded external configs,
+// since InitExternalConfig may run before QoS instances are registered.
 func (e *HealthCheckExecutor) SetQoSInstances(instances map[protocol.ServiceID]QoSService) {
 	e.qosInstances = instances
+
+	// Apply sync_allowance from already-loaded external configs.
+	// InitExternalConfig runs before SetQoSInstances, so the initial
+	// SetSyncAllowance calls in refreshExternalConfig find an empty map.
+	e.externalConfigMu.RLock()
+	configs := e.externalConfigs
+	e.externalConfigMu.RUnlock()
+
+	for _, cfg := range configs {
+		if cfg.SyncAllowance != nil && *cfg.SyncAllowance > 0 {
+			if qosInstance, ok := instances[cfg.ServiceID]; ok {
+				if setter, ok := qosInstance.(interface{ SetSyncAllowance(uint64) }); ok {
+					setter.SetSyncAllowance(uint64(*cfg.SyncAllowance))
+				}
+			}
+		}
+	}
 }
 
 // GetServiceConfigs returns the merged health check configurations for all services.
@@ -450,6 +520,16 @@ func (e *HealthCheckExecutor) refreshExternalConfig(ctx context.Context) {
 			if cfg.SyncAllowance != nil && *cfg.SyncAllowance > 0 {
 				e.unifiedServicesConfig.SetServiceSyncAllowance(cfg.ServiceID, *cfg.SyncAllowance)
 				syncAllowanceCount++
+
+				// Also propagate to the QoS instance so it uses the updated value
+				// for endpoint selection. QoS instances are created at startup before
+				// external rules are loaded, so they start with syncAllowance=0.
+				if qosInstance, ok := e.qosInstances[cfg.ServiceID]; ok {
+					if setter, ok := qosInstance.(interface{ SetSyncAllowance(uint64) }); ok {
+						setter.SetSyncAllowance(uint64(*cfg.SyncAllowance))
+					}
+				}
+
 				e.logger.Info().
 					Str("service_id", string(cfg.ServiceID)).
 					Int("sync_allowance", *cfg.SyncAllowance).
@@ -962,7 +1042,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 
 	// Heuristic analysis - detect bad gateway, empty responses, and other error patterns
 	// This runs BEFORE QoS validation to catch issues the basic validation might miss
-	heuristicResult := heuristic.Analyze(responseBody, httpStatusCode, servicePayload.RPCType)
+	heuristicResult := heuristic.Analyze(responseBody, httpStatusCode, servicePayload.EffectiveRPCType(), "")
 	if heuristicResult.ShouldRetry {
 		heuristicErr := fmt.Errorf("heuristic detected error: %s - %s", heuristicResult.Reason, heuristicResult.Details)
 		e.logger.Debug().
@@ -1007,6 +1087,12 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Str("error", hcQoSCtx.GetError()).
 			Dur("latency", latency).
 			Msg("Health check response validation failed")
+
+		// If this was an archival check that failed validation (expected_response_contains didn't match),
+		// clear the archival status. This ensures endpoints that return errors are not marked as archival.
+		if check.Archival {
+			e.clearEndpointArchival(serviceID, endpointAddr, check)
+		}
 
 		// Record relay metric for validation failure (relay succeeded but validation failed)
 		statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
@@ -1081,10 +1167,18 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Msg("Supplier unblacklisted after successful health check")
 	}
 
+	// If this was an archival health check that passed all validations (including error_detection),
+	// mark the endpoint as archival-capable. This is done explicitly AFTER all checks pass to avoid
+	// marking endpoints that returned "false success" responses (like "0x0" for archival queries).
+	if check.Archival {
+		e.markEndpointArchival(serviceID, endpointAddr, check)
+	}
+
 	e.logger.Debug().
 		Str("service_id", string(serviceID)).
 		Str("endpoint", string(endpointAddr)).
 		Str("check", check.Name).
+		Bool("archival_check", check.Archival).
 		Dur("latency", latency).
 		Msg("Health check passed via protocol relay")
 
@@ -1165,6 +1259,7 @@ func (e *HealthCheckExecutor) processObservationSync(
 		ServiceID:          serviceID,
 		EndpointAddr:       endpointAddr,
 		Source:             SourceHealthCheck,
+		IsArchivalCheck:    check.Archival,
 		Timestamp:          startTime,
 		Latency:            latency,
 		RequestPath:        payload.Path,
@@ -1182,6 +1277,104 @@ func (e *HealthCheckExecutor) processObservationSync(
 		Str("endpoint", string(endpointAddr)).
 		Str("check", check.Name).
 		Msg("Health check observation processed synchronously for block height extraction")
+}
+
+// archivalTTL is how long an archival status from health checks remains valid.
+// Health checks run periodically, so this should be longer than the health check interval.
+const archivalTTL = 30 * time.Minute
+
+// markEndpointArchival marks an endpoint as archival-capable via the reputation service.
+// This is called ONLY after an archival health check passes ALL validations including error_detection.
+// This ensures we don't mark endpoints that returned "false success" responses (e.g., "0x0").
+// The archival status is shared across all replicas via Redis storage.
+func (e *HealthCheckExecutor) markEndpointArchival(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, check HealthCheckConfig) {
+	if e.reputationSvc == nil {
+		e.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Msg("No reputation service available for archival marking")
+		return
+	}
+
+	// IMPORTANT: Always use RPCType_JSON_RPC for archival status keys, regardless of health check type.
+	// This ensures consistency with endpoint selection filtering, which always uses RPCType_JSON_RPC
+	// when checking archival status. If we used different RPC types here, non-leader replicas would
+	// not find archival endpoints in Redis (different keys = different storage buckets).
+	// For cross-replica consistency, health checks, UpdateFromExtractedData, and endpoint selection
+	// filtering all must use the same RPC type: RPCType_JSON_RPC.
+	rpcType := sharedtypes.RPCType_JSON_RPC
+
+	// Build reputation key
+	key := reputation.NewEndpointKey(serviceID, endpointAddr, rpcType)
+
+	// Set archival status via reputation service (synced to Redis)
+	ctx := context.Background()
+	if err := e.reputationSvc.SetArchivalStatus(ctx, key, true, archivalTTL); err != nil {
+		e.logger.Warn().
+			Err(err).
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Msg("Failed to mark endpoint as archival-capable in reputation service")
+		return
+	}
+
+	// Also update the local QoS instance for immediate effect on this replica
+	qosInstance, exists := e.qosInstances[serviceID]
+	if exists && qosInstance != nil {
+		data := &qostypes.ExtractedData{
+			IsArchival: true,
+		}
+		_ = qosInstance.UpdateFromExtractedData(endpointAddr, data)
+	}
+
+	e.logger.Info().
+		Str("service_id", string(serviceID)).
+		Str("endpoint", string(endpointAddr)).
+		Str("rpc_type", rpcType.String()).
+		Msg("📜 Endpoint marked as archival-capable (synced to Redis)")
+}
+
+// clearEndpointArchival clears the archival status for an endpoint.
+// This is called when an archival health check FAILS validation (expected_response_contains didn't match).
+// This ensures endpoints that return errors are not marked as archival-capable.
+func (e *HealthCheckExecutor) clearEndpointArchival(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, check HealthCheckConfig) {
+	// IMPORTANT: Always use RPCType_JSON_RPC for archival status keys, regardless of health check type.
+	// This ensures consistency with endpoint selection filtering, which always uses RPCType_JSON_RPC
+	// when checking archival status. If we used different RPC types here, non-leader replicas would
+	// not find archival endpoints in Redis (different keys = different storage buckets).
+	// For cross-replica consistency, health checks, UpdateFromExtractedData, and endpoint selection
+	// filtering all must use the same RPC type: RPCType_JSON_RPC.
+	rpcType := sharedtypes.RPCType_JSON_RPC
+
+	// Clear archival status via reputation service (synced to Redis)
+	if e.reputationSvc != nil {
+		key := reputation.NewEndpointKey(serviceID, endpointAddr, rpcType)
+		ctx := context.Background()
+		// Set archival to false with 0 TTL (immediate expiration)
+		if err := e.reputationSvc.SetArchivalStatus(ctx, key, false, 0); err != nil {
+			e.logger.Warn().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Str("endpoint", string(endpointAddr)).
+				Msg("Failed to clear archival status in reputation service")
+		}
+	}
+
+	// Also update the local QoS instance for immediate effect on this replica
+	qosInstance, exists := e.qosInstances[serviceID]
+	if exists && qosInstance != nil {
+		data := &qostypes.ExtractedData{
+			ArchivalCheckPerformed: true,
+			IsArchival:             false,
+		}
+		_ = qosInstance.UpdateFromExtractedData(endpointAddr, data)
+	}
+
+	e.logger.Warn().
+		Str("service_id", string(serviceID)).
+		Str("endpoint", string(endpointAddr)).
+		Str("rpc_type", rpcType.String()).
+		Msg("🚫 Endpoint archival status CLEARED - health check validation failed")
 }
 
 // buildServicePayload creates a protocol.Payload from the health check configuration.
@@ -1450,8 +1643,9 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 	e.logger.Info().
 		Int("service_count", len(serviceConfigs)).
 		Int("total_jobs", totalJobs).
-		Int("pool_running", int(e.pool.RunningWorkers())).
-		Msg("Starting health checks via protocol with pond pool")
+		Int("max_workers", e.maxWorkers).
+		Int("pool_running_workers", int(e.pool.RunningWorkers())).
+		Msg("🏊 Starting health check cycle")
 
 	// Wait for all jobs to complete
 	// group.Wait() returns an error only if context is canceled
@@ -1605,15 +1799,23 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 	// Try different formats
 	switch v := result.(type) {
 	case string:
-		// EVM format: "0x1940c6f5"
-		return parseHexBlockNumber(v)
+		if strings.HasPrefix(v, "0x") || strings.HasPrefix(v, "0X") {
+			// EVM hex format: "0x1940c6f5"
+			return parseHexBlockNumber(v)
+		}
+		// Decimal string format (e.g. Sui's sui_getLatestCheckpointSequenceNumber): "246404377"
+		height, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid decimal block number string: %w", err)
+		}
+		return height, nil
 
 	case float64:
 		// Already a number
 		return int64(v), nil
 
 	case map[string]interface{}:
-		// Cosmos format: {"sync_info": {"latest_block_height": "12345"}}
+		// Cosmos/NEAR format: {"sync_info": {"latest_block_height": "12345"}}
 		if syncInfo, ok := v["sync_info"].(map[string]interface{}); ok {
 			if heightStr, ok := syncInfo["latest_block_height"].(string); ok {
 				height, err := strconv.ParseInt(heightStr, 10, 64)
@@ -1621,6 +1823,10 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 					return 0, fmt.Errorf("invalid block height in sync_info: %w", err)
 				}
 				return height, nil
+			}
+			// NEAR returns latest_block_height as a number
+			if heightNum, ok := syncInfo["latest_block_height"].(float64); ok {
+				return int64(heightNum), nil
 			}
 		}
 		return 0, fmt.Errorf("unsupported response format: object without sync_info")

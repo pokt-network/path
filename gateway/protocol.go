@@ -151,6 +151,11 @@ type Protocol interface {
 	// Returns true if the session is still in the current active sessions list.
 	IsSessionActive(ctx context.Context, serviceID protocol.ServiceID, sessionID string) bool
 
+	// SetQoSServiceRegistry sets the QoS service registry for endpoint details reporting.
+	// This enables /ready/<service>?detailed=true to include archival status information
+	// by allowing the protocol to query QoS services for endpoint-specific data.
+	SetQoSServiceRegistry(registry QoSServiceRegistry)
+
 	// health.Check interface is used to verify protocol instance's health status.
 	health.Check
 }

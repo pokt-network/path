@@ -22,7 +22,11 @@ set_docker_log_ci() {
     # Update the config to enable Docker logging to stdout for CI
     yq -i '.e2e_load_test_config.e2e_config.docker_config.docker_log = true' $CONFIG_FILE
 
-    echo "Successfully set docker_log to true in $CONFIG_FILE"
+    # Skip Docker image rebuild in CI — the image is already built in Phase 1
+    # of the CI workflow and loaded via `docker load` before the test runs.
+    yq -i '.e2e_load_test_config.e2e_config.docker_config.force_rebuild_image = false' $CONFIG_FILE
+
+    echo "Successfully configured Docker settings for CI in $CONFIG_FILE"
 }
 
 set_docker_log_ci "$@"

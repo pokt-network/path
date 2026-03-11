@@ -52,8 +52,9 @@ type WebsocketMessageProcessor interface {
 // - Show interaction between gateway, protocol, and QoS layers for Websocket messages
 type bridge struct {
 	// ctx is used to stop the bridge when the context is canceled from either connection
-	ctx    context.Context
-	logger polylog.Logger
+	ctx       context.Context
+	cancelCtx context.CancelFunc
+	logger    polylog.Logger
 
 	// endpointConn is the connection to the Websocket Endpoint
 	endpointConn *websocketConnection
@@ -120,8 +121,9 @@ func StartBridge(
 
 	// Create bridge instance
 	b := &bridge{
-		logger: logger,
-		ctx:    bridgeCtx, // Use the bridge-specific context
+		logger:    logger,
+		ctx:       bridgeCtx, // Use the bridge-specific context
+		cancelCtx: cancelCtx,
 
 		msgChan:                   msgChan,
 		websocketMessageProcessor: websocketMessageProcessor,
@@ -182,19 +184,20 @@ func (b *bridge) validateComponents() error {
 func (b *bridge) start() {
 	b.logger.Info().Msg("Websocket bridge operation started successfully")
 
-	// Listen for the context to be canceled and shut down the bridge
-	go func() {
-		<-b.ctx.Done()
-		b.shutdown(ErrBridgeContextCanceled)
-	}()
+	for {
+		select {
+		case msg := <-b.msgChan:
+			switch msg.source {
+			case messageSourceClient:
+				b.handleClientMessage(msg)
 
-	for msg := range b.msgChan {
-		switch msg.source {
-		case messageSourceClient:
-			b.handleClientMessage(msg)
+			case messageSourceEndpoint:
+				b.handleEndpointMessage(msg)
+			}
 
-		case messageSourceEndpoint:
-			b.handleEndpointMessage(msg)
+		case <-b.ctx.Done():
+			b.shutdown(ErrBridgeContextCanceled)
+			return
 		}
 	}
 }
@@ -221,6 +224,11 @@ func (b *bridge) shutdown(err error) {
 	b.shutdownOnce.Do(func() {
 		b.logger.Warn().Err(err).Msg("🔌👋 Websocket bridge shutting down.")
 
+		// Cancel the context first to signal all goroutines (connLoop, pingLoop, start)
+		// to stop. This must happen before closing connections to prevent connLoop
+		// from sending on msgChan after it's no longer being read.
+		b.cancelCtx()
+
 		// Determine appropriate close code and message for client reconnection guidance
 		closeCode, errMsg := b.determineCloseCodeAndMessage(err)
 		closeMsg := websocket.FormatCloseMessage(closeCode, errMsg)
@@ -241,8 +249,11 @@ func (b *bridge) shutdown(err error) {
 			b.endpointConn.Close()
 		}
 
-		// Close the message channel to stop the message loop
-		close(b.msgChan)
+		// Note: msgChan is intentionally NOT closed here. Closing it would cause a
+		// "send on closed channel" panic if connLoop is concurrently trying to send.
+		// Instead, context cancellation (above) signals connLoop to exit via its
+		// select on ctx.Done(), and the channel is garbage collected once all
+		// goroutines have exited.
 
 		// Close the observation channel to signal the gateway that no more observations will be sent
 		if b.messageObservationsChan != nil {

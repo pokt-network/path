@@ -2,6 +2,7 @@ package heuristic
 
 import (
 	"bytes"
+	"strings"
 )
 
 // Tier 3: Error Indicator Pattern Detection
@@ -144,9 +145,15 @@ var errorPatterns = []errorPattern{
 
 	// Blockchain-Specific Errors (EVM)
 	// ONLY include errors that indicate supplier/node problems, NOT application-level errors
-	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},     // Data corruption/sync issue
-	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95}, // Archival data not available
-	{[]byte("state not available"), CategoryBlockchainError, 0.90},   // Node sync issue
+	{[]byte("mdbx_panic"), CategoryBlockchainError, 0.98},                 // Erigon MDBX database corruption/disk full
+	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},          // Data corruption/sync issue
+	{[]byte("failed to call fallback"), CategoryBlockchainError, 0.95},    // Node's internal fallback for archival data failed
+	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95},      // Archival data not available
+	{[]byte("is pruned"), CategoryBlockchainError, 0.95},                  // Generic pruned error (e.g., "state at block #X is pruned")
+	{[]byte("state not available"), CategoryBlockchainError, 0.90},        // Node sync issue
+	{[]byte("haven't been fully indexed"), CategoryBlockchainError, 0.95}, // Archival indexing not complete (BSC)
+	{[]byte("not been fully indexed"), CategoryBlockchainError, 0.95},     // Archival indexing not complete (variant)
+	{[]byte("historical state"), CategoryBlockchainError, 0.85},           // Historical state not available
 
 	// Blockchain-Specific Errors (Solana)
 	{[]byte("node is behind"), CategoryBlockchainError, 0.90},    // Sync issue
@@ -231,12 +238,85 @@ func IndicatorAnalysisToResult(ir IndicatorResult) AnalysisResult {
 	}
 
 	return AnalysisResult{
-		ShouldRetry: true,
-		Confidence:  ir.Confidence,
-		Reason:      "error_indicator_" + ir.Category.String(),
-		Structure:   StructureValid,
-		Details:     "Detected error pattern: " + ir.Pattern,
+		ShouldRetry:    true,
+		Confidence:     ir.Confidence,
+		Reason:         "error_indicator_" + ir.Category.String(),
+		Structure:      StructureValid,
+		Details:        "Detected error pattern: " + ir.Pattern,
+		MatchedPattern: ir.Pattern,
 	}
+}
+
+// IsArchivalRelatedError returns true if the indicator pattern is an archival/pruning error.
+// These errors are expected from non-archival nodes and should NOT trigger domain-level
+// circuit breaking — the domain isn't broken, it just doesn't have historical state.
+// Retrying on a different (archival-capable) supplier is correct, but punishing the
+// domain for a capability mismatch causes death spirals where all domains get locked out.
+func IsArchivalRelatedError(pattern string) bool {
+	switch pattern {
+	case "historical state",
+		"state has been pruned",
+		"is pruned",
+		"state not available",
+		"haven't been fully indexed",
+		"not been fully indexed",
+		"missing trie node",
+		"block has been pruned",
+		"height is not available":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsCapabilityLimitationError returns true if the pattern indicates a node capability
+// limitation rather than a broken domain. These include archival errors AND other
+// capability mismatches like Tron lite fullnodes that can't serve certain API calls.
+// The request should retry on a different supplier but should NOT circuit-break the domain.
+func IsCapabilityLimitationError(pattern string) bool {
+	if IsArchivalRelatedError(pattern) {
+		return true
+	}
+	switch pattern {
+	case "capability_limitation": // Tron lite fullnode, "api not supported" plain text responses
+		return true
+	default:
+		return false
+	}
+}
+
+// capabilityLimitationSubstrings are the patterns to search for in error strings.
+// These correspond to the same patterns in IsCapabilityLimitationError but are used
+// for substring matching when the structured AnalysisResult is not available.
+// Includes archival patterns AND capability limitation patterns (e.g., lite fullnode).
+var capabilityLimitationSubstrings = []string{
+	// Archival-related
+	"historical state",
+	"state has been pruned",
+	"is pruned",
+	"state not available",
+	"haven't been fully indexed",
+	"not been fully indexed",
+	"missing trie node",
+	"block has been pruned",
+	"height is not available",
+	// Capability limitation (e.g., Tron lite fullnodes)
+	"lite fullnode",
+	"api is not supported",
+}
+
+// ErrorContainsArchivalPattern checks if an error string contains any archival-related
+// or capability-limitation pattern. This is a fallback for when the structured heuristic
+// AnalysisResult is not available (e.g., protocol-layer errors propagated through the
+// hedge_failed path).
+func ErrorContainsArchivalPattern(errStr string) bool {
+	lower := strings.ToLower(errStr)
+	for _, pattern := range capabilityLimitationSubstrings {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // QuickErrorCheck performs a fast check for obvious error indicators.

@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -90,6 +92,10 @@ type requestContext struct {
 	// If nil, no async observation processing occurs.
 	observationQueue *ObservationQueue
 
+	// circuitBreaker tracks broken domains across pods via Redis.
+	// If nil, no cross-pod domain circuit breaking occurs.
+	circuitBreaker *DomainCircuitBreaker
+
 	// QoS related request context
 	serviceID  protocol.ServiceID
 	serviceQoS QoSService
@@ -142,11 +148,87 @@ type requestContext struct {
 
 	// suppliersTried tracks all supplier addresses that were attempted during the request.
 	// Includes the initial attempt and all retry attempts (up to 10 for header size limits).
+	// Access must be protected by suppliersMu when used from batch request goroutines.
 	suppliersTried []string
+	suppliersMu    sync.Mutex // Protects suppliersTried for concurrent batch request access
 
 	// hedgeResult tracks the outcome of hedge racing, if hedging was used.
 	// Values: "primary_only", "primary_won", "hedge_won", "both_failed", "no_hedge", or empty if not used.
 	hedgeResult string
+
+	// archivalRequestDetected tracks whether this request requires archival data.
+	archivalRequestDetected bool
+}
+
+// addSupplierTried safely adds a supplier address to the suppliersTried list.
+// Thread-safe for use from concurrent batch request goroutines.
+// Returns true if the supplier was added, false if already present or limit reached.
+func (rc *requestContext) addSupplierTried(supplier string) bool {
+	if supplier == "" {
+		return false
+	}
+	rc.suppliersMu.Lock()
+	defer rc.suppliersMu.Unlock()
+
+	// Check limit
+	if len(rc.suppliersTried) >= 10 {
+		return false
+	}
+
+	// Check if already tracked
+	for _, s := range rc.suppliersTried {
+		if s == supplier {
+			return false
+		}
+	}
+
+	rc.suppliersTried = append(rc.suppliersTried, supplier)
+	return true
+}
+
+// addSuppliersTried safely adds multiple supplier addresses to the suppliersTried list.
+// Thread-safe for use from concurrent batch request goroutines.
+func (rc *requestContext) addSuppliersTried(suppliers ...string) {
+	rc.suppliersMu.Lock()
+	defer rc.suppliersMu.Unlock()
+
+	for _, supplier := range suppliers {
+		if supplier == "" {
+			continue
+		}
+		if len(rc.suppliersTried) >= 10 {
+			return
+		}
+		// Check if already tracked
+		alreadyTracked := false
+		for _, s := range rc.suppliersTried {
+			if s == supplier {
+				alreadyTracked = true
+				break
+			}
+		}
+		if !alreadyTracked {
+			rc.suppliersTried = append(rc.suppliersTried, supplier)
+		}
+	}
+}
+
+// getSuppliersTried safely returns a copy of the suppliersTried list.
+// Thread-safe for use from concurrent batch request goroutines.
+func (rc *requestContext) getSuppliersTried() []string {
+	rc.suppliersMu.Lock()
+	defer rc.suppliersMu.Unlock()
+	result := make([]string, len(rc.suppliersTried))
+	copy(result, rc.suppliersTried)
+	return result
+}
+
+// getSuppliersTriedCount safely returns the count of suppliers tried.
+// Thread-safe for use from concurrent batch request goroutines.
+func (rc *requestContext) getSuppliersTriedCount() int {
+	rc.suppliersMu.Lock()
+	defer rc.suppliersMu.Unlock()
+	return len(rc.suppliersTried)
 }
 
 // InitFromHTTPRequest builds the required context for serving an HTTP request.
@@ -256,8 +338,23 @@ func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
 	detector := NewRPCTypeDetector()
 	rpcType, err := detector.DetectRPCType(httpReq, string(rc.serviceID), serviceRPCTypes)
 	if err != nil {
+		// Log request details at error level for diagnosing bad traffic patterns.
+		// Read up to 512 bytes of the body for diagnostics, then restore it.
+		bodySnippet := ""
+		if httpReq.Body != nil {
+			bodyBytes, readErr := readBodySafely(httpReq, 512)
+			if readErr == nil {
+				bodySnippet = string(bodyBytes)
+				httpReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			}
+		}
 		rc.logger.Error().
 			Str("method", "ValidateRPCType").
+			Str("http_method", httpReq.Method).
+			Str("url_path", httpReq.URL.Path).
+			Str("content_type", httpReq.Header.Get("Content-Type")).
+			Str("user_agent", httpReq.Header.Get("User-Agent")).
+			Str("body_snippet", bodySnippet).
 			Err(err).
 			Msg("RPC type detection failed")
 
@@ -383,13 +480,36 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 		return fmt.Errorf("%w: no available endpoints could be found for the request: %w", errBuildProtocolContextsFromHTTPRequest, err)
 	}
 
+	// Filter out domains known to be broken across the fleet (cross-pod circuit breaker).
+	// This prevents initial attempts from hitting domains that other pods have already
+	// discovered are returning errors, reducing wasted relay attempts.
+	if rc.circuitBreaker != nil {
+		brokenDomains := rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID))
+		if len(brokenDomains) > 0 {
+			filtered := filterEndpointsByBrokenDomains(availableEndpoints, brokenDomains)
+			if len(filtered) > 0 {
+				availableEndpoints = filtered
+			}
+			// If ALL endpoints are from broken domains, keep the original list (graceful degradation).
+		}
+	}
+
 	// Select multiple endpoints for parallel relay attempts
 	// Use per-service max_parallel_endpoints with fallback to global config (default: 1)
 	maxParallelEndpoints := rc.protocol.GetConcurrencyConfig().MaxParallelEndpoints // Global default
 	if concurrencyConfig := rc.getConcurrencyConfigForService(); concurrencyConfig != nil && concurrencyConfig.MaxParallelEndpoints != nil {
 		maxParallelEndpoints = *concurrencyConfig.MaxParallelEndpoints // Per-service override
 	}
-	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultiple(availableEndpoints, uint(maxParallelEndpoints))
+
+	// Check if the request requires archival data (EVM-specific)
+	// Use type assertion to check for RequiresArchival method
+	requiresArchival := false
+	if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
+		requiresArchival = archivalChecker.RequiresArchival()
+	}
+
+	// Use archival-aware endpoint selection to filter endpoints appropriately
+	selectedEndpoints, err := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(availableEndpoints, uint(maxParallelEndpoints), requiresArchival)
 	if err != nil || len(selectedEndpoints) == 0 {
 		// no protocol context will be built: use the endpointLookup observation.
 		rc.updateProtocolObservations(&endpointLookupObs)
@@ -415,14 +535,59 @@ func (rc *requestContext) BuildProtocolContextsFromHTTPRequest(httpReq *http.Req
 	rc.protocolContexts = make([]ProtocolRequestContext, 0, numSelectedEndpoints)
 	var lastProtocolCtxSetupErrObs *protocolobservations.Observations
 
+	// Track endpoints that have been attempted to avoid retrying the same one
+	attemptedEndpoints := make(map[protocol.EndpointAddr]bool)
+
 	for i, endpointAddr := range selectedEndpoints {
 		rc.logger.Debug().
 			Str("method", "BuildProtocolContextsFromHTTPRequest").
 			Msgf("Building protocol context for endpoint %d/%d: %s", i+1, numSelectedEndpoints, endpointAddr)
+
+		attemptedEndpoints[endpointAddr] = true
+
 		// filterByReputation=true: Normal requests respect reputation filtering
 		protocolCtx, protocolCtxSetupErrObs, err := rc.protocol.BuildHTTPRequestContextForEndpoint(rc.context, rc.serviceID, endpointAddr, rpcType, httpReq, true)
 		if err != nil {
 			lastProtocolCtxSetupErrObs = &protocolCtxSetupErrObs
+
+			// Handle endpoint unavailable error by trying to re-select using QoS rules
+			if errors.Is(err, protocol.ErrEndpointUnavailable) {
+				rc.logger.Warn().
+					Str("method", "BuildProtocolContextsFromHTTPRequest").
+					Str("endpoint_addr", string(endpointAddr)).
+					Msgf("Endpoint %d/%d became unavailable, attempting re-selection", i+1, numSelectedEndpoints)
+
+				// Get fresh endpoints and try to find a replacement
+				freshEndpoints, _, freshErr := rc.protocol.AvailableHTTPEndpoints(rc.context, rc.serviceID, rpcType, httpReq)
+				if freshErr == nil && len(freshEndpoints) > 0 {
+					// Filter out endpoints we've already attempted
+					for _, freshEndpoint := range freshEndpoints {
+						if attemptedEndpoints[freshEndpoint] {
+							continue
+						}
+						// Try to build context for this fresh endpoint
+						attemptedEndpoints[freshEndpoint] = true
+						replacementCtx, _, replaceErr := rc.protocol.BuildHTTPRequestContextForEndpoint(
+							rc.context, rc.serviceID, freshEndpoint, rpcType, httpReq, true)
+						if replaceErr == nil {
+							rc.protocolContexts = append(rc.protocolContexts, replacementCtx)
+							rc.logger.Info().
+								Str("method", "BuildProtocolContextsFromHTTPRequest").
+								Str("original_endpoint", string(endpointAddr)).
+								Str("replacement_endpoint", string(freshEndpoint)).
+								Msgf("Successfully replaced unavailable endpoint %d/%d with new endpoint", i+1, numSelectedEndpoints)
+							break
+						}
+						rc.logger.Debug().
+							Str("method", "BuildProtocolContextsFromHTTPRequest").
+							Err(replaceErr).
+							Str("replacement_endpoint", string(freshEndpoint)).
+							Msg("Replacement endpoint also failed, trying next")
+					}
+				}
+				continue
+			}
+
 			rc.logger.Warn().
 				Str("method", "BuildProtocolContextsFromHTTPRequest").
 				Err(err).
@@ -526,17 +691,28 @@ func (rc *requestContext) writeHTTPResponse(response pathhttp.HTTPResponse, w ht
 //   - X-Supplier-Address: The supplier address of the endpoint (comma-separated for batched relays)
 //   - X-Session-ID: The session ID (comma-separated for batched relays if different)
 //   - X-Environment: The environment from PATH_ENVIRONMENT env variable
+//   - X-Archival-Request: Whether the request requires archival data (true/false)
+//   - X-Retry-Count: Number of retries attempted
+//   - X-Suppliers-Tried: Comma-separated list of supplier addresses tried
 //
 // For batched relays, up to 10 samples are included.
 func (rc *requestContext) addRelayMetadataHeaders(w http.ResponseWriter) {
+	// ALWAYS add archival request header (even on errors)
+	w.Header().Set("X-Archival-Request", strconv.FormatBool(rc.archivalRequestDetected))
+
 	// ALWAYS add retry count header (even on errors, even if 0)
 	w.Header().Set("X-Retry-Count", fmt.Sprintf("%d", rc.retryCount))
 
-	// ALWAYS add suppliers tried header if any were attempted (even on errors)
-	if len(rc.suppliersTried) > 0 {
-		w.Header().Set("X-Suppliers-Tried", strings.Join(rc.suppliersTried, ","))
+	// ALWAYS add suppliers tried header (even on errors, even if empty)
+	// Use thread-safe getter since suppliersTried may be modified by concurrent batch goroutines
+	suppliersTried := rc.getSuppliersTried()
+	suppliersTriedStr := strings.Join(suppliersTried, ",")
+	w.Header().Set("X-Suppliers-Tried", suppliersTriedStr)
+
+	// Log suppliers tried details if any were attempted
+	if len(suppliersTried) > 0 {
 		rc.logger.Debug().
-			Str("suppliers_tried", strings.Join(rc.suppliersTried, ",")).
+			Str("suppliers_tried", suppliersTriedStr).
 			Int("retry_count", rc.retryCount).
 			Str("hedge_result", rc.hedgeResult).
 			Msg("🔍 FINAL X-Suppliers-Tried header set")

@@ -59,9 +59,9 @@ func TestClassifyErrorAsSignal_Heuristic(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Construct the error as it would be from context.go
+			// Construct the error as it would be from context.go (heuristic-detected backend errors)
 			err := fmt.Errorf("raw_payload: %s: heuristic detected %s: %w",
-				tt.body, tt.heuristicReason, errMalformedEndpointPayload)
+				tt.body, tt.heuristicReason, errHeuristicDetectedBackendError)
 
 			errType, signal := classifyErrorAsSignal(logger, err, latency)
 
