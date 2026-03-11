@@ -417,23 +417,20 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				break
 			}
 
-			// Check if the request requires archival data and filter endpoints accordingly
-			// This ensures retries also respect archival requirements
+			// Filter endpoints through QoS validation (block height, chain ID, etc.)
+			// This prevents stale endpoints from being selected for retries.
 			requiresArchival := false
 			if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
 				requiresArchival = archivalChecker.RequiresArchival()
 			}
-			if requiresArchival {
-				// Filter available endpoints using archival-aware selection
-				// This returns only archival-capable endpoints
-				archivalEndpoints, archivalErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
-					availableEndpoints, uint(len(availableEndpoints)), true)
-				if archivalErr == nil && len(archivalEndpoints) > 0 {
-					availableEndpoints = archivalEndpoints
-					logger.Debug().
-						Int("archival_endpoints", len(archivalEndpoints)).
-						Msg("Filtered to archival-capable endpoints for retry")
-				}
+			validatedEndpoints, validateErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+				availableEndpoints, uint(len(availableEndpoints)), requiresArchival)
+			if validateErr == nil && len(validatedEndpoints) > 0 {
+				availableEndpoints = validatedEndpoints
+				logger.Debug().
+					Int("validated_endpoints", len(validatedEndpoints)).
+					Bool("requires_archival", requiresArchival).
+					Msg("Filtered endpoints through QoS validation for retry")
 			}
 
 			// Filter out endpoints and domains we've already tried
@@ -497,21 +494,20 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				logger.Warn().Err(err).Msg("Failed to get endpoints for hedge racing, falling back to normal request")
 				// Fall through to normal request
 			} else if len(availableEndpoints) > 0 {
-				// Filter for archival endpoints if request requires archival data
-				// This ensures hedge requests also go to archival-capable endpoints
+				// Filter endpoints through QoS validation (block height, chain ID, etc.)
+				// This prevents stale endpoints from being selected as hedge targets.
 				requiresArchival := false
 				if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
 					requiresArchival = archivalChecker.RequiresArchival()
 				}
-				if requiresArchival {
-					archivalEndpoints, archivalErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
-						availableEndpoints, uint(len(availableEndpoints)), true)
-					if archivalErr == nil && len(archivalEndpoints) > 0 {
-						availableEndpoints = archivalEndpoints
-						logger.Debug().
-							Int("archival_endpoints", len(archivalEndpoints)).
-							Msg("Filtered to archival-capable endpoints for hedge racing")
-					}
+				filteredForHedge, filterErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+					availableEndpoints, uint(len(availableEndpoints)), requiresArchival)
+				if filterErr == nil && len(filteredForHedge) > 0 {
+					availableEndpoints = filteredForHedge
+					logger.Debug().
+						Int("filtered_endpoints", len(filteredForHedge)).
+						Bool("requires_archival", requiresArchival).
+						Msg("Filtered endpoints through QoS validation for hedge racing")
 				}
 				// Select primary endpoint (first one, which is already reputation-sorted)
 				primaryEndpoint := availableEndpoints[0]
@@ -1003,20 +999,20 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			continue
 		}
 
-		// Filter for archival endpoints if request requires archival data
+		// Filter endpoints through QoS validation (block height, chain ID, etc.)
+		// This prevents stale endpoints from being selected for batch items.
 		requiresArchival := false
 		if archivalChecker, ok := rc.qosCtx.(ArchivalRequirementChecker); ok {
 			requiresArchival = archivalChecker.RequiresArchival()
 		}
-		if requiresArchival {
-			archivalEndpoints, archivalErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
-				availableEndpoints, uint(len(availableEndpoints)), true)
-			if archivalErr == nil && len(archivalEndpoints) > 0 {
-				availableEndpoints = archivalEndpoints
-				logger.Debug().
-					Int("archival_endpoints", len(archivalEndpoints)).
-					Msg("Filtered to archival-capable endpoints for batch item")
-			}
+		validatedEndpoints, validateErr := rc.qosCtx.GetEndpointSelector().SelectMultipleWithArchival(
+			availableEndpoints, uint(len(availableEndpoints)), requiresArchival)
+		if validateErr == nil && len(validatedEndpoints) > 0 {
+			availableEndpoints = validatedEndpoints
+			logger.Debug().
+				Int("validated_endpoints", len(validatedEndpoints)).
+				Bool("requires_archival", requiresArchival).
+				Msg("Filtered endpoints through QoS validation for batch item")
 		}
 
 		// Filter out already tried endpoints and domains for retries

@@ -644,3 +644,160 @@ func archivalCacheHas(cache *ArchivalCache, key string) bool {
 	isArchival, ok := cache.Get(key)
 	return ok && isArchival
 }
+
+// TestSelectMultipleWithArchival_FiltersStaleEndpoints verifies that SelectMultipleWithArchival
+// (used by hedge race, retry, and batch paths) filters out endpoints that are behind
+// the perceived block height by more than sync_allowance.
+//
+// This is a regression test for the root cause of stale responses being served:
+// the hedge race, retry, and batch code paths previously used raw protocol endpoints
+// without QoS block height validation. The fix routes all three paths through
+// SelectMultipleWithArchival which calls filterValidEndpointsWithDetails → isBlockNumberValid.
+func TestSelectMultipleWithArchival_FiltersStaleEndpoints(t *testing.T) {
+	logger := polylog.Ctx(context.Background())
+
+	perceivedBlock := uint64(43224462)
+	syncAllowance := uint64(5) // 5 blocks tolerance
+
+	tests := []struct {
+		name            string
+		endpoints       map[protocol.EndpointAddr]uint64 // addr -> block height
+		expectFiltered  []protocol.EndpointAddr          // expected to pass
+		expectExcluded  []protocol.EndpointAddr          // expected to be filtered out
+		expectFallback  bool                             // if all filtered, should fall back
+	}{
+		{
+			name: "stale endpoint filtered, fresh endpoint kept",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"fresh-supplier:https://good-node.com":  perceivedBlock - 1, // 1 block behind = OK
+				"stale-supplier:https://stale-node.com": perceivedBlock - 65000, // 65K behind = stale
+			},
+			expectFiltered: []protocol.EndpointAddr{"fresh-supplier:https://good-node.com"},
+			expectExcluded: []protocol.EndpointAddr{"stale-supplier:https://stale-node.com"},
+		},
+		{
+			name: "all endpoints within sync allowance",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"ep1:https://node1.com": perceivedBlock - 2,
+				"ep2:https://node2.com": perceivedBlock - 4,
+				"ep3:https://node3.com": perceivedBlock, // at perceived block
+			},
+			expectFiltered: []protocol.EndpointAddr{
+				"ep1:https://node1.com",
+				"ep2:https://node2.com",
+				"ep3:https://node3.com",
+			},
+		},
+		{
+			name: "endpoint exactly at sync allowance boundary passes",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"boundary:https://edge.com": perceivedBlock - syncAllowance, // exactly at boundary
+			},
+			expectFiltered: []protocol.EndpointAddr{"boundary:https://edge.com"},
+		},
+		{
+			name: "endpoint one block past sync allowance filtered",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"past-boundary:https://slow.com": perceivedBlock - syncAllowance - 1, // 1 past boundary
+			},
+			expectExcluded: []protocol.EndpointAddr{"past-boundary:https://slow.com"},
+			expectFallback: true, // all filtered = fallback
+		},
+		{
+			name: "mix of valid and stale - only valid returned",
+			endpoints: map[protocol.EndpointAddr]uint64{
+				"good1:https://fast1.com":    perceivedBlock,
+				"good2:https://fast2.com":    perceivedBlock - 3,
+				"stale1:https://behind1.com": perceivedBlock - 100,
+				"stale2:https://behind2.com": perceivedBlock - 37000,
+			},
+			expectFiltered: []protocol.EndpointAddr{
+				"good1:https://fast1.com",
+				"good2:https://fast2.com",
+			},
+			expectExcluded: []protocol.EndpointAddr{
+				"stale1:https://behind1.com",
+				"stale2:https://behind2.com",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockRepSvc := &mockReputationService{
+				archivalEndpoints: make(map[string]bool),
+			}
+
+			// Build endpoint store with block heights and valid chain ID
+			chainID := "1"
+			endpoints := make(map[protocol.EndpointAddr]endpoint)
+			for addr, blockHeight := range tt.endpoints {
+				bh := blockHeight // copy for pointer
+				endpoints[addr] = endpoint{
+					checkBlockNumber: endpointCheckBlockNumber{
+						parsedBlockNumberResponse: &bh,
+					},
+					checkChainID: endpointCheckChainID{
+						chainID:   &chainID,
+						expiresAt: time.Now().Add(1 * time.Hour),
+					},
+				}
+			}
+
+			ss := &serviceState{
+				logger: logger,
+				serviceQoSConfig: NewEVMServiceQoSConfigWithSyncAllowance(
+					"test-service", "1", nil, syncAllowance,
+				),
+				endpointStore: &endpointStore{
+					logger:    logger,
+					endpoints: endpoints,
+				},
+				reputationSvc:  mockRepSvc,
+				blockConsensus: NewBlockHeightConsensus(logger, 128),
+				archivalCache:  NewArchivalCache(),
+			}
+
+			// Set perceived block number
+			ss.perceivedBlockNumber.Store(perceivedBlock)
+
+			// Build available endpoints list
+			availableEndpoints := make(protocol.EndpointAddrList, 0, len(tt.endpoints))
+			for addr := range tt.endpoints {
+				availableEndpoints = append(availableEndpoints, addr)
+			}
+
+			// Call SelectMultipleWithArchival (non-archival) — this is exactly what
+			// the hedge race, retry, and batch paths now call after the fix
+			selected, err := ss.SelectMultipleWithArchival(
+				availableEndpoints, uint(len(availableEndpoints)), false, "test-req")
+
+			if tt.expectFallback {
+				// When ALL endpoints are stale, SelectMultipleWithArchival falls back to
+				// random selection (STANDARD_FALLBACK_RANDOM). This is a known behavior:
+				// it returns endpoints rather than erroring to avoid total service failure.
+				require.NoError(t, err)
+				require.NotEmpty(t, selected, "fallback should still return endpoints")
+				return
+			}
+
+			require.NoError(t, err)
+
+			// Verify expected endpoints are in the result
+			selectedSet := make(map[protocol.EndpointAddr]bool)
+			for _, addr := range selected {
+				selectedSet[addr] = true
+			}
+
+			for _, addr := range tt.expectFiltered {
+				require.True(t, selectedSet[addr],
+					"expected endpoint %s to pass QoS validation but it was filtered out", addr)
+			}
+
+			for _, addr := range tt.expectExcluded {
+				require.False(t, selectedSet[addr],
+					"expected stale endpoint %s to be filtered out but it passed QoS validation", addr)
+			}
+		})
+	}
+}
