@@ -199,7 +199,22 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 	}
 	endpointsCopy := make([]endpointData, len(availableEndpoints))
 
+	// Build a URL→blockHeight lookup from ALL store entries (not just available endpoints).
+	// This lets us validate fresh endpoints against known block heights for the same URL
+	// (different supplier addresses staked against the same backend infrastructure).
+	urlBlockHeights := make(map[string]uint64)
+
 	ss.endpointStore.endpointsMu.RLock()
+	for addr, ep := range ss.endpointStore.endpoints {
+		if ep.checkBlockNumber.parsedBlockNumberResponse != nil {
+			if url, err := addr.GetURL(); err == nil {
+				h := *ep.checkBlockNumber.parsedBlockNumberResponse
+				if existing, ok := urlBlockHeights[url]; !ok || h > existing {
+					urlBlockHeights[url] = h
+				}
+			}
+		}
+	}
 	for i, addr := range availableEndpoints {
 		ep, found := ss.endpointStore.endpoints[addr]
 		endpointsCopy[i] = endpointData{addr: addr, endpoint: ep, found: found}
@@ -258,13 +273,45 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 				}
 			}
 
-			// Non-archival requests OR archival-confirmed fresh endpoints: allow through.
-			// It is valid for an endpoint to not be in the store yet (e.g., first request,
-			// no observations collected). It will be added to the store once observations are collected.
-			logger.Warn().
+			// Fresh endpoint: not in the store yet. Before allowing, check if another
+			// supplier's entry for the same URL has a known block height. This prevents
+			// new supplier addresses behind stale infrastructure from getting a "free pass".
+			syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
+			perceivedBlock := ss.perceivedBlockNumber.Load()
+			if syncAllowance > 0 && perceivedBlock > 0 {
+				if url, err := data.addr.GetURL(); err == nil {
+					if urlBlock, ok := urlBlockHeights[url]; ok {
+						minAllowed := perceivedBlock - syncAllowance
+						if urlBlock < minAllowed {
+							blocksBehind := int64(perceivedBlock) - int64(urlBlock)
+							invalidCount++
+							logger.Warn().
+								Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
+								Str("url", url).
+								Uint64("url_block", urlBlock).
+								Uint64("perceived_block", perceivedBlock).
+								Uint64("sync_allowance", syncAllowance).
+								Int64("blocks_behind", blocksBehind).
+								Msg("⛔ Fresh endpoint filtered: URL has known stale block height from another supplier")
+
+							failureReason := qosobservations.EndpointValidationFailureReason_ENDPOINT_VALIDATION_FAILURE_REASON_BLOCK_NUMBER_BEHIND
+							failureDetails := fmt.Sprintf("fresh endpoint URL block height %d is %d blocks behind perceived %d", urlBlock, blocksBehind, perceivedBlock)
+							validationResults = append(validationResults, &qosobservations.EndpointValidationResult{
+								EndpointAddr:   string(data.addr),
+								Success:        false,
+								FailureReason:  &failureReason,
+								FailureDetails: &failureDetails,
+							})
+							continue
+						}
+					}
+				}
+			}
+
+			logger.Debug().
 				Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 				Uint64("sync_allowance", ss.serviceQoSConfig.getSyncAllowance()).
-				Msg("🔍 Sync allowance check SKIPPED (endpoint not yet in store - fresh endpoint)")
+				Msg("Fresh endpoint allowed (not yet in store)")
 
 			result := &qosobservations.EndpointValidationResult{
 				EndpointAddr: string(data.addr),
@@ -272,7 +319,6 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 			}
 			validationResults = append(validationResults, result)
 			filteredEndpointsAddr = append(filteredEndpointsAddr, data.addr)
-			logger.Debug().Msg("endpoint not in store - allowing as fresh endpoint")
 			continue
 		}
 
