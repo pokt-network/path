@@ -801,3 +801,123 @@ func TestSelectMultipleWithArchival_FiltersStaleEndpoints(t *testing.T) {
 		})
 	}
 }
+
+// TestRedisURLBlockHeightsCache_FiltersFreshStaleEndpoints verifies that fresh endpoints
+// (not in endpointStore) are filtered using cached Redis URL block heights.
+//
+// This is a regression test for stale responses during session rotation:
+// when sessions rotate, new supplier addresses appear for the same stale infrastructure.
+// These endpoints aren't in the local store yet, but their URLs have known stale block
+// heights in Redis. The cached Redis URL block heights provide a fallback to catch them.
+func TestRedisURLBlockHeightsCache_FiltersFreshStaleEndpoints(t *testing.T) {
+	logger := polylog.Ctx(context.Background())
+
+	perceivedBlock := uint64(43228834)
+	staleBlock := uint64(43188889) // 39K behind
+	syncAllowance := uint64(5)
+
+	mockRepSvc := &mockReputationService{
+		archivalEndpoints: make(map[string]bool),
+	}
+
+	// Create serviceState with NO local entries — simulates a fresh session
+	// where endpoints haven't been synced to the store yet
+	ss := &serviceState{
+		logger: logger,
+		serviceQoSConfig: NewEVMServiceQoSConfigWithSyncAllowance(
+			"test-service", "1", nil, syncAllowance,
+		),
+		endpointStore: &endpointStore{
+			logger:    logger,
+			endpoints: make(map[protocol.EndpointAddr]endpoint),
+		},
+		reputationSvc:  mockRepSvc,
+		blockConsensus: NewBlockHeightConsensus(logger, 128),
+		archivalCache:  NewArchivalCache(),
+	}
+	ss.perceivedBlockNumber.Store(perceivedBlock)
+
+	// Simulate Redis cache populated by syncEndpointBlocksFromRedis —
+	// contains stale block height for the qspider URL
+	redisCache := map[string]uint64{
+		"https://relayminer03.portal.qspider.com": staleBlock,
+		"https://good.node.com":                   perceivedBlock - 1,
+	}
+	ss.redisURLBlockHeights.Store(&redisCache)
+
+	// Fresh endpoints: new supplier addresses not in local store,
+	// backed by the same stale/good infrastructure.
+	// Uses pokt1...-https://... format so GetURL() (SplitN on first dash) works correctly.
+	availableEndpoints := protocol.EndpointAddrList{
+		"pokt1stalesupplier-https://relayminer03.portal.qspider.com", // stale URL
+		"pokt1goodsupplier-https://good.node.com",                   // good URL
+	}
+
+	// filterValidEndpointsWithDetails should use Redis cache to reject the stale one
+	filtered, _, err := ss.filterValidEndpointsWithDetails(availableEndpoints, false, "test-req")
+	require.NoError(t, err)
+	require.Len(t, filtered, 1, "should filter out fresh endpoint with stale URL from Redis cache")
+	require.Equal(t, protocol.EndpointAddr("pokt1goodsupplier-https://good.node.com"), filtered[0])
+
+	// Also verify filterStaleURLEndpoints uses Redis cache
+	staleFiltered := ss.filterStaleURLEndpoints(availableEndpoints)
+	require.Len(t, staleFiltered, 1, "filterStaleURLEndpoints should use Redis cache to remove stale URL")
+	require.Equal(t, protocol.EndpointAddr("pokt1goodsupplier-https://good.node.com"), staleFiltered[0])
+}
+
+// TestRedisURLBlockHeightsCache_NotUsedWhenLocalStoreHasData verifies that
+// the Redis cache doesn't override higher local block heights.
+func TestRedisURLBlockHeightsCache_NotUsedWhenLocalStoreHasData(t *testing.T) {
+	logger := polylog.Ctx(context.Background())
+
+	perceivedBlock := uint64(43228834)
+	syncAllowance := uint64(5)
+	chainID := "1"
+
+	mockRepSvc := &mockReputationService{
+		archivalEndpoints: make(map[string]bool),
+	}
+
+	// Local store has current block height for the endpoint
+	localBlock := perceivedBlock - 2
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"supplier1:https://node.com": {
+			checkBlockNumber: endpointCheckBlockNumber{
+				parsedBlockNumberResponse: &localBlock,
+			},
+			checkChainID: endpointCheckChainID{
+				chainID:   &chainID,
+				expiresAt: time.Now().Add(1 * time.Hour),
+			},
+		},
+	}
+
+	ss := &serviceState{
+		logger: logger,
+		serviceQoSConfig: NewEVMServiceQoSConfigWithSyncAllowance(
+			"test-service", "1", nil, syncAllowance,
+		),
+		endpointStore: &endpointStore{
+			logger:    logger,
+			endpoints: endpoints,
+		},
+		reputationSvc:  mockRepSvc,
+		blockConsensus: NewBlockHeightConsensus(logger, 128),
+		archivalCache:  NewArchivalCache(),
+	}
+	ss.perceivedBlockNumber.Store(perceivedBlock)
+
+	// Redis cache has OLDER block (shouldn't override local)
+	staleRedisBlock := perceivedBlock - 100
+	redisCache := map[string]uint64{
+		"https://node.com": staleRedisBlock,
+	}
+	ss.redisURLBlockHeights.Store(&redisCache)
+
+	availableEndpoints := protocol.EndpointAddrList{"supplier1:https://node.com"}
+
+	// Should pass — local store has current block, Redis stale value shouldn't override
+	selected, err := ss.SelectMultipleWithArchival(availableEndpoints, 1, false, "test-req")
+	require.NoError(t, err)
+	require.Len(t, selected, 1, "endpoint with current local block should pass even with stale Redis cache")
+}

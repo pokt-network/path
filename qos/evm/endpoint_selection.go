@@ -227,6 +227,17 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 	}
 	ss.endpointStore.endpointsMu.RUnlock()
 
+	// Merge cached Redis URL block heights as fallback.
+	// This catches stale URLs that aren't in the local store yet
+	// (e.g., new supplier addresses after session rotation).
+	if cached := ss.redisURLBlockHeights.Load(); cached != nil {
+		for url, h := range *cached {
+			if existing, ok := urlBlockHeights[url]; !ok || h > existing {
+				urlBlockHeights[url] = h
+			}
+		}
+	}
+
 	// Touch endpoints to update lastSeen for stale endpoint cleanup.
 	// Uses a separate WLock call to avoid changing the read-heavy filtering path.
 	ss.endpointStore.touchEndpoints(availableEndpoints)
@@ -642,6 +653,15 @@ func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrL
 		}
 	}
 	ss.endpointStore.endpointsMu.RUnlock()
+
+	// Merge cached Redis URL block heights as fallback.
+	if cached := ss.redisURLBlockHeights.Load(); cached != nil {
+		for url, h := range *cached {
+			if existing, ok := urlBlockHeights[url]; !ok || h > existing {
+				urlBlockHeights[url] = h
+			}
+		}
+	}
 
 	if len(urlBlockHeights) == 0 {
 		ss.logger.Warn().

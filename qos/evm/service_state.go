@@ -65,6 +65,11 @@ type serviceState struct {
 	// Populated by UpdateFromExtractedData and background refresh worker.
 	// Replaces synchronous Redis calls in the hot path.
 	archivalCache *ArchivalCache
+
+	// redisURLBlockHeights caches URL→blockHeight from Redis, updated every 5s
+	// by syncEndpointBlocksFromRedis. Used as fallback when the local endpointStore
+	// doesn't have block height data for a URL (e.g., during session rotation).
+	redisURLBlockHeights atomic.Pointer[map[string]uint64]
 }
 
 /* -------------------- QoS Endpoint Check Generator -------------------- */

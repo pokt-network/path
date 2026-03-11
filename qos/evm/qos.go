@@ -497,6 +497,11 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 			}
 		}
 
+		// Cache URL block heights for use by filtering functions.
+		// This provides a fallback when the local endpointStore doesn't have
+		// block height data for a URL (e.g., fresh endpoints during session rotation).
+		qos.redisURLBlockHeights.Store(&urlHeights)
+
 		qos.endpointStore.endpointsMu.Lock()
 		updated := 0
 		for addr, redisHeight := range heights {
