@@ -125,7 +125,7 @@ func (c *simpleCosmosConfig) getSyncAllowance() uint64 {
 // This is called when external health check rules are loaded/refreshed, since those
 // rules may specify a sync_allowance that wasn't available at QoS creation time.
 func (qos *QoS) SetSyncAllowance(syncAllowance uint64) {
-	if cfg, ok := qos.serviceState.serviceQoSConfig.(*simpleCosmosConfig); ok {
+	if cfg, ok := qos.serviceQoSConfig.(*simpleCosmosConfig); ok {
 		cfg.syncAllowance.Store(syncAllowance)
 	}
 }

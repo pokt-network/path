@@ -270,7 +270,7 @@ func (r *router) handleCircuitBreakerClear(w http.ResponseWriter, req *http.Requ
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"service_id":      serviceID,
 		"cleared_domains": count,
 		"message":         "circuit breaker state cleared (in-memory + Redis)",

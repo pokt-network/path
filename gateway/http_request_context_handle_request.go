@@ -1827,21 +1827,6 @@ func extractDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 	return parsed.Hostname()
 }
 
-// calculateRetryBackoff returns the backoff duration for a retry attempt.
-// Uses a simple stepped backoff strategy: 100ms, 200ms, then 400ms for all subsequent attempts.
-func calculateRetryBackoff(attempt int) time.Duration {
-	switch attempt {
-	case 1:
-		return 0 // No backoff for first attempt
-	case 2:
-		return 100 * time.Millisecond
-	case 3:
-		return 200 * time.Millisecond
-	default:
-		return 400 * time.Millisecond
-	}
-}
-
 // selectTopRankedEndpoint selects the highest-reputation endpoint for retry.
 // This maximizes the chance of getting a successful response on retry by
 // prioritizing the best-performing endpoints based on their reputation scores.

@@ -96,18 +96,6 @@ func (m *mockRedisSyncRepSvc) GetArchivalEndpoints(_ context.Context, _ protocol
 
 func (m *mockRedisSyncRepSvc) SetLogger(_ polylog.Logger) {}
 
-func (m *mockRedisSyncRepSvc) getBlock(serviceID protocol.ServiceID) uint64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.perceivedBlock[serviceID]
-}
-
-func (m *mockRedisSyncRepSvc) setBlock(serviceID protocol.ServiceID, block uint64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.perceivedBlock[serviceID] = block
-}
-
 const testEVMServiceID = protocol.ServiceID("evm-test")
 
 func newTestEVMQoS() *QoS {
