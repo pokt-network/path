@@ -35,6 +35,11 @@ type Endpoint interface {
 type EndpointSelector interface {
 	Select(EndpointAddrList) (EndpointAddr, error)
 	SelectMultiple(EndpointAddrList, uint) (EndpointAddrList, error)
+	// SelectMultipleWithArchival selects multiple endpoints with optional archival filtering.
+	// When requiresArchival is true, only endpoints that have passed archival capability checks
+	// are considered. When false, all valid endpoints are considered (same as SelectMultiple).
+	// This enables archival requests to be routed only to archival-capable endpoints.
+	SelectMultipleWithArchival(EndpointAddrList, uint, bool) (EndpointAddrList, error)
 }
 
 func (e EndpointAddrList) String() string {

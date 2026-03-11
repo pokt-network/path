@@ -21,6 +21,7 @@ import (
 	"github.com/pokt-network/path/health"
 	"github.com/pokt-network/path/metrics/devtools"
 	protocolPkg "github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 	"github.com/pokt-network/path/request"
 	"github.com/pokt-network/path/router"
 )
@@ -82,6 +83,91 @@ func main() {
 	qosInstances, err := getServiceQoSInstances(logger, config, unifiedServicesConfig, protocol)
 	if err != nil {
 		log.Fatalf(`{"level":"fatal","error":"%v","message":"failed to setup QoS instances"}`, err)
+	}
+
+	// Wire up reputation service to QoS instances for shared state across replicas.
+	// The reputation service provides Redis-backed storage for:
+	// - Archival status: ensures all replicas can access archival endpoint info set by health checks
+	// - Perceived block number: ensures sync_allowance validation uses consistent chain tip
+	// - Reputation scores: already handled by the reputation service's periodic refresh
+	if reputationSvc := protocol.GetReputationService(); reputationSvc != nil {
+		const perceivedBlockSyncInterval = 5 * time.Second
+		const archivalCacheRefreshInterval = 5 * time.Second
+
+		for serviceID, qosInstance := range qosInstances {
+			// Set reputation service for archival status lookups
+			if evmQoS, ok := qosInstance.(interface {
+				SetReputationService(reputation.ReputationService)
+			}); ok {
+				evmQoS.SetReputationService(reputationSvc)
+				logger.Debug().Str("service_id", string(serviceID)).Msg("Wired reputation service to QoS instance")
+			}
+
+			// Start background sync for perceived block number
+			if evmQoS, ok := qosInstance.(interface {
+				StartBackgroundSync(ctx context.Context, syncInterval time.Duration)
+			}); ok {
+				evmQoS.StartBackgroundSync(backgroundCtx, perceivedBlockSyncInterval)
+				logger.Debug().Str("service_id", string(serviceID)).Msg("Started background sync for QoS instance")
+			}
+
+			// Start archival cache refresh worker for cross-replica archival status sync
+			if evmQoS, ok := qosInstance.(interface {
+				StartArchivalCacheRefreshWorker(ctx context.Context, refreshInterval time.Duration)
+			}); ok {
+				evmQoS.StartArchivalCacheRefreshWorker(backgroundCtx, archivalCacheRefreshInterval)
+				logger.Debug().Str("service_id", string(serviceID)).Msg("Started archival cache refresh worker for QoS instance")
+			}
+		}
+		logger.Info().Msg("Reputation service wired to QoS instances for shared state (archival, block height)")
+	}
+
+	// Start external block height fetchers for services that have external_block_sources configured.
+	// These fetchers periodically query external RPC endpoints for ground-truth block heights,
+	// which act as a floor for perceivedBlockNumber to detect when all session endpoints are stale.
+	for serviceID, qosInstance := range qosInstances {
+		merged := unifiedServicesConfig.GetMergedServiceConfig(serviceID)
+		if merged == nil || len(merged.ExternalBlockSources) == 0 {
+			continue
+		}
+
+		// Build config list from the merged service config
+		var configs []gateway.ExternalBlockSourceConfig
+		for _, src := range merged.ExternalBlockSources {
+			configs = append(configs, gateway.ExternalBlockSourceConfig{
+				URL:      src.URL,
+				Type:     src.Type,
+				Method:   src.Method,
+				Path:     src.Path,
+				Interval: src.Interval,
+				Timeout:  src.Timeout,
+			})
+		}
+
+		fetcher := gateway.NewExternalBlockHeightFetcher(logger, configs)
+		heightsCh := fetcher.Start(backgroundCtx)
+
+		// Determine grace period from config (first source with a value wins, else default)
+		var gracePeriod time.Duration
+		for _, src := range merged.ExternalBlockSources {
+			if src.GracePeriod > 0 {
+				gracePeriod = src.GracePeriod
+				break
+			}
+		}
+
+		// Connect fetcher output to QoS consumer
+		if consumer, ok := qosInstance.(interface {
+			ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64, gracePeriod time.Duration)
+		}); ok {
+			consumer.ConsumeExternalBlockHeight(backgroundCtx, heightsCh, gracePeriod)
+
+			logger.Info().
+				Str("service_id", string(serviceID)).
+				Int("source_count", len(configs)).
+				Dur("grace_period", gracePeriod).
+				Msg("Started external block height fetcher")
+		}
 	}
 
 	// Setup metrics reporter, to be used by Gateway and Health Checks
@@ -175,6 +261,10 @@ func main() {
 		}
 	}
 
+	// Create domain circuit breaker for cross-pod broken domain tracking.
+	// Uses the same Redis client as leader election. Nil-safe (local-only mode if no Redis).
+	domainCircuitBreaker := gateway.NewDomainCircuitBreaker(redisClient, logger)
+
 	healthCheckExecutor, leaderElector := setupHealthCheckExecutor(
 		backgroundCtx,
 		logger,
@@ -198,14 +288,20 @@ func main() {
 		QoSServices: qosInstances,
 	}
 
+	// Wire up the QoS service registry to the protocol for endpoint details reporting.
+	// This enables /ready/<service>?detailed=true to include archival status information.
+	protocol.SetQoSServiceRegistry(requestParser)
+
 	// NOTE: the gateway uses the requestParser to get the correct QoS instance for any incoming request.
 	gtw := &gateway.Gateway{
 		Logger:                     logger,
 		HTTPRequestParser:          requestParser,
 		Protocol:                   protocol,
+		RPCTypeValidator:           gateway.NewRPCTypeValidator(unifiedServicesConfig, gateway.NewRPCTypeMapper()),
 		MetricsReporter:            metricsReporter,
 		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
 		ObservationQueue:           observationQueue,
+		DomainCircuitBreaker:       domainCircuitBreaker,
 	}
 
 	// Until all components are ready, the `/healthz` endpoint will return a 503 Service
@@ -240,6 +336,7 @@ func main() {
 		disqualifiedEndpointsReporter,
 		healthChecker,
 		config.GetRouterConfig(),
+		gtw.DomainCircuitBreaker,
 	)
 
 	// -------------------- Start PATH API Router --------------------

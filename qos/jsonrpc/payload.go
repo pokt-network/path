@@ -16,10 +16,11 @@ func (r Request) BuildPayload() (protocol.Payload, error) {
 	}
 
 	return protocol.Payload{
-		Data:    string(reqBz),
-		Method:  http.MethodPost, // Method is always POST for JSON-RPC.
-		Headers: map[string]string{},
-		RPCType: sharedtypes.RPCType_JSON_RPC,
+		Data:          string(reqBz),
+		Method:        http.MethodPost, // Method is always POST for JSON-RPC.
+		Headers:       map[string]string{},
+		RPCType:       sharedtypes.RPCType_JSON_RPC,
+		JSONRPCMethod: string(r.Method),
 	}, nil
 }
 

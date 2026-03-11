@@ -62,6 +62,10 @@ type websocketRequestContext struct {
 	// gatewayObservations stores gateway related observations.
 	gatewayObservations *observation.GatewayObservations
 
+	// circuitBreaker tracks broken domains across pods via Redis.
+	// Shared with the HTTP request context to skip broken domains during endpoint selection.
+	circuitBreaker *DomainCircuitBreaker
+
 	// Channel for receiving message processing notifications from the bridge
 	messageObservationsChan chan *observation.RequestResponseObservations
 }
@@ -164,6 +168,18 @@ func (wrc *websocketRequestContext) buildProtocolContextAndStartBridge(
 		return nil, fmt.Errorf("no available endpoints for websocket request: %w", err)
 	}
 
+	// Filter out domains known to be broken across the fleet (cross-pod circuit breaker).
+	if wrc.circuitBreaker != nil {
+		brokenDomains := wrc.circuitBreaker.GetBrokenDomains(wrc.context, string(wrc.serviceID))
+		if len(brokenDomains) > 0 {
+			filtered := filterEndpointsByBrokenDomains(availableEndpoints, brokenDomains)
+			if len(filtered) > 0 {
+				availableEndpoints = filtered
+			}
+			// If ALL endpoints are from broken domains, keep the original list (graceful degradation).
+		}
+	}
+
 	// For websockets, select a single endpoint
 	selectedEndpoint, err := wrc.qosCtx.GetEndpointSelector().Select(availableEndpoints)
 	if err != nil {
@@ -215,6 +231,15 @@ func (wrc *websocketRequestContext) ProcessClientWebsocketMessage(msgData []byte
 
 	logger.Debug().Msgf("received message from client: %s", string(msgData))
 
+	// Guard against a race condition where the bridge delivers a message before
+	// buildProtocolContextAndStartBridge has returned and assigned protocolCtx.
+	// Without this check, calling a method on the nil interface causes a panic
+	// (nil pointer dereference / SIGSEGV).
+	if wrc.protocolCtx == nil {
+		logger.Error().Msg("❌ protocol context is nil — message arrived before websocket setup completed")
+		return nil, errWebsocketProtocolContextNotReady
+	}
+
 	// Process the client message using the protocol context.
 	clientMessageBz, err := wrc.protocolCtx.ProcessProtocolClientWebsocketMessage(msgData)
 	if err != nil {
@@ -230,6 +255,13 @@ func (wrc *websocketRequestContext) ProcessClientWebsocketMessage(msgData []byte
 // If an error occurs, it is returned and the message is not forwarded to the client.
 func (wrc *websocketRequestContext) ProcessEndpointWebsocketMessage(msgData []byte) ([]byte, *observation.RequestResponseObservations, error) {
 	logger := wrc.logger.With("method", "ProcessEndpointWebsocketMessage")
+
+	// Guard against a race condition where the bridge delivers a message before
+	// buildProtocolContextAndStartBridge has returned and assigned protocolCtx.
+	if wrc.protocolCtx == nil {
+		logger.Error().Msg("❌ protocol context is nil — message arrived before websocket setup completed")
+		return nil, nil, errWebsocketProtocolContextNotReady
+	}
 
 	messageObservations := wrc.initializeMessageObservations()
 

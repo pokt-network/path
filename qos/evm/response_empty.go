@@ -25,6 +25,10 @@ var _ response = responseEmpty{}
 type responseEmpty struct {
 	logger          polylog.Logger
 	servicePayloads map[jsonrpc.ID]protocol.Payload
+	// requestID is the JSON-RPC request ID for this specific request.
+	// Used for batch requests to ensure error responses have the correct ID.
+	// When empty, falls back to extracting ID from servicePayloads (single request case).
+	requestID string
 }
 
 // GetObservation returns an observation indicating the endpoint returned an empty response.
@@ -55,7 +59,16 @@ func (r responseEmpty) GetHTTPResponse() jsonrpc.HTTPResponse {
 // getResponsePayload constructs a JSONRPC error response indicating endpoint failure.
 // Uses request ID in response per JSONRPC spec: https://www.jsonrpc.org/specification#response_object
 func (r responseEmpty) getResponsePayload() []byte {
-	userResponse := jsonrpc.NewErrResponseEmptyEndpointResponse(getJsonRpcIDForErrorResponse(r.servicePayloads))
+	// Use the specific requestID if provided (batch request case),
+	// otherwise fall back to extracting from servicePayloads (single request case).
+	var responseID jsonrpc.ID
+	if r.requestID != "" {
+		responseID = jsonrpc.IDFromString(r.requestID)
+	} else {
+		responseID = getJsonRpcIDForErrorResponse(r.servicePayloads)
+	}
+
+	userResponse := jsonrpc.NewErrResponseEmptyEndpointResponse(responseID)
 	bz, err := json.Marshal(userResponse)
 	if err != nil {
 		// This should never happen: log an entry but return the response anyway.

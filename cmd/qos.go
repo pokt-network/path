@@ -68,7 +68,11 @@ func getServiceQoSInstances(
 		case gateway.ServiceTypeEVM:
 			evmQoS := evm.NewSimpleQoSInstanceWithSyncAllowance(qosLogger, serviceID, syncAllowance)
 			qosServices[serviceID] = evmQoS
-			svcLogger.Debug().Uint64("sync_allowance", syncAllowance).Msg("Added EVM QoS instance")
+			if syncAllowance > 0 {
+				svcLogger.Info().Uint64("sync_allowance", syncAllowance).Msg("✅ EVM QoS: sync allowance ENABLED")
+			} else {
+				svcLogger.Info().Msg("⚠️ EVM QoS: sync allowance DISABLED (set sync_allowance > 0 to enable)")
+			}
 
 		case gateway.ServiceTypeCosmos:
 			// Convert string RPC types to sharedtypes.RPCType
@@ -76,9 +80,11 @@ func getServiceQoSInstances(
 
 			cosmosQoS := cosmos.NewSimpleQoSInstanceWithAPIs(qosLogger, serviceID, syncAllowance, supportedAPIs)
 			qosServices[serviceID] = cosmosQoS
-			svcLogger.Debug().
-				Uint64("sync_allowance", syncAllowance).
-				Msgf("Added Cosmos QoS instance with supported RPC types: %v", rpcTypesStr)
+			if syncAllowance > 0 {
+				svcLogger.Info().Uint64("sync_allowance", syncAllowance).Msgf("✅ Cosmos QoS: sync allowance ENABLED, RPC types: %v", rpcTypesStr)
+			} else {
+				svcLogger.Info().Msgf("⚠️ Cosmos QoS: sync allowance DISABLED, RPC types: %v", rpcTypesStr)
+			}
 
 		case gateway.ServiceTypeSolana:
 			solanaQoS := solana.NewSimpleQoSInstance(qosLogger, serviceID)

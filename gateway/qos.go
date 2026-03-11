@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"time"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
@@ -34,7 +35,16 @@ type RequestQoSContext interface {
 	// - Informs the request QoS context of the payload returned by a specific endpoint.
 	// - Response is for the service payload produced by GetServicePayload.
 	// - httpStatusCode is the original HTTP status code from the backend endpoint.
-	UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int)
+	// - requestID is the JSON-RPC request ID that this response corresponds to (for batch processing).
+	//   For non-JSON-RPC or single requests, this can be empty and the ID will be extracted from the response.
+	UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int, requestID string)
+
+	// SetProtocolError:
+	// - Sets a protocol-level error that occurred before any endpoint could respond.
+	// - Used to provide more specific error messages to clients.
+	// - Examples: "no valid endpoints available", "RPC type not supported", etc.
+	// - If set, GetHTTPResponse should use this error for a more informative response.
+	SetProtocolError(err error)
 
 	// GetHTTPResponse:
 	// - Returns the user-facing HTTP response.
@@ -148,4 +158,40 @@ type QoSService interface {
 	// HydrateDisqualifiedEndpointsResponse:
 	// - Fills the disqualified endpoint response with QoS-specific data.
 	HydrateDisqualifiedEndpointsResponse(protocol.ServiceID, *devtools.DisqualifiedEndpointResponse)
+}
+
+// QoSArchivalReporter is an optional interface that QoS services can implement
+// to report archival capability status for endpoints.
+// Used by the /ready endpoint to include archival information in endpoint details.
+type QoSArchivalReporter interface {
+	// GetEndpointArchivalStatus returns the archival status for a specific endpoint.
+	// Returns (isArchival, expiresAt) if the endpoint has been checked for archival capability.
+	// Returns (false, zero time) if the endpoint has not been checked or is not archival-capable.
+	GetEndpointArchivalStatus(endpointAddr protocol.EndpointAddr) (isArchival bool, expiresAt time.Time)
+}
+
+// QoSBlockConsensusReporter is an optional interface that QoS services can implement
+// to report block consensus statistics for observability.
+// Used by the /ready endpoint to include block consensus info.
+type QoSBlockConsensusReporter interface {
+	// GetBlockConsensusStats returns the median block and observation count.
+	// Used for observability to understand how block consensus is calculated.
+	GetBlockConsensusStats() (medianBlock uint64, observationCount int)
+}
+
+// ArchivalRequirementChecker is an optional interface that RequestQoSContext can implement
+// to indicate whether the current request requires archival data.
+// Used by endpoint selection to filter for archival-capable endpoints.
+type ArchivalRequirementChecker interface {
+	// RequiresArchival returns true if the request requires archival data
+	// (e.g., querying historical blockchain state).
+	RequiresArchival() bool
+}
+
+// QoSServiceRegistry provides access to QoS services by service ID.
+// Used by the protocol to query endpoint-specific QoS data like archival status.
+type QoSServiceRegistry interface {
+	// GetQoSServiceForServiceID returns the QoS service for a given service ID.
+	// Returns nil if no QoS service is registered for the service ID.
+	GetQoSServiceForServiceID(serviceID protocol.ServiceID) QoSService
 }

@@ -1,10 +1,13 @@
 package cosmos
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	qostypes "github.com/pokt-network/path/qos/types"
 )
 
 func TestCosmosDataExtractor_ExtractBlockHeight(t *testing.T) {
@@ -54,12 +57,70 @@ func TestCosmosDataExtractor_ExtractBlockHeight(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			blockHeight, err := extractor.ExtractBlockHeight([]byte(tt.response))
+			blockHeight, err := extractor.ExtractBlockHeight(nil, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, tt.expectedBlock, blockHeight)
+			}
+		})
+	}
+}
+
+func TestCosmosDataExtractor_InvalidBlockHeightResult(t *testing.T) {
+	extractor := NewCosmosDataExtractor()
+
+	tests := []struct {
+		name           string
+		response       string
+		expectSentinel bool
+	}{
+		{
+			name:           "CometBFT empty object result — broken supplier",
+			response:       `{"jsonrpc":"2.0","id":1,"result":{}}`,
+			expectSentinel: true,
+		},
+		{
+			name:           "CometBFT empty array result — broken supplier",
+			response:       `{"jsonrpc":"2.0","id":1,"result":[]}`,
+			expectSentinel: true,
+		},
+		{
+			name:           "JSON-RPC error — NOT broken, proper error",
+			response:       `{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid"}}`,
+			expectSentinel: false,
+		},
+		{
+			name:           "REST response without height — no sentinel (not JSON-RPC)",
+			response:       `{"balances":[],"pagination":{"next_key":null,"total":"0"}}`,
+			expectSentinel: false,
+		},
+		{
+			name:           "REST empty object — no sentinel (not JSON-RPC)",
+			response:       `{}`,
+			expectSentinel: false,
+		},
+		{
+			name: "Valid CometBFT block response (non-empty result, no block height) — no sentinel",
+			response: `{"jsonrpc":"2.0","id":1,"result":{
+				"block_id":{"hash":"ABC123"},
+				"block":{"header":{"height":"12345"}}
+			}}`,
+			expectSentinel: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := extractor.ExtractBlockHeight(nil, []byte(tt.response))
+			require.Error(t, err)
+			if tt.expectSentinel {
+				assert.True(t, errors.Is(err, qostypes.ErrInvalidBlockHeightResult),
+					"expected ErrInvalidBlockHeightResult but got: %v", err)
+			} else {
+				assert.False(t, errors.Is(err, qostypes.ErrInvalidBlockHeightResult),
+					"did NOT expect ErrInvalidBlockHeightResult but got: %v", err)
 			}
 		})
 	}
@@ -114,7 +175,7 @@ func TestCosmosDataExtractor_ExtractChainID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			chainID, err := extractor.ExtractChainID([]byte(tt.response))
+			chainID, err := extractor.ExtractChainID(nil, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -169,7 +230,7 @@ func TestCosmosDataExtractor_IsSyncing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isSyncing, err := extractor.IsSyncing([]byte(tt.response))
+			isSyncing, err := extractor.IsSyncing(nil, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -221,7 +282,7 @@ func TestCosmosDataExtractor_IsArchival(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isArchival, err := extractor.IsArchival([]byte(tt.response))
+			isArchival, err := extractor.IsArchival(nil, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -278,7 +339,7 @@ func TestCosmosDataExtractor_IsValidResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isValid, err := extractor.IsValidResponse([]byte(tt.response))
+			isValid, err := extractor.IsValidResponse(nil, []byte(tt.response))
 			require.NoError(t, err)
 			assert.Equal(t, tt.expectedValid, isValid)
 		})

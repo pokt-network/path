@@ -43,6 +43,8 @@ const (
 	fieldErrorCount      = "error_count"
 	fieldCriticalStrikes = "critical_strikes"
 	fieldCooldownUntil   = "cooldown_until"
+	fieldIsArchival      = "is_archival"
+	fieldArchivalExpires = "archival_expires_at"
 )
 
 // NewRedisStorage creates a new Redis-backed storage.
@@ -79,6 +81,9 @@ func (r *RedisStorage) buildKey(key reputation.EndpointKey) string {
 }
 
 // parseKey extracts the EndpointKey from a Redis key string.
+// Key format after prefix removal: "serviceID:endpointAddr:rpcType"
+// EndpointAddr may contain colons (e.g., URLs like "pokt1abc-https://node.com:8545"),
+// so we split serviceID at the first colon and rpcType at the last colon.
 func (r *RedisStorage) parseKey(redisKey string) (reputation.EndpointKey, bool) {
 	// Remove prefix
 	withoutPrefix := strings.TrimPrefix(redisKey, r.keyPrefix)
@@ -86,18 +91,31 @@ func (r *RedisStorage) parseKey(redisKey string) (reputation.EndpointKey, bool) 
 		return reputation.EndpointKey{}, false // Key didn't have the expected prefix
 	}
 
-	// Split into serviceID:endpointAddr:rpcType
-	parts := strings.SplitN(withoutPrefix, ":", 3)
-	if len(parts) != 3 {
+	// Find rpcType: always the last colon-separated segment
+	lastColon := strings.LastIndex(withoutPrefix, ":")
+	if lastColon <= 0 {
+		return reputation.EndpointKey{}, false
+	}
+	rpcTypeStr := withoutPrefix[lastColon+1:]
+
+	// Find serviceID: always the first colon-separated segment
+	rest := withoutPrefix[:lastColon]
+	firstColon := strings.Index(rest, ":")
+	if firstColon <= 0 {
+		return reputation.EndpointKey{}, false
+	}
+	serviceID := rest[:firstColon]
+	endpointAddr := rest[firstColon+1:]
+
+	if endpointAddr == "" {
 		return reputation.EndpointKey{}, false
 	}
 
-	// Parse RPC type from string
-	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[parts[2]])
+	rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(rpcTypeStr)])
 
 	return reputation.NewEndpointKey(
-		protocol.ServiceID(parts[0]),
-		protocol.EndpointAddr(parts[1]),
+		protocol.ServiceID(serviceID),
+		protocol.EndpointAddr(endpointAddr),
 		rpcType,
 	), true
 }
@@ -159,6 +177,12 @@ func (r *RedisStorage) GetMultiple(ctx context.Context, keys []reputation.Endpoi
 func (r *RedisStorage) Set(ctx context.Context, key reputation.EndpointKey, score reputation.Score) error {
 	redisKey := r.buildKey(key)
 
+	// Convert bool to "1" or "0" for Redis storage
+	isArchivalStr := "0"
+	if score.IsArchival {
+		isArchivalStr = "1"
+	}
+
 	fields := map[string]interface{}{
 		fieldValue:           strconv.FormatFloat(score.Value, 'f', -1, 64),
 		fieldLastUpdated:     strconv.FormatInt(score.LastUpdated.Unix(), 10),
@@ -166,6 +190,8 @@ func (r *RedisStorage) Set(ctx context.Context, key reputation.EndpointKey, scor
 		fieldErrorCount:      strconv.FormatInt(score.ErrorCount, 10),
 		fieldCriticalStrikes: strconv.Itoa(score.CriticalStrikes),
 		fieldCooldownUntil:   strconv.FormatInt(score.CooldownUntil.Unix(), 10),
+		fieldIsArchival:      isArchivalStr,
+		fieldArchivalExpires: strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
 	}
 
 	pipe := r.client.Pipeline()
@@ -194,6 +220,12 @@ func (r *RedisStorage) SetMultiple(ctx context.Context, scores map[reputation.En
 	for key, score := range scores {
 		redisKey := r.buildKey(key)
 
+		// Convert bool to "1" or "0" for Redis storage
+		isArchivalStr := "0"
+		if score.IsArchival {
+			isArchivalStr = "1"
+		}
+
 		fields := map[string]interface{}{
 			fieldValue:           strconv.FormatFloat(score.Value, 'f', -1, 64),
 			fieldLastUpdated:     strconv.FormatInt(score.LastUpdated.Unix(), 10),
@@ -201,6 +233,8 @@ func (r *RedisStorage) SetMultiple(ctx context.Context, scores map[reputation.En
 			fieldErrorCount:      strconv.FormatInt(score.ErrorCount, 10),
 			fieldCriticalStrikes: strconv.Itoa(score.CriticalStrikes),
 			fieldCooldownUntil:   strconv.FormatInt(score.CooldownUntil.Unix(), 10),
+			fieldIsArchival:      isArchivalStr,
+			fieldArchivalExpires: strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
 		}
 
 		pipe.HSet(ctx, redisKey, fields)
@@ -327,5 +361,126 @@ func (r *RedisStorage) parseScore(data map[string]string) (reputation.Score, err
 		}
 	}
 
+	// Parse archival fields (for multi-instance coordination)
+	if v, ok := data[fieldIsArchival]; ok {
+		score.IsArchival = v == "1" || v == "true"
+	}
+
+	if v, ok := data[fieldArchivalExpires]; ok {
+		ts, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return score, fmt.Errorf("invalid archival_expires_at: %w", err)
+		}
+		// Unix timestamp 0 means no archival expiry set
+		if ts > 0 {
+			score.ArchivalExpiresAt = time.Unix(ts, 0)
+		}
+	}
+
 	return score, nil
+}
+
+// perceivedBlockKey returns the Redis key for storing perceived block number.
+func (s *RedisStorage) perceivedBlockKey(serviceID protocol.ServiceID) string {
+	return fmt.Sprintf("%schain_state:%s:perceived_block", s.keyPrefix, serviceID)
+}
+
+// SetPerceivedBlockNumber stores the perceived block number for a service.
+// Uses Redis atomic GETSET pattern: only updates if new value is higher.
+// This enables sharing chain state across replicas with "max wins" semantics.
+func (s *RedisStorage) SetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID, blockNumber uint64) error {
+	key := s.perceivedBlockKey(serviceID)
+
+	// Use Lua script for atomic compare-and-set (only update if higher)
+	// This ensures that across all replicas, the max value always wins
+	script := redis.NewScript(`
+		local current = redis.call('GET', KEYS[1])
+		local newVal = tonumber(ARGV[1])
+		if current == false or tonumber(current) < newVal then
+			redis.call('SET', KEYS[1], ARGV[1])
+			return 1
+		end
+		return 0
+	`)
+
+	_, err := script.Run(ctx, s.client, []string{key}, blockNumber).Result()
+	if err != nil {
+		return fmt.Errorf("failed to set perceived block number: %w", err)
+	}
+
+	return nil
+}
+
+// GetPerceivedBlockNumber retrieves the perceived block number for a service.
+// Returns 0 if no block number has been stored yet.
+func (s *RedisStorage) GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) (uint64, error) {
+	key := s.perceivedBlockKey(serviceID)
+
+	result, err := s.client.Get(ctx, key).Result()
+	if err == redis.Nil {
+		return 0, nil // Not found, return 0
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to get perceived block number: %w", err)
+	}
+
+	blockNumber, err := strconv.ParseUint(result, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid perceived block number value: %w", err)
+	}
+
+	return blockNumber, nil
+}
+
+// endpointBlocksKey returns the Redis key for storing per-endpoint block heights.
+func (s *RedisStorage) endpointBlocksKey(serviceID protocol.ServiceID) string {
+	return fmt.Sprintf("%schain_state:%s:endpoint_blocks", s.keyPrefix, serviceID)
+}
+
+// SetEndpointBlockHeight stores a single endpoint's block height using HSET.
+func (s *RedisStorage) SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	key := s.endpointBlocksKey(serviceID)
+	err := s.client.HSet(ctx, key, string(endpointAddr), strconv.FormatUint(blockHeight, 10)).Err()
+	if err != nil {
+		return fmt.Errorf("failed to set endpoint block height: %w", err)
+	}
+	return nil
+}
+
+// RemoveEndpointBlockHeights removes endpoint block height entries using HDEL.
+func (s *RedisStorage) RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error {
+	if len(addrs) == 0 {
+		return nil
+	}
+	key := s.endpointBlocksKey(serviceID)
+	fields := make([]string, len(addrs))
+	for i, addr := range addrs {
+		fields[i] = string(addr)
+	}
+	err := s.client.HDel(ctx, key, fields...).Err()
+	if err != nil {
+		return fmt.Errorf("failed to remove endpoint block heights: %w", err)
+	}
+	return nil
+}
+
+// GetEndpointBlockHeights retrieves all endpoint block heights using HGETALL.
+func (s *RedisStorage) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) (map[protocol.EndpointAddr]uint64, error) {
+	key := s.endpointBlocksKey(serviceID)
+
+	result, err := s.client.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get endpoint block heights: %w", err)
+	}
+
+	heights := make(map[protocol.EndpointAddr]uint64, len(result))
+	for addr, val := range result {
+		h, err := strconv.ParseUint(val, 10, 64)
+		if err != nil {
+			continue // skip malformed entries
+		}
+		heights[protocol.EndpointAddr(addr)] = h
+	}
+
+	return heights, nil
 }

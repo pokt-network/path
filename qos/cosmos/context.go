@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	"github.com/tidwall/gjson"
 
 	pathhttp "github.com/pokt-network/path/network/http"
 	qosobservations "github.com/pokt-network/path/observation/qos"
@@ -12,8 +13,18 @@ import (
 	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
-// requestContext provides specialized context for both JSONRPC and REST requests
-// Implements gateway.RequestQoSContext interface
+// rawEndpointResponse stores raw bytes from endpoint responses.
+// This is used on the hot path to avoid parsing overhead.
+// Heavy parsing for observations is done asynchronously via the ObservationQueue.
+type rawEndpointResponse struct {
+	EndpointAddr   protocol.EndpointAddr
+	ResponseBytes  []byte
+	HTTPStatusCode int
+}
+
+// requestContext provides specialized context for both JSONRPC and REST requests.
+// Uses raw byte passthrough on the hot path to minimize latency.
+// Implements gateway.RequestQoSContext interface.
 type requestContext struct {
 	logger polylog.Logger
 
@@ -48,28 +59,17 @@ type requestContext struct {
 	// Used only if no endpoint responses are received.
 	protocolErrorObservationBuilder func() *qosobservations.RequestError
 
-	// Validator to use to build user response/endpoint observations from the endpoint response.
-	endpointResponseValidator func(polylog.Logger, []byte) response
-
 	// Service state for endpoint selection
 	serviceState protocol.EndpointSelector
 
-	// Endpoint response tracking
-	endpointResponses []endpointResponse
-}
+	// rawResponses stores raw endpoint responses.
+	// Raw bytes are stored without parsing for low-latency client response.
+	// Heavy parsing (for observations) is done asynchronously via ObservationQueue.
+	rawResponses []rawEndpointResponse
 
-// endpointResponse tracks a response from a specific endpoint
-type endpointResponse struct {
-	endpointAddr protocol.EndpointAddr
-	response     response
-	// httpStatusCode is the original HTTP status code from the backend endpoint.
-	httpStatusCode int
-}
-
-// response interface defines what endpoint response validators must return
-type response interface {
-	GetHTTPResponse() pathhttp.HTTPResponse
-	GetObservation() qosobservations.CosmosEndpointObservation
+	// protocolError stores a protocol-level error that occurred before any endpoint could respond.
+	// Used to provide more specific error messages to clients.
+	protocolError error
 }
 
 // TODO_NEXT(@commoddity): handle batch requests for Cosmos SDK
@@ -82,31 +82,47 @@ func (rc requestContext) GetServicePayloads() []protocol.Payload {
 	return payloads
 }
 
-// UpdateWithResponse processes a response from an endpoint
-// Uses the existing response unmarshaling system
-// NOT safe for concurrent use
-func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int) {
-	logger := rc.logger.With(
-		"method", "UpdateWithResponse",
+// UpdateWithResponse is NOT safe for concurrent use
+//
+// Raw bytes are stored without parsing for low-latency client response.
+// Heavy parsing (for observations) is done asynchronously via ObservationQueue.
+//
+// The requestID parameter is unused for raw byte passthrough but required by the interface.
+func (rc *requestContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, responseBz []byte, httpStatusCode int, _ string) {
+	rc.logger = rc.logger.With(
 		"endpoint_addr", endpointAddr,
+		"endpoint_response_len", len(responseBz),
 	)
 
-	// Parse and validate the endpoint response.
-	parsedEndpointResponse := rc.endpointResponseValidator(logger, responseBz)
-
-	rc.endpointResponses = append(rc.endpointResponses, endpointResponse{
-		endpointAddr:   endpointAddr,
-		response:       parsedEndpointResponse,
-		httpStatusCode: httpStatusCode,
+	// Store raw bytes without parsing for low-latency client response.
+	// Heavy parsing (for observations) is done async via ObservationQueue.
+	rc.rawResponses = append(rc.rawResponses, rawEndpointResponse{
+		EndpointAddr:   endpointAddr,
+		ResponseBytes:  responseBz,
+		HTTPStatusCode: httpStatusCode,
 	})
 }
 
+// SetProtocolError stores a protocol-level error for more specific client error messages.
+// Implements the gateway.RequestQoSContext interface.
+func (rc *requestContext) SetProtocolError(err error) {
+	rc.protocolError = err
+}
+
 // GetHTTPResponse builds the HTTP response that should be returned for
-// an EVM blockchain service request.
+// a Cosmos blockchain service request.
+//
+// Returns raw bytes as-is (no parsing/re-encoding) for low-latency client response.
+// Heavy parsing for observations is done asynchronously via ObservationQueue.
+//
 // Implements the gateway.RequestQoSContext interface.
 func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
-	// Use a noResponses struct if no responses were reported by the protocol from any endpoints.
-	if len(rc.endpointResponses) == 0 {
+	// No responses received - return error response with protocol error context if available
+	if len(rc.rawResponses) == 0 {
+		// If a specific protocol error is available, use it for a more informative response
+		if rc.protocolError != nil {
+			return rc.buildProtocolErrorResponse()
+		}
 		return rc.protocolErrorResponseBuilder(rc.logger)
 	}
 
@@ -116,47 +132,48 @@ func (rc requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 		return rc.getBatchHTTPResponse()
 	}
 
-	// Handle single requests
-	resp := rc.endpointResponses[0].response.GetHTTPResponse()
-	// Use the original HTTP status code from the backend if available
-	if rc.endpointResponses[0].httpStatusCode != 0 {
-		return &httpResponseWithStatus{
-			wrapped:    resp,
-			statusCode: rc.endpointResponses[0].httpStatusCode,
-		}
+	// Return the most recent raw response as-is for single requests
+	latestResponse := rc.rawResponses[len(rc.rawResponses)-1]
+
+	return &rawHTTPResponse{
+		httpStatusCode: latestResponse.HTTPStatusCode,
+		payload:        latestResponse.ResponseBytes,
 	}
-	return resp
 }
 
-// httpResponseWithStatus wraps an HTTPResponse and overrides its status code
-type httpResponseWithStatus struct {
-	wrapped    pathhttp.HTTPResponse
-	statusCode int
+// rawHTTPResponse implements pathhttp.HTTPResponse for raw byte passthrough.
+type rawHTTPResponse struct {
+	httpStatusCode int
+	payload        []byte
 }
 
-func (r *httpResponseWithStatus) GetPayload() []byte {
-	return r.wrapped.GetPayload()
+func (r *rawHTTPResponse) GetPayload() []byte {
+	return r.payload
 }
 
-func (r *httpResponseWithStatus) GetHTTPStatusCode() int {
-	return r.statusCode
+func (r *rawHTTPResponse) GetHTTPStatusCode() int {
+	if r.httpStatusCode == 0 {
+		return http.StatusOK
+	}
+	return r.httpStatusCode
 }
 
-func (r *httpResponseWithStatus) GetHTTPHeaders() map[string]string {
-	return r.wrapped.GetHTTPHeaders()
+func (r *rawHTTPResponse) GetHTTPHeaders() map[string]string {
+	return map[string]string{
+		"Content-Type": "application/json",
+	}
 }
 
 // getBatchHTTPResponse handles batch requests by combining individual JSON-RPC responses
 // into an array according to the JSON-RPC 2.0 specification.
 // https://www.jsonrpc.org/specification#batch
 func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
-	// Collect individual response payloads
+	// Collect individual response payloads from raw responses
 	var individualResponses []json.RawMessage
-	for _, endpointResp := range rc.endpointResponses {
-		// Extract the JSON payload from each response
-		payload := endpointResp.response.GetHTTPResponse().GetPayload()
-		if len(payload) > 0 {
-			individualResponses = append(individualResponses, json.RawMessage(payload))
+	for _, rawResp := range rc.rawResponses {
+		// Use raw bytes directly - no parsing needed
+		if len(rawResp.ResponseBytes) > 0 {
+			individualResponses = append(individualResponses, json.RawMessage(rawResp.ResponseBytes))
 		}
 	}
 
@@ -171,6 +188,7 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 	}
 
 	// Validate and construct batch response using jsonrpc package
+	// This does minimal parsing for ID validation only
 	batchResponse, err := jsonrpc.ValidateAndBuildBatchResponse(
 		rc.logger,
 		individualResponses,
@@ -184,8 +202,8 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 
 	// Use original HTTP status from backend if available, otherwise default to 200 OK
 	httpStatusCode := http.StatusOK
-	if len(rc.endpointResponses) > 0 && rc.endpointResponses[0].httpStatusCode != 0 {
-		httpStatusCode = rc.endpointResponses[0].httpStatusCode
+	if len(rc.rawResponses) > 0 && rc.rawResponses[0].HTTPStatusCode != 0 {
+		httpStatusCode = rc.rawResponses[0].HTTPStatusCode
 	}
 	return jsonrpc.HTTPResponse{
 		ResponsePayload: batchResponse,
@@ -193,10 +211,11 @@ func (rc requestContext) getBatchHTTPResponse() pathhttp.HTTPResponse {
 	}
 }
 
-// GetObservations returns QoS observations for requests
+// GetObservations returns QoS observations for requests.
+// Uses gjson to parse raw bytes for observation creation (async path).
 func (rc *requestContext) GetObservations() qosobservations.Observations {
 	// Handle case where no endpoint responses were received
-	if len(rc.endpointResponses) == 0 {
+	if len(rc.rawResponses) == 0 {
 		rc.observations.RequestLevelError = rc.protocolErrorObservationBuilder()
 
 		return qosobservations.Observations{
@@ -206,12 +225,10 @@ func (rc *requestContext) GetObservations() qosobservations.Observations {
 		}
 	}
 
-	// Build endpoint observations using the existing response system
-	endpointObservations := make([]*qosobservations.CosmosEndpointObservation, 0, len(rc.endpointResponses))
-	for _, endpointResp := range rc.endpointResponses {
-		endpointObs := endpointResp.response.GetObservation()
-		endpointObs.EndpointAddr = string(endpointResp.endpointAddr)
-		endpointObservations = append(endpointObservations, &endpointObs)
+	// Build endpoint observations from raw bytes using gjson
+	endpointObservations := make([]*qosobservations.CosmosEndpointObservation, 0, len(rc.rawResponses))
+	for _, rawResp := range rc.rawResponses {
+		endpointObservations = append(endpointObservations, rc.createEndpointObservationFromRawBytes(rawResp))
 	}
 
 	rc.observations.EndpointObservations = endpointObservations
@@ -221,6 +238,75 @@ func (rc *requestContext) GetObservations() qosobservations.Observations {
 			Cosmos: rc.observations,
 		},
 	}
+}
+
+// createEndpointObservationFromRawBytes creates an endpoint observation from raw response bytes.
+// Uses gjson for efficient parsing of only the fields needed for observations.
+// Returns a pointer to avoid copying the protobuf struct which contains a mutex.
+func (rc requestContext) createEndpointObservationFromRawBytes(rawResp rawEndpointResponse) *qosobservations.CosmosEndpointObservation {
+	// Determine validation error based on response structure
+	var validationErr *qosobservations.CosmosResponseValidationError
+	if len(rawResp.ResponseBytes) == 0 {
+		err := qosobservations.CosmosResponseValidationError_COSMOS_RESPONSE_VALIDATION_ERROR_EMPTY
+		validationErr = &err
+	} else if !gjson.ValidBytes(rawResp.ResponseBytes) {
+		err := qosobservations.CosmosResponseValidationError_COSMOS_RESPONSE_VALIDATION_ERROR_UNMARSHAL
+		validationErr = &err
+	}
+
+	// Build parsed JSONRPC response observation using gjson
+	parsedResp := rc.parseJSONRPCResponseForObservation(rawResp.ResponseBytes)
+
+	// Build endpoint response validation result
+	return &qosobservations.CosmosEndpointObservation{
+		EndpointAddr: string(rawResp.EndpointAddr),
+		EndpointResponseValidationResult: &qosobservations.CosmosEndpointResponseValidationResult{
+			ResponseValidationType: qosobservations.CosmosResponseValidationType_COSMOS_RESPONSE_VALIDATION_TYPE_JSONRPC,
+			HttpStatusCode:         int32(rawResp.HTTPStatusCode),
+			ValidationError:        validationErr,
+			UserJsonrpcResponse:    parsedResp,
+		},
+	}
+}
+
+// parseJSONRPCResponseForObservation parses raw bytes into a JsonRpcResponse observation using gjson.
+func (rc requestContext) parseJSONRPCResponseForObservation(responseBz []byte) *qosobservations.JsonRpcResponse {
+	if len(responseBz) == 0 {
+		return nil
+	}
+
+	resp := &qosobservations.JsonRpcResponse{}
+
+	// Extract ID as string
+	idResult := gjson.GetBytes(responseBz, "id")
+	if idResult.Exists() {
+		resp.Id = idResult.String()
+	}
+
+	// Check for error
+	errorResult := gjson.GetBytes(responseBz, "error")
+	if errorResult.Exists() && errorResult.Type != gjson.Null {
+		errorCode := gjson.GetBytes(responseBz, "error.code")
+		errorMsg := gjson.GetBytes(responseBz, "error.message")
+		resp.Error = &qosobservations.JsonRpcResponseError{
+			Code:    errorCode.Int(),
+			Message: errorMsg.String(),
+		}
+	}
+
+	// Extract result preview (truncated for size)
+	resultResult := gjson.GetBytes(responseBz, "result")
+	if resultResult.Exists() && resultResult.Type != gjson.Null {
+		resultStr := resultResult.String()
+		// Truncate result preview to a reasonable length
+		const maxPreviewLen = 200
+		if len(resultStr) > maxPreviewLen {
+			resultStr = resultStr[:maxPreviewLen] + "..."
+		}
+		resp.ResultPreview = resultStr
+	}
+
+	return resp
 }
 
 // GetEndpointSelector returns the endpoint selector for the request context.
@@ -240,4 +326,26 @@ func (rc *requestContext) Select(allEndpoints protocol.EndpointAddrList) (protoc
 func (rc *requestContext) SelectMultiple(allEndpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
 	// Select multiple endpoints from the available endpoints using the service state.
 	return rc.serviceState.SelectMultiple(allEndpoints, numEndpoints)
+}
+
+// buildProtocolErrorResponse builds an HTTP response using the stored protocol error.
+// This provides more specific error messages to clients than the generic error builders.
+func (rc requestContext) buildProtocolErrorResponse() pathhttp.HTTPResponse {
+	// Get an appropriate request ID for the error response
+	var requestID jsonrpc.ID
+	for id := range rc.servicePayloads {
+		requestID = id
+		break
+	}
+
+	errorResp := jsonrpc.NewErrResponseInternalErr(requestID, rc.protocolError)
+	bz, err := json.Marshal(errorResp)
+	if err != nil {
+		rc.logger.Warn().Err(err).Msg("buildProtocolErrorResponse: Marshaling JSONRPC response failed.")
+	}
+
+	return jsonrpc.HTTPResponse{
+		ResponsePayload: bz,
+		HTTPStatusCode:  http.StatusInternalServerError,
+	}
 }

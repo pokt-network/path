@@ -21,10 +21,12 @@ var _ reputation.Storage = (*MemoryStorage)(nil)
 //
 // Note: Data is lost on process restart and is not shared across instances.
 type MemoryStorage struct {
-	mu     sync.RWMutex
-	scores map[string]scoreEntry
-	ttl    time.Duration
-	closed bool
+	mu              sync.RWMutex
+	scores          map[string]scoreEntry
+	perceivedBlocks map[string]uint64 // serviceID -> block number
+	endpointBlocks  map[string]map[protocol.EndpointAddr]uint64 // serviceID -> endpointAddr -> block height
+	ttl             time.Duration
+	closed          bool
 }
 
 // scoreEntry holds a score with its expiration time.
@@ -45,8 +47,10 @@ func (e scoreEntry) isExpired() bool {
 // If ttl is zero, entries never expire.
 func NewMemoryStorage(ttl time.Duration) *MemoryStorage {
 	return &MemoryStorage{
-		scores: make(map[string]scoreEntry),
-		ttl:    ttl,
+		scores:          make(map[string]scoreEntry),
+		perceivedBlocks: make(map[string]uint64),
+		endpointBlocks:  make(map[string]map[protocol.EndpointAddr]uint64),
+		ttl:             ttl,
 	}
 }
 
@@ -227,4 +231,94 @@ func (m *MemoryStorage) Cleanup() {
 			delete(m.scores, key)
 		}
 	}
+}
+
+// SetPerceivedBlockNumber stores the perceived block number for a service.
+// Uses atomic max semantics: only updates if new value is higher.
+func (m *MemoryStorage) SetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID, blockNumber uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return reputation.ErrStorageClosed
+	}
+
+	key := string(serviceID)
+	current := m.perceivedBlocks[key]
+	if blockNumber > current {
+		m.perceivedBlocks[key] = blockNumber
+	}
+
+	return nil
+}
+
+// GetPerceivedBlockNumber retrieves the perceived block number for a service.
+// Returns 0 if no block number has been stored yet.
+func (m *MemoryStorage) GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) (uint64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.closed {
+		return 0, reputation.ErrStorageClosed
+	}
+
+	return m.perceivedBlocks[string(serviceID)], nil
+}
+
+// SetEndpointBlockHeight stores a single endpoint's block height for a service.
+func (m *MemoryStorage) SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return reputation.ErrStorageClosed
+	}
+
+	key := string(serviceID)
+	if m.endpointBlocks[key] == nil {
+		m.endpointBlocks[key] = make(map[protocol.EndpointAddr]uint64)
+	}
+	m.endpointBlocks[key][endpointAddr] = blockHeight
+	return nil
+}
+
+// RemoveEndpointBlockHeights removes endpoint block height entries for a service.
+func (m *MemoryStorage) RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return reputation.ErrStorageClosed
+	}
+
+	blocks := m.endpointBlocks[string(serviceID)]
+	if blocks == nil {
+		return nil
+	}
+	for _, addr := range addrs {
+		delete(blocks, addr)
+	}
+	return nil
+}
+
+// GetEndpointBlockHeights retrieves all endpoint block heights for a service.
+func (m *MemoryStorage) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) (map[protocol.EndpointAddr]uint64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.closed {
+		return nil, reputation.ErrStorageClosed
+	}
+
+	src := m.endpointBlocks[string(serviceID)]
+	if len(src) == 0 {
+		return make(map[protocol.EndpointAddr]uint64), nil
+	}
+
+	// Return a copy to avoid races
+	result := make(map[protocol.EndpointAddr]uint64, len(src))
+	for k, v := range src {
+		result[k] = v
+	}
+	return result, nil
 }

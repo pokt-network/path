@@ -212,7 +212,7 @@ func (p *Protocol) getPreSelectedEndpoint(
 	// NOTE: WebSocket endpoints currently don't have dedicated health checks, so they may have
 	// low initial scores. We use filterByReputation=false for WebSocket until health checks are implemented.
 	filterByReputation := rpcType != sharedtypes.RPCType_WEBSOCKET
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers)
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers, selectedEndpointAddr)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, err
@@ -230,9 +230,9 @@ func (p *Protocol) getPreSelectedEndpoint(
 	// This ensures QoS checks are performed on the selected endpoint.
 	selectedEndpoint, ok := endpoints[selectedEndpointAddr]
 	if !ok {
-		// Wrap the context setup error.
-		// Used to generate the observation.
-		err := fmt.Errorf("%w: service %s endpoint %s", errRequestContextSetupInvalidEndpointSelected, serviceID, selectedEndpointAddr)
+		// Wrap the context setup error with the protocol package's error.
+		// This allows the gateway package to detect and handle this specific case.
+		err := fmt.Errorf("%w: service %s endpoint %s", protocol.ErrEndpointUnavailable, serviceID, selectedEndpointAddr)
 		logger.Error().Err(err).Msg("Selected endpoint is not available.")
 		return nil, err
 	}

@@ -2,10 +2,12 @@ package reputation
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/protocol"
 )
@@ -106,8 +108,12 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 
 	if signal.IsPositive() {
 		score.SuccessCount++
-		// Reset strikes on successful request - endpoint has proven it can work
-		score.CriticalStrikes = 0
+		// Decay strikes gradually — one success reduces strikes by 1.
+		// This prevents deceptive suppliers (who pass some requests) from
+		// instantly wiping their strike history with a single success.
+		if score.CriticalStrikes > 0 {
+			score.CriticalStrikes--
+		}
 	} else if signal.IsNegative() {
 		score.ErrorCount++
 	}
@@ -118,8 +124,12 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 
 		// Apply cooldown if strikes exceed threshold
 		if score.CriticalStrikes >= DefaultStrikeThreshold {
-			// Exponential backoff: base * 2^(strikes - threshold)
+			// Exponential backoff: base * 2^(strikes - threshold), capped at max cooldown.
+			// Cap exponent to avoid int64 overflow in the shift (5min * 2^7 = 640min > 60min max).
 			exponent := score.CriticalStrikes - DefaultStrikeThreshold
+			if exponent > 7 {
+				exponent = 7
+			}
 			cooldownDuration := DefaultBaseCooldown * time.Duration(1<<exponent)
 			if cooldownDuration > DefaultMaxCooldown {
 				cooldownDuration = DefaultMaxCooldown
@@ -257,6 +267,52 @@ func (s *service) GetScores(ctx context.Context, keys []EndpointKey) (map[Endpoi
 		if score, exists := s.cache[key.String()]; exists {
 			result[key] = score
 		}
+	}
+
+	return result, nil
+}
+
+// RankEndpointsByScore ranks endpoints by their reputation score (highest first).
+// Returns endpoints sorted by score in descending order.
+// Endpoints not in the cache receive the initial score for comparison.
+// This is useful for retry logic to prioritize the best-performing endpoints.
+func (s *service) RankEndpointsByScore(ctx context.Context, keys []EndpointKey) ([]EndpointKey, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	// Build score map for sorting
+	type scoredEndpoint struct {
+		key   EndpointKey
+		score float64
+	}
+
+	scored := make([]scoredEndpoint, len(keys))
+
+	s.mu.RLock()
+	for i, key := range keys {
+		if cachedScore, exists := s.cache[key.String()]; exists {
+			scored[i] = scoredEndpoint{key: key, score: cachedScore.Value}
+		} else {
+			// Endpoints not in cache get initial score (benefit of the doubt)
+			scored[i] = scoredEndpoint{key: key, score: s.GetInitialScoreForService(key.ServiceID)}
+		}
+	}
+	s.mu.RUnlock()
+
+	// Sort by score descending (highest first)
+	for i := 0; i < len(scored)-1; i++ {
+		for j := i + 1; j < len(scored); j++ {
+			if scored[j].score > scored[i].score {
+				scored[i], scored[j] = scored[j], scored[i]
+			}
+		}
+	}
+
+	// Extract sorted keys
+	result := make([]EndpointKey, len(scored))
+	for i, se := range scored {
+		result[i] = se.key
 	}
 
 	return result, nil
@@ -656,6 +712,220 @@ func (s *service) refreshFromStorage(ctx context.Context) error {
 	s.mu.Unlock()
 
 	return nil
+}
+
+// SetArchivalStatus marks an endpoint as archival-capable with an expiry time.
+// This is called by health checks when an endpoint passes archival validation.
+// The status is shared across all replicas via Redis storage.
+func (s *service) SetArchivalStatus(ctx context.Context, key EndpointKey, isArchival bool, archivalTTL time.Duration) error {
+	cacheKey := key.String()
+
+	// Get existing score or create new one
+	s.mu.Lock()
+	score, exists := s.cache[cacheKey]
+	if !exists {
+		// Create a new score with initial values
+		score = Score{
+			Value:       s.GetInitialScoreForService(key.ServiceID),
+			LastUpdated: time.Now(),
+		}
+	}
+
+	// Update archival status
+	score.IsArchival = isArchival
+	if isArchival {
+		score.ArchivalExpiresAt = time.Now().Add(archivalTTL)
+	} else {
+		score.ArchivalExpiresAt = time.Time{}
+	}
+	score.LastUpdated = time.Now()
+
+	// Update cache
+	s.cache[cacheKey] = score
+	s.mu.Unlock()
+
+	// Queue async write to storage
+	select {
+	case s.writeCh <- writeRequest{key: key, score: score}:
+	default:
+		// Channel full, write synchronously to avoid data loss
+		if err := s.storage.Set(ctx, key, score); err != nil {
+			if s.logger != nil {
+				s.logger.Error().Err(err).
+					Str("key", cacheKey).
+					Bool("is_archival", isArchival).
+					Msg("Failed to persist archival status to storage")
+			}
+			return err
+		}
+	}
+
+	if s.logger != nil {
+		s.logger.Debug().
+			Str("key", cacheKey).
+			Bool("is_archival", isArchival).
+			Time("expires_at", score.ArchivalExpiresAt).
+			Msg("📜 Set archival status in reputation service")
+	}
+
+	return nil
+}
+
+// IsArchivalCapable returns whether the endpoint has valid archival status.
+// Returns false if not marked as archival or if status has expired.
+//
+// IMPORTANT: This method reads from Redis storage if the endpoint is not in
+// the local cache, ensuring non-leader replicas can access archival status
+// set by health checks running on the leader replica.
+func (s *service) IsArchivalCapable(ctx context.Context, key EndpointKey) bool {
+	cacheKey := key.String()
+
+	// Check local cache first
+	s.mu.RLock()
+	score, exists := s.cache[cacheKey]
+	s.mu.RUnlock()
+
+	if exists {
+		return score.IsArchivalCapable()
+	}
+
+	// Not in cache - read from Redis storage (critical for non-leader replicas)
+	// This ensures archival status set by leader's health checks is accessible
+	if s.storage != nil {
+		storedScore, err := s.storage.Get(ctx, key)
+		if err == nil {
+			// Update local cache with fetched score
+			s.mu.Lock()
+			s.cache[cacheKey] = storedScore
+			s.mu.Unlock()
+
+			return storedScore.IsArchivalCapable()
+		}
+		// Log error but don't fail - just return false
+		if s.logger != nil {
+			s.logger.Debug().
+				Err(err).
+				Str("key", cacheKey).
+				Msg("Failed to fetch archival status from storage")
+		}
+	}
+
+	return false
+}
+
+// SetPerceivedBlockNumber updates the shared perceived block number for a service.
+// Uses Redis SETNX-like behavior: only updates if new value is higher (max wins).
+// This enables all replicas to share a consistent view of the chain tip.
+func (s *service) SetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID, blockNumber uint64) error {
+	if s.storage == nil {
+		return nil // No storage configured, skip
+	}
+
+	return s.storage.SetPerceivedBlockNumber(ctx, serviceID, blockNumber)
+}
+
+// GetPerceivedBlockNumber retrieves the shared perceived block number for a service.
+// Returns the maximum block number observed across all replicas.
+// Returns 0 if no block number has been stored yet or if storage is unavailable.
+func (s *service) GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) uint64 {
+	if s.storage == nil {
+		return 0 // No storage configured
+	}
+
+	blockNumber, err := s.storage.GetPerceivedBlockNumber(ctx, serviceID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Msg("Failed to get perceived block number from storage")
+		}
+		return 0
+	}
+
+	return blockNumber
+}
+
+// SetEndpointBlockHeight stores a single endpoint's block height for cross-replica sync.
+func (s *service) SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
+	if s.storage == nil {
+		return nil
+	}
+	return s.storage.SetEndpointBlockHeight(ctx, serviceID, endpointAddr, blockHeight)
+}
+
+// GetEndpointBlockHeights retrieves all endpoint block heights for a service.
+// Returns empty map on error or if storage is unavailable.
+func (s *service) GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) map[protocol.EndpointAddr]uint64 {
+	if s.storage == nil {
+		return make(map[protocol.EndpointAddr]uint64)
+	}
+
+	heights, err := s.storage.GetEndpointBlockHeights(ctx, serviceID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Msg("Failed to get endpoint block heights from storage")
+		}
+		return make(map[protocol.EndpointAddr]uint64)
+	}
+
+	return heights
+}
+
+// RemoveEndpointBlockHeights removes stale endpoint block height entries from storage.
+func (s *service) RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error {
+	if s.storage == nil {
+		return nil
+	}
+	return s.storage.RemoveEndpointBlockHeights(ctx, serviceID, addrs)
+}
+
+// GetArchivalEndpoints returns all endpoint keys for the given service
+// that have valid (non-expired) archival status in the local cache.
+// This enables bootstrapping the EVM archival cache at startup when the
+// endpoint store is empty but the reputation cache has been populated from Redis.
+func (s *service) GetArchivalEndpoints(ctx context.Context, serviceID protocol.ServiceID) []EndpointKey {
+	prefix := string(serviceID) + ":"
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []EndpointKey
+	for cacheKey, score := range s.cache {
+		// Quick prefix check to filter by service
+		if !strings.HasPrefix(cacheKey, prefix) {
+			continue
+		}
+
+		if !score.IsArchivalCapable() {
+			continue
+		}
+
+		// Parse "serviceID:endpointAddr:rpcType" back to EndpointKey.
+		// EndpointAddr may contain colons (e.g., URLs with ports),
+		// so split and take: first part = serviceID, last part = rpcType, middle = endpointAddr.
+		parts := strings.Split(cacheKey, ":")
+		if len(parts) < 3 {
+			continue
+		}
+
+		rpcTypeStr := parts[len(parts)-1]
+		endpointAddr := strings.Join(parts[1:len(parts)-1], ":")
+
+		rpcTypeUpper := strings.ToUpper(rpcTypeStr)
+		rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[rpcTypeUpper])
+
+		result = append(result, NewEndpointKey(
+			serviceID,
+			protocol.EndpointAddr(endpointAddr),
+			rpcType,
+		))
+	}
+
+	return result
 }
 
 // clamp constrains a value between min and max.

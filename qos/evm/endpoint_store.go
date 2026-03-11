@@ -11,6 +11,10 @@ import (
 	"github.com/pokt-network/path/protocol"
 )
 
+// defaultEndpointTTL is how long an endpoint entry is kept without being seen
+// in an active session. Sessions last ~1 hour, so 2x gives buffer.
+const defaultEndpointTTL = 2 * time.Hour
+
 // endpointStore maintains QoS data on the set of available endpoints
 // for an EVM-based blockchain service.
 //
@@ -24,11 +28,47 @@ type endpointStore struct {
 	endpoints   map[protocol.EndpointAddr]endpoint
 }
 
+// touchEndpoints updates the lastSeen timestamp for each endpoint address present in the store.
+// Called after filtering to mark endpoints that appeared in an active session.
+func (es *endpointStore) touchEndpoints(addrs protocol.EndpointAddrList) {
+	now := time.Now()
+	es.endpointsMu.Lock()
+	defer es.endpointsMu.Unlock()
+	for _, addr := range addrs {
+		if ep, found := es.endpoints[addr]; found {
+			ep.lastSeen = now
+			es.endpoints[addr] = ep
+		}
+	}
+}
+
+// sweepStaleEndpoints removes endpoints whose lastSeen is older than ttl (and non-zero).
+// Returns the list of removed endpoint addresses for Redis cleanup.
+func (es *endpointStore) sweepStaleEndpoints(ttl time.Duration) []protocol.EndpointAddr {
+	cutoff := time.Now().Add(-ttl)
+	es.endpointsMu.Lock()
+	defer es.endpointsMu.Unlock()
+
+	var removed []protocol.EndpointAddr
+	for addr, ep := range es.endpoints {
+		if ep.lastSeen.IsZero() {
+			continue // Never seen via filtering — skip (e.g., just created from Redis sync)
+		}
+		if ep.lastSeen.Before(cutoff) {
+			delete(es.endpoints, addr)
+			removed = append(removed, addr)
+		}
+	}
+	return removed
+}
+
 // updateEndpointsFromObservations creates/updates endpoint entries in the store based
 // on the supplied observations. It returns the set of created/updated endpoints.
+//
+// Note: Archival capability is determined by external health checks, not by observations.
+// Health checks mark endpoints as archival-capable via UpdateFromExtractedData.
 func (es *endpointStore) updateEndpointsFromObservations(
 	evmObservations *qosobservations.EVMRequestObservations,
-	archivalBlockHeight string,
 ) map[protocol.EndpointAddr]endpoint {
 	es.endpointsMu.Lock()
 	defer es.endpointsMu.Unlock()
@@ -62,11 +102,7 @@ func (es *endpointStore) updateEndpointsFromObservations(
 		// e.g. when the first observation(s) are received for an endpoint.
 		storedEndpoint := es.endpoints[endpointAddr]
 
-		isEndpointMutatedByObservation := applyObservation(
-			&storedEndpoint,
-			observation,
-			archivalBlockHeight,
-		)
+		isEndpointMutatedByObservation := applyObservation(&storedEndpoint, observation)
 
 		// If the observation did not mutate the endpoint, there is no need to update the stored endpoint entry.
 		if !isEndpointMutatedByObservation {
@@ -84,9 +120,8 @@ func (es *endpointStore) updateEndpointsFromObservations(
 // applyObservation updates the data stored regarding the endpoint using the supplied observation.
 // It returns true if the observation was recognized (i.e. mutated the endpoint).
 //
-// For archival balance observations:
-// - Only updates the archival balance if the balance was observed at the specified archival block height
-// - This ensures accurate historical balance validation at the specific block number
+// Note: Archival capability is determined by external health checks, not by observations.
+// Health checks mark endpoints as archival-capable via UpdateFromExtractedData.
 //
 // TODO_TECHDEBT(@adshmh): add a method to distinguish the following two scenarios:
 //   - an endpoint that returned in invalid response.
@@ -94,7 +129,6 @@ func (es *endpointStore) updateEndpointsFromObservations(
 func applyObservation(
 	endpoint *endpoint,
 	observation *qosobservations.EVMEndpointObservation,
-	archivalBlockHeight string,
 ) (endpointWasMutated bool) {
 	// If emptyResponse is not nil, the observation is for an empty response check.
 	if observation.GetEmptyResponse() != nil {
@@ -115,18 +149,6 @@ func applyObservation(
 		applyChainIDObservation(endpoint, observation.GetChainIdResponse())
 		endpointWasMutated = true
 		return
-	}
-
-	// If getBalanceResponse is not nil, the observation is for a getBalance check (which may be an archival check).
-	if getBalanceResponse := observation.GetGetBalanceResponse(); getBalanceResponse != nil {
-		balanceBlockHeight := getBalanceResponse.GetBlockNumber()
-
-		// Only update the archival balance if the balance was observed at the archival block height.
-		if balanceBlockHeight == archivalBlockHeight {
-			applyArchivalObservation(endpoint, getBalanceResponse)
-			endpointWasMutated = true
-			return
-		}
 	}
 
 	// If unrecognizedResponse is not nil, the observation is for an unrecognized response.
@@ -173,14 +195,6 @@ func applyChainIDObservation(endpoint *endpoint, chainIDResponse *qosobservation
 	endpoint.checkChainID = endpointCheckChainID{
 		chainID:   &observedChainID,
 		expiresAt: time.Now().Add(checkChainIDInterval),
-	}
-}
-
-// applyArchivalObservation updates the archival check if a valid observation is provided.
-func applyArchivalObservation(endpoint *endpoint, archivalResponse *qosobservations.EVMGetBalanceResponse) {
-	endpoint.checkArchival = endpointCheckArchival{
-		observedArchivalBalance: archivalResponse.GetBalance(),
-		expiresAt:               time.Now().Add(checkArchivalInterval),
 	}
 }
 

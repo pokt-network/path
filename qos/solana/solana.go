@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
@@ -13,6 +14,7 @@ import (
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
 	qostypes "github.com/pokt-network/path/qos/types"
+	"github.com/pokt-network/path/reputation"
 )
 
 // QoS implements gateway.QoSService by providing:
@@ -35,6 +37,10 @@ type QoS struct {
 	*EndpointStore
 	*ServiceState
 	*requestValidator
+
+	// reputationSvc provides shared perceived block height across replicas via Redis.
+	// Set via SetReputationService; nil when reputation is disabled.
+	reputationSvc reputation.ReputationService
 }
 
 // ParseHTTPRequest builds a request context from the provided HTTP request.
@@ -93,27 +99,44 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 		return nil
 	}
 
-	// Only update if we extracted a valid block height
-	if data.BlockHeight <= 0 {
+	// Determine block height to store
+	var blockHeight uint64
+	var hasBlock bool
+
+	if data.BlockHeight > 0 {
+		blockHeight = uint64(data.BlockHeight)
+		hasBlock = true
+	} else if data.InvalidBlockHeight {
+		// Supplier returned an unparseable block height result — store 0 so filter catches it
+		blockHeight = 0
+		hasBlock = true
+	}
+
+	if !hasBlock {
 		return nil
 	}
 
-	blockHeight := uint64(data.BlockHeight)
-
 	// Lock the endpoint store to update the endpoint observation
-	q.EndpointStore.endpointsMu.Lock()
-	storedEndpoint := q.EndpointStore.endpoints[endpointAddr]
+	q.endpointsMu.Lock()
+	defer q.endpointsMu.Unlock()
+
+	// Initialize the map if nil (can happen if UpdateFromExtractedData is called
+	// before any UpdateEndpointsFromObservations calls)
+	if q.endpoints == nil {
+		q.endpoints = make(map[protocol.EndpointAddr]endpoint)
+	}
+
+	storedEndpoint := q.endpoints[endpointAddr]
 
 	// Update the endpoint's block height observation (Solana uses block height from getEpochInfo)
 	// Create or update the SolanaGetEpochInfoResponse with just the block height
 	if storedEndpoint.SolanaGetEpochInfoResponse == nil {
 		storedEndpoint.SolanaGetEpochInfoResponse = &qosobservations.SolanaGetEpochInfoResponse{}
 	}
-	storedEndpoint.SolanaGetEpochInfoResponse.BlockHeight = blockHeight
+	storedEndpoint.BlockHeight = blockHeight
 
 	// Store the updated endpoint back
-	q.EndpointStore.endpoints[endpointAddr] = storedEndpoint
-	q.EndpointStore.endpointsMu.Unlock()
+	q.endpoints[endpointAddr] = storedEndpoint
 
 	// Lock service state to update perceived block height
 	q.serviceStateLock.Lock()
@@ -127,6 +150,24 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 			Uint64("new_block", blockHeight).
 			Msg("Updating perceived block height from observation pipeline")
 		q.perceivedBlockHeight = blockHeight
+
+		// Write to Redis for cross-replica sync (async, non-blocking)
+		if q.reputationSvc != nil {
+			go func(bn uint64, svcID protocol.ServiceID) {
+				rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = q.reputationSvc.SetPerceivedBlockNumber(rCtx, svcID, bn)
+			}(blockHeight, q.ServiceState.serviceID)
+		}
+	}
+
+	// Write per-endpoint block height to Redis for cross-replica sync (async, non-blocking)
+	if q.reputationSvc != nil {
+		go func(addr protocol.EndpointAddr, bn uint64, svcID protocol.ServiceID) {
+			rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = q.reputationSvc.SetEndpointBlockHeight(rCtx, svcID, addr, bn)
+		}(endpointAddr, blockHeight, q.ServiceState.serviceID)
 	}
 
 	return nil
@@ -141,4 +182,221 @@ func (q *QoS) GetPerceivedBlockNumber() uint64 {
 	q.serviceStateLock.RLock()
 	defer q.serviceStateLock.RUnlock()
 	return q.perceivedBlockHeight
+}
+
+// ConsumeExternalBlockHeight consumes block heights from an external fetcher channel
+// and uses them as a floor for perceivedBlockHeight. This ensures that if all session
+// endpoints are behind the real chain tip, the perceived block is corrected.
+// The gracePeriod delays applying the external floor after startup, giving suppliers
+// time to report their block heights. Use 0 for the default (60s).
+func (q *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int64, gracePeriod time.Duration) {
+	const defaultGracePeriod = 60 * time.Second
+	effectiveGrace := defaultGracePeriod
+	if gracePeriod > 0 {
+		effectiveGrace = gracePeriod
+	}
+	startedAt := time.Now()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case height, ok := <-heights:
+				if !ok {
+					return
+				}
+				if height <= 0 {
+					continue
+				}
+
+				// Skip during grace period to let suppliers report first
+				if time.Since(startedAt) < effectiveGrace {
+					q.logger.Debug().
+						Int64("external_block", height).
+						Dur("grace_remaining", effectiveGrace-time.Since(startedAt)).
+						Msg("External block floor deferred — grace period active")
+					continue
+				}
+
+				h := uint64(height)
+				q.serviceStateLock.Lock()
+				// Only apply external floor if suppliers have already reported.
+				// If perceivedBlockHeight is still 0, no supplier has reported yet
+				// and applying the floor would filter ALL endpoints.
+				if q.perceivedBlockHeight == 0 {
+					q.serviceStateLock.Unlock()
+					q.logger.Debug().
+						Uint64("external_block", h).
+						Msg("External block floor skipped — no suppliers have reported yet")
+					continue
+				}
+				if h > q.perceivedBlockHeight {
+					q.logger.Info().
+						Uint64("old_perceived", q.perceivedBlockHeight).
+						Uint64("external_block", h).
+						Msg("External block floor applied — raising perceived block height")
+					q.perceivedBlockHeight = h
+
+					// Write to Redis so other replicas benefit from the external source.
+					if q.reputationSvc != nil {
+						go func(bn uint64, svcID protocol.ServiceID) {
+							rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+							defer cancel()
+							_ = q.reputationSvc.SetPerceivedBlockNumber(rCtx, svcID, bn)
+						}(h, q.ServiceState.serviceID)
+					}
+				}
+				q.serviceStateLock.Unlock()
+			}
+		}
+	}()
+}
+
+// SetReputationService sets the reputation service for shared state across replicas.
+// The reputation service provides perceived block height via Redis, enabling
+// all replicas to converge on the same chain tip for sync_allowance validation.
+func (q *QoS) SetReputationService(svc reputation.ReputationService) {
+	q.reputationSvc = svc
+}
+
+// StartBackgroundSync starts a background goroutine that periodically syncs
+// perceived block height from Redis. This ensures all replicas converge to
+// the same max block height for sync_allowance validation.
+//
+// The syncInterval determines how often to check Redis (e.g., 5 seconds).
+// Call this after SetReputationService to enable cross-replica sync.
+//
+// IMPORTANT: This performs an immediate sync on startup to ensure the replica
+// has the latest perceived block height before serving requests.
+func (q *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Duration) {
+	if q.reputationSvc == nil {
+		q.logger.Warn().Msg("Cannot start background sync: reputation service not set")
+		return
+	}
+
+	serviceID := q.ServiceState.serviceID
+
+	// syncFromRedis fetches perceived block height from Redis and updates local
+	// state if the Redis value is higher (simple max semantics).
+	syncFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		redisBlockHeight := q.reputationSvc.GetPerceivedBlockNumber(fetchCtx, serviceID)
+		cancel()
+
+		if redisBlockHeight == 0 {
+			return // No data in Redis yet
+		}
+
+		q.serviceStateLock.Lock()
+		oldBlock := q.perceivedBlockHeight
+		if redisBlockHeight > q.perceivedBlockHeight {
+			q.perceivedBlockHeight = redisBlockHeight
+		}
+		q.serviceStateLock.Unlock()
+
+		if redisBlockHeight > oldBlock {
+			q.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Uint64("redis_block", redisBlockHeight).
+				Uint64("old_perceived", oldBlock).
+				Uint64("new_perceived", redisBlockHeight).
+				Msg("Updated perceived block height from Redis sync")
+		}
+	}
+
+	// syncEndpointBlocksFromRedis fetches per-endpoint block heights from Redis
+	// and updates local endpoint store entries where Redis has a higher value.
+	// Only updates EXISTING entries (Solana's validateBasic needs health+epoch data).
+	syncEndpointBlocksFromRedis := func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		heights := q.reputationSvc.GetEndpointBlockHeights(fetchCtx, serviceID)
+		cancel()
+
+		if len(heights) == 0 {
+			return
+		}
+
+		q.endpointsMu.Lock()
+		updated := 0
+		for addr, redisHeight := range heights {
+			ep, exists := q.endpoints[addr]
+			if !exists {
+				continue // Only update existing entries
+			}
+			if ep.SolanaGetEpochInfoResponse == nil {
+				continue // Need epoch info to be initialized
+			}
+			if redisHeight > ep.BlockHeight {
+				ep.BlockHeight = redisHeight
+				q.endpoints[addr] = ep
+				updated++
+			}
+		}
+		q.endpointsMu.Unlock()
+
+		if updated > 0 {
+			q.logger.Debug().
+				Str("service_id", string(serviceID)).
+				Int("updated_endpoints", updated).
+				Int("redis_endpoints", len(heights)).
+				Msg("Synced per-endpoint block heights from Redis")
+		}
+	}
+
+	// Perform immediate sync on startup to have latest data before serving requests
+	syncFromRedis()
+	syncEndpointBlocksFromRedis()
+	// sweepStaleEndpoints removes endpoint entries that haven't been seen
+	// in any active session within the TTL, and cleans up their Redis entries.
+	sweepStaleEndpoints := func() {
+		removed := q.sweepStaleEndpoints(defaultEndpointTTL)
+		if len(removed) == 0 {
+			return
+		}
+
+		q.logger.Info().
+			Str("service_id", string(serviceID)).
+			Int("removed_endpoints", len(removed)).
+			Msg("Swept stale endpoints from local store")
+
+		sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := q.reputationSvc.RemoveEndpointBlockHeights(sweepCtx, serviceID, removed); err != nil {
+			q.logger.Warn().
+				Err(err).
+				Str("service_id", string(serviceID)).
+				Int("count", len(removed)).
+				Msg("Failed to remove stale endpoint block heights from Redis")
+		}
+	}
+
+	q.logger.Info().
+		Str("service_id", string(serviceID)).
+		Uint64("perceived_block", q.perceivedBlockHeight).
+		Msg("Completed initial perceived block height sync from Redis")
+
+	go func() {
+		ticker := time.NewTicker(syncInterval)
+		defer ticker.Stop()
+
+		q.logger.Info().
+			Str("service_id", string(serviceID)).
+			Dur("sync_interval", syncInterval).
+			Msg("Started background sync for perceived block height")
+
+		for {
+			select {
+			case <-ctx.Done():
+				q.logger.Debug().
+					Str("service_id", string(serviceID)).
+					Msg("Stopping background sync for perceived block height")
+				return
+			case <-ticker.C:
+				syncFromRedis()
+				syncEndpointBlocksFromRedis()
+				sweepStaleEndpoints()
+			}
+		}
+	}()
 }

@@ -22,9 +22,6 @@ import (
 const (
 	// Maximum length of an HTTP response's body.
 	maxResponseSize = 100 * 1024 * 1024 // 100MB limit
-
-	// Maximum number of concurrent HTTP requests.
-	concurrencyLimiterMax = 10_000
 )
 
 // HTTPClientWithDebugMetrics provides HTTP client functionality with embedded tracking of debug metrics.
@@ -36,7 +33,6 @@ const (
 // - Connection issue visibility
 type HTTPClientWithDebugMetrics struct {
 	httpClient *http.Client
-	limiter    *concurrency.ConcurrencyLimiter
 	bufferPool *concurrency.BufferPool
 
 	// Atomic counters for monitoring
@@ -86,18 +82,23 @@ type httpRequestMetrics struct {
 // - Built in request debugging capabilities and metrics tracking
 // TODO_TECHDEBT(@adshmh): Make HTTP client settings configurable
 func NewDefaultHTTPClientWithDebugMetrics() *HTTPClientWithDebugMetrics {
-	// Configure transport with optimized settings for high-concurrency usage
+	// Configure transport with optimized settings for high-concurrency usage.
+	// These fixed pool sizes allow the gateway to scale naturally with OS resources
+	// (file descriptors, memory, CPU) similar to nginx/envoy/haproxy.
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,  // Quick connection establishment to fail fast on unreachable hosts
 			KeepAlive: 30 * time.Second, // Keep-alive probe interval to maintain connection health
 		}).DialContext,
 
-		// Connection pool settings scaled with concurrency limit
-		MaxIdleConns:        concurrencyLimiterMax / 5,  // Scale total pool: 20% of max concurrency
-		MaxIdleConnsPerHost: concurrencyLimiterMax / 20, // Scale per-host pool: 5% of max concurrency
-		MaxConnsPerHost:     concurrencyLimiterMax / 10, // Scale max connections: 10% of max concurrency
-		IdleConnTimeout:     90 * time.Second,           // Reduced from 300s - shorter idle to free resources
+		// Fixed connection pool settings for production-scale gateway operation.
+		// 10,000 total idle connections distributed across all supplier endpoints.
+		// At 500 idle per host, supports ~20 suppliers with full connection reuse.
+		// At 1,000 max per host, allows bursts to individual suppliers without blocking.
+		MaxIdleConns:        10000, // Total idle connections across all endpoints
+		MaxIdleConnsPerHost: 500,   // Idle connections per supplier endpoint
+		MaxConnsPerHost:     1000,  // Maximum concurrent connections per supplier endpoint
+		IdleConnTimeout:     90 * time.Second, // Reduced from 300s - shorter idle to free resources
 
 		// Timeout settings optimized for quick failure detection
 		TLSHandshakeTimeout:   5 * time.Second,  // Fast TLS timeout since handshakes typically complete in ~100ms
@@ -122,7 +123,6 @@ func NewDefaultHTTPClientWithDebugMetrics() *HTTPClientWithDebugMetrics {
 
 	return &HTTPClientWithDebugMetrics{
 		httpClient: httpClient,
-		limiter:    concurrency.NewConcurrencyLimiter(concurrencyLimiterMax),
 		bufferPool: concurrency.NewBufferPool(maxResponseSize),
 	}
 }
@@ -130,6 +130,13 @@ func NewDefaultHTTPClientWithDebugMetrics() *HTTPClientWithDebugMetrics {
 // SendHTTPRelay sends an HTTP POST request with the relay data to the specified URL.
 // Uses the provided context for timeout and cancellation control.
 // Logs detailed metrics and debugging information on failure for debugging.
+//
+// Architecture Note: This gateway intentionally has no internal concurrency limits.
+// Following the design of nginx/envoy/haproxy, scaling is achieved through:
+// - OS resources (file descriptors, memory, CPU)
+// - Go's http.Transport connection pooling (configured above)
+// - Horizontal scaling (multiple gateway replicas)
+// Endpoint protection is handled by the reputation system, not gateway throttling.
 //
 // Returns: response body, HTTP status code, error
 func (h *HTTPClientWithDebugMetrics) SendHTTPRelay(
@@ -140,12 +147,6 @@ func (h *HTTPClientWithDebugMetrics) SendHTTPRelay(
 	relayRequestBz []byte,
 	headers map[string]string,
 ) ([]byte, int, error) {
-	// Acquire concurrency slot before proceeding
-	// TODO: use a predefined error, so we can build a proper observation indicating request failure due to reaching max concurrency.
-	if !h.limiter.Acquire(ctx) {
-		return nil, 0, fmt.Errorf("failed to acquire concurrency slot: context canceled")
-	}
-	defer h.limiter.Release()
 
 	// Set up debugging context and logging function
 	debugCtx, requestRecorder := h.setupRequestDebugging(ctx, logger, endpointURL)

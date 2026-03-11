@@ -26,4 +26,11 @@ var (
 	// Websocket connection establishment failed.
 	// e.g. Failed to upgrade HTTP connection to Websocket or connect to endpoint.
 	errWebsocketConnectionFailed = errors.New("websocket connection establishment failed")
+
+	// errWebsocketProtocolContextNotReady is returned when a message is received
+	// before the protocol context has been initialized.
+	// This guards against a race condition where the bridge starts processing
+	// messages before BuildWebsocketRequestContextForEndpoint returns and
+	// protocolCtx is assigned.
+	errWebsocketProtocolContextNotReady = errors.New("websocket protocol context not initialized")
 )

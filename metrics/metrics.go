@@ -66,11 +66,21 @@ const (
 	RetryReason5xx        = "retry_on_5xx"
 	RetryReasonTimeout    = "retry_on_timeout"
 	RetryReasonConnection = "retry_on_connection"
+	RetryReasonHeuristic  = "retry_on_heuristic"
 
 	// --- Retry results
 
 	RetryResultSuccess = "success"
 	RetryResultFailure = "failure"
+
+	// --- Hedge results
+
+	HedgeResultPrimaryWon   = "primary_won"   // Primary request won the race
+	HedgeResultHedgeWon     = "hedge_won"     // Hedge request won the race
+	HedgeResultPrimaryOnly  = "primary_only"  // Primary responded before hedge delay
+	HedgeResultBothFailed   = "both_failed"   // Both primary and hedge failed
+	HedgeResultNoHedge      = "no_hedge"      // No hedge started (no alternative endpoint)
+	HedgeReasonDelayElapsed = "delay_elapsed" // Hedge started because delay elapsed
 
 	// --- Probation events
 
@@ -105,17 +115,17 @@ var ReputationEndpointLeaderboard = promauto.NewGaugeVec(
 
 // =============================================================================
 // Health Check Status (Counter)
-// Labels: domain, rpc_type, service_id, health_check_name, reputation_signal
+// Labels: domain, supplier, rpc_type, service_id, health_check_name, reputation_signal
 // Value: count
-// Purpose: Track health check results by domain and check type
+// Purpose: Track health check results per supplier for filtering visibility
 // =============================================================================
 
 var HealthCheckStatus = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "health_check_status_total",
-		Help: "Health check results by domain, rpc_type, service_id, health_check_name, and reputation_signal.",
+		Help: "Health check results by domain, supplier, rpc_type, service_id, health_check_name, and reputation_signal.",
 	},
-	[]string{LabelDomain, LabelRPCType, LabelServiceID, LabelHealthCheckName, LabelReputationSignal},
+	[]string{LabelDomain, LabelSupplier, LabelRPCType, LabelServiceID, LabelHealthCheckName, LabelReputationSignal},
 )
 
 // =============================================================================
@@ -471,9 +481,9 @@ var WebsocketMessagesTotal = promauto.NewCounterVec(
 // Helper Functions for Recording Metrics
 // =============================================================================
 
-// RecordHealthCheck records a health check result
-func RecordHealthCheck(domain, rpcType, serviceID, healthCheckName, reputationSignal string) {
-	HealthCheckStatus.WithLabelValues(domain, rpcType, serviceID, healthCheckName, reputationSignal).Inc()
+// RecordHealthCheck records a health check result per supplier
+func RecordHealthCheck(domain, supplier, rpcType, serviceID, healthCheckName, reputationSignal string) {
+	HealthCheckStatus.WithLabelValues(domain, supplier, rpcType, serviceID, healthCheckName, reputationSignal).Inc()
 }
 
 // RecordObservation records an observation pipeline event
@@ -501,6 +511,52 @@ func RecordRetryDistribution(domain, rpcType, serviceID, reason string) {
 func RecordRetryResult(rpcType, serviceID, retryCount, result string, latencySeconds float64) {
 	RetryResultsTotal.WithLabelValues(rpcType, serviceID, retryCount, result).Inc()
 	RetryResultsLatency.WithLabelValues(rpcType, serviceID, retryCount, result).Observe(latencySeconds)
+}
+
+// =============================================================================
+// Hedge Request Metrics (Counter + Histogram)
+// Labels: rpc_type, service_id, result
+// Purpose: Track hedge request usage, outcomes, and latency benefits
+// =============================================================================
+
+var HedgeRequestsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "hedge_requests_total",
+		Help: "Total hedge request events by rpc_type, service_id, and result (primary_won/hedge_won/primary_only/both_failed/no_hedge).",
+	},
+	[]string{LabelRPCType, LabelServiceID, LabelResult},
+)
+
+var HedgeLatencySavings = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "hedge_latency_savings_seconds",
+		Help:    "Latency saved by hedge requests (primary_latency - winning_latency) when hedge wins. Negative values mean hedge was slower.",
+		Buckets: []float64{-1, -0.5, -0.1, 0, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	},
+	[]string{LabelRPCType, LabelServiceID},
+)
+
+var HedgeWinningLatency = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "hedge_winning_latency_seconds",
+		Help:    "Latency of the winning request in a hedge race by result type.",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+	},
+	[]string{LabelRPCType, LabelServiceID, LabelResult},
+)
+
+// RecordHedgeRequest records a hedge request outcome
+// result should be one of: HedgeResultPrimaryWon, HedgeResultHedgeWon, HedgeResultPrimaryOnly, HedgeResultBothFailed, HedgeResultNoHedge
+func RecordHedgeRequest(rpcType, serviceID, result string, winningLatencySeconds float64) {
+	HedgeRequestsTotal.WithLabelValues(rpcType, serviceID, result).Inc()
+	HedgeWinningLatency.WithLabelValues(rpcType, serviceID, result).Observe(winningLatencySeconds)
+}
+
+// RecordHedgeLatencySavings records the latency benefit/cost of using hedged requests
+// savings = what the primary would have taken - what the winner took
+// positive = hedge saved time, negative = hedge was slower (but still won if primary failed)
+func RecordHedgeLatencySavings(rpcType, serviceID string, savingsSeconds float64) {
+	HedgeLatencySavings.WithLabelValues(rpcType, serviceID).Observe(savingsSeconds)
 }
 
 // RecordBatchSize records a batch request with latency
