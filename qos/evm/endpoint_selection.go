@@ -102,12 +102,6 @@ func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.E
 		}
 		// CODE_PATH: Standard fallback - random selection, but still exclude known-stale URLs
 		fallbackEndpoints := ss.filterStaleURLEndpoints(availableEndpoints)
-		if len(fallbackEndpoints) == 0 {
-			logger.Error().Str("code_path", "STANDARD_FALLBACK_ALL_STALE").
-				Int("total_endpoints", len(availableEndpoints)).
-				Msg("all endpoints failed validation and all URLs are stale — refusing to serve stale data")
-			return nil, fmt.Errorf("all %d endpoints are stale for service %s", len(availableEndpoints), ss.serviceQoSConfig.GetServiceID())
-		}
 		logger.Warn().Str("code_path", "STANDARD_FALLBACK_RANDOM").
 			Int("total_endpoints", len(availableEndpoints)).
 			Int("fallback_endpoints", len(fallbackEndpoints)).
@@ -150,16 +144,6 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 	if validCount == 0 {
 		// Still exclude known-stale URLs from the fallback pool
 		fallbackEndpoints := ss.filterStaleURLEndpoints(availableEndpoints)
-		if len(fallbackEndpoints) == 0 {
-			logger.Error().
-				Int("total_endpoints", len(availableEndpoints)).
-				Msg("all endpoints failed validation and all URLs are stale — refusing to serve stale data")
-			return EndpointSelectionResult{
-				Metadata: EndpointSelectionMetadata{
-					ValidationResults: validationResults,
-				},
-			}, fmt.Errorf("all %d endpoints are stale for service %s", len(availableEndpoints), ss.serviceQoSConfig.GetServiceID())
-		}
 		logger.Warn().
 			Int("fallback_endpoints", len(fallbackEndpoints)).
 			Msgf("SELECTING A RANDOM ENDPOINT because all endpoints failed validation from: %s", availableEndpoints.String())
@@ -709,9 +693,7 @@ func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrL
 		filtered = append(filtered, ep)
 	}
 
-	// If filtering removed everything, return empty — serving a response from an endpoint
-	// 39K+ blocks behind is worse than returning an error. The caller should handle this
-	// by returning an error to the client.
+	// If filtering removed everything, return original to avoid total failure
 	if len(filtered) == 0 {
 		ss.logger.Error().
 			Str("service_id", serviceID).
@@ -720,8 +702,8 @@ func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrL
 			Uint64("perceived_block", perceivedBlock).
 			Uint64("sync_allowance", syncAllowance).
 			Int("url_block_heights_count", len(urlBlockHeights)).
-			Msg("filterStaleURLEndpoints: ALL endpoints are stale — returning empty list")
-		return nil
+			Msg("filterStaleURLEndpoints: ALL endpoints are stale — returning unfiltered to avoid total failure")
+		return endpoints
 	}
 
 	if removedCount > 0 {
