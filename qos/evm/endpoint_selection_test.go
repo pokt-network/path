@@ -773,11 +773,10 @@ func TestSelectMultipleWithArchival_FiltersStaleEndpoints(t *testing.T) {
 				availableEndpoints, uint(len(availableEndpoints)), false, "test-req")
 
 			if tt.expectFallback {
-				// When ALL endpoints are stale, SelectMultipleWithArchival falls back to
-				// random selection (STANDARD_FALLBACK_RANDOM). This is a known behavior:
-				// it returns endpoints rather than erroring to avoid total service failure.
-				require.NoError(t, err)
-				require.NotEmpty(t, selected, "fallback should still return endpoints")
+				// When ALL endpoints are stale, SelectMultipleWithArchival returns an error
+				// rather than serving stale data to clients.
+				require.Error(t, err, "should return error when all endpoints are stale")
+				require.Empty(t, selected, "should not return stale endpoints")
 				return
 			}
 
