@@ -389,12 +389,13 @@ gateway_config:
     # Cosmos chain with EVM support
     - id: xrplevm
       type: "cosmos"
-      rpc_types: ["json_rpc", "comet_bft", "websocket"]
+      rpc_types: ["json_rpc", "websocket"]
+      # rpc_types: ["json_rpc", "comet_bft", "websocket"]
       latency_profile: "standard"
       timeout_config:
         relay_timeout: 15s
-      rpc_type_fallbacks:
-        comet_bft: json_rpc
+      # rpc_type_fallbacks:
+      #   comet_bft: json_rpc
 
     # -------------------------------------------------------------------------
     # Non-EVM Services
