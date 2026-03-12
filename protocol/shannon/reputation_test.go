@@ -335,7 +335,7 @@ func TestReputation_FilterByReputation(t *testing.T) {
 	require.Less(t, badScore.Value, reputation.DefaultMinThreshold)
 
 	// Filter endpoints by reputation
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
 
 	// Should have 2 endpoints: good and new (bad should be filtered out)
 	require.Len(t, filtered, 2)
@@ -363,7 +363,7 @@ func TestReputation_DisabledNoFiltering(t *testing.T) {
 	}
 
 	// Filter should return all endpoints unchanged
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
 	require.Equal(t, endpoints, filtered)
 }
 
@@ -872,7 +872,7 @@ func TestReputation_KeyGranularityPerSupplier(t *testing.T) {
 	}
 
 	// Filter by reputation
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
 
 	// Both endpoint1 and endpoint2 should be filtered out (same supplier, same low score)
 	// endpoint3 should pass (new endpoint, initial score)
@@ -953,7 +953,7 @@ func TestReputation_KeyGranularityPerDomain(t *testing.T) {
 	}
 
 	// Filter by reputation
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
 
 	// Both endpoint1 and endpoint2 should be filtered out (same domain, same low score)
 	// endpoint3 should pass (different domain, new endpoint, initial score)
@@ -1030,7 +1030,7 @@ func TestReputation_KeyGranularityDefault(t *testing.T) {
 	}
 
 	// Filter by reputation
-	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
 
 	// Only endpoint1 should be filtered out
 	require.Len(t, filtered, 1)
@@ -1170,12 +1170,12 @@ func TestReputationFiltering_RPCTypeAware(t *testing.T) {
 	require.Less(t, websocketScore.Value, config.MinThreshold, "WebSocket should be below threshold")
 
 	// Filter for JSON-RPC → endpoint should be included
-	filteredJsonRpc := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger)
+	filteredJsonRpc := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
 	require.Len(t, filteredJsonRpc, 1, "JSON-RPC filtering should include endpoint (high score)")
 	require.Contains(t, filteredJsonRpc, endpointAddr, "Endpoint should be included for JSON-RPC")
 
 	// Filter for WebSocket → endpoint should be excluded
-	filteredWebsocket := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger)
+	filteredWebsocket := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, "")
 	require.Len(t, filteredWebsocket, 0, "WebSocket filtering should exclude endpoint (low score)")
 	require.NotContains(t, filteredWebsocket, endpointAddr, "Endpoint should be excluded for WebSocket")
 

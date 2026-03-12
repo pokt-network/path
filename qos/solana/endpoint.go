@@ -46,6 +46,10 @@ type endpoint struct {
 	// latestJSONRPCValidationError tracks most recent JSON-RPC response validation error
 	latestJSONRPCValidationError *qosobservations.JsonRpcResponseValidationError
 
+	// lastSeen is updated when the endpoint appears in an active session.
+	// Used by stale endpoint cleanup to remove entries that are no longer active.
+	lastSeen time.Time
+
 	// TODO_FUTURE: support archival endpoints.
 }
 

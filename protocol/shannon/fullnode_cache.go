@@ -216,6 +216,13 @@ func (cfn *cachingFullNode) GetApp(ctx context.Context, appAddr string) (*apptyp
 }
 
 // GetSession returns (and auto-refreshes) the session for a service/app from cache.
+//
+// The cache key uses the session start height (derived from current block height
+// and NumBlocksPerSession) rather than the raw block height. This ensures the
+// same session is served from cache for the entire session window (~NumBlocksPerSession
+// blocks) instead of triggering a cache miss on every new block.
+//
+// See: https://github.com/pokt-network/path/issues/509
 func (cfn *cachingFullNode) GetSession(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
@@ -234,7 +241,20 @@ func (cfn *cachingFullNode) GetSession(
 		)
 		return sessiontypes.Session{}, err
 	}
-	sessionKey := getSessionCacheKey(serviceID, appAddr, height)
+
+	// Compute session start height deterministically so the cache key remains
+	// stable for all blocks within the same session window. SharedParams is
+	// already cached with a 2-minute TTL, so this adds no extra gRPC call.
+	sessionStartHeight, err := cfn.getSessionStartHeight(ctx, height)
+	if err != nil {
+		// Fall back to current height if shared params are unavailable.
+		// This preserves the previous behavior (one fetch per block) rather
+		// than failing the request entirely.
+		logger.Warn().Err(err).Msg("Failed to compute session start height, falling back to current block height")
+		sessionStartHeight = height
+	}
+
+	sessionKey := getSessionCacheKey(serviceID, appAddr, sessionStartHeight)
 
 	// See: https://github.com/viccon/sturdyc?tab=readme-ov-file#get-or-fetch
 	session, err := cfn.sessionCache.GetOrFetch(
@@ -352,6 +372,41 @@ func (cfn *cachingFullNode) GetSessionWithExtendedValidity(
 // getSessionCacheKey builds a unique cache key for session: <prefix>:<serviceID>:<appAddr>:<height>
 func getSessionCacheKey(serviceID protocol.ServiceID, appAddr string, height int64) string {
 	return fmt.Sprintf("%s:%s:%s:%d", sessionCacheKeyPrefix, serviceID, appAddr, height)
+}
+
+// getSessionStartHeight computes the session start block height from the current
+// block height and the on-chain NumBlocksPerSession parameter. This is used to
+// derive a stable cache key that doesn't change within a session window.
+//
+// Uses Shannon's 1-based session formula (sessions start at block 1, not 0):
+//   sessionStartHeight = currentHeight - ((currentHeight - 1) % numBlocksPerSession)
+//
+// For example, with NumBlocksPerSession=60:
+//
+//	height 1   → sessionStart 1
+//	height 30  → sessionStart 1
+//	height 60  → sessionStart 1
+//	height 61  → sessionStart 61
+//	height 120 → sessionStart 61
+//	height 121 → sessionStart 121
+//
+// See: poktroll/x/shared/types/session.go GetSessionStartHeight
+func (cfn *cachingFullNode) getSessionStartHeight(ctx context.Context, currentHeight int64) (int64, error) {
+	if currentHeight <= 0 {
+		return currentHeight, nil
+	}
+
+	params, err := cfn.GetSharedParams(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get shared params for session start height: %w", err)
+	}
+
+	numBlocksPerSession := int64(params.NumBlocksPerSession)
+	if numBlocksPerSession <= 0 {
+		return currentHeight, nil
+	}
+
+	return currentHeight - ((currentHeight - 1) % numBlocksPerSession), nil
 }
 
 // ValidateRelayResponse:

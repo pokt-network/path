@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 
@@ -193,54 +194,77 @@ func TestRPCTypeDetector_ProcessOfElimination(t *testing.T) {
 
 	tests := []struct {
 		name            string
+		httpMethod      string
 		serviceRPCTypes []string
 		expectedRPCType sharedtypes.RPCType
 		expectedOK      bool
 	}{
 		{
-			name:            "common case - json_rpc + websocket",
+			name:            "common case - json_rpc + websocket POST",
+			httpMethod:      http.MethodPost,
 			serviceRPCTypes: []string{"json_rpc", "websocket"},
 			expectedRPCType: sharedtypes.RPCType_JSON_RPC,
 			expectedOK:      true,
 		},
 		{
+			name:            "json_rpc + websocket GET - rejected (JSON-RPC requires POST)",
+			httpMethod:      http.MethodGet,
+			serviceRPCTypes: []string{"json_rpc", "websocket"},
+			expectedRPCType: sharedtypes.RPCType_UNKNOWN_RPC,
+			expectedOK:      false,
+		},
+		{
+			name:            "json_rpc only GET - rejected (JSON-RPC requires POST)",
+			httpMethod:      http.MethodGet,
+			serviceRPCTypes: []string{"json_rpc"},
+			expectedRPCType: sharedtypes.RPCType_UNKNOWN_RPC,
+			expectedOK:      false,
+		},
+		{
 			name:            "single http type - rest",
+			httpMethod:      http.MethodGet,
 			serviceRPCTypes: []string{"rest"},
 			expectedRPCType: sharedtypes.RPCType_REST,
 			expectedOK:      true,
 		},
 		{
 			name:            "single http type - comet_bft",
+			httpMethod:      http.MethodGet,
 			serviceRPCTypes: []string{"comet_bft"},
 			expectedRPCType: sharedtypes.RPCType_COMET_BFT,
 			expectedOK:      true,
 		},
 		{
 			name:            "rest + websocket",
+			httpMethod:      http.MethodGet,
 			serviceRPCTypes: []string{"rest", "websocket"},
 			expectedRPCType: sharedtypes.RPCType_REST,
 			expectedOK:      true,
 		},
 		{
 			name:            "multiple http types - need payload inspection",
+			httpMethod:      http.MethodPost,
 			serviceRPCTypes: []string{"json_rpc", "rest", "comet_bft"},
 			expectedRPCType: sharedtypes.RPCType_UNKNOWN_RPC,
 			expectedOK:      false,
 		},
 		{
 			name:            "only websocket - no http types",
+			httpMethod:      http.MethodGet,
 			serviceRPCTypes: []string{"websocket"},
 			expectedRPCType: sharedtypes.RPCType_UNKNOWN_RPC,
 			expectedOK:      false,
 		},
 		{
 			name:            "only grpc - no http types",
+			httpMethod:      http.MethodPost,
 			serviceRPCTypes: []string{"grpc"},
 			expectedRPCType: sharedtypes.RPCType_UNKNOWN_RPC,
 			expectedOK:      false,
 		},
 		{
 			name:            "websocket + grpc - no http types",
+			httpMethod:      http.MethodGet,
 			serviceRPCTypes: []string{"websocket", "grpc"},
 			expectedRPCType: sharedtypes.RPCType_UNKNOWN_RPC,
 			expectedOK:      false,
@@ -249,7 +273,8 @@ func TestRPCTypeDetector_ProcessOfElimination(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rpcType, ok := detector.processOfElimination(tt.serviceRPCTypes)
+			req := httptest.NewRequest(tt.httpMethod, "/", nil)
+			rpcType, ok := detector.processOfElimination(req, tt.serviceRPCTypes)
 
 			assert.Equal(t, tt.expectedOK, ok)
 			if tt.expectedOK {
@@ -321,6 +346,7 @@ func TestRPCTypeDetector_DetectRPCType_CommonCases(t *testing.T) {
 
 	tests := []struct {
 		name            string
+		httpMethod      string
 		serviceRPCTypes []string
 		headers         map[string]string
 		body            string
@@ -329,6 +355,7 @@ func TestRPCTypeDetector_DetectRPCType_CommonCases(t *testing.T) {
 	}{
 		{
 			name:            "websocket upgrade detected",
+			httpMethod:      http.MethodGet,
 			serviceRPCTypes: []string{"json_rpc", "websocket"},
 			headers: map[string]string{
 				"Upgrade": "websocket",
@@ -337,21 +364,38 @@ func TestRPCTypeDetector_DetectRPCType_CommonCases(t *testing.T) {
 			expectError:     false,
 		},
 		{
-			name:            "json_rpc by elimination (no payload inspection)",
+			name:            "json_rpc by elimination POST",
+			httpMethod:      http.MethodPost,
 			serviceRPCTypes: []string{"json_rpc", "websocket"},
 			headers:         map[string]string{},
 			expectedRPCType: sharedtypes.RPCType_JSON_RPC,
 			expectError:     false,
 		},
 		{
+			name:            "json_rpc only GET - rejected",
+			httpMethod:      http.MethodGet,
+			serviceRPCTypes: []string{"json_rpc"},
+			headers:         map[string]string{},
+			expectError:     true,
+		},
+		{
+			name:            "json_rpc + websocket GET - rejected",
+			httpMethod:      http.MethodGet,
+			serviceRPCTypes: []string{"json_rpc", "websocket"},
+			headers:         map[string]string{},
+			expectError:     true,
+		},
+		{
 			name:            "rest by elimination",
+			httpMethod:      http.MethodGet,
 			serviceRPCTypes: []string{"rest", "websocket"},
 			headers:         map[string]string{},
 			expectedRPCType: sharedtypes.RPCType_REST,
 			expectError:     false,
 		},
 		{
-			name:            "single type service",
+			name:            "single type service POST",
+			httpMethod:      http.MethodPost,
 			serviceRPCTypes: []string{"json_rpc"},
 			headers:         map[string]string{},
 			expectedRPCType: sharedtypes.RPCType_JSON_RPC,
@@ -362,6 +406,8 @@ func TestRPCTypeDetector_DetectRPCType_CommonCases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &http.Request{
+				Method: tt.httpMethod,
+				URL:    &url.URL{Path: "/"},
 				Header: http.Header{},
 				Body:   io.NopCloser(bytes.NewReader([]byte(tt.body))),
 			}
@@ -594,8 +640,9 @@ func TestRPCTypeDetector_OptimizationBehavior(t *testing.T) {
 
 	t.Run("most common case - no payload inspection", func(t *testing.T) {
 		// Service with ["json_rpc", "websocket"] should NEVER inspect payload
-		// for non-websocket requests
+		// for non-websocket POST requests
 		req := &http.Request{
+			Method: http.MethodPost,
 			Header: http.Header{},
 			Body:   io.NopCloser(bytes.NewReader([]byte(`{"method":"test"}`))),
 		}

@@ -3,6 +3,8 @@ package reputation
 import (
 	"context"
 	"errors"
+
+	"github.com/pokt-network/path/protocol"
 )
 
 // Common errors returned by storage implementations.
@@ -39,6 +41,27 @@ type Storage interface {
 	// List returns all stored endpoint keys for a service.
 	// If serviceID is empty, returns all endpoint keys.
 	List(ctx context.Context, serviceID string) ([]EndpointKey, error)
+
+	// SetPerceivedBlockNumber stores the perceived block number for a service.
+	// Uses atomic max semantics: only updates if new value > stored value.
+	// This enables sharing chain state across replicas.
+	SetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID, blockNumber uint64) error
+
+	// GetPerceivedBlockNumber retrieves the perceived block number for a service.
+	// Returns 0 if no block number has been stored yet.
+	GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) (uint64, error)
+
+	// SetEndpointBlockHeight stores a single endpoint's block height for a service.
+	// Uses HSET on a Redis hash keyed by service ID, with endpoint address as field.
+	SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error
+
+	// GetEndpointBlockHeights retrieves all endpoint block heights for a service.
+	// Returns a map of endpoint address to block height.
+	GetEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID) (map[protocol.EndpointAddr]uint64, error)
+
+	// RemoveEndpointBlockHeights removes endpoint block height entries for a service.
+	// Used by stale endpoint cleanup to remove entries that are no longer in active sessions.
+	RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error
 
 	// Close releases any resources held by the storage.
 	Close() error

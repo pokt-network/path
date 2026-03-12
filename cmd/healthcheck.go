@@ -134,8 +134,8 @@ func runHealthCheckLoop(
 	protocolInstance gateway.Protocol,
 	leaderElector *gateway.LeaderElector,
 ) {
-	// Default check interval
-	checkInterval := 30 * time.Second
+	// Get check interval from service configs (use minimum if multiple, default to 10s)
+	checkInterval := getMinCheckInterval(executor)
 
 	logger.Info().
 		Dur("check_interval", checkInterval).
@@ -194,4 +194,35 @@ func runHealthChecks(
 	if err != nil {
 		logger.Warn().Err(err).Msg("Some health checks failed")
 	}
+}
+
+// getMinCheckInterval returns the minimum check interval from all configured services.
+// If no services are configured or all have 0 interval, defaults to 10 seconds.
+func getMinCheckInterval(executor *gateway.HealthCheckExecutor) time.Duration {
+	const defaultInterval = 10 * time.Second
+
+	if executor == nil {
+		return defaultInterval
+	}
+
+	configs := executor.GetServiceConfigs()
+	if len(configs) == 0 {
+		return defaultInterval
+	}
+
+	// Find minimum non-zero interval
+	minInterval := time.Duration(0)
+	for _, cfg := range configs {
+		if cfg.CheckInterval > 0 {
+			if minInterval == 0 || cfg.CheckInterval < minInterval {
+				minInterval = cfg.CheckInterval
+			}
+		}
+	}
+
+	if minInterval == 0 {
+		return defaultInterval
+	}
+
+	return minInterval
 }

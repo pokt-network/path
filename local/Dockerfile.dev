@@ -22,14 +22,14 @@ RUN apk add --no-cache \
 # Install ajv-cli (for validating config.yaml against config.schema.yaml)
 RUN npm install -g ajv-cli
 
-# Install Go 1.24.3
+# Install Go 1.25.7
 RUN set -ex && \
     case "${TARGETPLATFORM:-linux/$(uname -m)}" in \
     "linux/amd64") ARCH="amd64" ;; \
     "linux/arm64") ARCH="arm64" ;; \
     *) echo "Unsupported platform: ${TARGETPLATFORM:-linux/$(uname -m)}" && exit 1 ;; \
     esac && \
-    FILENAME="go1.24.3.linux-${ARCH}.tar.gz" && \
+    FILENAME="go1.25.7.linux-${ARCH}.tar.gz" && \
     curl -L -o ${FILENAME} https://go.dev/dl/${FILENAME} && \
     rm -rf /usr/local/go && \
     tar -C /usr/local -xzf ${FILENAME} && \

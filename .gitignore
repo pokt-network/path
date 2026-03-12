@@ -91,3 +91,7 @@ node_modules
 
 # JWKS file
 jwks.json
+
+# test results
+load_test_results
+.planning/

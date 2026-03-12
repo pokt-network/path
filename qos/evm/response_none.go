@@ -20,6 +20,9 @@ var _ response = responseNone{}
 type responseNone struct {
 	logger          polylog.Logger
 	servicePayloads map[jsonrpc.ID]protocol.Payload
+	// protocolError contains the specific protocol-level error if available.
+	// Used to provide more informative error messages to clients.
+	protocolError error
 }
 
 // GetObservation returns an observation indicating no endpoint provided a response.
@@ -49,8 +52,19 @@ func (r responseNone) GetHTTPResponse() jsonrpc.HTTPResponse {
 
 // getResponsePayload constructs a JSONRPC error response indicating no endpoint response was received.
 // Uses request ID in response per JSONRPC spec: https://www.jsonrpc.org/specification#response_object
+// If a protocol error is available, it uses that for a more specific error message.
 func (r responseNone) getResponsePayload() []byte {
-	userResponse := jsonrpc.NewErrResponseNoEndpointResponse(getJsonRpcIDForErrorResponse(r.servicePayloads))
+	requestID := getJsonRpcIDForErrorResponse(r.servicePayloads)
+
+	var userResponse jsonrpc.Response
+	if r.protocolError != nil {
+		// Use the specific protocol error message for better client feedback
+		userResponse = jsonrpc.NewErrResponseInternalErr(requestID, r.protocolError)
+	} else {
+		// Fall back to generic "no endpoint response" message
+		userResponse = jsonrpc.NewErrResponseNoEndpointResponse(requestID)
+	}
+
 	bz, err := json.Marshal(userResponse)
 	if err != nil {
 		// This should never happen: log an entry but return the response anyway.

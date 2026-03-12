@@ -48,3 +48,12 @@ func getNoEndpointResponse() pathhttp.HTTPResponse {
 		payload:        formatJSONError(clientRespMsgNoProtocolEndpoints, err),
 	}
 }
+
+// getNoEndpointResponseWithError creates a HTTP response for no endpoint responses
+// with a specific error message for more informative client feedback.
+func getNoEndpointResponseWithError(protocolErr error) pathhttp.HTTPResponse {
+	return &HTTPResponse{
+		httpStatusCode: http.StatusInternalServerError,
+		payload:        formatJSONError(clientRespMsgNoProtocolEndpoints, protocolErr),
+	}
+}

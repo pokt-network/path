@@ -96,15 +96,23 @@ func (ec *errorContext) GetServicePayloads() []protocol.Payload {
 // UpdateWithResponse should never be called.
 // Only logs a warning.
 // Implements the gateway.RequestQoSContext interface.
-func (ec *errorContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int) {
+func (ec *errorContext) UpdateWithResponse(endpointAddr protocol.EndpointAddr, endpointSerializedResponse []byte, httpStatusCode int, requestID string) {
 	ec.logger.With(
 		"endpoint_addr", endpointAddr,
 		"endpoint_response_len", len(endpointSerializedResponse),
 		"http_status_code", httpStatusCode,
+		"request_id", requestID,
 	).Warn().Msg("SHOULD NEVER HAPPEN: errorContext.UpdateWithResponse() should never be called.")
 }
 
-// UpdateWithResponse should never be called.
+// SetProtocolError is a no-op for errorContext since this context
+// already has an error stored from its construction.
+// Implements the gateway.RequestQoSContext interface.
+func (ec *errorContext) SetProtocolError(err error) {
+	// No-op: errorContext already has an error response set.
+}
+
+// GetEndpointSelector should never be called.
 // It logs a warning and returns a failing selector that logs a warning on all selection attempts.
 // Implements the gateway.RequestQoSContext interface.
 func (ec *errorContext) GetEndpointSelector() protocol.EndpointSelector {
@@ -139,6 +147,15 @@ func (ets errorTrackingSelector) Select(endpoints protocol.EndpointAddrList) (pr
 // Implements the protocol.EndpointSelector interface.
 func (ets errorTrackingSelector) SelectMultiple(endpoints protocol.EndpointAddrList, numEndpoints uint) (protocol.EndpointAddrList, error) {
 	ets.logger.Warn().Msg("SHOULD NEVER HAPPEN: errorTrackingSelector.SelectMultiple() should never be called.")
+
+	return nil, errInvalidSelectorUsage
+}
+
+// SelectMultipleWithArchival method of an errorTrackingSelector should never be called.
+// It logs a warning and returns an invalid usage error.
+// Implements the protocol.EndpointSelector interface.
+func (ets errorTrackingSelector) SelectMultipleWithArchival(endpoints protocol.EndpointAddrList, _ uint, _ bool) (protocol.EndpointAddrList, error) {
+	ets.logger.Warn().Msg("SHOULD NEVER HAPPEN: errorTrackingSelector.SelectMultipleWithArchival() should never be called.")
 
 	return nil, errInvalidSelectorUsage
 }

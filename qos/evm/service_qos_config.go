@@ -9,9 +9,9 @@ import (
 // QoSType is the QoS type for the EVM blockchain.
 const QoSType = "evm"
 
-// 128 is the default archival threshold for EVM-based chains.
-// This is an opinionated value that aligns with industry standard
-// practices for defining what constitutes an archival block.
+// DefaultEVMArchivalThreshold is the default archival threshold for EVM-based chains.
+// This is used by the archival heuristic to determine which requests require archival data.
+// A block is considered "archival" if it's this many blocks behind the perceived block number.
 const DefaultEVMArchivalThreshold = 128
 
 // defaultEVMBlockNumberSyncAllowance is the default sync allowance for EVM-based chains.
@@ -28,45 +28,26 @@ type ServiceQoSConfig interface {
 }
 
 // EVMServiceQoSConfig is the configuration for the EVM service QoS.
+//
+// Note: Archival capability is determined by external health checks, not by config.
+// Health checks mark endpoints as archival-capable via UpdateFromExtractedData.
 type EVMServiceQoSConfig interface {
 	ServiceQoSConfig // Using locally defined interface to avoid circular dependency
 	getEVMChainID() string
 	getSyncAllowance() uint64
-	getEVMArchivalCheckConfig() evmArchivalCheckConfig
-	archivalCheckEnabled() bool
 	getSupportedAPIs() map[sharedtypes.RPCType]struct{}
 }
 
-// evmArchivalCheckConfig is the configuration for the archival check.
-//
-// The basic methodology is:
-//  1. Select a `ContractAddress` for the chain with a frequent transaction volume and large balance.
-//  2. Determine its starting block height (`ContractStartBlock`).
-//  3. Set a `Threshold` for how many blocks below the current block number are considered "archival" data.
-//
-// With all of this data, the QoS implementation can select a random block number to check using `eth_getBalance`.
-type evmArchivalCheckConfig struct {
-	threshold          uint64 // The number of blocks below the current block number to be considered "archival" data
-	contractAddress    string // The address of the contract to check for the archival balance.
-	contractStartBlock uint64 // The start block of the contract address (ie. when it first had a balance)
-}
-
-func (c evmArchivalCheckConfig) IsEmpty() bool {
-	return c.contractAddress == "" || c.contractStartBlock == 0 || c.threshold == 0
-}
-
-// NewEVMServiceQoSConfig creates a new EVM service configuration with the specified archival check settings.
+// NewEVMServiceQoSConfig creates a new EVM service configuration.
 func NewEVMServiceQoSConfig(
 	serviceID protocol.ServiceID,
 	evmChainID string,
-	archivalCheckConfig *evmArchivalCheckConfig,
 	supportedAPIs map[sharedtypes.RPCType]struct{},
 ) EVMServiceQoSConfig {
 	return evmServiceQoSConfig{
-		serviceID:           serviceID,
-		evmChainID:          evmChainID,
-		archivalCheckConfig: archivalCheckConfig,
-		supportedAPIs:       supportedAPIs,
+		serviceID:     serviceID,
+		evmChainID:    evmChainID,
+		supportedAPIs: supportedAPIs,
 	}
 }
 
@@ -74,27 +55,14 @@ func NewEVMServiceQoSConfig(
 func NewEVMServiceQoSConfigWithSyncAllowance(
 	serviceID protocol.ServiceID,
 	evmChainID string,
-	archivalCheckConfig *evmArchivalCheckConfig,
 	supportedAPIs map[sharedtypes.RPCType]struct{},
 	syncAllowance uint64,
 ) EVMServiceQoSConfig {
 	return evmServiceQoSConfig{
-		serviceID:           serviceID,
-		evmChainID:          evmChainID,
-		archivalCheckConfig: archivalCheckConfig,
-		supportedAPIs:       supportedAPIs,
-		syncAllowance:       syncAllowance,
-	}
-}
-
-func NewEVMArchivalCheckConfig(
-	contractAddress string,
-	contractStartBlock uint64,
-) *evmArchivalCheckConfig {
-	return &evmArchivalCheckConfig{
-		threshold:          DefaultEVMArchivalThreshold,
-		contractAddress:    contractAddress,
-		contractStartBlock: contractStartBlock,
+		serviceID:     serviceID,
+		evmChainID:    evmChainID,
+		supportedAPIs: supportedAPIs,
+		syncAllowance: syncAllowance,
 	}
 }
 
@@ -102,11 +70,10 @@ func NewEVMArchivalCheckConfig(
 var _ EVMServiceQoSConfig = (*evmServiceQoSConfig)(nil)
 
 type evmServiceQoSConfig struct {
-	serviceID           protocol.ServiceID
-	evmChainID          string
-	syncAllowance       uint64
-	archivalCheckConfig *evmArchivalCheckConfig
-	supportedAPIs       map[sharedtypes.RPCType]struct{}
+	serviceID     protocol.ServiceID
+	evmChainID    string
+	syncAllowance uint64
+	supportedAPIs map[sharedtypes.RPCType]struct{}
 }
 
 // GetServiceID returns the ID of the service.
@@ -134,18 +101,6 @@ func (c evmServiceQoSConfig) getSyncAllowance() uint64 {
 		c.syncAllowance = defaultEVMBlockNumberSyncAllowance
 	}
 	return c.syncAllowance
-}
-
-// archivalCheckEnabled returns true if the archival check is enabled.
-// If the archival check is not enabled for the service, this will always return false.
-func (c evmServiceQoSConfig) archivalCheckEnabled() bool {
-	return c.archivalCheckConfig != nil
-}
-
-// getEVMArchivalCheckConfig returns the archival check configuration.
-// Implements the EVMServiceQoSConfig interface.
-func (c evmServiceQoSConfig) getEVMArchivalCheckConfig() evmArchivalCheckConfig {
-	return *c.archivalCheckConfig
 }
 
 // getSupportedAPIs returns the RPC types supported by the service.

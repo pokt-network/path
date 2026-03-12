@@ -157,6 +157,11 @@ type Protocol struct {
 	// redundant AllEndpoints() calls and endpoint map construction on every request.
 	// Key: sessionId (string), Value: map[protocol.EndpointAddr]endpoint
 	sessionEndpointsCache sync.Map
+
+	// qosServiceRegistry provides access to QoS services by service ID.
+	// Used by GetServiceEndpointDetails to query archival status for endpoints.
+	// Set via SetQoSServiceRegistry after initialization.
+	qosServiceRegistry gateway.QoSServiceRegistry
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -203,11 +208,14 @@ func NewProtocol(
 			}
 			return 0
 		}(),
+		ConnectTimeout:             config.RetryConfig.ConnectTimeout,
+		HedgeDelay:                 config.RetryConfig.HedgeDelay,
 		ObservationPipelineEnabled: config.ObservationPipelineConfig.Enabled,
 		SampleRate:                 config.ObservationPipelineConfig.SampleRate,
 		HealthChecksEnabled:        config.ActiveHealthChecksConfig.Enabled,
 		HealthCheckInterval:        config.ActiveHealthChecksConfig.Coordination.RenewInterval,
 		SyncAllowance:              config.ActiveHealthChecksConfig.SyncAllowance,
+		LocalHealthChecks:          config.ActiveHealthChecksConfig.Local,
 	})
 
 	// Apply defaults to concurrency config if not set.
@@ -528,7 +536,7 @@ func (p *Protocol) AvailableHTTPEndpoints(
 	// The final boolean parameter sets whether to filter by reputation.
 	// The final RPC type parameter filters endpoints to only those supporting the requested RPC type.
 	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, rpcType, allowedSuppliers)
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, rpcType, allowedSuppliers, "")
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -606,7 +614,7 @@ func (p *Protocol) AvailableWebsocketEndpoints(
 	// low initial scores. We use filterByReputation=false to allow connections to all WebSocket
 	// endpoints until WebSocket health checks are implemented.
 	// TODO_IMPROVE: Add WebSocket health checks and re-enable reputation filtering.
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers)
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers, "")
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -681,7 +689,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 	// The filterByReputation parameter controls whether to filter by reputation score.
 	// The RPC type parameter filters endpoints to only those supporting the requested RPC type.
 	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers)
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers, selectedEndpointAddr)
 	if err != nil {
 		// Log with fresh context (without endpoint_addr which doesn't apply here)
 		logEvent := p.logger.Error().Err(err).
@@ -735,9 +743,9 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 	// This ensures QoS checks are performed on the selected endpoint.
 	selectedEndpoint, ok := endpoints[selectedEndpointAddr]
 	if !ok {
-		// Wrap the context setup error.
-		// Used to generate the observation.
-		err := fmt.Errorf("%w: service %s endpoint %s", errRequestContextSetupInvalidEndpointSelected, serviceID, selectedEndpointAddr)
+		// Wrap the context setup error with the protocol package's error.
+		// This allows the gateway package to detect and handle this specific case.
+		err := fmt.Errorf("%w: service %s endpoint %s", protocol.ErrEndpointUnavailable, serviceID, selectedEndpointAddr)
 		// Log at DEBUG level - this is expected during session rollover when:
 		// - Health check was scheduled with an endpoint from an old session
 		// - Session has since rolled over and the endpoint is no longer in the new session
@@ -873,6 +881,7 @@ func (p *Protocol) getUniqueEndpoints(
 	filterByReputation bool,
 	rpcType sharedtypes.RPCType,
 	allowedSuppliers []string,
+	requestedEndpointAddr protocol.EndpointAddr,
 ) (map[protocol.EndpointAddr]endpoint, sharedtypes.RPCType, error) {
 	logger := p.logger.With(
 		"method", "getUniqueEndpoints",
@@ -892,7 +901,7 @@ func (p *Protocol) getUniqueEndpoints(
 
 	// Try to get session endpoints first.
 	// Don't log errors here - will be logged at top-level caller with session context
-	sessionEndpoints, actualRPCType, _ := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers)
+	sessionEndpoints, actualRPCType, _ := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers, requestedEndpointAddr)
 
 	// Session endpoints are available, use them.
 	// This is the happy path where we have session endpoints available (after reputation filtering).
@@ -928,6 +937,7 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 	filterByReputation bool,
 	filterByRPCType sharedtypes.RPCType,
 	allowedSuppliers []string,
+	requestedEndpointAddr protocol.EndpointAddr,
 ) (map[protocol.EndpointAddr]endpoint, sharedtypes.RPCType, error) {
 	logger := p.logger.With(
 		"method", "getSessionsUniqueEndpoints",
@@ -992,8 +1002,8 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 
 			for addr, ep := range sessionEndpoints {
 				url := ep.GetURL(filterByRPCType)
-				if url != "" {
-					// Supplier supports this RPC type
+				if url != "" || addr == requestedEndpointAddr {
+					// Supplier supports this RPC type (or is the requested endpoint)
 					filteredEndpoints[addr] = ep
 				} else {
 					// Supplier doesn't support requested RPC type - skip it
@@ -1100,7 +1110,7 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 					}
 				}
 
-				if allowed {
+				if allowed || addr == requestedEndpointAddr {
 					supplierFilteredEndpoints[addr] = ep
 				} else {
 					skippedCount++
@@ -1143,7 +1153,7 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 
 			for addr, ep := range qualifiedEndpoints {
 				supplierAddr := ep.Supplier()
-				if p.supplierBlacklist.IsBlacklisted(serviceID, supplierAddr) {
+				if p.supplierBlacklist.IsBlacklisted(serviceID, supplierAddr) && addr != requestedEndpointAddr {
 					blacklistSkipped++
 					logger.Debug().
 						Str("supplier", supplierAddr).
@@ -1172,7 +1182,7 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		// - supplier filtering is active (user wants specific suppliers)
 		if filterByReputation && p.reputationService != nil && len(effectiveAllowedSuppliers) == 0 {
 			beforeCount := len(qualifiedEndpoints)
-			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, filterByRPCType, logger)
+			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, filterByRPCType, logger, requestedEndpointAddr)
 
 			if len(qualifiedEndpoints) == 0 {
 				logger.Warn().Msgf(
@@ -1205,7 +1215,7 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		// SKIP tiered filtering when filterByReputation is false (e.g., for leaderboard metrics gathering)
 		// because tiered selection is based on reputation scores.
 		if filterByReputation && p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
-			endpoints = p.filterToHighestTier(ctx, serviceID, endpoints, filterByRPCType, logger)
+			endpoints = p.filterToHighestTier(ctx, serviceID, endpoints, filterByRPCType, logger, requestedEndpointAddr)
 		}
 
 		logger.Debug().Msgf("Successfully fetched %d session endpoints for active sessions.", len(endpoints))
@@ -1246,7 +1256,7 @@ func (p *Protocol) GetTotalServiceEndpointsCount(serviceID protocol.ServiceID, h
 
 	// Get all endpoints for the service ID without filtering by reputation.
 	// No supplier filtering since we don't have access to httpReq here.
-	endpoints, _, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, false, sharedtypes.RPCType_UNKNOWN_RPC, nil)
+	endpoints, _, err := p.getSessionsUniqueEndpoints(ctx, serviceID, activeSessions, false, sharedtypes.RPCType_UNKNOWN_RPC, nil, "")
 	if err != nil {
 		return 0, err
 	}
@@ -1620,6 +1630,13 @@ func (p *Protocol) getRPCTypeFallback(serviceID protocol.ServiceID, requestedRPC
 // This is used by components that need to respect concurrency limits.
 func (p *Protocol) GetConcurrencyConfig() gateway.ConcurrencyConfig {
 	return p.concurrencyConfig
+}
+
+// SetQoSServiceRegistry sets the QoS service registry for the protocol.
+// This is called after initialization to provide access to QoS services
+// for querying endpoint-specific data like archival status.
+func (p *Protocol) SetQoSServiceRegistry(registry gateway.QoSServiceRegistry) {
+	p.qosServiceRegistry = registry
 }
 
 // UnblacklistSupplier removes a supplier from the blacklist.

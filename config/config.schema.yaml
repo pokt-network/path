@@ -346,6 +346,16 @@ properties:
             type: string
             pattern: "^[0-9]+m?s$"
             default: "500ms"
+          connect_timeout:
+            description: "Maximum time to establish a TCP connection. Used for fast failure detection. Default: 500ms."
+            type: string
+            pattern: "^[0-9]+m?s$"
+            default: "500ms"
+          hedge_delay:
+            description: "Time to wait before starting a hedge (parallel) request to a different endpoint. If the primary request doesn't respond within this time, a second request is started to the TOP-ranked alternative endpoint. Set to 0 to disable hedging. Default: 500ms."
+            type: string
+            pattern: "^[0-9]+m?s$"
+            default: "500ms"
 
       # Observation Pipeline Configuration
       observation_pipeline:
@@ -581,6 +591,8 @@ properties:
               $ref: "#/definitions/service_observation_config"
             concurrency_config:
               $ref: "#/definitions/service_concurrency_config"
+            timeout_config:
+              $ref: "#/definitions/service_timeout_config"
             fallback:
               description: "Fallback endpoint configuration (no defaults - must be explicitly set per-service)."
               type: object
@@ -878,6 +890,16 @@ definitions:
         description: "Maximum latency budget for retries."
         type: string
         pattern: "^[0-9]+m?s$"
+      connect_timeout:
+        description: "Maximum time to establish a TCP connection. Used for fast failure detection. Default: 500ms."
+        type: string
+        pattern: "^[0-9]+m?s$"
+        default: "500ms"
+      hedge_delay:
+        description: "Time to wait before starting a hedge (parallel) request to a different endpoint. If the primary request doesn't respond within this time, a second request is started to the TOP-ranked alternative endpoint. Set to 0 to disable hedging. Default: 500ms."
+        type: string
+        pattern: "^[0-9]+m?s$"
+        default: "500ms"
 
   # Per-service observation pipeline configuration
   # Note: worker_count and queue_size are GLOBAL only (gateway_config.observation_pipeline)
@@ -995,7 +1017,23 @@ definitions:
             archival:
               description: "Is this an archival check."
               type: boolean
+            sync_check:
+              description: "Enable sync check validation. When true, extracts block height from response and validates against the service's sync_allowance. Requires sync_allowance > 0."
+              type: boolean
+              default: false
             reputation_signal:
               description: "Signal type on failure."
               type: string
               enum: ["minor_error", "major_error", "critical_error", "fatal_error"]
+
+  # Per-service timeout configuration
+  service_timeout_config:
+    description: "Per-service timeout configuration. Allows different services to have different timeouts based on their payload sizes and expected response times."
+    type: object
+    additionalProperties: false
+    properties:
+      relay_timeout:
+        description: "Maximum time to wait for a response from a backend endpoint. LLM services may need 60s+, fast EVM chains may only need 5s. Default: 10s."
+        type: string
+        pattern: "^[0-9]+[smh]$"
+        default: "10s"

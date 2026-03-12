@@ -8,10 +8,22 @@
 package types
 
 import (
+	"errors"
 	"time"
 
 	"github.com/pokt-network/path/protocol"
 )
+
+// ErrInvalidBlockHeightResult is returned by DataExtractor.ExtractBlockHeight when the
+// response contains a result field but the result cannot be parsed as a block height.
+// For example, a supplier returning {"result":[]} for eth_blockNumber.
+//
+// This is distinct from "method not relevant" errors (e.g., eth_getBalance has no block height)
+// and from JSON-RPC error responses (which are valid protocol responses).
+//
+// When this error is returned, the endpoint should be marked with block height 0 so the
+// block height filter catches it, rather than treating it as "unknown/fresh".
+var ErrInvalidBlockHeightResult = errors.New("invalid block height result")
 
 // DataExtractor defines how endpoint quality data is extracted from responses.
 // All QoS services (EVM, Cosmos, Solana, generic) implement this interface.
@@ -24,48 +36,65 @@ type DataExtractor interface {
 	// This is used to determine sync status - endpoints behind in block height
 	// are potentially stale or syncing.
 	//
+	// Parameters:
+	//   - request: Original request bytes (to identify method)
+	//   - response: Response bytes to parse
+	//
 	// Returns:
 	//   - Block height as int64
 	//   - Error if extraction fails or response doesn't contain block height
-	ExtractBlockHeight(response []byte) (int64, error)
+	ExtractBlockHeight(request []byte, response []byte) (int64, error)
 
 	// ExtractChainID extracts the chain identifier from a response.
 	// This is used to validate endpoints are on the correct chain.
 	//
+	// Parameters:
+	//   - request: Original request bytes (to identify method)
+	//   - response: Response bytes to parse
+	//
 	// Returns:
 	//   - Chain ID as string (hex for EVM, chain-name for Cosmos)
 	//   - Error if extraction fails or response doesn't contain chain ID
-	ExtractChainID(response []byte) (string, error)
+	ExtractChainID(request []byte, response []byte) (string, error)
 
 	// IsSyncing determines if the endpoint is currently syncing.
 	// Syncing endpoints may return stale data and should be deprioritized.
+	//
+	// Parameters:
+	//   - request: Original request bytes (to identify method)
+	//   - response: Response bytes to parse
 	//
 	// Returns:
 	//   - true if endpoint is syncing
 	//   - false if endpoint is synced
 	//   - Error if sync status cannot be determined
-	IsSyncing(response []byte) (bool, error)
+	IsSyncing(request []byte, response []byte) (bool, error)
 
 	// IsArchival determines if the endpoint supports archival queries.
 	// Archival endpoints can serve historical data queries.
 	//
 	// Parameters:
-	//   - response: Response from an archival-specific query (e.g., eth_getBalance at historical block)
+	//   - request: Original request bytes (to identify method)
+	//   - response: Response bytes to parse
 	//
 	// Returns:
 	//   - true if endpoint is archival (query succeeded)
 	//   - false if endpoint is not archival (query failed)
 	//   - Error if archival status cannot be determined
-	IsArchival(response []byte) (bool, error)
+	IsArchival(request []byte, response []byte) (bool, error)
 
 	// IsValidResponse checks if the response is valid for the protocol.
 	// This performs basic validation without extracting specific data.
+	//
+	// Parameters:
+	//   - request: Original request bytes (to identify method)
+	//   - response: Response bytes to parse
 	//
 	// Returns:
 	//   - true if response is valid (correct format, no errors)
 	//   - false if response is invalid (malformed, contains error)
 	//   - Error if validation fails unexpectedly
-	IsValidResponse(response []byte) (bool, error)
+	IsValidResponse(request []byte, response []byte) (bool, error)
 }
 
 // ExtractedData holds all data extracted from a response.
@@ -74,6 +103,12 @@ type ExtractedData struct {
 	// BlockHeight is the latest block number (0 if not extracted).
 	BlockHeight int64
 
+	// InvalidBlockHeight is set when block height extraction was attempted
+	// but the supplier returned an unparseable result (e.g. "result":[] or "result":{}).
+	// When true, the endpoint should be marked with block height 0 so the
+	// block height filter catches it, rather than treating it as "unknown".
+	InvalidBlockHeight bool
+
 	// ChainID is the chain identifier (empty if not extracted).
 	ChainID string
 
@@ -81,7 +116,13 @@ type ExtractedData struct {
 	IsSyncing bool
 
 	// IsArchival indicates if the endpoint supports archival queries.
+	// Only meaningful when ArchivalCheckPerformed is true.
 	IsArchival bool
+
+	// ArchivalCheckPerformed indicates whether an archival check was actually performed.
+	// When true, IsArchival contains a definitive result (true or false).
+	// When false, IsArchival should be ignored (request wasn't an archival query).
+	ArchivalCheckPerformed bool
 
 	// IsValidResponse indicates if the response was valid.
 	IsValidResponse bool
@@ -117,37 +158,44 @@ func NewExtractedData(endpointAddr protocol.EndpointAddr, statusCode int, respon
 // ExtractAll runs all extractors and populates the ExtractedData.
 // Errors are captured in ExtractionErrors rather than returned directly,
 // allowing partial extraction even when some fields fail.
-func (ed *ExtractedData) ExtractAll(extractor DataExtractor) {
+func (ed *ExtractedData) ExtractAll(extractor DataExtractor, request []byte) {
 	// Extract block height
-	if blockHeight, err := extractor.ExtractBlockHeight(ed.RawResponse); err == nil {
+	if blockHeight, err := extractor.ExtractBlockHeight(request, ed.RawResponse); err == nil {
 		ed.BlockHeight = blockHeight
 	} else {
 		ed.ExtractionErrors["block_height"] = err.Error()
+		// If the extractor signals that the response had a result but it was unparseable,
+		// mark it so UpdateFromExtractedData stores block height 0 (filter catches it)
+		// instead of leaving the endpoint as "unknown" (filter skips it).
+		if errors.Is(err, ErrInvalidBlockHeightResult) {
+			ed.InvalidBlockHeight = true
+		}
 	}
 
 	// Extract chain ID
-	if chainID, err := extractor.ExtractChainID(ed.RawResponse); err == nil {
+	if chainID, err := extractor.ExtractChainID(request, ed.RawResponse); err == nil {
 		ed.ChainID = chainID
 	} else {
 		ed.ExtractionErrors["chain_id"] = err.Error()
 	}
 
 	// Check sync status
-	if isSyncing, err := extractor.IsSyncing(ed.RawResponse); err == nil {
+	if isSyncing, err := extractor.IsSyncing(request, ed.RawResponse); err == nil {
 		ed.IsSyncing = isSyncing
 	} else {
 		ed.ExtractionErrors["is_syncing"] = err.Error()
 	}
 
 	// Check archival status
-	if isArchival, err := extractor.IsArchival(ed.RawResponse); err == nil {
+	if isArchival, err := extractor.IsArchival(request, ed.RawResponse); err == nil {
 		ed.IsArchival = isArchival
+		ed.ArchivalCheckPerformed = true // Mark that we got a definitive result
 	} else {
 		ed.ExtractionErrors["is_archival"] = err.Error()
 	}
 
 	// Validate response
-	if isValid, err := extractor.IsValidResponse(ed.RawResponse); err == nil {
+	if isValid, err := extractor.IsValidResponse(request, ed.RawResponse); err == nil {
 		ed.IsValidResponse = isValid
 	} else {
 		ed.ExtractionErrors["is_valid"] = err.Error()
@@ -190,17 +238,20 @@ func DefaultExtractionConfig() ExtractionConfig {
 }
 
 // ExtractWithConfig runs extractions based on the provided config.
-func (ed *ExtractedData) ExtractWithConfig(extractor DataExtractor, config ExtractionConfig) {
+func (ed *ExtractedData) ExtractWithConfig(extractor DataExtractor, request []byte, config ExtractionConfig) {
 	if config.ExtractBlockHeight {
-		if blockHeight, err := extractor.ExtractBlockHeight(ed.RawResponse); err == nil {
+		if blockHeight, err := extractor.ExtractBlockHeight(request, ed.RawResponse); err == nil {
 			ed.BlockHeight = blockHeight
 		} else {
 			ed.ExtractionErrors["block_height"] = err.Error()
+			if errors.Is(err, ErrInvalidBlockHeightResult) {
+				ed.InvalidBlockHeight = true
+			}
 		}
 	}
 
 	if config.ExtractChainID {
-		if chainID, err := extractor.ExtractChainID(ed.RawResponse); err == nil {
+		if chainID, err := extractor.ExtractChainID(request, ed.RawResponse); err == nil {
 			ed.ChainID = chainID
 		} else {
 			ed.ExtractionErrors["chain_id"] = err.Error()
@@ -208,7 +259,7 @@ func (ed *ExtractedData) ExtractWithConfig(extractor DataExtractor, config Extra
 	}
 
 	if config.CheckSyncStatus {
-		if isSyncing, err := extractor.IsSyncing(ed.RawResponse); err == nil {
+		if isSyncing, err := extractor.IsSyncing(request, ed.RawResponse); err == nil {
 			ed.IsSyncing = isSyncing
 		} else {
 			ed.ExtractionErrors["is_syncing"] = err.Error()
@@ -216,15 +267,16 @@ func (ed *ExtractedData) ExtractWithConfig(extractor DataExtractor, config Extra
 	}
 
 	if config.CheckArchival {
-		if isArchival, err := extractor.IsArchival(ed.RawResponse); err == nil {
+		if isArchival, err := extractor.IsArchival(request, ed.RawResponse); err == nil {
 			ed.IsArchival = isArchival
+			ed.ArchivalCheckPerformed = true // Mark that we got a definitive result
 		} else {
 			ed.ExtractionErrors["is_archival"] = err.Error()
 		}
 	}
 
 	if config.ValidateResponse {
-		if isValid, err := extractor.IsValidResponse(ed.RawResponse); err == nil {
+		if isValid, err := extractor.IsValidResponse(request, ed.RawResponse); err == nil {
 			ed.IsValidResponse = isValid
 		} else {
 			ed.ExtractionErrors["is_valid"] = err.Error()
