@@ -53,6 +53,7 @@ func checkResponseSuccess(
 	responseBytes []byte,
 	heuristicRPCType sharedtypes.RPCType,
 	jsonrpcMethod string,
+	requestID string,
 	logger polylog.Logger,
 ) responseCheckResult {
 	// Protocol error - definitely not successful
@@ -77,6 +78,20 @@ func checkResponseSuccess(
 			Int("response_size", len(responseBytes)).
 			Msg("Heuristic analysis detected error in response payload despite HTTP success status")
 		return responseCheckResult{Success: false, HeuristicResult: &result}
+	}
+
+	// Check for fabricated responses via request ID mismatch.
+	// Suppliers that fabricate responses (e.g., wrapping 5xx as JSON-RPC errors)
+	// often return "id":null instead of echoing the request ID.
+	if requestID != "" && heuristicRPCType == sharedtypes.RPCType_JSON_RPC {
+		if idResult := heuristic.CheckRequestIDMismatch(responseBytes, requestID); idResult != nil {
+			logger.Debug().
+				Str("heuristic_reason", idResult.Reason).
+				Str("request_id", requestID).
+				Str("heuristic_details", idResult.Details).
+				Msg("Request ID mismatch detected — supplier fabricated the response")
+			return responseCheckResult{Success: false, HeuristicResult: idResult}
+		}
 	}
 
 	return responseCheckResult{Success: true}
@@ -197,7 +212,8 @@ func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCod
 func isDeceptiveResponsePattern(reason string) bool {
 	switch reason {
 	case "jsonrpc_invalid_empty_array", "jsonrpc_empty_object_result",
-		"rest_protocol_mismatch", "cometbft_invalid_empty_array":
+		"rest_protocol_mismatch", "cometbft_invalid_empty_array",
+		"jsonrpc_fabricated_parse_error", "jsonrpc_wrapped_service_error", "jsonrpc_id_mismatch":
 		return true
 	default:
 		return false
@@ -537,7 +553,11 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					responseBytesForHeuristic := hedgeResponses[0].Bytes
 
 					// Check if response is actually successful (HTTP status + heuristic)
-					checkResult := checkResponseSuccess(hedgeErr, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, logger)
+					hedgeRequestID := ""
+					if len(hedgeResponses) > 0 {
+						hedgeRequestID = hedgeResponses[0].RequestID
+					}
+					checkResult := checkResponseSuccess(hedgeErr, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, hedgeRequestID, logger)
 					if checkResult.Success {
 						// Success! Process the response
 						for _, endpointResponse := range hedgeResponses {
@@ -678,12 +698,14 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 
 		// Extract response bytes for heuristic analysis
 		var responseBytesForHeuristic []byte
+		requestID := ""
 		if len(endpointResponses) > 0 {
 			responseBytesForHeuristic = endpointResponses[0].Bytes
+			requestID = endpointResponses[0].RequestID
 		}
 
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
-		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, logger)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, requestID, logger)
 		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
@@ -1050,10 +1072,11 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 
 			if hedgeErr == nil && len(hedgeResponses) > 0 {
 				resp := hedgeResponses[0]
-				checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, logger)
+				batchRequestID := extractRequestIDFromPayload(payload)
+				checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, batchRequestID, logger)
 				if checkResult.Success {
 					// Extract request ID from payload
-					resp.RequestID = extractRequestIDFromPayload(payload)
+					resp.RequestID = batchRequestID
 					logger.Debug().
 						Str("endpoint", string(resp.EndpointAddr)).
 						Int("status", resp.HTTPStatusCode).
@@ -1104,7 +1127,7 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		resp.RequestID = extractRequestIDFromPayload(payload)
 
 		// Check response success with heuristic
-		checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, logger)
+		checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, resp.RequestID, logger)
 		if checkResult.Success {
 			logger.Debug().
 				Str("endpoint", string(resp.EndpointAddr)).
@@ -1451,12 +1474,14 @@ func (rc *requestContext) executeOneOfParallelRequests(
 
 		// Extract response bytes for heuristic analysis
 		var responseBytesForHeuristic []byte
+		parallelRequestID := ""
 		if len(responses) > 0 {
 			responseBytesForHeuristic = responses[0].Bytes
+			parallelRequestID = responses[0].RequestID
 		}
 
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
-		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, logger)
+		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, parallelRequestID, logger)
 		if checkResult.Success {
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {

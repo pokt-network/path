@@ -284,11 +284,41 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, 
 	}
 
 	// Case 2: Has "error" without "result" AND has proper structure
-	// This is a VALID JSON-RPC error response - should NOT retry
-	// Examples: smart contract errors, middleware errors, method not found, etc.
 	if hasError && !hasResult && hasVersion {
+		// Detect fabricated parse errors (-32700).
+		// PATH validates all JSON-RPC requests before relay — invalid requests are
+		// rejected at the gateway and never reach suppliers. A -32700 from a supplier
+		// means their relay miner or backend failed to forward a valid request
+		// (overloaded node, broken relay miner, rate-limited free-tier RPC).
+		if bytes.Contains(prefix, []byte(`"code":-32700`)) {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.98,
+				Reason:      "jsonrpc_fabricated_parse_error",
+				Structure:   StructureValid,
+				Details:     "Supplier returned -32700 parse error for valid JSON-RPC request",
+			}
+		}
+
+		// Detect suppliers wrapping backend 5xx errors as JSON-RPC errors.
+		// Some suppliers intercept HTTP 5xx from their backend and return
+		// HTTP 200 + {"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"service unavailable"}}
+		// to bypass PATH's 5xx retry logic. The supplier gets paid for a relay
+		// that returned garbage to the user.
+		if bytes.Contains(prefix, []byte(`"code":-32603`)) && containsServiceErrorMessage(prefix) {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.95,
+				Reason:      "jsonrpc_wrapped_service_error",
+				Structure:   StructureValid,
+				Details:     "Supplier wrapped a backend service error as JSON-RPC -32603",
+			}
+		}
+
+		// This is a VALID JSON-RPC error response - should NOT retry
+		// Examples: smart contract errors, method not found, invalid params, etc.
 		return AnalysisResult{
-			ShouldRetry: false, // FIXED: Don't retry valid error responses
+			ShouldRetry: false, // Don't retry valid error responses
 			Confidence:  0.0,
 			Reason:      "jsonrpc_valid_error",
 			Structure:   StructureValid,
@@ -525,4 +555,108 @@ func IsJSONRPCLikeSuccess(prefix []byte) bool {
 // Works for both JSON-RPC and REST responses.
 func HasErrorField(prefix []byte) bool {
 	return bytes.Contains(prefix, jsonrpcErrorField)
+}
+
+// serviceErrorMessages are messages that indicate a supplier is wrapping backend
+// transport/infrastructure errors as JSON-RPC -32603 responses to bypass 5xx retry logic.
+// A real node's -32603 ("Internal error") contains execution-specific messages,
+// not generic service availability messages.
+var serviceErrorMessages = [][]byte{
+	[]byte(`"service unavailable"`),
+	[]byte(`"bad gateway"`),
+	[]byte(`"gateway timeout"`),
+	[]byte(`"upstream connect error"`),
+	[]byte(`"connection refused"`),
+	[]byte(`"connection reset"`),
+	[]byte(`"no healthy upstream"`),
+	[]byte(`"backend unavailable"`),
+	[]byte(`"proxy error"`),
+}
+
+// containsServiceErrorMessage checks if the response contains a message
+// indicating the supplier wrapped a backend infrastructure error.
+func containsServiceErrorMessage(prefix []byte) bool {
+	lower := bytes.ToLower(prefix)
+	for _, msg := range serviceErrorMessages {
+		if bytes.Contains(lower, msg) {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckRequestIDMismatch detects fabricated responses by comparing the response ID
+// to the original request ID. JSON-RPC 2.0 spec requires the response ID to match
+// the request ID. A response with "id":null when the request had a real ID proves
+// the response was fabricated by the supplier's relay miner, not the actual node.
+//
+// Returns an AnalysisResult if a mismatch is detected, nil otherwise.
+func CheckRequestIDMismatch(responsePrefix []byte, requestID string) *AnalysisResult {
+	if requestID == "" || requestID == "null" {
+		return nil // Can't validate if request had no ID or null ID
+	}
+
+	responseID := extractResponseID(responsePrefix)
+	if responseID == "" {
+		return nil // Couldn't extract response ID, don't flag
+	}
+
+	// Response has "id":null but request had a real ID — fabricated response
+	if responseID == "null" {
+		return &AnalysisResult{
+			ShouldRetry: true,
+			Confidence:  0.99,
+			Reason:      "jsonrpc_id_mismatch",
+			Structure:   StructureValid,
+			Details:     fmt.Sprintf("Response id is null but request id was %s — supplier fabricated the response", requestID),
+		}
+	}
+
+	return nil
+}
+
+// extractResponseID extracts the value of the "id" field from a JSON-RPC response
+// using byte scanning (no full JSON parse). Returns the raw value as a string,
+// e.g. "1", "null", `"abc"`, or "" if not found.
+func extractResponseID(prefix []byte) string {
+	idField := []byte(`"id"`)
+	idx := bytes.Index(prefix, idField)
+	if idx < 0 {
+		return ""
+	}
+
+	// Skip past "id" and find the colon
+	after := prefix[idx+len(idField):]
+	after = bytes.TrimLeft(after, " \t\n\r")
+	if len(after) == 0 || after[0] != ':' {
+		return ""
+	}
+	after = bytes.TrimLeft(after[1:], " \t\n\r")
+
+	if len(after) == 0 {
+		return ""
+	}
+
+	// Extract the value
+	switch {
+	case bytes.HasPrefix(after, []byte("null")):
+		return "null"
+	case after[0] == '"':
+		// String ID — find closing quote
+		end := bytes.IndexByte(after[1:], '"')
+		if end < 0 {
+			return ""
+		}
+		return string(after[:end+2]) // include quotes
+	default:
+		// Numeric ID — read until non-digit
+		end := 0
+		for end < len(after) && (after[end] >= '0' && after[end] <= '9' || after[end] == '-') {
+			end++
+		}
+		if end == 0 {
+			return ""
+		}
+		return string(after[:end])
+	}
 }

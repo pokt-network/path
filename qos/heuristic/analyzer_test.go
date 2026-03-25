@@ -209,6 +209,53 @@ func TestProtocolAnalysis_JSONRPC(t *testing.T) {
 			expectedRetry:  false,
 			expectedReason: "large_no_result_in_prefix",
 		},
+		// Fabricated response detection
+		{
+			name:           "Fabricated parse error (-32700) — supplier returned parse error for valid request",
+			response:       []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}`),
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_fabricated_parse_error",
+			minConfidence:  0.95,
+		},
+		{
+			name:           "Fabricated parse error — real Bor format (still fabricated, PATH sends valid JSON)",
+			response:       []byte(`{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"Failed to parse the request body as JSON"},"id":-1}`),
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_fabricated_parse_error",
+			minConfidence:  0.95,
+		},
+		{
+			name:           "Wrapped service error (-32603 with service unavailable)",
+			response:       []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"service unavailable"}}`),
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_wrapped_service_error",
+			minConfidence:  0.95,
+		},
+		{
+			name:           "Wrapped service error (-32603 with bad gateway)",
+			response:       []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Bad Gateway"}}`),
+			expectedRetry:  true,
+			expectedReason: "jsonrpc_wrapped_service_error",
+			minConfidence:  0.95,
+		},
+		{
+			name:           "Legitimate -32603 internal error — should NOT retry",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"execution reverted: insufficient balance"}}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_valid_error",
+		},
+		{
+			name:           "Legitimate -32601 method not found — should NOT retry",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"the method eth_foo does not exist"}}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_valid_error",
+		},
+		{
+			name:           "Legitimate -32602 invalid params — should NOT retry",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing value for required argument 0"}}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_valid_error",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1307,5 +1354,120 @@ func BenchmarkAnalyze_LargeResponse(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		analyzer.Analyze(response, 200, sharedtypes.RPCType_JSON_RPC, "eth_getBlockByNumber")
+	}
+}
+
+func TestCheckRequestIDMismatch(t *testing.T) {
+	tests := []struct {
+		name        string
+		response    []byte
+		requestID   string
+		expectFlag  bool
+		expectReason string
+	}{
+		{
+			name:        "ID mismatch — response null, request had integer ID",
+			response:    []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}`),
+			requestID:   "1",
+			expectFlag:  true,
+			expectReason: "jsonrpc_id_mismatch",
+		},
+		{
+			name:        "ID mismatch — response null, request had string ID",
+			response:    []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"service unavailable"}}`),
+			requestID:   `"abc"`,
+			expectFlag:  true,
+			expectReason: "jsonrpc_id_mismatch",
+		},
+		{
+			name:       "ID match — both integer 1",
+			response:   []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"server error"}}`),
+			requestID:  "1",
+			expectFlag: false,
+		},
+		{
+			name:       "ID match — both null (request had null ID)",
+			response:   []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}`),
+			requestID:  "null",
+			expectFlag: false,
+		},
+		{
+			name:       "No request ID — cannot validate, should not flag",
+			response:   []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}`),
+			requestID:  "",
+			expectFlag: false,
+		},
+		{
+			name:       "Response has integer ID matching request",
+			response:   []byte(`{"jsonrpc":"2.0","id":42,"result":"0x123"}`),
+			requestID:  "42",
+			expectFlag: false,
+		},
+		{
+			name:       "Response has string ID, request had integer — not null mismatch",
+			response:   []byte(`{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"error"}}`),
+			requestID:  "1",
+			expectFlag: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := CheckRequestIDMismatch(tt.response, tt.requestID)
+			if tt.expectFlag {
+				require.NotNil(t, result, "Expected mismatch to be flagged")
+				assert.True(t, result.ShouldRetry)
+				assert.Equal(t, tt.expectReason, result.Reason)
+				assert.GreaterOrEqual(t, result.Confidence, 0.95)
+			} else {
+				assert.Nil(t, result, "Expected no mismatch flag")
+			}
+		})
+	}
+}
+
+func TestExtractResponseID(t *testing.T) {
+	tests := []struct {
+		name     string
+		response []byte
+		expected string
+	}{
+		{
+			name:     "null ID",
+			response: []byte(`{"jsonrpc":"2.0","id":null,"error":{}}`),
+			expected: "null",
+		},
+		{
+			name:     "integer ID",
+			response: []byte(`{"jsonrpc":"2.0","id":1,"result":"0x123"}`),
+			expected: "1",
+		},
+		{
+			name:     "negative integer ID",
+			response: []byte(`{"jsonrpc":"2.0","id":-1,"error":{}}`),
+			expected: "-1",
+		},
+		{
+			name:     "string ID",
+			response: []byte(`{"jsonrpc":"2.0","id":"abc","result":"0x123"}`),
+			expected: `"abc"`,
+		},
+		{
+			name:     "ID with spaces around colon",
+			response: []byte(`{"jsonrpc":"2.0", "id" : null, "error":{}}`),
+			expected: "null",
+		},
+		{
+			name:     "no ID field",
+			response: []byte(`{"jsonrpc":"2.0","result":"0x123"}`),
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractResponseID(tt.response)
+			assert.Equal(t, tt.expected, result)
+		})
 	}
 }
