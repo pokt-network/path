@@ -163,6 +163,11 @@ var (
 	// JSON-RPC success indicator - response MUST have "result" for success
 	jsonrpcResultField = []byte(`"result"`)
 
+	// JSON-RPC null result - many Ethereum clients (Geth, Bor, Erigon) include
+	// "result":null alongside error responses. This is technically a JSON-RPC spec
+	// violation but is standard behavior. We treat it as error-only (no result).
+	jsonrpcResultNull = []byte(`"result":null`)
+
 	// JSON-RPC error indicator
 	jsonrpcErrorField = []byte(`"error"`)
 
@@ -224,6 +229,15 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, 
 	hasResult := bytes.Contains(prefix, jsonrpcResultField)
 	hasError := bytes.Contains(prefix, jsonrpcErrorField)
 	hasVersion := bytes.Contains(prefix, jsonrpcVersionField)
+
+	// Many Ethereum clients (Geth, Bor/Polygon, Erigon) include "result":null alongside
+	// error responses. This is a JSON-RPC spec quirk, not a malformed response.
+	// A null result adds no information — treat it as error-only.
+	// We still catch genuinely contradictory responses like "result":"0x123" + "error":{...}
+	// which indicate a fake or broken supplier.
+	if hasResult && hasError && bytes.Contains(prefix, jsonrpcResultNull) {
+		hasResult = false
+	}
 
 	// Case 1: Has "result" without "error"
 	if hasResult && !hasError {
