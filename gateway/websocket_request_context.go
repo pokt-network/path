@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -56,8 +57,14 @@ type websocketRequestContext struct {
 
 	// Protocol related request context
 	protocol Protocol
-	// For websockets, we only use a single protocol context
-	protocolCtx ProtocolRequestContextWebsocket
+	// For websockets, we only use a single protocol context.
+	// protocolCtxMu guards protocolCtx against a data race: the bridge goroutine
+	// (started inside BuildWebsocketRequestContextForEndpoint) can deliver messages
+	// before the call returns and protocolCtx is assigned. Without synchronization,
+	// the reading goroutine may observe a partially-written interface value (type set,
+	// value nil) causing a nil-receiver panic in the Shannon websocket context.
+	protocolCtxMu sync.RWMutex
+	protocolCtx   ProtocolRequestContextWebsocket
 
 	// gatewayObservations stores gateway related observations.
 	gatewayObservations *observation.GatewayObservations
@@ -211,7 +218,9 @@ func (wrc *websocketRequestContext) buildProtocolContextAndStartBridge(
 		return nil, fmt.Errorf("failed to build protocol context and start bridge for websocket endpoint: %w", err)
 	}
 
+	wrc.protocolCtxMu.Lock()
 	wrc.protocolCtx = protocolCtx
+	wrc.protocolCtxMu.Unlock()
 	logger.Debug().Msgf("Successfully built protocol context and started bridge for websocket endpoint: %s", selectedEndpoint)
 	return connectionObservationChan, nil
 }
@@ -231,17 +240,22 @@ func (wrc *websocketRequestContext) ProcessClientWebsocketMessage(msgData []byte
 
 	logger.Debug().Msgf("received message from client: %s", string(msgData))
 
-	// Guard against a race condition where the bridge delivers a message before
-	// buildProtocolContextAndStartBridge has returned and assigned protocolCtx.
-	// Without this check, calling a method on the nil interface causes a panic
-	// (nil pointer dereference / SIGSEGV).
-	if wrc.protocolCtx == nil {
+	// Acquire read lock to safely check protocolCtx. The bridge goroutine can
+	// deliver messages before BuildWebsocketRequestContextForEndpoint returns and
+	// assigns protocolCtx. Without this lock, a concurrent unsynchronized read of
+	// the interface field can observe a partially-written value (type pointer set,
+	// data pointer nil) causing a nil-receiver panic in the Shannon layer.
+	wrc.protocolCtxMu.RLock()
+	pCtx := wrc.protocolCtx
+	wrc.protocolCtxMu.RUnlock()
+
+	if pCtx == nil {
 		logger.Error().Msg("❌ protocol context is nil — message arrived before websocket setup completed")
 		return nil, errWebsocketProtocolContextNotReady
 	}
 
 	// Process the client message using the protocol context.
-	clientMessageBz, err := wrc.protocolCtx.ProcessProtocolClientWebsocketMessage(msgData)
+	clientMessageBz, err := pCtx.ProcessProtocolClientWebsocketMessage(msgData)
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ failed to perform protocol-level client message processing")
 		return nil, err
@@ -256,9 +270,12 @@ func (wrc *websocketRequestContext) ProcessClientWebsocketMessage(msgData []byte
 func (wrc *websocketRequestContext) ProcessEndpointWebsocketMessage(msgData []byte) ([]byte, *observation.RequestResponseObservations, error) {
 	logger := wrc.logger.With("method", "ProcessEndpointWebsocketMessage")
 
-	// Guard against a race condition where the bridge delivers a message before
-	// buildProtocolContextAndStartBridge has returned and assigned protocolCtx.
-	if wrc.protocolCtx == nil {
+	// Acquire read lock — same race condition guard as ProcessClientWebsocketMessage.
+	wrc.protocolCtxMu.RLock()
+	pCtx := wrc.protocolCtx
+	wrc.protocolCtxMu.RUnlock()
+
+	if pCtx == nil {
 		logger.Error().Msg("❌ protocol context is nil — message arrived before websocket setup completed")
 		return nil, nil, errWebsocketProtocolContextNotReady
 	}
@@ -266,7 +283,7 @@ func (wrc *websocketRequestContext) ProcessEndpointWebsocketMessage(msgData []by
 	messageObservations := wrc.initializeMessageObservations()
 
 	// Process the endpoint message using the protocol context and update the message observations.
-	endpointMessageBz, protocolObservations, err := wrc.protocolCtx.ProcessProtocolEndpointWebsocketMessage(msgData)
+	endpointMessageBz, protocolObservations, err := pCtx.ProcessProtocolEndpointWebsocketMessage(msgData)
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ failed to perform protocol-level endpoint message processing")
 		return nil, nil, err
