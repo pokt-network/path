@@ -119,6 +119,15 @@ func NewDefaultHTTPClientWithDebugMetrics() *HTTPClientWithDebugMetrics {
 	httpClient := &http.Client{
 		Transport: transport,
 		Timeout:   80 * time.Second, // Large fallback timeout (80 seconds)
+
+		// Disable automatic redirect following for security.
+		// Relay miners should return direct responses, never redirects.
+		// Following redirects allows malicious suppliers to:
+		// 1. Redirect PATH to spam/malware domains (causes Spamhaus/DBL flagging)
+		// 2. Redirect PATH to internal/cloud metadata endpoints (SSRF)
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	return &HTTPClientWithDebugMetrics{
