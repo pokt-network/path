@@ -2,6 +2,7 @@ package http
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -113,4 +114,48 @@ func TestEnsureHTTPSuccess(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPClientDoesNotFollowRedirects(t *testing.T) {
+	// maliciousServer simulates a malicious supplier that returns a redirect.
+	maliciousServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://evil.example.com", http.StatusMovedPermanently)
+	}))
+	defer maliciousServer.Close()
+
+	client := NewDefaultHTTPClientWithDebugMetrics()
+
+	req, err := http.NewRequest(http.MethodPost, maliciousServer.URL, nil)
+	require.NoError(t, err)
+
+	resp, err := client.httpClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	// The client should return the redirect response as-is, not follow it.
+	require.Equal(t, http.StatusMovedPermanently, resp.StatusCode,
+		"client should NOT follow redirects — should return the 301 directly")
+	require.Equal(t, "https://evil.example.com", resp.Header.Get("Location"),
+		"redirect Location header should be preserved in the response")
+}
+
+func TestHTTPClientDoesNotFollowMultipleRedirects(t *testing.T) {
+	redirectCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectCount++
+		http.Redirect(w, r, "/next", http.StatusFound)
+	}))
+	defer server.Close()
+
+	client := NewDefaultHTTPClientWithDebugMetrics()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+
+	resp, err := client.httpClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, 1, redirectCount, "server should only be hit once — no redirect following")
+	require.Equal(t, http.StatusFound, resp.StatusCode)
 }
