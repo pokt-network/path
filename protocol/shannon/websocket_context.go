@@ -170,7 +170,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	}
 
 	// Test the websocket connection to the endpoint.
-	_, err = websockets.ConnectWebsocketEndpoint(
+	conn, err := websockets.ConnectWebsocketEndpoint(
 		logger,
 		websocketEndpointURL,
 		endpointConnectionHeaders,
@@ -180,8 +180,10 @@ func (p *Protocol) CheckWebsocketConnection(
 		logger.Debug().Err(err).Msg("❌ Failed to connect to websocket endpoint")
 		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
+	// Close the test connection immediately — this is only a connectivity probe.
+	conn.Close()
 
-	// A nil obsservation means no error occurred.
+	// A nil observation means no error occurred.
 	return nil
 }
 

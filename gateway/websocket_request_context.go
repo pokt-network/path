@@ -41,6 +41,10 @@ type websocketRequestContext struct {
 
 	// Enforces request completion deadline.
 	context context.Context
+	// cancelCtx cancels the websocket context when the connection is fully done.
+	// This is the safety net: if channel closures are missed during shutdown,
+	// listener goroutines will still exit via context cancellation.
+	cancelCtx context.CancelFunc
 
 	// httpRequestParser is used by the request context to interpret an HTTP request as a pair of:
 	// 	1. service ID
@@ -139,6 +143,13 @@ func (wrc *websocketRequestContext) handleWebsocketRequest(
 	// The protocol layer will create and return the connection observation channel
 	connectionObservationChan, err := wrc.buildProtocolContextAndStartBridge(httpRequest, httpResponseWriter)
 	if err != nil {
+		// Close the message observation channel so listenForMessageNotifications can exit.
+		// Without this, the goroutine spawned above would block forever since context.Background()
+		// (now context.WithCancel) provides the only other exit path.
+		close(wrc.messageObservationsChan)
+		// Cancel the context as a safety net to ensure the listener goroutine exits.
+		wrc.cancelCtx()
+
 		// Update gateway observations with the error
 		wrc.updateGatewayObservations(fmt.Errorf("%w: %s", errWebsocketConnectionFailed, err.Error()))
 		logger.Error().Err(err).Msg("Failed to build protocol context and start bridge")
@@ -332,7 +343,16 @@ func (wrc *websocketRequestContext) listenForMessageNotifications() {
 
 // listenForConnectionObservations listens for connection observations from the protocol layer
 // and broadcasts them based on the event type (establishment, closure, failure).
+//
+// When this goroutine exits (either from channel closure or context cancellation),
+// it cancels the websocket context as a safety net to ensure all other listener
+// goroutines also exit. This prevents goroutine leaks if channel closures are missed.
 func (wrc *websocketRequestContext) listenForConnectionObservations(observationChan <-chan *protocolobservations.Observations) {
+	// Safety net: when this listener exits, the connection is fully done.
+	// Cancel the websocket context to ensure listenForMessageNotifications exits
+	// even if messageObservationsChan closure was somehow missed.
+	defer wrc.cancelCtx()
+
 	for {
 		select {
 		case protocolObs, ok := <-observationChan:

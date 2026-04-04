@@ -207,11 +207,12 @@ func (g Gateway) handleWebSocketRequest(
 ) {
 	logger := g.Logger.With("method", "handleWebSocketRequest")
 
-	// Use a background context for the long-lived Websocket connection lifecycle.
+	// Use a cancellable background context for the long-lived Websocket connection lifecycle.
 	// Unlike HTTP requests, Websocket connections are long-lived and should not be tied to the HTTP request context.
 	// The HTTP request context gets canceled when the HTTP handler returns, which would stop the observation listener.
-	// The bridge will handle its own context lifecycle management.
-	websocketCtx := context.Background()
+	// The cancel function is stored in websocketRequestContext and called when the connection fully terminates,
+	// ensuring all listener goroutines exit even if channel closures are missed during shutdown.
+	websocketCtx, websocketCancel := context.WithCancel(context.Background())
 
 	// Determine the websocket message buffer size
 	websocketBufferSize := g.WebsocketMessageBufferSize
@@ -223,6 +224,7 @@ func (g Gateway) handleWebSocketRequest(
 	websocketRequestCtx := &websocketRequestContext{
 		logger:              g.Logger,
 		context:             websocketCtx,
+		cancelCtx:           websocketCancel,
 		gatewayObservations: getUserRequestGatewayObservations(httpReq),
 		protocol:            g.Protocol,
 		httpRequestParser:   g.HTTPRequestParser,
