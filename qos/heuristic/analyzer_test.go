@@ -208,6 +208,18 @@ func TestProtocolAnalysis_JSONRPC(t *testing.T) {
 			expectedReason: "jsonrpc_both_result_and_error",
 		},
 		{
+			name:           "NEAR result with nested error string - valid success (not malformed)",
+			response:       []byte(`{"jsonrpc":"2.0","result":{"block_hash":"kkJU2quYwNQ","block_height":192983668,"error":"wasm execution failed with error: HostError(GuestPanic { panic_msg: \"panicked at E102\" })","logs":[]},"id":20}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "NEAR result with nested error string - simple",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":{"error":"some error message","logs":[]}}`),
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
 			name:           "Error without jsonrpc version - suspicious",
 			response:       []byte(`{"error":"Bad Gateway"}`),
 			expectedRetry:  true,

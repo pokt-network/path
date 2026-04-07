@@ -340,14 +340,29 @@ func analyzeJSONRPC(prefix []byte, fullLength int, rpcType sharedtypes.RPCType, 
 		}
 	}
 
-	// Case 3: Has BOTH "result" and "error" - malformed (violates JSON-RPC spec)
+	// Case 3: Has BOTH "result" and "error"
+	// Standard JSON-RPC spec forbids both, but some protocols (e.g., NEAR) nest an
+	// "error" string inside the result object for execution failures:
+	//   {"jsonrpc":"2.0","result":{"error":"wasm execution failed...","logs":[]},"id":1}
+	// This is a valid success response — NOT malformed. Only flag if the "error" is a
+	// top-level JSON-RPC error object (i.e., "error" followed by `:` and `{`).
 	if hasResult && hasError {
+		if isTopLevelJSONRPCError(prefix) {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.95,
+				Reason:      "jsonrpc_both_result_and_error",
+				Structure:   StructureValid,
+				Details:     "JSON-RPC response has both result and error (malformed)",
+			}
+		}
+		// "error" is nested inside result (e.g., NEAR's result.error string) — treat as success
 		return AnalysisResult{
-			ShouldRetry: true,
-			Confidence:  0.95,
-			Reason:      "jsonrpc_both_result_and_error",
+			ShouldRetry: false,
+			Confidence:  0.0,
+			Reason:      "jsonrpc_success",
 			Structure:   StructureValid,
-			Details:     "JSON-RPC response has both result and error (malformed)",
+			Details:     "JSON-RPC response contains result field with nested error string",
 		}
 	}
 
@@ -555,6 +570,29 @@ func emptyResultType(prefix []byte) emptyResultKind {
 		return emptyObject
 	}
 	return notEmpty
+}
+
+// isTopLevelJSONRPCError checks if the "error" field in the prefix is a top-level
+// JSON-RPC error object (i.e., "error": {), as opposed to a nested error string
+// inside the result object (e.g., NEAR's "result":{"error":"wasm execution failed..."}).
+// Uses whitespace-tolerant scanning, same approach as emptyResultType.
+func isTopLevelJSONRPCError(prefix []byte) bool {
+	idx := bytes.Index(prefix, jsonrpcErrorField)
+	if idx < 0 {
+		return false
+	}
+
+	// Skip past "error" and find the colon
+	after := prefix[idx+len(jsonrpcErrorField):]
+	after = bytes.TrimLeft(after, " \t\n\r")
+	if len(after) == 0 || after[0] != ':' {
+		return false
+	}
+	after = bytes.TrimLeft(after[1:], " \t\n\r")
+
+	// Top-level JSON-RPC error is an object: "error": { ... }
+	// Nested error string is: "error": "string"
+	return len(after) > 0 && after[0] == '{'
 }
 
 // IsJSONRPCLikeSuccess provides a quick check for JSON-RPC success.
