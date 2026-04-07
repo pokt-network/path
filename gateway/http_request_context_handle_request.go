@@ -1124,11 +1124,21 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 				lastResponse = responses[0]
 				lastResponse.RequestID = extractRequestIDFromPayload(payload)
 			}
-			// Mark domain broken in cross-pod circuit breaker
+			// Mark domain broken in cross-pod circuit breaker.
+			// Skip circuit breaking for archival-related errors — the domain isn't broken,
+			// it just can't serve historical state. The error string from the protocol layer
+			// contains the archival pattern (e.g., "historical state is not available").
 			if rc.circuitBreaker != nil {
 				if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
-					rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain,
-						fmt.Sprintf("batch_transport_error: %v", lastErr))
+					if shouldCircuitBreak(nil, 0, lastErr) {
+						rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain,
+							fmt.Sprintf("batch_transport_error: %v", lastErr))
+					} else {
+						logger.Warn().
+							Str("domain", domain).
+							Err(lastErr).
+							Msg("Skipped circuit break for capability limitation error in batch path")
+					}
 				}
 			}
 			logger.Warn().Err(lastErr).Int("attempt", attempt).Msg("Request failed")
