@@ -24,6 +24,13 @@ type hedgeResult struct {
 	attemptNumber int  // 1 for primary, 2 for hedge
 }
 
+// defaultLoserGraceWindow is how long a hedge "loser" is allowed to keep running on a
+// detached context after the winner has been picked, so the loser's in-flight HTTP
+// exchange with the relay miner can finish cleanly (proper FIN) rather than being
+// torn down (RST). 2s comfortably covers p99 backend response time for fast EVM
+// chains while bounding extra bandwidth/backend cost.
+const defaultLoserGraceWindow = 2 * time.Second
+
 // hedgeRacer manages racing between primary and hedge requests.
 // It ensures both requests are properly tracked for reputation and only one response is returned.
 type hedgeRacer struct {
@@ -43,6 +50,13 @@ type hedgeRacer struct {
 	primaryEndpoint protocol.EndpointAddr
 	hedgeEndpoint   protocol.EndpointAddr
 
+	// Per-branch cancel funcs for the detached contexts handed to each protocolCtx.
+	// Calling these releases socket / goroutine resources after the loser drains
+	// (or after the grace window expires). Either may be nil if the corresponding
+	// branch never started (e.g., hedge was never fired).
+	primaryReqCancel context.CancelFunc
+	hedgeReqCancel   context.CancelFunc
+
 	// Timing tracking (for metrics)
 	raceStartTime    time.Time
 	hedgeStarted     bool
@@ -54,6 +68,17 @@ type hedgeRacer struct {
 	// payload is the single payload to send for this hedge race.
 	// For batch requests, this is the individual batch item being processed.
 	payload protocol.Payload
+}
+
+// detachedHedgeCtx returns a context that inherits parent's deadline (if any) but
+// not its cancellation, plus a small grace window to let an in-flight loser finish
+// flushing its response after race() returns. Used so cancelling the caller's request
+// ctx doesn't RST the loser's TCP connection to the relay miner.
+func detachedHedgeCtx(parent context.Context, grace time.Duration) (context.Context, context.CancelFunc) {
+	if d, ok := parent.Deadline(); ok {
+		return context.WithDeadline(context.Background(), d.Add(grace))
+	}
+	return context.WithTimeout(context.Background(), grace)
 }
 
 // newHedgeRacer creates a new hedge racer for a request.
@@ -109,6 +134,14 @@ func (hr *hedgeRacer) race(
 		Int("available_endpoints", len(availableEndpoints)).
 		Msg("🏁 Starting hedged request race")
 
+	// Detach the primary protocolCtx from the caller's request ctx. Without this, the
+	// caller's handler returning (after the winner is chosen) cancels the primary's
+	// in-flight HTTP request to the relay miner, producing the RST / EOF noise the
+	// RM operators see for ~every hedged loser.
+	primaryDetachedCtx, primaryDetachedCancel := detachedHedgeCtx(ctx, defaultLoserGraceWindow)
+	hr.primaryReqCancel = primaryDetachedCancel
+	primaryCtx.SetParentContext(primaryDetachedCtx)
+
 	// Start primary request
 	go hr.executeRequest(ctx, primaryCtx, primaryEndpoint, primarySupplier, false, 1, hr.raceStartTime)
 
@@ -133,6 +166,8 @@ func (hr *hedgeRacer) race(
 		// Record metric: primary_only (no hedge was started)
 		metrics.RecordHedgeRequest(rpcTypeStr, hr.serviceID, metrics.HedgeResultPrimaryOnly, winningLatency)
 
+		// Primary already returned and hedge never started — no in-flight branches.
+		hr.cancelBranches()
 		return hr.handleResult(result)
 
 	case <-time.After(hr.hedgeDelay):
@@ -160,7 +195,11 @@ func (hr *hedgeRacer) race(
 			// This ensures both are tracked even if one is cancelled before responding
 			hr.rc.addSuppliersTried(primarySupplier, hedgeSupplier)
 
-			// Build protocol context for hedge endpoint
+			// Build protocol context for hedge endpoint with a detached parent so the
+			// hedge branch (if it loses the race) can finish cleanly instead of being
+			// RST'd when the caller's handler unwinds. The build itself still uses
+			// the caller's ctx so session/endpoint lookups respect caller cancellation;
+			// only the downstream HTTP relay runs on the detached ctx.
 			hedgeCtx, _, err := hr.rc.protocol.BuildHTTPRequestContextForEndpoint(
 				ctx, hr.rc.serviceID, hedgeEndpoint, hr.rpcType, hr.rc.originalHTTPRequest, true)
 			if err != nil {
@@ -169,6 +208,9 @@ func (hr *hedgeRacer) race(
 					Msg("Failed to build hedge protocol context")
 				hr.hedgeStarted = false
 			} else {
+				hedgeDetachedCtx, hedgeDetachedCancel := detachedHedgeCtx(ctx, defaultLoserGraceWindow)
+				hr.hedgeReqCancel = hedgeDetachedCancel
+				hedgeCtx.SetParentContext(hedgeDetachedCtx)
 				// Start hedge request
 				go hr.executeRequest(ctx, hedgeCtx, hedgeEndpoint, hedgeSupplier, true, 2, time.Now())
 			}
@@ -190,6 +232,9 @@ func (hr *hedgeRacer) race(
 			Str("service_id", hr.serviceID).
 			Dur("elapsed", time.Since(hr.raceStartTime)).
 			Msg("Hedge race canceled by context")
+		// Caller cancelled before any response. Branches may still be in flight on
+		// their detached contexts — drain them so they finish cleanly.
+		hr.cleanupRunningBranches()
 		return nil, ctx.Err()
 	}
 }
@@ -293,6 +338,8 @@ func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, e
 	case result := <-hr.resultChan:
 		firstResult = &result
 	case <-ctx.Done():
+		// Caller cancelled while both branches were still in flight on detached ctxs.
+		hr.cleanupRunningBranches()
 		return nil, ctx.Err()
 	}
 
@@ -374,8 +421,12 @@ func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, e
 			hr.raceResult = metrics.HedgeResultNoHedge
 			metrics.RecordHedgeRequest(rpcTypeStr, hr.serviceID, metrics.HedgeResultNoHedge, winningLatency)
 		}
+		// Second branch may still be in flight on its detached ctx.
+		hr.cleanupRunningBranches()
 		return hr.handleResult(*firstResult)
 	case <-ctx.Done():
+		// Caller cancelled while waiting for the second result.
+		hr.cleanupRunningBranches()
 		return nil, ctx.Err()
 	}
 
@@ -418,6 +469,8 @@ func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, e
 		// Record latency savings (can be negative if winner was slower)
 		metrics.RecordHedgeLatencySavings(rpcTypeStr, hr.serviceID, latencySavings)
 
+		// Both branches have settled; release the detached cancel funcs.
+		hr.cancelBranches()
 		return hr.handleResult(*secondResult)
 	}
 
@@ -438,6 +491,8 @@ func (hr *hedgeRacer) waitForWinner(ctx context.Context) ([]protocol.Response, e
 
 	metrics.RecordHedgeRequest(rpcTypeStr, hr.serviceID, metrics.HedgeResultBothFailed, winningLatency)
 
+	// Both branches have settled; release the detached cancel funcs.
+	hr.cancelBranches()
 	return hr.handleResult(*firstResult)
 }
 
@@ -537,15 +592,69 @@ func (hr *hedgeRacer) recordLoser(result hedgeResult) {
 	metrics.RecordHedgeSupplierOutcome(result.supplierAddr, hr.serviceID, metrics.HedgeRoleLoser, result.duration.Seconds())
 }
 
-// collectLoserSync waits synchronously for the loser to record it in suppliersTried.
-// Uses a short timeout to avoid adding latency when loser is slow.
+// collectLoserSync gives the loser a short (100ms) synchronous window to be recorded
+// in X-Suppliers-Tried before response headers flush. If the loser hasn't arrived in
+// that window, the wait is detached so race() can return immediately while the loser
+// continues running on its own detached context (see detachedHedgeCtx) and finishes
+// flushing to the relay miner cleanly.
+//
+// Without this two-phase approach, race() returning unwound the caller's handler,
+// which cancelled the request ctx and RST'd whichever supplier was still mid-write —
+// producing the `write: connection reset by peer` and `unexpected EOF` log noise on
+// the RM side for roughly every losing branch of every hedged request.
 func (hr *hedgeRacer) collectLoserSync() {
+	// Phase 1: short synchronous window so the loser can be tracked in headers.
 	select {
 	case result := <-hr.resultChan:
 		hr.recordLoser(result)
+		hr.cancelBranches()
+		return
 	case <-time.After(100 * time.Millisecond):
-		// Loser didn't arrive in time - that's ok, we already have the winner
-		hr.logger.Debug().Msg("Loser did not arrive within 100ms for X-Suppliers-Tried")
+	}
+
+	// Phase 2: detached drain — same body as cleanupRunningBranches.
+	hr.cleanupRunningBranches()
+}
+
+// cleanupRunningBranches spawns a goroutine that waits for any still-in-flight
+// branches to complete naturally (so the relay miner sees a clean HTTP roundtrip),
+// records the loser for reputation if/when it arrives, and releases per-branch
+// cancel funcs. Bounded by defaultLoserGraceWindow.
+//
+// Use this on every race() exit path where at least one branch may still be
+// running (caller cancellation, second-result timeout, etc.).
+func (hr *hedgeRacer) cleanupRunningBranches() {
+	go func() {
+		// At most one unrecorded result remains on the channel (the channel is
+		// buffered to 2 and the winner has already been read). A second drain
+		// pass is a cheap way to absorb the case where both branches were still
+		// in flight when race() exited (e.g., caller cancelled before any result).
+		for i := 0; i < 2; i++ {
+			select {
+			case result := <-hr.resultChan:
+				hr.recordLoser(result)
+			case <-time.After(defaultLoserGraceWindow):
+				hr.logger.Debug().
+					Str("service_id", hr.serviceID).
+					Dur("grace_window", defaultLoserGraceWindow).
+					Msg("Hedge branch did not complete within grace window")
+				hr.cancelBranches()
+				return
+			}
+		}
+		hr.cancelBranches()
+	}()
+}
+
+// cancelBranches releases the cancel funcs for both detached branch contexts.
+// Calling a CancelFunc that's already fired (or whose ctx already expired) is a
+// no-op, so this is safe to call from any cleanup path.
+func (hr *hedgeRacer) cancelBranches() {
+	if hr.primaryReqCancel != nil {
+		hr.primaryReqCancel()
+	}
+	if hr.hedgeReqCancel != nil {
+		hr.hedgeReqCancel()
 	}
 }
 

@@ -421,6 +421,21 @@ func (rc *requestContext) GetObservations() protocolobservations.Observations {
 	}
 }
 
+// SetParentContext swaps the parent context used for the downstream HTTP relay and
+// observation recording.
+//
+// Implements gateway.ProtocolRequestContext.
+//
+// The hedge race calls this with a context that inherits the caller's deadline but NOT
+// its cancellation, so that the losing branch can finish flushing its response to the
+// relay miner cleanly instead of being torn down (TCP RST) the moment the winner is
+// chosen and the caller's HTTP handler returns. Without this, the relay miner logs
+// the cancelled half of every hedged request as `write: connection reset by peer` /
+// `failed to read request body: unexpected EOF` even though the relay itself succeeded.
+func (rc *requestContext) SetParentContext(ctx context.Context) {
+	rc.context = ctx
+}
+
 // getSelectedEndpoint returns the currently selected endpoint in a thread-safe manner.
 func (rc *requestContext) getSelectedEndpoint() endpoint {
 	rc.selectedEndpointMutex.RLock()
