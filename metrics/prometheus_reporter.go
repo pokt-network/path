@@ -127,7 +127,12 @@ func (pmr *PrometheusMetricsReporter) processEndpointObservation(serviceID strin
 	// Metric 3: Observation pipeline - determine signal from error type
 	reputationSignal := pmr.getReputationSignalFromEndpoint(hasError, errorType, latencyMs)
 	networkType := pmr.getNetworkType(serviceID, qosObs)
-	method := pmr.getMethodFromQoS(qosObs)
+	// SanitizeMethodLabel is the cardinality guard for the `method` label. Without
+	// it, raw user-supplied JSON-RPC method names and full Cosmos REST URL paths
+	// (with dynamic block heights / tx hashes / account addresses) flow straight
+	// into the Counter and produce a multi-GB heap leak in long-lived pods, since
+	// promauto Counters never evict cold series.
+	method := SanitizeMethodLabel(networkType, pmr.getMethodFromQoS(qosObs))
 	RecordObservation(domain, rpcType, serviceID, networkType, method, reputationSignal)
 
 	// Metric 9: Request/Response sizes

@@ -81,6 +81,20 @@ var cometBFTMethods = map[string]bool{
 	"unsubscribe_all":      true,
 }
 
+// CometBFTMethodList returns the set of CometBFT JSON-RPC method names tracked
+// by the heuristic protocol layer.
+//
+// Exposed so other packages (notably the metrics-label allowlist) can derive
+// their state from a single source of truth — preventing drift if a method is
+// added or removed here without the corresponding change in the consumer.
+func CometBFTMethodList() []string {
+	out := make([]string, 0, len(cometBFTMethods))
+	for m := range cometBFTMethods {
+		out = append(out, m)
+	}
+	return out
+}
+
 // isCometBFTPath checks if a request path corresponds to a CometBFT RPC endpoint.
 func isCometBFTPath(path string) bool {
 	for _, prefix := range cometBFTPathPrefixes {
