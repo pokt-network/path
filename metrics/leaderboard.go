@@ -32,12 +32,23 @@ type MeanScoreEntry struct {
 	MeanScore float64 // Average score across all endpoints for this combination
 }
 
+// SupplierScoreEntry represents the per-(supplier, service_id) reputation score.
+// One value per pair — averaged across RPC types if the supplier serves multiple.
+type SupplierScoreEntry struct {
+	Supplier  string
+	ServiceID string
+	Score     float64
+}
+
 // LeaderboardDataProvider is an interface for getting endpoint distribution data
 type LeaderboardDataProvider interface {
 	// GetEndpointLeaderboardData returns all endpoint entries grouped by the required dimensions
 	GetEndpointLeaderboardData(ctx context.Context) ([]EndpointLeaderboardEntry, error)
 	// GetMeanScoreData returns mean reputation scores per domain/service/rpc_type
 	GetMeanScoreData(ctx context.Context) ([]MeanScoreEntry, error)
+	// GetSupplierScoreData returns per-(supplier, service_id) reputation scores.
+	// Optional: implementations may return nil if per-supplier scoring is not supported.
+	GetSupplierScoreData(ctx context.Context) ([]SupplierScoreEntry, error)
 }
 
 // LeaderboardPublisher publishes endpoint leaderboard metrics every 10 seconds
@@ -143,17 +154,34 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 	meanScores, err := lp.provider.GetMeanScoreData(ctx)
 	if err != nil {
 		lp.logger.Warn().Err(err).Msg("Failed to get mean score data")
+	} else {
+		// Reset mean score metric to avoid stale data
+		ReputationMeanScore.Reset()
+
+		if len(meanScores) > 0 {
+			for _, entry := range meanScores {
+				SetMeanScore(entry.Domain, entry.ServiceID, entry.RPCType, entry.MeanScore)
+			}
+			lp.logger.Debug().Int("entries", len(meanScores)).Msg("Published mean scores")
+		}
+	}
+
+	// Publish per-(supplier, service_id) reputation scores. Reset between
+	// snapshots — suppliers may rotate out of sessions and stale series
+	// would persist forever otherwise.
+	supplierScores, err := lp.provider.GetSupplierScoreData(ctx)
+	if err != nil {
+		lp.logger.Warn().Err(err).Msg("Failed to get supplier score data")
 		return
 	}
 
-	// Reset mean score metric to avoid stale data
-	ReputationMeanScore.Reset()
+	SupplierReputationScore.Reset()
 
-	if len(meanScores) > 0 {
-		for _, entry := range meanScores {
-			SetMeanScore(entry.Domain, entry.ServiceID, entry.RPCType, entry.MeanScore)
+	if len(supplierScores) > 0 {
+		for _, entry := range supplierScores {
+			SetSupplierReputationScore(entry.Supplier, entry.ServiceID, entry.Score)
 		}
-		lp.logger.Debug().Int("entries", len(meanScores)).Msg("Published mean scores")
+		lp.logger.Debug().Int("entries", len(supplierScores)).Msg("Published supplier scores")
 	}
 }
 
