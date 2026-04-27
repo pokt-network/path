@@ -706,7 +706,11 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		}
 		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.heuristicRPCType, jsonrpcMethod)
 		if heuristicResult.ShouldRetry {
-			rc.logger.Error().
+			// Warn, not Error: a heuristic-triggered retry is the system working
+			// correctly when a backend misbehaves. Logging at error inflated log
+			// volume by ~70% on every gateway pod (canary audit, 2026-04-27) and
+			// drowned real errors. Operators on warn-level mainnet still see it.
+			rc.logger.Warn().
 				Str("heuristic_reason", heuristicResult.Reason).
 				Float64("heuristic_confidence", heuristicResult.Confidence).
 				Str("heuristic_details", heuristicResult.Details).
