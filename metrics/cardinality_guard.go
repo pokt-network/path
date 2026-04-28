@@ -15,15 +15,19 @@ import (
 // same tuple are always permitted. Past the limit, novel tuples are dropped
 // and counted in MetricsLabelDropped.
 //
-// Sized to cover ~10× the realistic active series for the per-supplier
-// metrics introduced alongside this guard:
+// IMPORTANT: this is a tuple cap, NOT a series cap. Histogram metrics emit
+// ~12 series per tuple (one per bucket plus _sum and _count), so the
+// effective series cap for a histogram is roughly 12× the tuple cap. A 100K
+// tuple cap on a histogram created 945K series in production (audit
+// 2026-04-28), exhausting the Prometheus client heap. When wiring the guard
+// to a new histogram, either pass a tighter per-metric limit or design the
+// metric's labels so the realistic tuple count is well under the cap.
 //
-//	~1000 active suppliers × ~70 services × small fan-out (signal_type, role,
-//	reason) ≈ 70K active series in the worst case.
-//
-// 100K leaves headroom without letting a runaway label leak burn unbounded
-// memory in the Prometheus client.
-const DefaultSeriesLimit = 100_000
+// 25K tuples = ~25K series for counters / ~300K series for histograms. Sized
+// to cover realistic active per-supplier workloads (~1000 suppliers × ~5
+// active services × small fan-out) without exposing the heap to a runaway
+// label leak.
+const DefaultSeriesLimit = 25_000
 
 // MetricsLabelDropped counts label tuples that were dropped by a cardinality
 // guard. The `metric` label identifies which guarded metric breached its cap.

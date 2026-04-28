@@ -560,7 +560,7 @@ func (hr *hedgeRacer) recordWinner(result hedgeResult) {
 			Bool("success", result.err == nil).
 			Msg("🏆 Race winner determined")
 
-		metrics.RecordHedgeSupplierOutcome(result.supplierAddr, hr.serviceID, metrics.HedgeRoleWinner, result.duration.Seconds())
+		metrics.RecordHedgeSupplierOutcome(result.supplierAddr, metrics.HedgeRoleWinner, result.duration.Seconds())
 	})
 }
 
@@ -589,7 +589,7 @@ func (hr *hedgeRacer) recordLoser(result hedgeResult) {
 		Err(result.err).
 		Msg("Race loser recorded")
 
-	metrics.RecordHedgeSupplierOutcome(result.supplierAddr, hr.serviceID, metrics.HedgeRoleLoser, result.duration.Seconds())
+	metrics.RecordHedgeSupplierOutcome(result.supplierAddr, metrics.HedgeRoleLoser, result.duration.Seconds())
 }
 
 // collectLoserSync gives the loser a short (100ms) synchronous window to be recorded

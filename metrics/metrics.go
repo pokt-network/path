@@ -612,10 +612,16 @@ var HedgeWinningLatency = promauto.NewHistogramVec(
 
 // =============================================================================
 // Hedge per-supplier outcome (Histogram)
-// Labels: supplier, service_id, role (winner|loser)
+// Labels: supplier, role (winner|loser)
 // Purpose: Answers "am I losing races, and by how much?" — a question the
 // existing path_hedge_* metrics cannot answer because they don't carry a
 // supplier label. Use win-rate = count{role=winner} / count{role=*}.
+//
+// Cardinality: deliberately omits service_id. With service_id, observed
+// production cardinality was ~79K unique tuples × 12 histogram series each
+// = 945K series for this one metric (audit 2026-04-28). Per-supplier latency
+// across all services answers the operator question; service-level breakdown
+// is available without supplier on path_hedge_winning_latency_seconds.
 // =============================================================================
 
 const (
@@ -626,10 +632,10 @@ const (
 var HedgeSupplierLatency = promauto.NewHistogramVec(
 	prometheus.HistogramOpts{
 		Name:    MetricPrefix + "hedge_supplier_latency_seconds",
-		Help:    "Per-supplier hedge race outcome latency. role=winner|loser.",
+		Help:    "Per-supplier hedge race outcome latency. role=winner|loser. service_id intentionally omitted to bound cardinality.",
 		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
 	},
-	[]string{LabelSupplier, LabelServiceID, "role"},
+	[]string{LabelSupplier, "role"},
 )
 
 // RecordHedgeRequest records a hedge request outcome
@@ -649,14 +655,14 @@ func RecordHedgeLatencySavings(rpcType, serviceID string, savingsSeconds float64
 // RecordHedgeSupplierOutcome records a per-supplier hedge race outcome.
 // role must be HedgeRoleWinner or HedgeRoleLoser. Skipped when supplier is
 // empty or when the cardinality guard has tripped for this metric.
-func RecordHedgeSupplierOutcome(supplier, serviceID, role string, latencySeconds float64) {
+func RecordHedgeSupplierOutcome(supplier, role string, latencySeconds float64) {
 	if supplier == "" {
 		return
 	}
-	if !hedgeSupplierGuard.allow(supplier, serviceID, role) {
+	if !hedgeSupplierGuard.allow(supplier, role) {
 		return
 	}
-	HedgeSupplierLatency.WithLabelValues(supplier, serviceID, role).Observe(latencySeconds)
+	HedgeSupplierLatency.WithLabelValues(supplier, role).Observe(latencySeconds)
 }
 
 // RecordBatchSize records a batch request with latency.
