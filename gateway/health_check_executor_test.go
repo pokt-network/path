@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 )
 
 // TestExternalConfigFetching tests that external config is fetched and parsed correctly.
@@ -541,3 +544,128 @@ func TestGetServiceConfigs(t *testing.T) {
 	require.True(t, serviceIDs["eth"])
 	require.True(t, serviceIDs["solana"])
 }
+
+// recordedSignalReputationSvc captures every RecordSignal call so tests can
+// assert whether the health-check path skipped or applied a penalty. Other
+// ReputationService methods are inherited from the embedded nil interface and
+// must NOT be called by the code under test (they will panic, surfacing any
+// accidental dependency).
+type recordedSignalReputationSvc struct {
+	reputation.ReputationService
+
+	mu      sync.Mutex
+	signals []reputation.Signal
+}
+
+func (m *recordedSignalReputationSvc) RecordSignal(_ context.Context, _ reputation.EndpointKey, signal reputation.Signal) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.signals = append(m.signals, signal)
+	return nil
+}
+
+func (m *recordedSignalReputationSvc) KeyBuilderForService(_ protocol.ServiceID) reputation.KeyBuilder {
+	return reputation.NewKeyBuilder(reputation.KeyGranularityEndpoint)
+}
+
+func (m *recordedSignalReputationSvc) RecordedSignals() []reputation.Signal {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]reputation.Signal, len(m.signals))
+	copy(out, m.signals)
+	return out
+}
+
+// TestRecordCheckResult_OverServicedSkipsPenalty pins the invariant that the
+// health-check executor must not penalize a supplier when the relay-miner has
+// signaled the application's per-session stake budget is exhausted. Without
+// this skip the executor was draining easy2stake's BSC supplier set to score=0
+// in production despite the request-path no-penalty fix.
+func TestRecordCheckResult_OverServicedSkipsPenalty(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "poktroll main exact phrase",
+			err:  fmt.Errorf("relay miner returned error: offchain rate limit hit by relayer proxy"),
+		},
+		{
+			name: "HA relay-miner JSON body via wrapped error",
+			err:  fmt.Errorf("non-2xx: 429 — body: {\"error\":\"session relay limit reached: claimable portion fully consumed\"}"),
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rep := &recordedSignalReputationSvc{}
+			executor := &HealthCheckExecutor{
+				logger:        polyzero.NewLogger(),
+				reputationSvc: rep,
+			}
+
+			executor.recordCheckResult(
+				context.Background(),
+				protocol.ServiceID("bsc"),
+				protocol.EndpointAddr("pokt1abc-https://relay.example.com"),
+				HealthCheckConfig{Name: "block-number", Type: "json_rpc"},
+				c.err,
+				100*time.Millisecond,
+			)
+
+			require.Empty(t, rep.RecordedSignals(),
+				"over-serviced check failures must not record a reputation signal")
+		})
+	}
+}
+
+// TestRecordCheckResult_NonOverServicedFailureRecordsPenalty pins that generic
+// check failures still penalize. The over-serviced skip must be narrowly scoped
+// to relay-miner phrases — anything else stays a fault.
+func TestRecordCheckResult_NonOverServicedFailureRecordsPenalty(t *testing.T) {
+	rep := &recordedSignalReputationSvc{}
+	executor := &HealthCheckExecutor{
+		logger:        polyzero.NewLogger(),
+		reputationSvc: rep,
+	}
+
+	executor.recordCheckResult(
+		context.Background(),
+		protocol.ServiceID("bsc"),
+		protocol.EndpointAddr("pokt1abc-https://relay.example.com"),
+		HealthCheckConfig{Name: "block-number", Type: "json_rpc", ReputationSignal: "major_error"},
+		fmt.Errorf("connection refused"),
+		100*time.Millisecond,
+	)
+
+	signals := rep.RecordedSignals()
+	require.Len(t, signals, 1, "regular check failure must record exactly one penalty signal")
+	require.Equal(t, reputation.SignalTypeMajorError, signals[0].Type,
+		"configured major_error severity must propagate; over-served skip must not catch this")
+}
+
+// TestRecordCheckResult_SuccessRecordsRecoverySignal pins the success path.
+func TestRecordCheckResult_SuccessRecordsRecoverySignal(t *testing.T) {
+	rep := &recordedSignalReputationSvc{}
+	executor := &HealthCheckExecutor{
+		logger:        polyzero.NewLogger(),
+		reputationSvc: rep,
+	}
+
+	executor.recordCheckResult(
+		context.Background(),
+		protocol.ServiceID("bsc"),
+		protocol.EndpointAddr("pokt1abc-https://relay.example.com"),
+		HealthCheckConfig{Name: "block-number", Type: "json_rpc"},
+		nil,
+		50*time.Millisecond,
+	)
+
+	signals := rep.RecordedSignals()
+	require.Len(t, signals, 1)
+	require.Equal(t, reputation.SignalTypeRecoverySuccess, signals[0].Type)
+}
+
+// Ensure the sharedtypes import is referenced — used elsewhere in the package
+// but kept here so future tests that need RPCType can copy this file as a
+// template without hunting for the import.
+var _ = sharedtypes.RPCType_JSON_RPC
