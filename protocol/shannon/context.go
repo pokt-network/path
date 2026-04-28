@@ -1112,11 +1112,8 @@ func (rc *requestContext) handleEndpointError(
 	// (service, session, supplier) tuple so endpoint selection skips it for
 	// the rest of the session, and let the classifier (which now returns
 	// SuccessSignal for over-serviced payloads) handle the no-penalty path.
-	overServiced := false
-	if rc.currentRelayMinerError != nil &&
-		heuristic.IsOverServicedRelayMinerError(rc.currentRelayMinerError.Codespace, rc.currentRelayMinerError.Code) {
-		overServiced = true
-	}
+	overServiced := rc.currentRelayMinerError != nil &&
+		heuristic.IsOverServicedRelayMinerError(rc.currentRelayMinerError.Codespace, rc.currentRelayMinerError.Code)
 	if !overServiced && endpointErr != nil && heuristic.IsOverServicedError(endpointErr.Error()) {
 		overServiced = true
 	}
