@@ -647,8 +647,14 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// 1. From the RelayMiner when sending a relay
 	// 2. From the backend service: contained in the RelayResponse struct parsed from payload returned by RelayMiner.
 	//
-	// Non-2xx HTTP status code received from the endpoint: build and return an error
+	// Non-2xx HTTP status code received from the endpoint: build and return an error.
+	// Preserve the response body and status so the gateway's retry layer can return
+	// the supplier's actual error message to the user if all retries fail. Without
+	// this, users get a zero-bytes response — which is what produced the "empty body"
+	// puzzle for HA relay-miner over-servicing (HTTP 429 + JSON error body).
 	if httpStatusCode != http.StatusOK {
+		defaultResponse.Bytes = httpRelayResponseBz
+		defaultResponse.HTTPStatusCode = httpStatusCode
 		return defaultResponse, fmt.Errorf("%w %w: %d", errSendHTTPRelay, errEndpointNon2XXHTTPStatusCode, httpStatusCode)
 	}
 
@@ -1023,9 +1029,12 @@ func (rc *requestContext) sendFallbackRelay(
 	// Examples: a fallback endpoint for a RESTful service.
 	//
 	// Non-2xx HTTP status code: build and return an error.
+	// Preserve the body so it can be returned to the user if all retries fail.
 	if httpStatusCode != http.StatusOK {
 		return protocol.Response{
-			EndpointAddr: fallbackEndpoint.Addr(),
+			Bytes:          httpResponseBz,
+			HTTPStatusCode: httpStatusCode,
+			EndpointAddr:   fallbackEndpoint.Addr(),
 		}, fmt.Errorf("%w %w: %d", errSendHTTPRelay, errEndpointNon2XXHTTPStatusCode, httpStatusCode)
 	}
 
