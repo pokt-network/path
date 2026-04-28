@@ -143,6 +143,11 @@ type requestContext struct {
 	// supplierBlacklist tracks suppliers with validation/signature errors.
 	// Used to blacklist suppliers on errors and skip domain reputation penalty.
 	supplierBlacklist *supplierBlacklist
+
+	// sessionExhaustion flags (service, session, supplier) tuples reported as
+	// over-serviced by their relay-miner. Skips them in selection to avoid
+	// hammering them with relays the supplier will keep rejecting.
+	sessionExhaustion *sessionExhaustionTracker
 }
 
 // HandleServiceRequest:
@@ -1096,6 +1101,38 @@ func (rc *requestContext) handleEndpointError(
 	// PERF: Removed hydrateLogger() call to avoid logger allocation
 	selectedEndpoint := rc.getSelectedEndpoint()
 	selectedEndpointAddr := selectedEndpoint.Addr()
+
+	// Detect supplier over-servicing rejection. Two signals:
+	//   1. Structured: RelayMinerError {codespace="relayer_proxy", code=7} from
+	//      poktroll main when the supplier has overServicingEnabled=false.
+	//   2. Text: error string contains the relay-miner over-servicing phrases.
+	//      Catches the HA relay-miner (HTTP 429 + JSON, no RelayMinerError set)
+	//      and any other path that surfaces the message text.
+	// When detected we record the per-supplier exhaustion metric, mark the
+	// (service, session, supplier) tuple so endpoint selection skips it for
+	// the rest of the session, and let the classifier (which now returns
+	// SuccessSignal for over-serviced payloads) handle the no-penalty path.
+	overServiced := false
+	if rc.currentRelayMinerError != nil &&
+		heuristic.IsOverServicedRelayMinerError(rc.currentRelayMinerError.Codespace, rc.currentRelayMinerError.Code) {
+		overServiced = true
+	}
+	if !overServiced && endpointErr != nil && heuristic.IsOverServicedError(endpointErr.Error()) {
+		overServiced = true
+	}
+	if overServiced {
+		supplier := selectedEndpoint.Supplier()
+		metrics.RecordSupplierExhausted(supplier, string(rc.serviceID))
+		if rc.sessionExhaustion != nil {
+			if session := selectedEndpoint.Session(); session != nil {
+				rc.sessionExhaustion.Mark(string(rc.serviceID), session.SessionId, supplier)
+			}
+		}
+		rc.logger.Debug().
+			Str("supplier", supplier).
+			Str("service_id", string(rc.serviceID)).
+			Msg("Supplier flagged as over-serviced for this session — skipping reputation penalty and excluding from selection")
+	}
 
 	// Classify error and get reputation signal directly
 	// See ERROR_CLASSIFICATION.md for detailed error category documentation

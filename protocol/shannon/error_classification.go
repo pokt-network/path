@@ -295,6 +295,16 @@ func classifyHeuristicErrorAsSignal(
 
 	// Category: Rate Limiting (MAJOR -10)
 	case strings.HasPrefix(reason, "error_indicator_rate_limit"):
+		// Distinguish backend-side rate limiting (real supplier infra issue) from
+		// relay-miner over-servicing (correct protocol behavior — no penalty).
+		// IsOverServicedError matches the specific relay-miner phrases that the
+		// generic "rate limit" / "too many request" patterns would otherwise also
+		// match. Falls through to the supplier-fault branch only for true backend
+		// rate limits (the indicator itself doesn't carry enough context).
+		if heuristic.IsOverServicedError(payloadContent) {
+			return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED,
+				reputation.NewSuccessSignal(latency)
+		}
 		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_BACKEND_SERVICE,
 			reputation.NewMajorErrorSignal("rate_limit", latency)
 
@@ -332,6 +342,22 @@ func classifyHeuristicErrorAsSignal(
 // classifyMalformedPayloadAsSignal classifies errors found in malformed endpoint response payloads.
 // See ERROR_CLASSIFICATION.md sections 1-2 and 4-6 for payload error categories.
 func classifyMalformedPayloadAsSignal(logger polylog.Logger, payloadContent string, latency time.Duration) (protocolobservations.ShannonEndpointErrorType, reputation.Signal) {
+	// Over-servicing rejections from the supplier's relay-miner ("session relay
+	// limit reached", "offchain rate limit hit by relayer proxy") are NOT
+	// supplier faults — the supplier is correctly enforcing protocol rate
+	// limits because the application's per-session stake allocation is
+	// exhausted. Returning a Success signal here means we don't penalize
+	// reputation; the caller (handleEndpointError) records the metric and
+	// marks the (supplier, service, session) tuple as exhausted to avoid
+	// further wasted relays this session.
+	if heuristic.IsOverServicedError(payloadContent) {
+		logger.Debug().
+			Str("payload_preview", payloadContent[:min(len(payloadContent), 200)]).
+			Msg("Detected relay-miner over-servicing rejection in payload — skipping reputation penalty")
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED,
+			reputation.NewSuccessSignal(latency)
+	}
+
 	// If this was a heuristic detected error, handle it using the detected reason
 	if idx := strings.LastIndex(payloadContent, ": heuristic detected "); idx != -1 {
 		heuristicReason := payloadContent[idx+len(": heuristic detected "):]

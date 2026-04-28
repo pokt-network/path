@@ -394,6 +394,35 @@ var ReputationMeanScore = promauto.NewGaugeVec(
 )
 
 // =============================================================================
+// Supplier Exhausted (Counter)
+// Labels: supplier, service_id
+// Purpose: Track relay-miner-reported "session stake exhausted" / "over-serviced"
+// rejections per supplier. These are NOT supplier faults — they mean the app
+// has consumed its per-(supplier, session) stake allocation and the supplier
+// is correctly refusing further relays. We use this metric to:
+//   1. Confirm we are not penalizing reputation for these (operator visibility)
+//   2. Surface which suppliers/services frequently saturate, suggesting either
+//      app under-staking or supplier over-allocation.
+// =============================================================================
+
+var SupplierExhaustedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "supplier_exhausted_total",
+		Help: "Relay rejected by supplier's relay-miner because the application's per-session stake allocation is exhausted (over-servicing). NOT counted against reputation.",
+	},
+	[]string{LabelSupplier, LabelServiceID},
+)
+
+// RecordSupplierExhausted increments the per-supplier exhaustion counter.
+// Skipped when supplier is empty.
+func RecordSupplierExhausted(supplier, serviceID string) {
+	if supplier == "" {
+		return
+	}
+	SupplierExhaustedTotal.WithLabelValues(supplier, serviceID).Inc()
+}
+
+// =============================================================================
 // QoS Filter Rejections (Counter)
 // Labels: supplier, service_id, reason
 // Purpose: Per-supplier visibility into why QoS dropped an endpoint pre-relay.
