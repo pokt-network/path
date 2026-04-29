@@ -5,7 +5,6 @@ package metrics
 
 import (
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,6 +33,7 @@ const (
 	LabelResult             = "result"
 	LabelBatchCount         = "batch_count"
 	LabelSupplier           = "supplier"
+	LabelSignalType         = "signal_type"
 
 	// --- Latency signal values
 
@@ -394,6 +394,100 @@ var ReputationMeanScore = promauto.NewGaugeVec(
 )
 
 // =============================================================================
+// Supplier Exhausted (Counter)
+// Labels: supplier, service_id
+// Purpose: Track relay-miner-reported "session stake exhausted" / "over-serviced"
+// rejections per supplier. These are NOT supplier faults — they mean the app
+// has consumed its per-(supplier, session) stake allocation and the supplier
+// is correctly refusing further relays. We use this metric to:
+//   1. Confirm we are not penalizing reputation for these (operator visibility)
+//   2. Surface which suppliers/services frequently saturate, suggesting either
+//      app under-staking or supplier over-allocation.
+// =============================================================================
+
+var SupplierExhaustedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "supplier_exhausted_total",
+		Help: "Relay rejected by supplier's relay-miner because the application's per-session stake allocation is exhausted (over-servicing). NOT counted against reputation.",
+	},
+	[]string{LabelSupplier, LabelServiceID},
+)
+
+// RecordSupplierExhausted increments the per-supplier exhaustion counter.
+// Skipped when supplier is empty.
+func RecordSupplierExhausted(supplier, serviceID string) {
+	if supplier == "" {
+		return
+	}
+	SupplierExhaustedTotal.WithLabelValues(supplier, serviceID).Inc()
+}
+
+// =============================================================================
+// QoS Filter Rejections (Counter)
+// Labels: supplier, service_id, reason
+// Purpose: Per-supplier visibility into why QoS dropped an endpoint pre-relay.
+// These rejections are silent today — operators can't tell whether their
+// endpoint was filtered for being block-behind, missing chain_id, lacking
+// archival capability, etc.
+// =============================================================================
+
+const (
+	QoSFilterReasonBlockHeightLag     = "block_height_lag"
+	QoSFilterReasonBlockHeightUnknown = "block_height_unknown"
+	QoSFilterReasonChainIDMismatch    = "chain_id_mismatch"
+	QoSFilterReasonArchivalRequired   = "archival_required"
+	QoSFilterReasonInvalidResponse    = "invalid_response"
+	QoSFilterReasonEmptyResponse      = "empty_response"
+	QoSFilterReasonCapabilityLimited  = "capability_limitation"
+)
+
+var QoSFilterRejectionTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "qos_filter_rejection_total",
+		Help: "QoS filter rejections by supplier, service_id, and reason. Reasons: block_height_lag, block_height_unknown, chain_id_mismatch, archival_required, invalid_response, empty_response, capability_limitation.",
+	},
+	[]string{LabelSupplier, LabelServiceID, "reason"},
+)
+
+// RecordQoSFilterRejection counts a per-supplier QoS filter rejection.
+// Skipped when supplier is empty (e.g., missing endpoint context) or when
+// the cardinality guard has tripped for this metric.
+func RecordQoSFilterRejection(supplier, serviceID, reason string) {
+	if supplier == "" {
+		return
+	}
+	if !qosFilterRejectionGuard.allow(supplier, serviceID, reason) {
+		return
+	}
+	QoSFilterRejectionTotal.WithLabelValues(supplier, serviceID, reason).Inc()
+}
+
+// =============================================================================
+// Per-supplier reputation observability (Gauge + Counter)
+// Labels: supplier, service_id (+ signal_type on counter)
+// Purpose: Give operators of relay miners a metric-level view of why PATH is
+// or isn't routing to them. Supplier already implies domain — no domain label.
+// Signals are emitted from reputation/service.go::RecordSignal, so any QoS
+// code that produces a Signal automatically feeds this counter.
+// =============================================================================
+
+var SupplierReputationScore = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: MetricPrefix + "supplier_reputation_score",
+		Help: "Per-supplier reputation score (0-100) by supplier and service_id. Snapshotted every 10s.",
+	},
+	[]string{LabelSupplier, LabelServiceID},
+)
+
+var SupplierSignalTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "supplier_signal_total",
+		Help: "Reputation signals emitted by supplier, service_id, and signal_type (success/minor_error/major_error/critical_error/fatal_error/recovery_success/slow_response/very_slow_response).",
+	},
+	[]string{LabelSupplier, LabelServiceID, LabelSignalType},
+)
+
+// =============================================================================
 // Relays (Counter + Histogram)
 // Labels: domain, rpc_type, service_id, status_code, reputation_signal, request_type
 // Purpose: Track ALL outgoing relays from PATH to supplier endpoints
@@ -545,6 +639,34 @@ var HedgeWinningLatency = promauto.NewHistogramVec(
 	[]string{LabelRPCType, LabelServiceID, LabelResult},
 )
 
+// =============================================================================
+// Hedge per-supplier outcome (Histogram)
+// Labels: supplier, role (winner|loser)
+// Purpose: Answers "am I losing races, and by how much?" — a question the
+// existing path_hedge_* metrics cannot answer because they don't carry a
+// supplier label. Use win-rate = count{role=winner} / count{role=*}.
+//
+// Cardinality: deliberately omits service_id. With service_id, observed
+// production cardinality was ~79K unique tuples × 12 histogram series each
+// = 945K series for this one metric (audit 2026-04-28). Per-supplier latency
+// across all services answers the operator question; service-level breakdown
+// is available without supplier on path_hedge_winning_latency_seconds.
+// =============================================================================
+
+const (
+	HedgeRoleWinner = "winner"
+	HedgeRoleLoser  = "loser"
+)
+
+var HedgeSupplierLatency = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "hedge_supplier_latency_seconds",
+		Help:    "Per-supplier hedge race outcome latency. role=winner|loser. service_id intentionally omitted to bound cardinality.",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+	},
+	[]string{LabelSupplier, "role"},
+)
+
 // RecordHedgeRequest records a hedge request outcome
 // result should be one of: HedgeResultPrimaryWon, HedgeResultHedgeWon, HedgeResultPrimaryOnly, HedgeResultBothFailed, HedgeResultNoHedge
 func RecordHedgeRequest(rpcType, serviceID, result string, winningLatencySeconds float64) {
@@ -559,14 +681,47 @@ func RecordHedgeLatencySavings(rpcType, serviceID string, savingsSeconds float64
 	HedgeLatencySavings.WithLabelValues(rpcType, serviceID).Observe(savingsSeconds)
 }
 
-// RecordBatchSize records a batch request with latency
+// RecordHedgeSupplierOutcome records a per-supplier hedge race outcome.
+// role must be HedgeRoleWinner or HedgeRoleLoser. Skipped when supplier is
+// empty or when the cardinality guard has tripped for this metric.
+func RecordHedgeSupplierOutcome(supplier, role string, latencySeconds float64) {
+	if supplier == "" {
+		return
+	}
+	if !hedgeSupplierGuard.allow(supplier, role) {
+		return
+	}
+	HedgeSupplierLatency.WithLabelValues(supplier, role).Observe(latencySeconds)
+}
+
+// RecordBatchSize records a batch request with latency.
+// batchCount is bucketed via batchCountBucket to bound label cardinality —
+// max_batch_payloads defaults to 5500, so emitting raw counts would create
+// an unbounded `batch_count` label. Buckets: 1, 2-10, 11-50, 51-500, 500+.
 func RecordBatchSize(rpcType, serviceID string, batchCount int, latencySeconds float64) {
-	batchCountStr := strconv.Itoa(batchCount)
-	BatchSizeTotal.WithLabelValues(rpcType, serviceID, batchCountStr).Inc()
-	BatchSizeLatency.WithLabelValues(rpcType, serviceID, batchCountStr).Observe(latencySeconds)
+	bucket := batchCountBucket(batchCount)
+	BatchSizeTotal.WithLabelValues(rpcType, serviceID, bucket).Inc()
+	BatchSizeLatency.WithLabelValues(rpcType, serviceID, bucket).Observe(latencySeconds)
 	// Record for average calculation: avg = items_total / requests_total
 	BatchRequestsTotal.WithLabelValues(serviceID).Inc()
 	BatchItemsTotal.WithLabelValues(serviceID).Add(float64(batchCount))
+}
+
+// batchCountBucket maps a raw batch count to one of five fixed bucket labels.
+// Caps cardinality of the batch_count label at 5 values regardless of payload size.
+func batchCountBucket(batchCount int) string {
+	switch {
+	case batchCount <= 1:
+		return "1"
+	case batchCount <= 10:
+		return "2-10"
+	case batchCount <= 50:
+		return "11-50"
+	case batchCount <= 500:
+		return "51-500"
+	default:
+		return "500+"
+	}
 }
 
 // RecordRequestSize records request and response sizes
@@ -613,6 +768,32 @@ func RecordRPCTypeFallback(domain, supplier, serviceID, requestedRPCType, fallba
 // SetMeanScore sets the mean reputation score for a domain/service/rpc_type combination
 func SetMeanScore(domain, serviceID, rpcType string, score float64) {
 	ReputationMeanScore.WithLabelValues(domain, serviceID, rpcType).Set(score)
+}
+
+// SetSupplierReputationScore sets the per-supplier reputation gauge.
+// Skipped silently when supplier is empty (e.g., per-domain reputation key)
+// or when the cardinality guard has tripped for this metric.
+func SetSupplierReputationScore(supplier, serviceID string, score float64) {
+	if supplier == "" {
+		return
+	}
+	if !supplierReputationGuard.allow(supplier, serviceID) {
+		return
+	}
+	SupplierReputationScore.WithLabelValues(supplier, serviceID).Set(score)
+}
+
+// RecordSupplierSignal increments the per-supplier signal counter.
+// Skipped silently when supplier is empty (e.g., per-domain reputation key)
+// or when the cardinality guard has tripped for this metric.
+func RecordSupplierSignal(supplier, serviceID, signalType string) {
+	if supplier == "" {
+		return
+	}
+	if !supplierSignalGuard.allow(supplier, serviceID, signalType) {
+		return
+	}
+	SupplierSignalTotal.WithLabelValues(supplier, serviceID, signalType).Inc()
 }
 
 // RecordRelay records an outgoing relay to a supplier endpoint with latency

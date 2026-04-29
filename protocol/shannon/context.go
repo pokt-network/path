@@ -143,6 +143,11 @@ type requestContext struct {
 	// supplierBlacklist tracks suppliers with validation/signature errors.
 	// Used to blacklist suppliers on errors and skip domain reputation penalty.
 	supplierBlacklist *supplierBlacklist
+
+	// sessionExhaustion flags (service, session, supplier) tuples reported as
+	// over-serviced by their relay-miner. Skips them in selection to avoid
+	// hammering them with relays the supplier will keep rejecting.
+	sessionExhaustion *sessionExhaustionTracker
 }
 
 // HandleServiceRequest:
@@ -421,6 +426,21 @@ func (rc *requestContext) GetObservations() protocolobservations.Observations {
 	}
 }
 
+// SetParentContext swaps the parent context used for the downstream HTTP relay and
+// observation recording.
+//
+// Implements gateway.ProtocolRequestContext.
+//
+// The hedge race calls this with a context that inherits the caller's deadline but NOT
+// its cancellation, so that the losing branch can finish flushing its response to the
+// relay miner cleanly instead of being torn down (TCP RST) the moment the winner is
+// chosen and the caller's HTTP handler returns. Without this, the relay miner logs
+// the cancelled half of every hedged request as `write: connection reset by peer` /
+// `failed to read request body: unexpected EOF` even though the relay itself succeeded.
+func (rc *requestContext) SetParentContext(ctx context.Context) {
+	rc.context = ctx
+}
+
 // getSelectedEndpoint returns the currently selected endpoint in a thread-safe manner.
 func (rc *requestContext) getSelectedEndpoint() endpoint {
 	rc.selectedEndpointMutex.RLock()
@@ -627,8 +647,14 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 	// 1. From the RelayMiner when sending a relay
 	// 2. From the backend service: contained in the RelayResponse struct parsed from payload returned by RelayMiner.
 	//
-	// Non-2xx HTTP status code received from the endpoint: build and return an error
+	// Non-2xx HTTP status code received from the endpoint: build and return an error.
+	// Preserve the response body and status so the gateway's retry layer can return
+	// the supplier's actual error message to the user if all retries fail. Without
+	// this, users get a zero-bytes response — which is what produced the "empty body"
+	// puzzle for HA relay-miner over-servicing (HTTP 429 + JSON error body).
 	if httpStatusCode != http.StatusOK {
+		defaultResponse.Bytes = httpRelayResponseBz
+		defaultResponse.HTTPStatusCode = httpStatusCode
 		return defaultResponse, fmt.Errorf("%w %w: %d", errSendHTTPRelay, errEndpointNon2XXHTTPStatusCode, httpStatusCode)
 	}
 
@@ -691,7 +717,11 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		}
 		heuristicResult := heuristic.Analyze(deserializedResponse.Bytes, responseHTTPStatusCode, rc.heuristicRPCType, jsonrpcMethod)
 		if heuristicResult.ShouldRetry {
-			rc.logger.Error().
+			// Warn, not Error: a heuristic-triggered retry is the system working
+			// correctly when a backend misbehaves. Logging at error inflated log
+			// volume by ~70% on every gateway pod (canary audit, 2026-04-27) and
+			// drowned real errors. Operators on warn-level mainnet still see it.
+			rc.logger.Warn().
 				Str("heuristic_reason", heuristicResult.Reason).
 				Float64("heuristic_confidence", heuristicResult.Confidence).
 				Str("heuristic_details", heuristicResult.Details).
@@ -999,9 +1029,12 @@ func (rc *requestContext) sendFallbackRelay(
 	// Examples: a fallback endpoint for a RESTful service.
 	//
 	// Non-2xx HTTP status code: build and return an error.
+	// Preserve the body so it can be returned to the user if all retries fail.
 	if httpStatusCode != http.StatusOK {
 		return protocol.Response{
-			EndpointAddr: fallbackEndpoint.Addr(),
+			Bytes:          httpResponseBz,
+			HTTPStatusCode: httpStatusCode,
+			EndpointAddr:   fallbackEndpoint.Addr(),
 		}, fmt.Errorf("%w %w: %d", errSendHTTPRelay, errEndpointNon2XXHTTPStatusCode, httpStatusCode)
 	}
 
@@ -1077,6 +1110,35 @@ func (rc *requestContext) handleEndpointError(
 	// PERF: Removed hydrateLogger() call to avoid logger allocation
 	selectedEndpoint := rc.getSelectedEndpoint()
 	selectedEndpointAddr := selectedEndpoint.Addr()
+
+	// Detect supplier over-servicing rejection. Two signals:
+	//   1. Structured: RelayMinerError {codespace="relayer_proxy", code=7} from
+	//      poktroll main when the supplier has overServicingEnabled=false.
+	//   2. Text: error string contains the relay-miner over-servicing phrases.
+	//      Catches the HA relay-miner (HTTP 429 + JSON, no RelayMinerError set)
+	//      and any other path that surfaces the message text.
+	// When detected we record the per-supplier exhaustion metric, mark the
+	// (service, session, supplier) tuple so endpoint selection skips it for
+	// the rest of the session, and let the classifier (which now returns
+	// SuccessSignal for over-serviced payloads) handle the no-penalty path.
+	overServiced := rc.currentRelayMinerError != nil &&
+		heuristic.IsOverServicedRelayMinerError(rc.currentRelayMinerError.Codespace, rc.currentRelayMinerError.Code)
+	if !overServiced && endpointErr != nil && heuristic.IsOverServicedError(endpointErr.Error()) {
+		overServiced = true
+	}
+	if overServiced {
+		supplier := selectedEndpoint.Supplier()
+		metrics.RecordSupplierExhausted(supplier, string(rc.serviceID))
+		if rc.sessionExhaustion != nil {
+			if session := selectedEndpoint.Session(); session != nil {
+				rc.sessionExhaustion.Mark(string(rc.serviceID), session.SessionId, supplier)
+			}
+		}
+		rc.logger.Debug().
+			Str("supplier", supplier).
+			Str("service_id", string(rc.serviceID)).
+			Msg("Supplier flagged as over-serviced for this session — skipping reputation penalty and excluding from selection")
+	}
 
 	// Classify error and get reputation signal directly
 	// See ERROR_CLASSIFICATION.md for detailed error category documentation

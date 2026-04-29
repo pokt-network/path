@@ -108,6 +108,13 @@ var errorPatterns = []errorPattern{
 	{[]byte("too many request"), CategoryRateLimit, 0.95},
 	{[]byte("quota exceeded"), CategoryRateLimit, 0.90},
 	{[]byte("throttl"), CategoryRateLimit, 0.85}, // throttle, throttled, throttling
+	// Relay-miner over-servicing (per-app stake exhausted) — must take precedence
+	// over generic rate-limit patterns so MatchedPattern carries the specific
+	// phrase and downstream handlers can route to IsOverServicedError().
+	// Confidence 0.99 ensures these win over the 0.95 generic patterns above.
+	{[]byte("offchain rate limit hit by relayer proxy"), CategoryRateLimit, 0.99},
+	{[]byte("session relay limit reached"), CategoryRateLimit, 0.99},
+	{[]byte("claimable portion fully consumed"), CategoryRateLimit, 0.99},
 
 	// Authentication/Authorization Errors
 	{[]byte("unauthorized"), CategoryAuthError, 0.90},
@@ -283,6 +290,54 @@ func IsCapabilityLimitationError(pattern string) bool {
 	default:
 		return false
 	}
+}
+
+// overServicedPatterns are exact substrings emitted by relay miners when a relay
+// is rejected because the application's per-(supplier, session) stake allocation
+// has been exhausted. These are NOT supplier faults — the supplier is correctly
+// enforcing protocol-level rate limits — and must not penalize reputation or
+// trigger circuit-breaking.
+//
+// Sources:
+//   - poktroll main relay-miner: pkg/relayer/proxy/errors.go
+//     ErrRelayerProxyRateLimited = "offchain rate limit hit by relayer proxy"
+//   - HA relay-miner (pocket-relay-miner): relayer/proxy.go sends HTTP 429 with
+//     body "session relay limit reached: claimable portion fully consumed".
+//
+// All matched lower-cased.
+var overServicedPatterns = []string{
+	"offchain rate limit hit by relayer proxy",
+	"session relay limit reached",
+	"claimable portion fully consumed",
+}
+
+// IsOverServicedError reports whether the given pattern or response payload
+// indicates the supplier's relay-miner rejected the relay because the
+// application's per-session stake budget is exhausted.
+//
+// Accepts either a heuristic pattern (the matched substring stored on
+// AnalysisResult.MatchedPattern) or a raw payload string. Match is
+// case-insensitive substring.
+func IsOverServicedError(patternOrPayload string) bool {
+	lower := strings.ToLower(patternOrPayload)
+	for _, p := range overServicedPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsOverServicedRelayMinerError reports whether the structured RelayMinerError
+// fields indicate an offchain rate-limit / over-servicing rejection from the
+// poktroll main relay-miner. This is the most reliable signal — text-based
+// detection on the payload is the fallback for relay miners (e.g. HA) that
+// don't populate RelayMinerError correctly.
+//
+// codespace="relayer_proxy", code=7 corresponds to ErrRelayerProxyRateLimited
+// in github.com/pokt-network/poktroll/pkg/relayer/proxy/errors.go.
+func IsOverServicedRelayMinerError(codespace string, code uint32) bool {
+	return codespace == "relayer_proxy" && code == 7
 }
 
 // capabilityLimitationSubstrings are the patterns to search for in error strings.

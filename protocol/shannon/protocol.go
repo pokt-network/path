@@ -146,6 +146,11 @@ type Protocol struct {
 	// penalizing domain reputation for individual supplier issues.
 	supplierBlacklist *supplierBlacklist
 
+	// sessionExhaustion tracks (service, session, supplier) tuples whose
+	// relay-miner has reported the application's per-session stake budget
+	// is consumed. Excluded from selection for the rest of the session.
+	sessionExhaustion *sessionExhaustionTracker
+
 	// loggedMisconfigErrors tracks which misconfiguration errors have been logged
 	// to avoid spamming logs with the same error on every request.
 	loggedMisconfigErrors sync.Map
@@ -282,6 +287,9 @@ func NewProtocol(
 
 		// supplierBlacklist tracks suppliers with validation/signature errors
 		supplierBlacklist: newSupplierBlacklist(),
+
+		// sessionExhaustion tracks suppliers whose per-session stake budget is consumed
+		sessionExhaustion: newSessionExhaustionTracker(),
 	}
 
 	// Initialize the relay signer with SignerContext caching for optimal ring signature performance.
@@ -814,6 +822,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		reputationService:     p.reputationService,
 		tieredSelector:        tieredSelector,
 		supplierBlacklist:     p.supplierBlacklist,
+		sessionExhaustion:     p.sessionExhaustion,
 		currentRPCType:        actualRPCType, // Use actual RPC type after fallback (may differ from requested)
 	}, protocolobservations.Observations{}, nil
 }
@@ -1219,6 +1228,58 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 			}
 
 			qualifiedEndpoints = blacklistFilteredEndpoints
+		}
+
+		// SESSION EXHAUSTION FILTERING
+		// Filter out suppliers whose relay-miner has reported the application's
+		// per-session stake budget is consumed. Sending more relays would just
+		// be rejected the same way for the rest of the session.
+		// Skip when filterByReputation=false (health checks must still probe).
+		// Honor explicit Target-Suppliers (requestedEndpointAddr) — operator
+		// override should bypass this filter, same as the blacklist case.
+		//
+		// Safety net: if the filter would leave the session with zero qualified
+		// endpoints, keep the exhausted suppliers as a last resort instead of
+		// cornering ourselves into a hard failure. A subset of exhausted
+		// suppliers may still serve relays as goodwill (overServicingEnabled=true
+		// in poktroll main is the supplier's choice and we can't observe it),
+		// so attempting them is strictly better than returning no endpoints.
+		if p.sessionExhaustion != nil && filterByReputation {
+			exhaustionFilteredEndpoints := make(map[protocol.EndpointAddr]endpoint)
+			exhaustionSkipped := 0
+
+			for addr, ep := range qualifiedEndpoints {
+				supplierAddr := ep.Supplier()
+				session := ep.Session()
+				if session != nil && addr != requestedEndpointAddr &&
+					p.sessionExhaustion.IsExhausted(string(serviceID), session.SessionId, supplierAddr) {
+					exhaustionSkipped++
+					logger.Debug().
+						Str("supplier", supplierAddr).
+						Str("session_id", session.SessionId).
+						Msg("Skipping exhausted (over-serviced) supplier for this session")
+				} else {
+					exhaustionFilteredEndpoints[addr] = ep
+				}
+			}
+
+			switch {
+			case exhaustionSkipped == 0:
+				// No-op: filter did nothing.
+			case len(exhaustionFilteredEndpoints) == 0:
+				// All endpoints in this session are exhausted. Falling through
+				// to the unfiltered set so the request still has somewhere to go.
+				logger.Warn().
+					Int("exhausted", exhaustionSkipped).
+					Str("app", app.Address).
+					Msg("All suppliers in this session are flagged exhausted — keeping them as last resort to avoid empty endpoint pool")
+			default:
+				logger.Info().
+					Int("exhausted", exhaustionSkipped).
+					Int("remaining", len(exhaustionFilteredEndpoints)).
+					Msg("Filtered out suppliers with exhausted per-session stake")
+				qualifiedEndpoints = exhaustionFilteredEndpoints
+			}
 		}
 
 		// Filter out low-reputation endpoints if reputation service is enabled and filtering is requested.

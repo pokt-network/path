@@ -312,5 +312,91 @@ func (p *Protocol) GetMeanScoreData(ctx context.Context) ([]metrics.MeanScoreEnt
 	return entries, nil
 }
 
+// GetSupplierScoreData implements the metrics.LeaderboardDataProvider interface.
+// It returns the mean reputation score per (supplier, service_id) pair, averaging
+// across RPC types and per-endpoint scores when the supplier has multiple endpoints.
+//
+// Cardinality note: this metric is bounded by active suppliers × active services.
+// We deliberately omit domain and rpc_type — supplier already implies domain and
+// adding rpc_type would multiply cardinality without operator value (operators
+// running relay miners want one number per service).
+func (p *Protocol) GetSupplierScoreData(ctx context.Context) ([]metrics.SupplierScoreEntry, error) {
+	logger := p.logger.With("method", "GetSupplierScoreData")
+
+	if p.unifiedServicesConfig == nil {
+		logger.Debug().Msg("No unified services config available, returning empty supplier scores")
+		return nil, nil
+	}
+
+	if p.reputationService == nil {
+		logger.Debug().Msg("Reputation service not enabled, returning empty supplier scores")
+		return nil, nil
+	}
+
+	type supplierKey struct {
+		Supplier  string
+		ServiceID string
+	}
+	type aggregator struct {
+		Total float64
+		Count int
+	}
+	aggregates := make(map[supplierKey]*aggregator)
+
+	for _, serviceConfig := range p.unifiedServicesConfig.Services {
+		serviceID := serviceConfig.ID
+
+		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID)
+		if err != nil || len(activeSessions) == 0 {
+			continue
+		}
+
+		rpcTypesToQuery := p.getServiceRPCTypesForLeaderboard(serviceID)
+
+		for _, rpcType := range rpcTypesToQuery {
+			endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil, "")
+			if err != nil {
+				continue
+			}
+
+			for endpointAddr := range endpoints {
+				supplier, err := endpointAddr.GetAddress()
+				if err != nil || supplier == "" {
+					continue
+				}
+
+				keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+				key := keyBuilder.BuildKey(serviceID, endpointAddr, actualRPCType)
+				score, scoreErr := p.reputationService.GetScore(ctx, key)
+				if scoreErr != nil {
+					score = reputation.Score{Value: p.reputationService.GetInitialScoreForService(serviceID)}
+				}
+
+				aggKey := supplierKey{Supplier: supplier, ServiceID: string(serviceID)}
+				if aggregates[aggKey] == nil {
+					aggregates[aggKey] = &aggregator{}
+				}
+				aggregates[aggKey].Total += score.Value
+				aggregates[aggKey].Count++
+			}
+		}
+	}
+
+	entries := make([]metrics.SupplierScoreEntry, 0, len(aggregates))
+	for k, agg := range aggregates {
+		if agg.Count == 0 {
+			continue
+		}
+		entries = append(entries, metrics.SupplierScoreEntry{
+			Supplier:  k.Supplier,
+			ServiceID: k.ServiceID,
+			Score:     agg.Total / float64(agg.Count),
+		})
+	}
+
+	logger.Debug().Int("total_entries", len(entries)).Msg("Built supplier score data")
+	return entries, nil
+}
+
 // Ensure Protocol implements LeaderboardDataProvider at compile time
 var _ metrics.LeaderboardDataProvider = (*Protocol)(nil)

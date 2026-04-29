@@ -128,6 +128,21 @@ func recordHeuristicErrorToReputation(
 		return
 	}
 
+	// Over-servicing rejections (relay-miner says "this app's per-session stake is
+	// exhausted") are not supplier faults — the supplier is correctly enforcing
+	// protocol rate limits. Skip the reputation penalty and record a metric so
+	// operators can see how often this happens. The session-exhaustion tracker
+	// (set elsewhere) prevents future relays to this (supplier, service, session).
+	if heuristicResult.MatchedPattern != "" && heuristic.IsOverServicedError(heuristicResult.MatchedPattern) {
+		supplier, _ := endpointAddr.GetAddress()
+		metrics.RecordSupplierExhausted(supplier, string(serviceID))
+		logger.Debug().
+			Str("endpoint", string(endpointAddr)).
+			Str("matched_pattern", heuristicResult.MatchedPattern).
+			Msg("Skipping reputation penalty for over-serviced (stake-exhausted) supplier")
+		return
+	}
+
 	keyBuilder := reputationSvc.KeyBuilderForService(serviceID)
 	endpointKey := keyBuilder.BuildKey(serviceID, endpointAddr, rpcType)
 
@@ -199,8 +214,12 @@ func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCod
 	}
 	// Capability limitation errors (archival, lite fullnode, etc.) are expected from
 	// nodes that can't serve certain request types — don't circuit break the domain.
+	// Over-servicing rejections (per-app stake exhausted) are also not domain faults.
 	if heuristicResult != nil {
 		if heuristicResult.MatchedPattern != "" && heuristic.IsCapabilityLimitationError(heuristicResult.MatchedPattern) {
+			return false
+		}
+		if heuristicResult.MatchedPattern != "" && heuristic.IsOverServicedError(heuristicResult.MatchedPattern) {
 			return false
 		}
 	} else if lastErr != nil {
@@ -208,6 +227,9 @@ func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCod
 		// detected error → returned error → hedge_failed path → heuristicResult is nil).
 		// Fall back to checking the error string for capability limitation patterns.
 		if heuristic.ErrorContainsArchivalPattern(lastErr.Error()) {
+			return false
+		}
+		if heuristic.IsOverServicedError(lastErr.Error()) {
 			return false
 		}
 	}

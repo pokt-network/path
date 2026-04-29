@@ -816,6 +816,23 @@ func (e *HealthCheckExecutor) recordCheckResult(
 		return
 	}
 
+	// Over-servicing rejections — same no-penalty rule as the request path.
+	// Without this, every health-check probe to an exhausted supplier records a
+	// MajorError signal and pins their reputation at 0 even after the request
+	// path has stopped penalizing them. Production canary observed easy2stake's
+	// BSC supplier set stuck at score=0 with success-only request-path signals
+	// because the health-check executor was draining them in parallel.
+	if heuristic.IsOverServicedError(checkErr.Error()) {
+		metrics.RecordSupplierExhausted(supplier, string(serviceID))
+		metrics.RecordHealthCheck(domain, supplier, rpcTypeStr, string(serviceID), check.Name, metrics.SignalOK)
+		e.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Str("check", check.Name).
+			Msg("Skipping health-check reputation penalty for over-serviced (stake-exhausted) supplier")
+		return
+	}
+
 	// Check failed - record error signal based on configured severity
 	signal := e.mapSignalType(check.ReputationSignal, checkErr.Error(), latency)
 	if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {

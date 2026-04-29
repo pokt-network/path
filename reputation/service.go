@@ -9,6 +9,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -162,7 +163,30 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 		// Buffer full, write will be picked up on next flush from cache
 	}
 
+	// Per-supplier observability: emit a supplier-labeled signal counter so
+	// relay-miner operators can see what's happening on their endpoints.
+	// Empty supplier (per-domain reputation keys) is dropped by RecordSupplierSignal.
+	metrics.RecordSupplierSignal(supplierFromKey(key), string(key.ServiceID), string(signal.Type))
+
 	return nil
+}
+
+// supplierFromKey extracts the supplier address from an EndpointKey.
+// Returns "" for per-domain keys (where supplier is not recoverable).
+//
+// The EndpointKey.EndpointAddr varies by KeyGranularity:
+//   - per-endpoint  → "pokt1abc-https://..." (has dash, supplier before)
+//   - per-supplier  → "pokt1abc..." (bech32 only)
+//   - per-domain    → "node.example.com" (host only — no supplier available)
+func supplierFromKey(key EndpointKey) string {
+	addr := string(key.EndpointAddr)
+	if i := strings.IndexByte(addr, '-'); i > 0 {
+		return addr[:i]
+	}
+	if strings.HasPrefix(addr, "pokt1") {
+		return addr
+	}
+	return ""
 }
 
 // GetScore retrieves the current reputation score for an endpoint.

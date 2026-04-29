@@ -22,7 +22,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
 
       # Needed so release_build_cgo can produce arm64 artifacts on amd64 runner
       - name: Install cross toolchains for CGO

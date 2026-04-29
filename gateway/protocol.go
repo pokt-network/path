@@ -173,6 +173,12 @@ type ProtocolRequestContext interface {
 	// and receives and verifies the response.
 	HandleServiceRequest([]protocol.Payload) ([]protocol.Response, error)
 
+	// SetParentContext replaces the parent context used for downstream HTTP requests and
+	// observation recording. The hedge race uses this to detach each branch from the caller's
+	// request ctx so a hedge "loser" can finish its in-flight HTTP exchange cleanly rather
+	// than being RST'd the moment the winner is picked and the caller's handler unwinds.
+	SetParentContext(ctx context.Context)
+
 	// GetObservations builds and returns the set of protocol-specific observations using the current context.
 	//
 	// Hypothetical illustrative example.

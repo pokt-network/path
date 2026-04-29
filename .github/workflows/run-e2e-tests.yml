@@ -76,7 +76,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
 
       # Stagger artifact downloads to avoid GitHub secondary rate limits
       - name: Stagger artifact download
@@ -130,7 +130,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
 
       # Stagger artifact downloads to avoid GitHub secondary rate limits
       - name: Stagger artifact download
