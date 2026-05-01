@@ -135,6 +135,15 @@ type requestContext struct {
 	// When nil, no reputation-based filtering is applied.
 	reputationService reputation.ReputationService
 
+	// isHedge marks this request as the hedge branch of a hedge race. Set by
+	// MarkAsHedge() before HandleServiceRequest is called. Used at metric/reputation
+	// recording time to:
+	//   - Tag the relay metric as request_type="hedge" (not "normal")
+	//   - Skip latency-penalty reputation signals (don't punish far-from-gateway endpoints)
+	// Success/error reputation signals still fire — endpoints still get fair feedback
+	// about whether they actually work.
+	isHedge bool
+
 	// tieredSelector provides access to tier-based selection and probation status.
 	// Used to check if endpoints are in probation when recording success signals.
 	// If non-nil and endpoint is in probation, RecoverySuccessSignal is used instead of SuccessSignal.
@@ -439,6 +448,13 @@ func (rc *requestContext) GetObservations() protocolobservations.Observations {
 // `failed to read request body: unexpected EOF` even though the relay itself succeeded.
 func (rc *requestContext) SetParentContext(ctx context.Context) {
 	rc.context = ctx
+}
+
+// MarkAsHedge tags this request as the hedge branch of a hedge race.
+// Implements gateway.ProtocolRequestContext. See the field doc on `isHedge`
+// for behavior implications (metric request_type, latency penalty skip).
+func (rc *requestContext) MarkAsHedge() {
+	rc.isHedge = true
 }
 
 // getSelectedEndpoint returns the currently selected endpoint in a thread-safe manner.
@@ -1212,8 +1228,12 @@ func (rc *requestContext) handleEndpointError(
 		statusCodeStr = metrics.GetStatusCodeCategory(statusCode)
 	}
 
-	// Determine relay type - errors are recorded as normal type (probation detection requires success)
+	// Determine relay type - errors are recorded as normal type (probation detection requires success).
+	// Hedge errors are tagged as hedge so they don't pollute the per-domain RPS view.
 	relayType := metrics.RelayTypeNormal
+	if rc.isHedge {
+		relayType = metrics.RelayTypeHedge
+	}
 	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
 	// Return the original response (preserving any response bytes) with the error.
@@ -1291,6 +1311,13 @@ func (rc *requestContext) handleEndpointSuccess(
 				Str("endpoint", string(selectedEndpointAddr)).
 				Str("service_id", string(rc.serviceID)).
 				Msg("Backend returned 5xx error - recording critical error signal for reputation")
+		} else if rc.isHedge {
+			// Hedge branch succeeded — record success signal (so the endpoint gets fair
+			// reputation feedback) but tag the relay metric as hedge so it doesn't
+			// inflate per-domain RPS dashboards. Latency penalty is skipped below.
+			signal = reputation.NewSuccessSignal(latency)
+			reputationSignal = metrics.SignalOK
+			relayType = metrics.RelayTypeHedge
 		} else if rc.tieredSelector != nil && rc.tieredSelector.Config().Probation.Enabled && rc.tieredSelector.IsInProbation(endpointKey) {
 			// Probation endpoint succeeded - use recovery signal for stronger positive reinforcement
 			signal = reputation.NewRecoverySuccessSignal(latency)
@@ -1321,8 +1348,11 @@ func (rc *requestContext) handleEndpointSuccess(
 			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for success")
 		}
 
-		// Record additional latency penalty signals if applicable (only for actual successes)
-		if !isBackend5xx {
+		// Record additional latency penalty signals if applicable (only for actual successes).
+		// Skip for hedge branches: a hedge that's "slow" only failed to win the race —
+		// often because of network distance, not endpoint health. Penalizing it for
+		// latency would systematically drift far-from-gateway endpoints downward.
+		if !isBackend5xx && !rc.isHedge {
 			rc.recordLatencyPenaltySignalsIfNeeded(endpointKey, latency)
 		}
 	} else {
@@ -1332,7 +1362,11 @@ func (rc *requestContext) handleEndpointSuccess(
 		} else {
 			reputationSignal = metrics.SignalOK
 		}
-		relayType = metrics.RelayTypeNormal
+		if rc.isHedge {
+			relayType = metrics.RelayTypeHedge
+		} else {
+			relayType = metrics.RelayTypeNormal
+		}
 	}
 
 	// Record relay metric for successful request

@@ -500,6 +500,12 @@ const (
 	RelayTypeNormal      = "normal"
 	RelayTypeHealthCheck = "health_check"
 	RelayTypeProbation   = "probation"
+	// RelayTypeHedge tags relays issued as the hedge branch of a hedge race —
+	// a backup attempt to a different endpoint when the primary is slow. These
+	// inflate per-domain RPS metrics if grouped with normal traffic, because
+	// fast endpoints are picked as hedge again and again. Dashboards filter to
+	// request_type="normal" by default to show fair primary-traffic distribution.
+	RelayTypeHedge = "hedge"
 )
 
 var RelaysTotal = promauto.NewCounterVec(

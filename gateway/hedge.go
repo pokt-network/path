@@ -211,6 +211,12 @@ func (hr *hedgeRacer) race(
 				hedgeDetachedCtx, hedgeDetachedCancel := detachedHedgeCtx(ctx, defaultLoserGraceWindow)
 				hr.hedgeReqCancel = hedgeDetachedCancel
 				hedgeCtx.SetParentContext(hedgeDetachedCtx)
+				// Tag this branch as hedge so the protocol records it under
+				// request_type="hedge" and skips latency-penalty reputation signals.
+				// Without this, fast endpoints picked as hedge accumulate inflated
+				// "normal" relay counts and slow endpoints get latency-penalized for
+				// losing races they only entered because of distance.
+				hedgeCtx.MarkAsHedge()
 				// Start hedge request
 				go hr.executeRequest(ctx, hedgeCtx, hedgeEndpoint, hedgeSupplier, true, 2, time.Now())
 			}
