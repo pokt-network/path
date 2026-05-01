@@ -179,6 +179,16 @@ type ProtocolRequestContext interface {
 	// than being RST'd the moment the winner is picked and the caller's handler unwinds.
 	SetParentContext(ctx context.Context)
 
+	// MarkAsHedge tags this request as the hedge branch of a hedge race so that
+	// (1) its relay metric is recorded with request_type="hedge" rather than "normal"
+	//     — keeps per-domain RPS dashboards honest by not double-counting fast endpoints
+	//     that win disproportionate hedge races, and
+	// (2) latency-penalty reputation signals are skipped — slow geographies should not
+	//     be penalized for losing hedge races they only entered because of distance.
+	// Reputation success/error signals still fire so endpoints get fair feedback
+	// about whether they actually work.
+	MarkAsHedge()
+
 	// GetObservations builds and returns the set of protocol-specific observations using the current context.
 	//
 	// Hypothetical illustrative example.

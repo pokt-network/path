@@ -2,7 +2,9 @@ package solana
 
 import (
 	"errors"
+	"math"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
@@ -52,11 +54,14 @@ func (es *EndpointStore) Select(allAvailableEndpoints protocol.EndpointAddrList)
 		return protocol.EndpointAddr(""), err
 	}
 
-	// No valid endpoints -> select a random endpoint
+	// No valid endpoints -> least-stale fallback (was random). See selectLeastStaleEndpoints.
 	if len(filteredEndpointsAddr) == 0 {
-		logger.Warn().Msg("SELECTING A RANDOM ENDPOINT because all endpoints failed validation.")
-		randomAvailableEndpointAddr := allAvailableEndpoints[rand.Intn(len(allAvailableEndpoints))]
-		return randomAvailableEndpointAddr, nil
+		picked := es.selectLeastStaleEndpoints(allAvailableEndpoints, 1)
+		if len(picked) == 0 {
+			return protocol.EndpointAddr(""), errors.New("no endpoints available for fallback selection")
+		}
+		logger.Warn().Msg("STANDARD_FALLBACK_LEAST_STALE: all endpoints failed validation; picked least-stale.")
+		return picked[0], nil
 	}
 
 	// TODO_FUTURE: consider ranking filtered endpoints, e.g. based on latency, rather than randomization.
@@ -96,10 +101,14 @@ func (es *EndpointStore) SelectMultipleWithArchival(
 		return nil, err
 	}
 
-	// Select random endpoints as fallback
+	// Least-stale fallback (was random). See selectLeastStaleEndpoints.
 	if len(filteredEndpointsAddr) == 0 {
-		logger.Warn().Msg("SELECTING RANDOM ENDPOINTS because all endpoints failed validation.")
-		return selector.RandomSelectMultiple(allAvailableEndpoints, numEndpoints), nil
+		picked := es.selectLeastStaleEndpoints(allAvailableEndpoints, numEndpoints)
+		logger.Warn().
+			Int("returned", len(picked)).
+			Int("total", len(allAvailableEndpoints)).
+			Msg("STANDARD_FALLBACK_LEAST_STALE: all endpoints failed validation; ranked by blocks-behind")
+		return picked, nil
 	}
 
 	// Select up to numEndpoints endpoints from filtered list
@@ -139,6 +148,79 @@ func (es *EndpointStore) sweepStaleEndpoints(ttl time.Duration) []protocol.Endpo
 		}
 	}
 	return removed
+}
+
+// selectLeastStaleEndpoints picks endpoints ranked by "blocks behind perceived height"
+// when all endpoints have failed normal validation.
+//
+// This replaces the previous fully-random fallback, which concentrated traffic on
+// stable-but-stale single-endpoint suppliers — random selection treated a far-behind
+// endpoint exactly the same as one a few blocks behind. With ranking, traffic flows
+// preferentially to the least-stale candidates while preserving randomness within ties.
+//
+// Mirrors qos/evm/endpoint_selection.go::selectLeastStaleEndpoints. Solana uses
+// SolanaGetEpochInfoResponse.BlockHeight as the per-endpoint block height source.
+func (es *EndpointStore) selectLeastStaleEndpoints(availableEndpoints protocol.EndpointAddrList, numEndpoints uint) protocol.EndpointAddrList {
+	if numEndpoints == 0 {
+		numEndpoints = 1
+	}
+	if len(availableEndpoints) == 0 {
+		return nil
+	}
+
+	es.serviceState.serviceStateLock.RLock()
+	perceivedBlock := es.serviceState.perceivedBlockHeight
+	es.serviceState.serviceStateLock.RUnlock()
+
+	// No chain context to rank against: degrade to prior random behavior.
+	if perceivedBlock == 0 {
+		return selector.RandomSelectMultiple(availableEndpoints, numEndpoints)
+	}
+
+	type scored struct {
+		addr         protocol.EndpointAddr
+		blocksBehind uint64
+		hasData      bool
+	}
+	scoredEps := make([]scored, 0, len(availableEndpoints))
+
+	es.endpointsMu.RLock()
+	for _, addr := range availableEndpoints {
+		s := scored{addr: addr, blocksBehind: math.MaxUint64}
+		ep, found := es.endpoints[addr]
+		// SolanaGetEpochInfoResponse can be nil for fresh endpoints — treat as no-data.
+		if found && ep.SolanaGetEpochInfoResponse != nil && ep.BlockHeight > 0 {
+			s.hasData = true
+			h := ep.BlockHeight
+			if h >= perceivedBlock {
+				s.blocksBehind = 0
+			} else {
+				s.blocksBehind = perceivedBlock - h
+			}
+		}
+		scoredEps = append(scoredEps, s)
+	}
+	es.endpointsMu.RUnlock()
+
+	// Random tie-break: shuffle then stable-sort. With-data candidates always rank above
+	// no-data ones — a known stale endpoint is safer than an unknown one.
+	rand.Shuffle(len(scoredEps), func(i, j int) { scoredEps[i], scoredEps[j] = scoredEps[j], scoredEps[i] })
+	sort.SliceStable(scoredEps, func(i, j int) bool {
+		if scoredEps[i].hasData != scoredEps[j].hasData {
+			return scoredEps[i].hasData
+		}
+		return scoredEps[i].blocksBehind < scoredEps[j].blocksBehind
+	})
+
+	n := int(numEndpoints)
+	if n > len(scoredEps) {
+		n = len(scoredEps)
+	}
+	out := make(protocol.EndpointAddrList, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, scoredEps[i].addr)
+	}
+	return out
 }
 
 // filterValidEndpoints returns the subset of available endpoints that are valid according to previously processed observations.

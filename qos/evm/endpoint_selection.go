@@ -3,7 +3,9 @@ package evm
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -81,19 +83,23 @@ func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.E
 		return nil, err
 	}
 
-	// Select random endpoints as fallback
+	// Select least-stale endpoints as fallback when normal validation rejects everything.
+	// Least-stale ranking (instead of fully-random) prevents traffic from concentrating on
+	// stable-but-stale single-endpoint suppliers — they used to win disproportionately
+	// because random fallback ignored block-height differences.
 	if len(filteredEndpointsAddr) == 0 {
 		// When requiresArchival is true, we must respect archival filtering even in fallback.
-		// Filter to only archival-capable endpoints before random selection.
 		if requiresArchival {
 			archivalEndpoints := ss.filterArchivalEndpointsForFallback(availableEndpoints)
 			if len(archivalEndpoints) > 0 {
-				// CODE_PATH: Archival fallback - random selection from archival-capable endpoints
-				logger.Warn().Str("code_path", "ARCHIVAL_FALLBACK_RANDOM").
+				// CODE_PATH: Archival fallback - least-stale among archival-capable endpoints
+				picked := ss.selectLeastStaleEndpoints(archivalEndpoints, numEndpoints)
+				logger.Warn().Str("code_path", "ARCHIVAL_FALLBACK_LEAST_STALE").
 					Int("archival_endpoints", len(archivalEndpoints)).
 					Int("total_endpoints", len(availableEndpoints)).
-					Msgf("selecting random archival endpoints (fallback) from %d archival-capable endpoints", len(archivalEndpoints))
-				return selector.RandomSelectMultiple(archivalEndpoints, numEndpoints), nil
+					Int("returned", len(picked)).
+					Msgf("archival fallback: %d archival-capable, picked %d least-stale", len(archivalEndpoints), len(picked))
+				return picked, nil
 			}
 			// CODE_PATH: No archival endpoints available - request will fail
 			logger.Error().Str("code_path", "ARCHIVAL_NO_ENDPOINTS").
@@ -101,13 +107,13 @@ func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.E
 				Msg("no archival-capable endpoints available for archival request")
 			return nil, fmt.Errorf("no archival-capable endpoints available for archival request")
 		}
-		// CODE_PATH: Standard fallback - random selection, but still exclude known-stale URLs
-		fallbackEndpoints := ss.filterStaleURLEndpoints(availableEndpoints)
-		logger.Warn().Str("code_path", "STANDARD_FALLBACK_RANDOM").
+		// CODE_PATH: Standard fallback - least-stale ranking instead of random
+		picked := ss.selectLeastStaleEndpoints(availableEndpoints, numEndpoints)
+		logger.Warn().Str("code_path", "STANDARD_FALLBACK_LEAST_STALE").
 			Int("total_endpoints", len(availableEndpoints)).
-			Int("fallback_endpoints", len(fallbackEndpoints)).
-			Msgf("selecting random endpoints because all endpoints failed validation from: %s", availableEndpoints.String())
-		return selector.RandomSelectMultiple(fallbackEndpoints, numEndpoints), nil
+			Int("returned", len(picked)).
+			Msgf("all endpoints failed validation; picked %d least-stale from %d", len(picked), len(availableEndpoints))
+		return picked, nil
 	}
 
 	// CODE_PATH: Selection success - using diversity-aware selection
@@ -141,16 +147,21 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 	}
 
 	validCount := len(filteredEndpointsAddr)
-	// Handle case where all endpoints failed validation
+	// Handle case where all endpoints failed validation: pick the least-stale endpoint
+	// instead of a fully-random one. Same fix as SelectMultipleWithArchival — random
+	// fallback was concentrating traffic on whichever single-endpoint suppliers happened
+	// to be stable-but-stale.
 	if validCount == 0 {
-		// Still exclude known-stale URLs from the fallback pool
-		fallbackEndpoints := ss.filterStaleURLEndpoints(availableEndpoints)
+		picked := ss.selectLeastStaleEndpoints(availableEndpoints, 1)
+		if len(picked) == 0 {
+			return EndpointSelectionResult{}, fmt.Errorf("no endpoints available for fallback selection")
+		}
 		logger.Warn().
-			Int("fallback_endpoints", len(fallbackEndpoints)).
-			Msgf("SELECTING A RANDOM ENDPOINT because all endpoints failed validation from: %s", availableEndpoints.String())
-		randomAvailableEndpointAddr := fallbackEndpoints[rand.Intn(len(fallbackEndpoints))]
+			Int("returned", len(picked)).
+			Int("total", len(availableEndpoints)).
+			Msgf("all endpoints failed validation; picked least-stale from %d", len(availableEndpoints))
 		return EndpointSelectionResult{
-			SelectedEndpoint: randomAvailableEndpointAddr,
+			SelectedEndpoint: picked[0],
 			Metadata: EndpointSelectionMetadata{
 				RandomEndpointFallback: true,
 				ValidationResults:      validationResults,
@@ -210,38 +221,15 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 	// This lets us validate fresh endpoints against known block heights for the same URL
 	// (different supplier addresses staked against the same backend infrastructure).
 	// Uses MIN per URL: if ANY supplier at that URL reports a stale block height,
-	// the URL is considered stale. This prevents old high values from previous sessions
-	// masking current staleness.
-	urlBlockHeights := make(map[string]uint64)
+	// the URL is considered stale. See buildURLBlockHeightMap.
+	urlBlockHeights := ss.buildURLBlockHeightMap()
 
 	ss.endpointStore.endpointsMu.RLock()
-	for addr, ep := range ss.endpointStore.endpoints {
-		if ep.checkBlockNumber.parsedBlockNumberResponse != nil {
-			if url, err := addr.GetURL(); err == nil {
-				h := *ep.checkBlockNumber.parsedBlockNumberResponse
-				if existing, ok := urlBlockHeights[url]; !ok || h < existing {
-					urlBlockHeights[url] = h
-				}
-			}
-		}
-	}
 	for i, addr := range availableEndpoints {
 		ep, found := ss.endpointStore.endpoints[addr]
 		endpointsCopy[i] = endpointData{addr: addr, endpoint: ep, found: found}
 	}
 	ss.endpointStore.endpointsMu.RUnlock()
-
-	// Merge cached Redis URL block heights as fallback.
-	// This catches stale URLs that aren't in the local store yet
-	// (e.g., new supplier addresses after session rotation).
-	// Uses MIN to be conservative — stale URLs should not pass the filter.
-	if cached := ss.redisURLBlockHeights.Load(); cached != nil {
-		for url, h := range *cached {
-			if existing, ok := urlBlockHeights[url]; !ok || h < existing {
-				urlBlockHeights[url] = h
-			}
-		}
-	}
 
 	// Touch endpoints to update lastSeen for stale endpoint cleanup.
 	// Uses a separate WLock call to avoid changing the read-heavy filtering path.
@@ -635,6 +623,138 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 	return nil
 }
 
+// selectLeastStaleEndpoints picks endpoints ranked by "blocks behind perceived height"
+// when all endpoints have failed normal validation.
+//
+// This replaces the previous fully-random fallback (STANDARD_FALLBACK_RANDOM), which
+// concentrated traffic on whichever single-endpoint suppliers happened to be present in
+// the unfiltered pool — random selection treated a 100k-blocks-behind endpoint exactly
+// the same as a 6-blocks-behind one. With ranking, traffic flows preferentially to the
+// least-stale candidates while preserving randomness within ties.
+//
+// Behavior:
+//   - Endpoints with known block heights (from local store or Redis cache) are ranked
+//     by blocks-behind ascending; ties broken randomly.
+//   - Endpoints with no block-height data are deprioritized — they only get picked
+//     when there are no with-data candidates left to fill numEndpoints.
+//   - When we have no chain context (sync_allowance==0, perceivedBlock==0, or no URL
+//     block-height data anywhere), falls back to the prior random behavior on the
+//     stale-URL-filtered pool.
+func (ss *serviceState) selectLeastStaleEndpoints(availableEndpoints protocol.EndpointAddrList, numEndpoints uint) protocol.EndpointAddrList {
+	if numEndpoints == 0 {
+		numEndpoints = 1
+	}
+	if len(availableEndpoints) == 0 {
+		return nil
+	}
+
+	serviceID := string(ss.serviceQoSConfig.GetServiceID())
+	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
+	perceivedBlock := ss.perceivedBlockNumber.Load()
+
+	// No chain context to rank against: degrade to prior random behavior on the
+	// stale-URL-filtered pool. Caller's safety net (filterStaleURLEndpoints already
+	// returns the unfiltered list when filtering would zero everything out) is preserved.
+	if syncAllowance == 0 || perceivedBlock == 0 {
+		return selector.RandomSelectMultiple(ss.filterStaleURLEndpoints(availableEndpoints), numEndpoints)
+	}
+
+	urlBlockHeights := ss.buildURLBlockHeightMap()
+	if len(urlBlockHeights) == 0 {
+		ss.logger.Warn().
+			Str("service_id", serviceID).
+			Int("endpoint_count", len(availableEndpoints)).
+			Msg("selectLeastStaleEndpoints: no URL block-height data — falling back to random selection")
+		return selector.RandomSelectMultiple(ss.filterStaleURLEndpoints(availableEndpoints), numEndpoints)
+	}
+
+	type scored struct {
+		addr         protocol.EndpointAddr
+		blocksBehind uint64 // math.MaxUint64 when no data is available for this URL
+		hasData      bool
+	}
+	scoredEps := make([]scored, 0, len(availableEndpoints))
+	for _, addr := range availableEndpoints {
+		s := scored{addr: addr, blocksBehind: math.MaxUint64}
+		if url, err := addr.GetURL(); err == nil {
+			if h, ok := urlBlockHeights[url]; ok {
+				s.hasData = true
+				if h >= perceivedBlock {
+					s.blocksBehind = 0
+				} else {
+					s.blocksBehind = perceivedBlock - h
+				}
+			}
+		}
+		scoredEps = append(scoredEps, s)
+	}
+
+	// Random tie-break: shuffle first, then stable-sort by score. Endpoints at the same
+	// blocks-behind value end up in random relative order, so traffic spreads across ties
+	// instead of always landing on the lexicographically-first endpoint.
+	rand.Shuffle(len(scoredEps), func(i, j int) { scoredEps[i], scoredEps[j] = scoredEps[j], scoredEps[i] })
+	sort.SliceStable(scoredEps, func(i, j int) bool {
+		// With-data candidates always rank above no-data candidates: a known stale
+		// endpoint is safer than an unknown one.
+		if scoredEps[i].hasData != scoredEps[j].hasData {
+			return scoredEps[i].hasData
+		}
+		return scoredEps[i].blocksBehind < scoredEps[j].blocksBehind
+	})
+
+	n := int(numEndpoints)
+	if n > len(scoredEps) {
+		n = len(scoredEps)
+	}
+	out := make(protocol.EndpointAddrList, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, scoredEps[i].addr)
+	}
+
+	ss.logger.Warn().
+		Str("service_id", serviceID).
+		Int("returned", len(out)).
+		Int("total", len(availableEndpoints)).
+		Uint64("perceived_block", perceivedBlock).
+		Uint64("best_blocks_behind", scoredEps[0].blocksBehind).
+		Bool("best_has_data", scoredEps[0].hasData).
+		Msg("STANDARD_FALLBACK_LEAST_STALE: ranked endpoints by blocks-behind for fallback selection")
+
+	return out
+}
+
+// buildURLBlockHeightMap merges per-URL block heights from the local endpoint store and
+// the cached Redis URL block heights. Uses MIN per URL so that any stale observation for
+// a given backend dominates (matches filterValidEndpointsWithDetails / filterStaleURLEndpoints).
+func (ss *serviceState) buildURLBlockHeightMap() map[string]uint64 {
+	urlBlockHeights := make(map[string]uint64)
+
+	ss.endpointStore.endpointsMu.RLock()
+	for addr, ep := range ss.endpointStore.endpoints {
+		if ep.checkBlockNumber.parsedBlockNumberResponse == nil {
+			continue
+		}
+		url, err := addr.GetURL()
+		if err != nil {
+			continue
+		}
+		h := *ep.checkBlockNumber.parsedBlockNumberResponse
+		if existing, ok := urlBlockHeights[url]; !ok || h < existing {
+			urlBlockHeights[url] = h
+		}
+	}
+	ss.endpointStore.endpointsMu.RUnlock()
+
+	if cached := ss.redisURLBlockHeights.Load(); cached != nil {
+		for url, h := range *cached {
+			if existing, ok := urlBlockHeights[url]; !ok || h < existing {
+				urlBlockHeights[url] = h
+			}
+		}
+	}
+	return urlBlockHeights
+}
+
 // filterStaleURLEndpoints removes endpoints whose URL has a known stale block height
 // from the endpoint store. Used by fallback paths to avoid selecting stale infrastructure
 // when all endpoints fail normal validation.
@@ -658,29 +778,7 @@ func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrL
 	}
 	minAllowed := perceivedBlock - syncAllowance
 
-	// Build URL→blockHeight map from store
-	urlBlockHeights := make(map[string]uint64)
-	ss.endpointStore.endpointsMu.RLock()
-	for addr, ep := range ss.endpointStore.endpoints {
-		if ep.checkBlockNumber.parsedBlockNumberResponse != nil {
-			if url, err := addr.GetURL(); err == nil {
-				h := *ep.checkBlockNumber.parsedBlockNumberResponse
-				if existing, ok := urlBlockHeights[url]; !ok || h < existing {
-					urlBlockHeights[url] = h
-				}
-			}
-		}
-	}
-	ss.endpointStore.endpointsMu.RUnlock()
-
-	// Merge cached Redis URL block heights as fallback.
-	if cached := ss.redisURLBlockHeights.Load(); cached != nil {
-		for url, h := range *cached {
-			if existing, ok := urlBlockHeights[url]; !ok || h < existing {
-				urlBlockHeights[url] = h
-			}
-		}
-	}
+	urlBlockHeights := ss.buildURLBlockHeightMap()
 
 	if len(urlBlockHeights) == 0 {
 		ss.logger.Warn().
