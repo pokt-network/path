@@ -11,6 +11,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -112,6 +113,10 @@ func (cb *DomainCircuitBreaker) MarkBroken(ctx context.Context, serviceID, domai
 	entry.domains[domain] = brokenDomainState{expiry: expiry, hitCount: hitCount, reason: reason}
 	cb.mu.Unlock()
 
+	// Surface state via Prometheus gauge so dashboards can show "currently broken
+	// domains" without needing Redis access. Idempotent — re-setting to 1 is fine.
+	metrics.SetCircuitBreakerState(serviceID, domain, true)
+
 	// Always log circuit break events at error level for production visibility.
 	// This is critical for diagnosing why domains get locked out.
 	cb.logger.Error().
@@ -172,17 +177,20 @@ func filterExpiredDomains(domains map[string]brokenDomainState) map[string]bool 
 // Used when Redis is not available (local-only mode).
 func (cb *DomainCircuitBreaker) refreshLocal(serviceID string) map[string]bool {
 	cb.mu.Lock()
-	defer cb.mu.Unlock()
 
 	entry, ok := cb.cache[serviceID]
 	if !ok {
+		cb.mu.Unlock()
 		return nil
 	}
 
-	// Remove expired entries
+	// Remove expired entries; collect their names so we can drop the gauge to 0
+	// outside the lock (avoid taking metrics lock under cb.mu).
 	now := time.Now()
+	var expired []string
 	for domain, state := range entry.domains {
 		if !state.expiry.After(now) {
+			expired = append(expired, domain)
 			delete(entry.domains, domain)
 		}
 	}
@@ -191,6 +199,11 @@ func (cb *DomainCircuitBreaker) refreshLocal(serviceID string) map[string]bool {
 	result := make(map[string]bool, len(entry.domains))
 	for d := range entry.domains {
 		result[d] = true
+	}
+	cb.mu.Unlock()
+
+	for _, d := range expired {
+		metrics.SetCircuitBreakerState(serviceID, d, false)
 	}
 	return result
 }
@@ -264,8 +277,11 @@ func (cb *DomainCircuitBreaker) refreshFromRedis(ctx context.Context, serviceID 
 		cb.redisClient.HDel(ctx, key, expiredFields...)
 	}
 
-	// Merge with local cache (local entries might be newer than Redis)
+	// Merge with local cache (local entries might be newer than Redis).
+	// Capture pre-merge cache contents so we can drop the gauge to 0 for any
+	// domain that was previously broken but is no longer present after merge.
 	cb.mu.Lock()
+	var previouslyBroken []string
 	existingEntry, ok := cb.cache[serviceID]
 	if ok {
 		for domain, state := range existingEntry.domains {
@@ -273,6 +289,8 @@ func (cb *DomainCircuitBreaker) refreshFromRedis(ctx context.Context, serviceID 
 				if redisState, exists := domains[domain]; !exists || state.expiry.After(redisState.expiry) {
 					domains[domain] = state
 				}
+			} else {
+				previouslyBroken = append(previouslyBroken, domain)
 			}
 		}
 	}
@@ -281,6 +299,21 @@ func (cb *DomainCircuitBreaker) refreshFromRedis(ctx context.Context, serviceID 
 		refreshAt: now.Add(cb.cacheTTL),
 	}
 	cb.mu.Unlock()
+
+	// Drop gauge for previously-broken-but-now-expired domains, plus the explicit
+	// expiredFields list we already collected from Redis. Done outside the lock.
+	for _, d := range expiredFields {
+		metrics.SetCircuitBreakerState(serviceID, d, false)
+	}
+	for _, d := range previouslyBroken {
+		metrics.SetCircuitBreakerState(serviceID, d, false)
+	}
+	// Re-assert gauge=1 for currently-broken domains. Idempotent and ensures the
+	// metric is correct on a fresh pod that lazily picks up Redis state without
+	// going through MarkBroken locally.
+	for d := range domains {
+		metrics.SetCircuitBreakerState(serviceID, d, true)
+	}
 
 	// Build result
 	result := make(map[string]bool, len(domains))
@@ -297,14 +330,24 @@ func (cb *DomainCircuitBreaker) ClearService(ctx context.Context, serviceID stri
 	cb.mu.Lock()
 	entry, ok := cb.cache[serviceID]
 	count := 0
+	var clearedDomains []string
 	if ok {
 		count = len(entry.domains)
+		clearedDomains = make([]string, 0, count)
+		for d := range entry.domains {
+			clearedDomains = append(clearedDomains, d)
+		}
 		delete(cb.cache, serviceID)
 	}
 	cb.mu.Unlock()
 
 	if cb.redisClient != nil {
 		cb.redisClient.Del(ctx, cb.keyPrefix+serviceID)
+	}
+
+	// Drop the gauge for every domain we cleared so the dashboard reflects reality.
+	for _, d := range clearedDomains {
+		metrics.SetCircuitBreakerState(serviceID, d, false)
 	}
 
 	cb.logger.Info().
