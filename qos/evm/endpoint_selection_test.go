@@ -774,8 +774,9 @@ func TestSelectMultipleWithArchival_FiltersStaleEndpoints(t *testing.T) {
 
 			if tt.expectFallback {
 				// When ALL endpoints are stale, SelectMultipleWithArchival falls back to
-				// random selection (STANDARD_FALLBACK_RANDOM). This is a known behavior:
-				// it returns endpoints rather than erroring to avoid total service failure.
+				// least-stale ranking (STANDARD_FALLBACK_LEAST_STALE) instead of fully-random
+				// selection. It returns endpoints rather than erroring to avoid total service
+				// failure, and prefers the least-stale candidates among the stale pool.
 				require.NoError(t, err)
 				require.NotEmpty(t, selected, "fallback should still return endpoints")
 				return
@@ -920,4 +921,207 @@ func TestRedisURLBlockHeightsCache_NotUsedWhenLocalStoreHasData(t *testing.T) {
 	selected, err := ss.SelectMultipleWithArchival(availableEndpoints, 1, false, "test-req")
 	require.NoError(t, err)
 	require.Len(t, selected, 1, "endpoint with current local block should pass even with stale Redis cache")
+}
+
+// TestStandardFallback_PrefersLeastStale verifies that when ALL endpoints fail
+// validation, the fallback ranks endpoints by blocks-behind rather than picking
+// fully randomly. Replaces the previous STANDARD_FALLBACK_RANDOM behavior.
+//
+// Setup: 3 endpoints, all stale (all behind sync_allowance), with different
+// degrees of staleness. Pre-fix, any of them could be returned. Post-fix,
+// the least-stale endpoint is preferred.
+func TestStandardFallback_PrefersLeastStale(t *testing.T) {
+	logger := polylog.Ctx(context.Background())
+
+	perceivedBlock := uint64(1000)
+	syncAllowance := uint64(5)
+	chainID := "1"
+
+	// Three endpoints, all stale (>5 behind):
+	//   leastStale:   8 blocks behind  (least stale — should win)
+	//   midStale:    50 blocks behind
+	//   worstStale: 500 blocks behind
+	leastStaleBlock := perceivedBlock - 8
+	midStaleBlock := perceivedBlock - 50
+	worstStaleBlock := perceivedBlock - 500
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"pokt1least-https://least.example.com": {
+			checkBlockNumber: endpointCheckBlockNumber{parsedBlockNumberResponse: &leastStaleBlock},
+			checkChainID:     endpointCheckChainID{chainID: &chainID, expiresAt: time.Now().Add(1 * time.Hour)},
+		},
+		"pokt1mid-https://mid.example.com": {
+			checkBlockNumber: endpointCheckBlockNumber{parsedBlockNumberResponse: &midStaleBlock},
+			checkChainID:     endpointCheckChainID{chainID: &chainID, expiresAt: time.Now().Add(1 * time.Hour)},
+		},
+		"pokt1worst-https://worst.example.com": {
+			checkBlockNumber: endpointCheckBlockNumber{parsedBlockNumberResponse: &worstStaleBlock},
+			checkChainID:     endpointCheckChainID{chainID: &chainID, expiresAt: time.Now().Add(1 * time.Hour)},
+		},
+	}
+
+	ss := &serviceState{
+		logger: logger,
+		serviceQoSConfig: NewEVMServiceQoSConfigWithSyncAllowance(
+			"test-service", chainID, nil, syncAllowance,
+		),
+		endpointStore: &endpointStore{logger: logger, endpoints: endpoints},
+		reputationSvc: &mockReputationService{archivalEndpoints: make(map[string]bool)},
+		blockConsensus: NewBlockHeightConsensus(logger, 128),
+		archivalCache:  NewArchivalCache(),
+	}
+	ss.perceivedBlockNumber.Store(perceivedBlock)
+
+	availableEndpoints := protocol.EndpointAddrList{
+		"pokt1least-https://least.example.com",
+		"pokt1mid-https://mid.example.com",
+		"pokt1worst-https://worst.example.com",
+	}
+
+	// Run selection many times: with random ranking, the most-stale endpoint would
+	// be picked ~33% of the time. With least-stale ranking, it should be picked 0
+	// times when asking for 1 endpoint.
+	const trials = 100
+	picks := map[protocol.EndpointAddr]int{}
+	for i := 0; i < trials; i++ {
+		selected, err := ss.SelectMultipleWithArchival(availableEndpoints, 1, false, "test-req")
+		require.NoError(t, err)
+		require.Len(t, selected, 1)
+		picks[selected[0]]++
+	}
+
+	require.Equal(t, trials, picks["pokt1least-https://least.example.com"],
+		"least-stale endpoint should be the only pick when asking for 1 endpoint; got picks=%v", picks)
+	require.Zero(t, picks["pokt1mid-https://mid.example.com"],
+		"mid-stale endpoint should never be picked over least-stale when asking for 1; got picks=%v", picks)
+	require.Zero(t, picks["pokt1worst-https://worst.example.com"],
+		"worst-stale endpoint should never be picked over least-stale; got picks=%v", picks)
+
+	// Asking for 2 endpoints should return the two least-stale ones (in either order),
+	// never the worst-stale.
+	multi, err := ss.SelectMultipleWithArchival(availableEndpoints, 2, false, "test-req")
+	require.NoError(t, err)
+	require.Len(t, multi, 2)
+	multiSet := map[protocol.EndpointAddr]bool{multi[0]: true, multi[1]: true}
+	require.True(t, multiSet["pokt1least-https://least.example.com"], "least-stale must be in top-2")
+	require.True(t, multiSet["pokt1mid-https://mid.example.com"], "mid-stale must be in top-2")
+	require.False(t, multiSet["pokt1worst-https://worst.example.com"], "worst-stale must NOT be in top-2")
+}
+
+// TestStandardFallback_DeprioritizesNoBlockHeightEndpoints verifies that endpoints
+// with no block-height data are ranked below endpoints that DO have data, even when
+// the with-data endpoints are stale. A known-stale endpoint is safer than an unknown one.
+func TestStandardFallback_DeprioritizesNoBlockHeightEndpoints(t *testing.T) {
+	logger := polylog.Ctx(context.Background())
+
+	perceivedBlock := uint64(1000)
+	syncAllowance := uint64(5)
+	chainID := "1"
+
+	// One endpoint with known-stale height, one endpoint with no block height.
+	// Both fail normal validation: the with-data one for being behind, the
+	// no-data one for having no block-number observation.
+	staleBlock := perceivedBlock - 100
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"pokt1known-https://known.example.com": {
+			checkBlockNumber: endpointCheckBlockNumber{parsedBlockNumberResponse: &staleBlock},
+			checkChainID:     endpointCheckChainID{chainID: &chainID, expiresAt: time.Now().Add(1 * time.Hour)},
+		},
+		"pokt1unknown-https://unknown.example.com": {
+			checkBlockNumber: endpointCheckBlockNumber{parsedBlockNumberResponse: nil},
+			checkChainID:     endpointCheckChainID{chainID: &chainID, expiresAt: time.Now().Add(1 * time.Hour)},
+		},
+	}
+
+	ss := &serviceState{
+		logger: logger,
+		serviceQoSConfig: NewEVMServiceQoSConfigWithSyncAllowance(
+			"test-service", chainID, nil, syncAllowance,
+		),
+		endpointStore: &endpointStore{logger: logger, endpoints: endpoints},
+		reputationSvc: &mockReputationService{archivalEndpoints: make(map[string]bool)},
+		blockConsensus: NewBlockHeightConsensus(logger, 128),
+		archivalCache:  NewArchivalCache(),
+	}
+	ss.perceivedBlockNumber.Store(perceivedBlock)
+
+	availableEndpoints := protocol.EndpointAddrList{
+		"pokt1known-https://known.example.com",
+		"pokt1unknown-https://unknown.example.com",
+	}
+
+	const trials = 50
+	picks := map[protocol.EndpointAddr]int{}
+	for i := 0; i < trials; i++ {
+		selected, err := ss.SelectMultipleWithArchival(availableEndpoints, 1, false, "test-req")
+		require.NoError(t, err)
+		require.Len(t, selected, 1)
+		picks[selected[0]]++
+	}
+
+	require.Equal(t, trials, picks["pokt1known-https://known.example.com"],
+		"known-stale endpoint should always rank above unknown-height endpoint; picks=%v", picks)
+}
+
+// TestStandardFallback_RandomTieBreakAcrossEqualStaleness verifies that when multiple
+// endpoints share the same blocks-behind value, traffic is spread across them rather
+// than always landing on one. This is the core "no more single-endpoint magnet"
+// guarantee — ties get distributed, not concentrated.
+func TestStandardFallback_RandomTieBreakAcrossEqualStaleness(t *testing.T) {
+	logger := polylog.Ctx(context.Background())
+
+	perceivedBlock := uint64(1000)
+	syncAllowance := uint64(5)
+	chainID := "1"
+	staleBlock := perceivedBlock - 100 // all endpoints equally stale
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"pokt1a-https://a.example.com": {
+			checkBlockNumber: endpointCheckBlockNumber{parsedBlockNumberResponse: &staleBlock},
+			checkChainID:     endpointCheckChainID{chainID: &chainID, expiresAt: time.Now().Add(1 * time.Hour)},
+		},
+		"pokt1b-https://b.example.com": {
+			checkBlockNumber: endpointCheckBlockNumber{parsedBlockNumberResponse: &staleBlock},
+			checkChainID:     endpointCheckChainID{chainID: &chainID, expiresAt: time.Now().Add(1 * time.Hour)},
+		},
+		"pokt1c-https://c.example.com": {
+			checkBlockNumber: endpointCheckBlockNumber{parsedBlockNumberResponse: &staleBlock},
+			checkChainID:     endpointCheckChainID{chainID: &chainID, expiresAt: time.Now().Add(1 * time.Hour)},
+		},
+	}
+
+	ss := &serviceState{
+		logger: logger,
+		serviceQoSConfig: NewEVMServiceQoSConfigWithSyncAllowance(
+			"test-service", chainID, nil, syncAllowance,
+		),
+		endpointStore: &endpointStore{logger: logger, endpoints: endpoints},
+		reputationSvc: &mockReputationService{archivalEndpoints: make(map[string]bool)},
+		blockConsensus: NewBlockHeightConsensus(logger, 128),
+		archivalCache:  NewArchivalCache(),
+	}
+	ss.perceivedBlockNumber.Store(perceivedBlock)
+
+	availableEndpoints := protocol.EndpointAddrList{
+		"pokt1a-https://a.example.com",
+		"pokt1b-https://b.example.com",
+		"pokt1c-https://c.example.com",
+	}
+
+	const trials = 600
+	picks := map[protocol.EndpointAddr]int{}
+	for i := 0; i < trials; i++ {
+		selected, err := ss.SelectMultipleWithArchival(availableEndpoints, 1, false, "test-req")
+		require.NoError(t, err)
+		require.Len(t, selected, 1)
+		picks[selected[0]]++
+	}
+
+	// Each endpoint should get roughly 1/3 of picks. Allow a generous margin for
+	// random variance — we just need to confirm no endpoint is starved.
+	for _, addr := range availableEndpoints {
+		require.GreaterOrEqual(t, picks[addr], trials/6,
+			"endpoint %s got %d/%d picks — tie-break is concentrating traffic", addr, picks[addr], trials)
+	}
 }

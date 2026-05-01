@@ -2,7 +2,9 @@ package cosmos
 
 import (
 	"errors"
+	"math"
 	"math/rand"
+	"sort"
 	"time"
 
 	"github.com/pokt-network/path/protocol"
@@ -41,9 +43,15 @@ func (ss *serviceState) Select(availableEndpoints protocol.EndpointAddrList) (pr
 	}
 
 	if len(filteredEndpointsAddr) == 0 {
-		logger.Warn().Msgf("SELECTING A RANDOM ENDPOINT because all endpoints failed validation from: %s", availableEndpoints.String())
-		randomAvailableEndpointAddr := availableEndpoints[rand.Intn(len(availableEndpoints))]
-		return randomAvailableEndpointAddr, nil
+		// Least-stale fallback (was random). See selectLeastStaleEndpoints docstring for
+		// why random fallback was a bug — it concentrated traffic on stable-but-stale
+		// single-endpoint suppliers.
+		picked := ss.selectLeastStaleEndpoints(availableEndpoints, 1)
+		if len(picked) == 0 {
+			return protocol.EndpointAddr(""), errors.New("no endpoints available for fallback selection")
+		}
+		logger.Warn().Msgf("STANDARD_FALLBACK_LEAST_STALE: all endpoints failed validation; picked least-stale from: %s", availableEndpoints.String())
+		return picked[0], nil
 	}
 
 	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(availableEndpoints))
@@ -73,10 +81,14 @@ func (ss *serviceState) SelectMultipleWithArchival(allAvailableEndpoints protoco
 		return nil, err
 	}
 
-	// Select random endpoints as fallback
+	// Least-stale fallback (was random). See selectLeastStaleEndpoints docstring.
 	if len(filteredEndpointsAddr) == 0 {
-		logger.Warn().Msg("SELECTING RANDOM ENDPOINTS because all endpoints failed validation.")
-		return selector.RandomSelectMultiple(allAvailableEndpoints, numEndpoints), nil
+		picked := ss.selectLeastStaleEndpoints(allAvailableEndpoints, numEndpoints)
+		logger.Warn().
+			Int("returned", len(picked)).
+			Int("total", len(allAvailableEndpoints)).
+			Msg("STANDARD_FALLBACK_LEAST_STALE: all endpoints failed validation; ranked by blocks-behind")
+		return picked, nil
 	}
 
 	// Select up to numEndpoints endpoints from filtered list
@@ -134,4 +146,80 @@ func (ss *serviceState) filterValidEndpoints(availableEndpoints protocol.Endpoin
 	ss.endpointStore.touchEndpoints(availableEndpoints)
 
 	return filteredEndpointsAddr, nil
+}
+
+// selectLeastStaleEndpoints picks endpoints ranked by "blocks behind perceived height"
+// when all endpoints have failed normal validation.
+//
+// This replaces the previous fully-random fallback, which concentrated traffic on
+// whichever single-endpoint suppliers happened to be present in the unfiltered pool.
+// Random selection treated a far-behind endpoint exactly the same as one that was a
+// few blocks behind. With ranking, traffic flows preferentially to least-stale
+// candidates while preserving randomness within ties.
+//
+// Mirrors qos/evm/endpoint_selection.go::selectLeastStaleEndpoints. Cosmos uses the
+// CometBFT status latestBlockHeight as the per-endpoint block height source.
+func (ss *serviceState) selectLeastStaleEndpoints(availableEndpoints protocol.EndpointAddrList, numEndpoints uint) protocol.EndpointAddrList {
+	if numEndpoints == 0 {
+		numEndpoints = 1
+	}
+	if len(availableEndpoints) == 0 {
+		return nil
+	}
+
+	syncAllowance := ss.serviceQoSConfig.getSyncAllowance()
+
+	ss.serviceStateLock.RLock()
+	perceivedBlock := ss.perceivedBlockNumber
+	ss.serviceStateLock.RUnlock()
+
+	// No chain context to rank against: degrade to prior random behavior.
+	if syncAllowance == 0 || perceivedBlock == 0 {
+		return selector.RandomSelectMultiple(availableEndpoints, numEndpoints)
+	}
+
+	type scored struct {
+		addr         protocol.EndpointAddr
+		blocksBehind uint64
+		hasData      bool
+	}
+	scoredEps := make([]scored, 0, len(availableEndpoints))
+
+	ss.endpointStore.endpointsMu.RLock()
+	for _, addr := range availableEndpoints {
+		s := scored{addr: addr, blocksBehind: math.MaxUint64}
+		ep, found := ss.endpointStore.endpoints[addr]
+		if found {
+			if h, err := ep.checkCometBFTStatus.GetLatestBlockHeight(); err == nil && h > 0 {
+				s.hasData = true
+				if h >= perceivedBlock {
+					s.blocksBehind = 0
+				} else {
+					s.blocksBehind = perceivedBlock - h
+				}
+			}
+		}
+		scoredEps = append(scoredEps, s)
+	}
+	ss.endpointStore.endpointsMu.RUnlock()
+
+	// Random tie-break: shuffle then stable-sort. With-data candidates always rank above
+	// no-data ones — a known stale endpoint is safer than an unknown one.
+	rand.Shuffle(len(scoredEps), func(i, j int) { scoredEps[i], scoredEps[j] = scoredEps[j], scoredEps[i] })
+	sort.SliceStable(scoredEps, func(i, j int) bool {
+		if scoredEps[i].hasData != scoredEps[j].hasData {
+			return scoredEps[i].hasData
+		}
+		return scoredEps[i].blocksBehind < scoredEps[j].blocksBehind
+	})
+
+	n := int(numEndpoints)
+	if n > len(scoredEps) {
+		n = len(scoredEps)
+	}
+	out := make(protocol.EndpointAddrList, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, scoredEps[i].addr)
+	}
+	return out
 }
