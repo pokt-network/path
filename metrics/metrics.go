@@ -337,6 +337,61 @@ func SetCircuitBreakerState(serviceID, domain string, broken bool) {
 }
 
 // =============================================================================
+// Domain Circuit Breaker Events (Counter)
+// Labels: service_id, domain, reason_category, event
+// Purpose: Surface WHY domains break and at what rate. Pairs with
+// path_circuit_breaker_state (current 0/1 view) — events_total gives the
+// historical decomposition by reason and event type (broken vs recovered).
+//
+// reason_category is a low-cardinality bucket extracted from the free-text
+// reason passed to MarkBroken (which itself contains response snippets and
+// error messages — too high-cardinality for direct labelling). See
+// CircuitBreakerReasonCategory.
+//
+// event ∈ {"broken", "recovered"} so a single counter captures both transitions.
+// =============================================================================
+
+const (
+	LabelReasonCategory       = "reason_category"
+	LabelCircuitBreakerEvent  = "event"
+	CircuitBreakerEventBroken    = "broken"
+	CircuitBreakerEventRecovered = "recovered"
+)
+
+// CircuitBreakerReasonCategory enumerates the bounded set of reason buckets
+// surfaced via the events counter. Keeps cardinality bounded regardless of
+// how variable the underlying reason strings are. Add new categories here
+// when MarkBroken call sites grow new reason prefixes.
+const (
+	CircuitBreakReasonRetry            = "retry"             // failure during retry path
+	CircuitBreakReasonBatchTransport   = "batch_transport"   // batch path: transport-level error
+	CircuitBreakReasonBatchHeuristic   = "batch_heuristic"   // batch path: heuristic flagged response
+	CircuitBreakReasonParallelRetry   = "parallel_retry"    // parallel-retry path failure
+	CircuitBreakReasonHeuristic        = "heuristic"         // top-level heuristic break
+	CircuitBreakReasonUnknown          = "unknown"           // anything we can't classify
+)
+
+var DomainCircuitBreakerEventsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "circuit_breaker_events_total",
+		Help: "Domain circuit-breaker transitions over time. event ∈ {broken, recovered}. reason_category is a bounded prefix bucket extracted from the raw MarkBroken reason. Pairs with path_circuit_breaker_state for current snapshot.",
+	},
+	[]string{LabelServiceID, LabelDomain, LabelReasonCategory, LabelCircuitBreakerEvent},
+)
+
+// RecordCircuitBreakerEvent increments the per-(service, domain, reason, event)
+// counter. Skipped silently when domain is empty.
+func RecordCircuitBreakerEvent(serviceID, domain, reasonCategory, event string) {
+	if domain == "" {
+		return
+	}
+	if reasonCategory == "" {
+		reasonCategory = CircuitBreakReasonUnknown
+	}
+	DomainCircuitBreakerEventsTotal.WithLabelValues(serviceID, domain, reasonCategory, event).Inc()
+}
+
+// =============================================================================
 // Endpoints In Cooldown (Gauge, published every 10s via leaderboard publisher)
 // Labels: domain, rpc_type, service_id
 // Value: count of endpoints currently in a strike cooldown period (Score.IsInCooldown
