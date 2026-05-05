@@ -875,6 +875,25 @@ func TestProtocolAnalysis_REST(t *testing.T) {
 			expectedRetry:  true,
 			expectedReason: "rest_protocol_mismatch",
 		},
+		{
+			// Honest JSON-RPC error from a node that only speaks JSON-RPC: PATH routed
+			// a REST-shaped request to it and the node correctly replied with its
+			// native error format. This is a capability mismatch, NOT gaming, and
+			// should be classified separately so the gateway does not punish it as
+			// a deceptive response.
+			name:           "REST receives JSON-RPC error — honest capability mismatch, not gaming",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`),
+			expectedRetry:  true,
+			expectedReason: "rest_protocol_mismatch_error",
+		},
+		{
+			// Geth/Bor/Erigon spec quirk: error response with "result":null. Should
+			// still be treated as an honest error, not a canned success.
+			name:           "REST receives JSON-RPC error with null result — honest capability mismatch",
+			response:       []byte(`{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-32601,"message":"Method not found"}}`),
+			expectedRetry:  true,
+			expectedReason: "rest_protocol_mismatch_error",
+		},
 	}
 
 	for _, tt := range tests {

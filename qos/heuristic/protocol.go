@@ -470,13 +470,41 @@ func analyzeREST(prefix []byte, fullLength int, requestPath string) AnalysisResu
 
 	// Protocol mismatch: a JSON-RPC response to a REST request.
 	// Real Cosmos SDK REST endpoints never return JSON-RPC envelopes.
-	// Gaming suppliers (e.g., spacebelt.xyz) return canned {"jsonrpc":"2.0","id":1,"result":[]}
-	// for ALL requests regardless of protocol type.
+	//
+	// Two sub-cases, treated very differently:
+	//
+	//   1) Canned success ({"jsonrpc":"2.0","result":...}) — supplier is returning
+	//      a fabricated success regardless of the request shape. This is gaming
+	//      (e.g. spacebelt.xyz returning {"result":[]} for everything). Flagged
+	//      as deceptive — caller will treat as a critical signal.
+	//
+	//   2) Honest JSON-RPC error ({"jsonrpc":"2.0","error":{...}}) — supplier's
+	//      backend speaks JSON-RPC only and replied with its native error format
+	//      (e.g. -32601 Method not found) when PATH routed a REST-shaped request
+	//      to it. The response is still a protocol mismatch (we should retry
+	//      against a REST-capable peer), but it's NOT gaming — penalising it as
+	//      deceptive triggers false-positive cooldowns on operators whose nodes
+	//      simply don't support REST. Use a distinct reason so the gateway can
+	//      route this to a major (non-strike) signal.
 	//
 	// EXCEPTION: CometBFT endpoints (e.g., /health, /status, /block) ALWAYS return
 	// JSON-RPC formatted responses even for GET requests. This is expected CometBFT
 	// behavior, not a protocol mismatch. Skip the check for CometBFT paths.
 	if bytes.Contains(prefix, jsonrpcVersionField) && !isCometBFTPath(requestPath) {
+		// Honest JSON-RPC error: has "error" and either no "result" or "result":null
+		// (the spec-quirk null-result-with-error pattern from Geth/Bor/Erigon).
+		hasJSONRPCError := bytes.Contains(prefix, jsonrpcErrorField)
+		hasJSONRPCResult := bytes.Contains(prefix, jsonrpcResultField) &&
+			!bytes.Contains(prefix, jsonrpcResultNull)
+		if hasJSONRPCError && !hasJSONRPCResult {
+			return AnalysisResult{
+				ShouldRetry: true,
+				Confidence:  0.95,
+				Reason:      "rest_protocol_mismatch_error",
+				Structure:   StructureValid,
+				Details:     "REST request received a JSON-RPC error response — supplier likely doesn't support REST",
+			}
+		}
 		return AnalysisResult{
 			ShouldRetry: true,
 			Confidence:  0.95,

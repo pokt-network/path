@@ -112,6 +112,7 @@ func TestIsDeceptiveResponsePattern(t *testing.T) {
 		{"jsonrpc_invalid_empty_array", true},
 		{"jsonrpc_empty_object_result", true},
 		{"rest_protocol_mismatch", true},
+		{"rest_protocol_mismatch_error", false},
 		{"cometbft_invalid_empty_array", true},
 		{"jsonrpc_fabricated_parse_error", true},
 		{"jsonrpc_wrapped_service_error", true},
