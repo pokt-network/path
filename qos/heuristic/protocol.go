@@ -497,12 +497,18 @@ func analyzeREST(prefix []byte, fullLength int, requestPath string) AnalysisResu
 		hasJSONRPCResult := bytes.Contains(prefix, jsonrpcResultField) &&
 			!bytes.Contains(prefix, jsonrpcResultNull)
 		if hasJSONRPCError && !hasJSONRPCResult {
+			// Tag MatchedPattern as a capability limitation so existing guards
+			// (recordHeuristicErrorToReputation and shouldCircuitBreak) skip
+			// reputation penalty and circuit breaking. The supplier behaved
+			// correctly — its backend simply doesn't speak REST. Mirrors the
+			// non_json_capability_limitation treatment for Tron lite fullnodes.
 			return AnalysisResult{
-				ShouldRetry: true,
-				Confidence:  0.95,
-				Reason:      "rest_protocol_mismatch_error",
-				Structure:   StructureValid,
-				Details:     "REST request received a JSON-RPC error response — supplier likely doesn't support REST",
+				ShouldRetry:    true,
+				Confidence:     0.95,
+				Reason:         "rest_protocol_mismatch_error",
+				Structure:      StructureValid,
+				MatchedPattern: "capability_limitation",
+				Details:        "REST request received a JSON-RPC error response — supplier likely doesn't support REST",
 			}
 		}
 		return AnalysisResult{
