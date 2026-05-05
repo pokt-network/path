@@ -411,6 +411,46 @@ func TestService_WorksWithDefaultConfig(t *testing.T) {
 	require.Len(t, passed, 1, "endpoint should pass with lower threshold")
 }
 
+// TestService_StrikeDecay locks in the per-success strike decay rate. A
+// transient burst that pushes strikes near (but below) the threshold should
+// not trigger a cooldown if a small number of successes follow.
+func TestService_StrikeDecay(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	defer store.Close()
+
+	config := Config{Enabled: true, InitialScore: 80, MinThreshold: 30}
+	config.HydrateDefaults()
+
+	svc := NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	key := NewEndpointKey("eth", "endpoint1", sharedtypes.RPCType_JSON_RPC)
+
+	// Land 4 critical errors — one below threshold, no cooldown yet.
+	for i := 0; i < 4; i++ {
+		require.NoError(t, svc.RecordSignal(ctx, key, NewCriticalErrorSignal("burst", 0)))
+	}
+	score, err := svc.GetScore(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, 4, score.CriticalStrikes)
+	require.True(t, score.CooldownUntil.IsZero(), "should not be in cooldown below threshold")
+
+	// Two successes should fully clear strikes (4 - 2*3 = -2, clamped to 0)
+	// under the new decay rate. With the old 1-per-success rule it would take
+	// four successes; the bursty-traffic case the change is meant to address
+	// (a 99%-success endpoint that occasionally bursts) requires this faster
+	// recovery to avoid false cooldowns.
+	require.NoError(t, svc.RecordSignal(ctx, key, NewSuccessSignal(10*time.Millisecond)))
+	require.NoError(t, svc.RecordSignal(ctx, key, NewSuccessSignal(10*time.Millisecond)))
+
+	score, err = svc.GetScore(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, 0, score.CriticalStrikes, "two successes should fully decay 4 strikes")
+	require.True(t, score.CooldownUntil.IsZero(), "no cooldown should ever have been entered")
+}
+
 func TestService_AsyncWriteToStorage(t *testing.T) {
 	ctx := context.Background()
 	store := newMockStorage()

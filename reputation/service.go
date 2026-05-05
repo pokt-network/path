@@ -109,11 +109,15 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 
 	if signal.IsPositive() {
 		score.SuccessCount++
-		// Decay strikes gradually — one success reduces strikes by 1.
-		// This prevents deceptive suppliers (who pass some requests) from
-		// instantly wiping their strike history with a single success.
+		// Decay strikes — each success reduces strikes by DefaultStrikeDecayPerSuccess.
+		// Deceptive suppliers that pass some requests still can't instantly wipe
+		// their strike history with a single success (it would take a sustained
+		// success rate). See DefaultStrikeDecayPerSuccess for rationale.
 		if score.CriticalStrikes > 0 {
-			score.CriticalStrikes--
+			score.CriticalStrikes -= DefaultStrikeDecayPerSuccess
+			if score.CriticalStrikes < 0 {
+				score.CriticalStrikes = 0
+			}
 		}
 	} else if signal.IsNegative() {
 		score.ErrorCount++
