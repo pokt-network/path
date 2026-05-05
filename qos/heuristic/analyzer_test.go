@@ -1558,3 +1558,37 @@ func TestExtractResponseID(t *testing.T) {
 		})
 	}
 }
+
+// TestErrorContainsArchivalPattern_RestProtocolMismatchError verifies the
+// fallback path used when a heuristic-detected REST/JSON-RPC capability
+// mismatch surfaces through the hedge_failed retry layer (heuristicResult
+// is lost; only the wrapped error string remains). The substring check
+// must catch the honest-error reason but NOT the gaming-variant reason.
+func TestErrorContainsArchivalPattern_RestProtocolMismatchError(t *testing.T) {
+	tests := []struct {
+		name     string
+		errStr   string
+		expected bool
+	}{
+		{
+			name:     "honest error wrapped through hedge_failed path is matched",
+			errStr:   `retry: hedge_failed: relay: ... heuristic detected rest_protocol_mismatch_error (method=): backend returned error response`,
+			expected: true,
+		},
+		{
+			name:     "gaming variant must NOT match (no _error suffix)",
+			errStr:   `retry: hedge_failed: ... heuristic detected rest_protocol_mismatch (method=): supplier returned canned result`,
+			expected: false,
+		},
+		{
+			name:     "unrelated error must not match",
+			errStr:   `relay: timeout sending request to endpoint`,
+			expected: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, ErrorContainsArchivalPattern(tt.errStr))
+		})
+	}
+}
