@@ -358,6 +358,13 @@ var capabilityLimitationSubstrings = []string{
 	// Capability limitation (e.g., Tron lite fullnodes)
 	"lite fullnode",
 	"api is not supported",
+	// rest_protocol_mismatch_error: heuristic-detected honest JSON-RPC error
+	// returned to a REST-shaped request (supplier's backend doesn't speak REST).
+	// The structured AnalysisResult is lost when this surfaces through the
+	// hedge_failed retry path; we match on the embedded reason string instead.
+	// Distinct from "rest_protocol_mismatch" (canned-response gaming) — the
+	// suffix prevents the substring check from matching the gaming variant.
+	"rest_protocol_mismatch_error",
 }
 
 // ErrorContainsArchivalPattern checks if an error string contains any archival-related

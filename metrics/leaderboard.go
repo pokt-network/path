@@ -40,6 +40,15 @@ type SupplierScoreEntry struct {
 	Score     float64
 }
 
+// CooldownCountEntry represents per-domain count of endpoints currently in strike
+// cooldown for a given service / rpc_type.
+type CooldownCountEntry struct {
+	Domain    string
+	RPCType   string
+	ServiceID string
+	Count     int
+}
+
 // LeaderboardDataProvider is an interface for getting endpoint distribution data
 type LeaderboardDataProvider interface {
 	// GetEndpointLeaderboardData returns all endpoint entries grouped by the required dimensions
@@ -49,6 +58,10 @@ type LeaderboardDataProvider interface {
 	// GetSupplierScoreData returns per-(supplier, service_id) reputation scores.
 	// Optional: implementations may return nil if per-supplier scoring is not supported.
 	GetSupplierScoreData(ctx context.Context) ([]SupplierScoreEntry, error)
+	// GetCooldownCountData returns per-(domain, service_id, rpc_type) counts of
+	// endpoints currently in strike cooldown. Optional: implementations may return
+	// nil if cooldown tracking is not supported.
+	GetCooldownCountData(ctx context.Context) ([]CooldownCountEntry, error)
 }
 
 // LeaderboardPublisher publishes endpoint leaderboard metrics every 10 seconds
@@ -182,6 +195,24 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 			SetSupplierReputationScore(entry.Supplier, entry.ServiceID, entry.Score)
 		}
 		lp.logger.Debug().Int("entries", len(supplierScores)).Msg("Published supplier scores")
+	}
+
+	// Publish per-domain endpoint cooldown counts. Reset between snapshots so a
+	// domain that drops to zero cooldown'd endpoints actually shows zero (instead
+	// of sticking at its last value via Prometheus' 5-min staleness window).
+	cooldownCounts, err := lp.provider.GetCooldownCountData(ctx)
+	if err != nil {
+		lp.logger.Warn().Err(err).Msg("Failed to get cooldown count data")
+		return
+	}
+
+	EndpointsInCooldown.Reset()
+
+	if len(cooldownCounts) > 0 {
+		for _, entry := range cooldownCounts {
+			EndpointsInCooldown.WithLabelValues(entry.Domain, entry.RPCType, entry.ServiceID).Set(float64(entry.Count))
+		}
+		lp.logger.Debug().Int("entries", len(cooldownCounts)).Msg("Published cooldown counts")
 	}
 }
 

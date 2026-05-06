@@ -304,6 +304,115 @@ var ProbationEventsTotal = promauto.NewCounterVec(
 )
 
 // =============================================================================
+// Domain Circuit Breaker State (Gauge)
+// Labels: service_id, domain
+// Value: 1 if domain is currently broken (circuit-breaker locked out), 0 otherwise
+// Purpose: Surface circuit-breaker state to dashboards. Without this, broken-domain
+// state lives only in Redis (`path:gw:circuit:{serviceID}`) and is invisible to
+// operators inspecting Grafana.
+// =============================================================================
+
+var DomainCircuitBreakerState = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: MetricPrefix + "circuit_breaker_state",
+		Help: "1 if the domain is currently circuit-broken for this service (locked out from selection), 0 otherwise. Set on MarkBroken / MarkRecovered transitions and refreshed from Redis on each Get.",
+	},
+	[]string{LabelServiceID, LabelDomain},
+)
+
+// SetCircuitBreakerState sets the per-domain circuit-breaker gauge.
+//   - broken=true → 1 (domain is currently locked out)
+//   - broken=false → 0 (domain is healthy / has been recovered)
+// Skipped silently when domain is empty (which would happen for endpoints whose
+// URL parse fails and only happens in error paths anyway).
+func SetCircuitBreakerState(serviceID, domain string, broken bool) {
+	if domain == "" {
+		return
+	}
+	v := 0.0
+	if broken {
+		v = 1.0
+	}
+	DomainCircuitBreakerState.WithLabelValues(serviceID, domain).Set(v)
+}
+
+// =============================================================================
+// Domain Circuit Breaker Events (Counter)
+// Labels: service_id, domain, reason_category, event
+// Purpose: Surface WHY domains break and at what rate. Pairs with
+// path_circuit_breaker_state (current 0/1 view) — events_total gives the
+// historical decomposition by reason and event type (broken vs recovered).
+//
+// reason_category is a low-cardinality bucket extracted from the free-text
+// reason passed to MarkBroken (which itself contains response snippets and
+// error messages — too high-cardinality for direct labelling). See
+// CircuitBreakerReasonCategory.
+//
+// event ∈ {"broken", "recovered"} so a single counter captures both transitions.
+// =============================================================================
+
+const (
+	LabelReasonCategory       = "reason_category"
+	LabelCircuitBreakerEvent  = "event"
+	CircuitBreakerEventBroken    = "broken"
+	CircuitBreakerEventRecovered = "recovered"
+)
+
+// CircuitBreakerReasonCategory enumerates the bounded set of reason buckets
+// surfaced via the events counter. Keeps cardinality bounded regardless of
+// how variable the underlying reason strings are. Add new categories here
+// when MarkBroken call sites grow new reason prefixes.
+const (
+	CircuitBreakReasonRetry            = "retry"             // failure during retry path
+	CircuitBreakReasonBatchTransport   = "batch_transport"   // batch path: transport-level error
+	CircuitBreakReasonBatchHeuristic   = "batch_heuristic"   // batch path: heuristic flagged response
+	CircuitBreakReasonParallelRetry   = "parallel_retry"    // parallel-retry path failure
+	CircuitBreakReasonHeuristic        = "heuristic"         // top-level heuristic break
+	CircuitBreakReasonUnknown          = "unknown"           // anything we can't classify
+)
+
+var DomainCircuitBreakerEventsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "circuit_breaker_events_total",
+		Help: "Domain circuit-breaker transitions over time. event ∈ {broken, recovered}. reason_category is a bounded prefix bucket extracted from the raw MarkBroken reason. Pairs with path_circuit_breaker_state for current snapshot.",
+	},
+	[]string{LabelServiceID, LabelDomain, LabelReasonCategory, LabelCircuitBreakerEvent},
+)
+
+// RecordCircuitBreakerEvent increments the per-(service, domain, reason, event)
+// counter. Skipped silently when domain is empty.
+func RecordCircuitBreakerEvent(serviceID, domain, reasonCategory, event string) {
+	if domain == "" {
+		return
+	}
+	if reasonCategory == "" {
+		reasonCategory = CircuitBreakReasonUnknown
+	}
+	DomainCircuitBreakerEventsTotal.WithLabelValues(serviceID, domain, reasonCategory, event).Inc()
+}
+
+// =============================================================================
+// Endpoints In Cooldown (Gauge, published every 10s via leaderboard publisher)
+// Labels: domain, rpc_type, service_id
+// Value: count of endpoints currently in a strike cooldown period (Score.IsInCooldown
+// returns true — i.e. CooldownUntil is in the future).
+// Purpose: Cooldown is a TEMPORARY state imposed by accumulated critical strikes,
+// independent from "score below minThreshold". Pre-this-metric, cooldown state was
+// only visible via /ready/<svc>?detailed=true on a single pod. Now operators can
+// see at a glance: "how many endpoints does this domain have in cooldown right now?"
+// (For "below minThreshold / excluded" use path_reputation_endpoint_leaderboard
+// with tier_threshold="0" — that's already covered by the existing leaderboard.)
+// =============================================================================
+
+var EndpointsInCooldown = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: MetricPrefix + "endpoints_in_cooldown",
+		Help: "Number of endpoints currently in strike cooldown (Score.CooldownUntil in the future). Published every 10s. Cooldown is independent from score-below-threshold — an endpoint can be cooldown'd even with a high score after critical strikes.",
+	},
+	[]string{LabelDomain, LabelRPCType, LabelServiceID},
+)
+
+// =============================================================================
 // Supplier Blacklist Events (Counter)
 // Labels: domain, supplier, service_id, reason
 // Value: count

@@ -219,6 +219,18 @@ const (
 
 	// DefaultMaxCooldown is the maximum cooldown duration regardless of strike count.
 	DefaultMaxCooldown = 1 * time.Hour
+
+	// DefaultStrikeDecayPerSuccess is the number of strikes decayed by each
+	// positive (success) signal. The original value of 1 was unfair to
+	// high-traffic suppliers: their absolute critical-error count grows with
+	// volume, and a transient burst (e.g. a 73-second 5xx wave on otherwise
+	// healthy nodes) could push a 99%-success endpoint over the threshold
+	// because each intervening success only erased a single strike. Decaying
+	// by 3 lets transient flickers wash out while still letting genuinely bad
+	// endpoints accumulate (strikes only persist when error rate exceeds
+	// ~25%). Deliberately deceptive suppliers that pass some requests still
+	// can't instantly wipe their strike history with a single success.
+	DefaultStrikeDecayPerSuccess = 3
 )
 
 // Key granularity options determine how endpoints are grouped for scoring.

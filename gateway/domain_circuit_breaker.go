@@ -11,10 +11,39 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 )
 
 const defaultMaxTTL = 30 * time.Minute
+
+// classifyCircuitBreakReason maps the free-text reason string passed to
+// MarkBroken into a bounded category, suitable for use as a Prometheus label.
+// The raw reason contains response snippets, error messages, and status codes
+// (high cardinality) — for metrics we only need the prefix bucket.
+//
+// Keep in sync with the metrics.CircuitBreakReason* constants and with the
+// reason strings produced by MarkBroken call sites in
+// gateway/http_request_context_handle_request.go.
+func classifyCircuitBreakReason(reason string) string {
+	// Match by prefix; reasons are typically formatted as "<category>: <details>"
+	// or "<category>_<detail>: ...". Order matters for prefixes that share leading
+	// substrings (parallel_retry vs retry).
+	switch {
+	case strings.HasPrefix(reason, "parallel_retry"):
+		return metrics.CircuitBreakReasonParallelRetry
+	case strings.HasPrefix(reason, "batch_transport"):
+		return metrics.CircuitBreakReasonBatchTransport
+	case strings.HasPrefix(reason, "batch_heuristic"):
+		return metrics.CircuitBreakReasonBatchHeuristic
+	case strings.HasPrefix(reason, "retry"):
+		return metrics.CircuitBreakReasonRetry
+	case strings.HasPrefix(reason, "heuristic"):
+		return metrics.CircuitBreakReasonHeuristic
+	default:
+		return metrics.CircuitBreakReasonUnknown
+	}
+}
 
 // DomainCircuitBreaker tracks broken domains across pods via Redis.
 // When any pod discovers a domain is returning errors, it marks it broken
@@ -112,6 +141,17 @@ func (cb *DomainCircuitBreaker) MarkBroken(ctx context.Context, serviceID, domai
 	entry.domains[domain] = brokenDomainState{expiry: expiry, hitCount: hitCount, reason: reason}
 	cb.mu.Unlock()
 
+	// Surface state via Prometheus gauge so dashboards can show "currently broken
+	// domains" without needing Redis access. Idempotent — re-setting to 1 is fine.
+	metrics.SetCircuitBreakerState(serviceID, domain, true)
+
+	// Record a "broken" event with reason category so dashboards can show rate
+	// of breaks decomposed by cause (retry / batch_transport / batch_heuristic /
+	// parallel_retry / heuristic / unknown). Counter increments on every call
+	// — including hit-count escalations — which is the right semantic: each
+	// MarkBroken is a discrete trigger event.
+	metrics.RecordCircuitBreakerEvent(serviceID, domain, classifyCircuitBreakReason(reason), metrics.CircuitBreakerEventBroken)
+
 	// Always log circuit break events at error level for production visibility.
 	// This is critical for diagnosing why domains get locked out.
 	cb.logger.Error().
@@ -172,17 +212,24 @@ func filterExpiredDomains(domains map[string]brokenDomainState) map[string]bool 
 // Used when Redis is not available (local-only mode).
 func (cb *DomainCircuitBreaker) refreshLocal(serviceID string) map[string]bool {
 	cb.mu.Lock()
-	defer cb.mu.Unlock()
 
 	entry, ok := cb.cache[serviceID]
 	if !ok {
+		cb.mu.Unlock()
 		return nil
 	}
 
-	// Remove expired entries
+	// Remove expired entries; collect their names + reasons so we can drop the
+	// gauge to 0 and record a "recovered" event outside the lock.
 	now := time.Now()
+	type expiredEntry struct {
+		domain string
+		reason string
+	}
+	var expired []expiredEntry
 	for domain, state := range entry.domains {
 		if !state.expiry.After(now) {
+			expired = append(expired, expiredEntry{domain: domain, reason: state.reason})
 			delete(entry.domains, domain)
 		}
 	}
@@ -191,6 +238,12 @@ func (cb *DomainCircuitBreaker) refreshLocal(serviceID string) map[string]bool {
 	result := make(map[string]bool, len(entry.domains))
 	for d := range entry.domains {
 		result[d] = true
+	}
+	cb.mu.Unlock()
+
+	for _, e := range expired {
+		metrics.SetCircuitBreakerState(serviceID, e.domain, false)
+		metrics.RecordCircuitBreakerEvent(serviceID, e.domain, classifyCircuitBreakReason(e.reason), metrics.CircuitBreakerEventRecovered)
 	}
 	return result
 }
@@ -264,8 +317,15 @@ func (cb *DomainCircuitBreaker) refreshFromRedis(ctx context.Context, serviceID 
 		cb.redisClient.HDel(ctx, key, expiredFields...)
 	}
 
-	// Merge with local cache (local entries might be newer than Redis)
+	// Merge with local cache (local entries might be newer than Redis).
+	// Capture pre-merge cache contents so we can drop the gauge to 0 for any
+	// domain that was previously broken but is no longer present after merge.
 	cb.mu.Lock()
+	type expiredLocal struct {
+		domain string
+		reason string
+	}
+	var previouslyBroken []expiredLocal
 	existingEntry, ok := cb.cache[serviceID]
 	if ok {
 		for domain, state := range existingEntry.domains {
@@ -273,6 +333,8 @@ func (cb *DomainCircuitBreaker) refreshFromRedis(ctx context.Context, serviceID 
 				if redisState, exists := domains[domain]; !exists || state.expiry.After(redisState.expiry) {
 					domains[domain] = state
 				}
+			} else {
+				previouslyBroken = append(previouslyBroken, expiredLocal{domain: domain, reason: state.reason})
 			}
 		}
 	}
@@ -281,6 +343,29 @@ func (cb *DomainCircuitBreaker) refreshFromRedis(ctx context.Context, serviceID 
 		refreshAt: now.Add(cb.cacheTTL),
 	}
 	cb.mu.Unlock()
+
+	// Drop gauge for previously-broken-but-now-expired domains, plus the explicit
+	// expiredFields list we already collected from Redis. Done outside the lock.
+	// We don't have a reason for expiredFields entries (parsed Redis value gave us
+	// one, but for compactness we don't carry it through here) — they get the
+	// "unknown" reason bucket on recovery, which is acceptable.
+	for _, d := range expiredFields {
+		metrics.SetCircuitBreakerState(serviceID, d, false)
+		metrics.RecordCircuitBreakerEvent(serviceID, d, metrics.CircuitBreakReasonUnknown, metrics.CircuitBreakerEventRecovered)
+	}
+	for _, e := range previouslyBroken {
+		metrics.SetCircuitBreakerState(serviceID, e.domain, false)
+		metrics.RecordCircuitBreakerEvent(serviceID, e.domain, classifyCircuitBreakReason(e.reason), metrics.CircuitBreakerEventRecovered)
+	}
+	// Re-assert gauge=1 for currently-broken domains. Idempotent and ensures the
+	// metric is correct on a fresh pod that lazily picks up Redis state without
+	// going through MarkBroken locally. Note: we deliberately do NOT record a
+	// "broken" event here — these aren't new transitions, just a metric resync
+	// for a state that was already counted at MarkBroken time on whichever pod
+	// originally fired it.
+	for d := range domains {
+		metrics.SetCircuitBreakerState(serviceID, d, true)
+	}
 
 	// Build result
 	result := make(map[string]bool, len(domains))
@@ -297,14 +382,32 @@ func (cb *DomainCircuitBreaker) ClearService(ctx context.Context, serviceID stri
 	cb.mu.Lock()
 	entry, ok := cb.cache[serviceID]
 	count := 0
+	type clearedEntry struct {
+		domain string
+		reason string
+	}
+	var cleared []clearedEntry
 	if ok {
 		count = len(entry.domains)
+		cleared = make([]clearedEntry, 0, count)
+		for d, state := range entry.domains {
+			cleared = append(cleared, clearedEntry{domain: d, reason: state.reason})
+		}
 		delete(cb.cache, serviceID)
 	}
 	cb.mu.Unlock()
 
 	if cb.redisClient != nil {
 		cb.redisClient.Del(ctx, cb.keyPrefix+serviceID)
+	}
+
+	// Drop the gauge AND record a recovered event for every cleared domain. Each
+	// admin-clear represents an explicit "operator forced these domains back to
+	// healthy" action, distinct from natural TTL-driven recovery — the recovery
+	// counter still captures it because operationally it's the same transition.
+	for _, c := range cleared {
+		metrics.SetCircuitBreakerState(serviceID, c.domain, false)
+		metrics.RecordCircuitBreakerEvent(serviceID, c.domain, classifyCircuitBreakReason(c.reason), metrics.CircuitBreakerEventRecovered)
 	}
 
 	cb.logger.Info().

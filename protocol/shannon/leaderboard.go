@@ -398,5 +398,89 @@ func (p *Protocol) GetSupplierScoreData(ctx context.Context) ([]metrics.Supplier
 	return entries, nil
 }
 
+// GetCooldownCountData implements the metrics.LeaderboardDataProvider interface.
+// It returns per-(domain, service_id, rpc_type) counts of endpoints currently in
+// strike cooldown (Score.IsInCooldown() == true).
+//
+// Cooldown is a transient state: endpoints accumulate critical strikes and enter
+// cooldown for a configurable duration; once expired, they become selectable again.
+// This metric exposes that state so dashboards can answer "how many endpoints
+// does this domain currently have locked out?" without needing /ready introspection.
+func (p *Protocol) GetCooldownCountData(ctx context.Context) ([]metrics.CooldownCountEntry, error) {
+	logger := p.logger.With("method", "GetCooldownCountData")
+
+	if p.unifiedServicesConfig == nil {
+		logger.Debug().Msg("No unified services config available, returning empty cooldown counts")
+		return nil, nil
+	}
+	if p.reputationService == nil {
+		logger.Debug().Msg("Reputation service not enabled, returning empty cooldown counts")
+		return nil, nil
+	}
+
+	type groupKey struct {
+		Domain    string
+		ServiceID string
+		RPCType   string
+	}
+	counts := make(map[groupKey]int)
+
+	for _, serviceConfig := range p.unifiedServicesConfig.Services {
+		serviceID := serviceConfig.ID
+
+		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID)
+		if err != nil || len(activeSessions) == 0 {
+			continue
+		}
+
+		rpcTypesToQuery := p.getServiceRPCTypesForLeaderboard(serviceID)
+
+		for _, rpcType := range rpcTypesToQuery {
+			endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil, "")
+			if err != nil {
+				continue
+			}
+
+			for endpointAddr, ep := range endpoints {
+				keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+				key := keyBuilder.BuildKey(serviceID, endpointAddr, actualRPCType)
+				score, scoreErr := p.reputationService.GetScore(ctx, key)
+				if scoreErr != nil {
+					// No score recorded → can't be in cooldown. Skip silently.
+					continue
+				}
+				if !score.IsInCooldown() {
+					continue
+				}
+
+				endpointURL := ep.GetURL(actualRPCType)
+				domain, domainErr := shannonmetrics.ExtractDomainOrHost(endpointURL)
+				if domainErr != nil {
+					domain = shannonmetrics.ErrDomain
+				}
+				k := groupKey{
+					Domain:    domain,
+					ServiceID: string(serviceID),
+					RPCType:   metrics.NormalizeRPCType(actualRPCType.String()),
+				}
+				counts[k]++
+			}
+		}
+	}
+
+	entries := make([]metrics.CooldownCountEntry, 0, len(counts))
+	for k, n := range counts {
+		entries = append(entries, metrics.CooldownCountEntry{
+			Domain:    k.Domain,
+			RPCType:   k.RPCType,
+			ServiceID: k.ServiceID,
+			Count:     n,
+		})
+	}
+
+	logger.Debug().Int("total_entries", len(entries)).Msg("Built cooldown count data")
+	return entries, nil
+}
+
 // Ensure Protocol implements LeaderboardDataProvider at compile time
 var _ metrics.LeaderboardDataProvider = (*Protocol)(nil)

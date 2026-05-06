@@ -822,10 +822,11 @@ func TestFullAnalyzer_SolanaEmptyArrayDetection(t *testing.T) {
 
 func TestProtocolAnalysis_REST(t *testing.T) {
 	tests := []struct {
-		name           string
-		response       []byte
-		expectedRetry  bool
-		expectedReason string
+		name                   string
+		response               []byte
+		expectedRetry          bool
+		expectedReason         string
+		expectedMatchedPattern string
 	}{
 		{
 			name:           "REST success response",
@@ -875,6 +876,27 @@ func TestProtocolAnalysis_REST(t *testing.T) {
 			expectedRetry:  true,
 			expectedReason: "rest_protocol_mismatch",
 		},
+		{
+			// Honest JSON-RPC error from a node that only speaks JSON-RPC: PATH routed
+			// a REST-shaped request to it and the node correctly replied with its
+			// native error format. This is a capability mismatch, NOT gaming, and
+			// should be tagged so the gateway skips both the reputation penalty and
+			// the circuit breaker.
+			name:                   "REST receives JSON-RPC error — honest capability mismatch, not gaming",
+			response:               []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`),
+			expectedRetry:          true,
+			expectedReason:         "rest_protocol_mismatch_error",
+			expectedMatchedPattern: "capability_limitation",
+		},
+		{
+			// Geth/Bor/Erigon spec quirk: error response with "result":null. Should
+			// still be treated as an honest error, not a canned success.
+			name:                   "REST receives JSON-RPC error with null result — honest capability mismatch",
+			response:               []byte(`{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-32601,"message":"Method not found"}}`),
+			expectedRetry:          true,
+			expectedReason:         "rest_protocol_mismatch_error",
+			expectedMatchedPattern: "capability_limitation",
+		},
 	}
 
 	for _, tt := range tests {
@@ -884,6 +906,7 @@ func TestProtocolAnalysis_REST(t *testing.T) {
 
 			assert.Equal(t, tt.expectedRetry, result.ShouldRetry, "ShouldRetry mismatch")
 			assert.Equal(t, tt.expectedReason, result.Reason, "Reason mismatch")
+			assert.Equal(t, tt.expectedMatchedPattern, result.MatchedPattern, "MatchedPattern mismatch")
 		})
 	}
 }
@@ -1532,6 +1555,40 @@ func TestExtractResponseID(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := extractResponseID(tt.response)
 			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestErrorContainsArchivalPattern_RestProtocolMismatchError verifies the
+// fallback path used when a heuristic-detected REST/JSON-RPC capability
+// mismatch surfaces through the hedge_failed retry layer (heuristicResult
+// is lost; only the wrapped error string remains). The substring check
+// must catch the honest-error reason but NOT the gaming-variant reason.
+func TestErrorContainsArchivalPattern_RestProtocolMismatchError(t *testing.T) {
+	tests := []struct {
+		name     string
+		errStr   string
+		expected bool
+	}{
+		{
+			name:     "honest error wrapped through hedge_failed path is matched",
+			errStr:   `retry: hedge_failed: relay: ... heuristic detected rest_protocol_mismatch_error (method=): backend returned error response`,
+			expected: true,
+		},
+		{
+			name:     "gaming variant must NOT match (no _error suffix)",
+			errStr:   `retry: hedge_failed: ... heuristic detected rest_protocol_mismatch (method=): supplier returned canned result`,
+			expected: false,
+		},
+		{
+			name:     "unrelated error must not match",
+			errStr:   `relay: timeout sending request to endpoint`,
+			expected: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, ErrorContainsArchivalPattern(tt.errStr))
 		})
 	}
 }

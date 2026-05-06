@@ -8,12 +8,20 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 )
 
 func testCircuitBreakerLogger() polylog.Logger {
 	return polyzero.NewLogger(polyzero.WithOutput(os.Stderr))
+}
+
+// readCircuitBreakerGauge returns the current value of the per-(serviceID, domain)
+// circuit-breaker state gauge. Used by metric-transition tests.
+func readCircuitBreakerGauge(serviceID, domain string) float64 {
+	return testutil.ToFloat64(metrics.DomainCircuitBreakerState.WithLabelValues(serviceID, domain))
 }
 
 func TestDomainCircuitBreaker_MarkAndGet(t *testing.T) {
@@ -425,5 +433,118 @@ func TestParseRedisValue_InvalidFormat(t *testing.T) {
 	_, _, _, ok = parseRedisValue("")
 	if ok {
 		t.Fatal("expected parse to fail for empty string")
+	}
+}
+
+// TestClassifyCircuitBreakReason verifies that the free-text reason strings
+// passed to MarkBroken get bucketed into the correct bounded category for use
+// as a Prometheus label. Order-sensitive prefix matches must be stable —
+// "parallel_retry" must NOT match the "retry" branch.
+func TestClassifyCircuitBreakReason(t *testing.T) {
+	cases := []struct {
+		raw      string
+		expected string
+	}{
+		{"retry: heuristic_html | status=502 | response=<html>...", metrics.CircuitBreakReasonRetry},
+		{"batch_transport_error: connection refused", metrics.CircuitBreakReasonBatchTransport},
+		{"batch_heuristic: empty_array | status=200 | response=[]", metrics.CircuitBreakReasonBatchHeuristic},
+		{"parallel_retry: timeout after 5s", metrics.CircuitBreakReasonParallelRetry},
+		{"heuristic: structured error response", metrics.CircuitBreakReasonHeuristic},
+		{"completely unknown reason format", metrics.CircuitBreakReasonUnknown},
+		{"", metrics.CircuitBreakReasonUnknown},
+	}
+	for _, c := range cases {
+		got := classifyCircuitBreakReason(c.raw)
+		if got != c.expected {
+			t.Errorf("classifyCircuitBreakReason(%q) = %q, want %q", c.raw, got, c.expected)
+		}
+	}
+}
+
+// TestCircuitBreakerEventsCounter verifies that broken/recovered transitions
+// increment the events counter with the correct reason_category bucket.
+func TestCircuitBreakerEventsCounter(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
+	cb.defaultTTL = 50 * time.Millisecond
+	ctx := context.Background()
+	const serviceID = "events-test-svc"
+	const domain = "events-test.example.com"
+
+	// Capture pre-state of the counter for the expected (service, domain, retry, broken)
+	// label combination so the test is hermetic against other tests' increments.
+	preBroken := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventBroken,
+	))
+	preRecovered := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventRecovered,
+	))
+
+	// MarkBroken with a "retry: ..." reason should record one broken event with
+	// reason_category="retry"
+	cb.MarkBroken(ctx, serviceID, domain, "retry: heuristic_html | status=502 | response=oops")
+	postBroken := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventBroken,
+	))
+	if postBroken-preBroken != 1 {
+		t.Fatalf("expected broken counter to increment by 1, got delta=%v", postBroken-preBroken)
+	}
+
+	// ClearService should record one recovered event with the same reason_category
+	cb.ClearService(ctx, serviceID)
+	postRecovered := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventRecovered,
+	))
+	if postRecovered-preRecovered != 1 {
+		t.Fatalf("expected recovered counter to increment by 1, got delta=%v", postRecovered-preRecovered)
+	}
+}
+
+// TestDomainCircuitBreaker_MetricGaugeTransitions verifies that the circuit-breaker
+// state gauge moves between 0 and 1 correctly: set to 1 on MarkBroken, dropped to 0
+// on ClearService, and dropped to 0 by refreshLocal once a TTL expires. We test
+// directly against the Prometheus client metric rather than scraping /metrics so the
+// test stays hermetic.
+func TestDomainCircuitBreaker_MetricGaugeTransitions(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
+	cb.defaultTTL = 50 * time.Millisecond
+	ctx := context.Background()
+	const serviceID = "metric-test-svc"
+	const domain = "metric-test-domain.example.com"
+
+	// Initial state: gauge should be 0 (or absent — the Set on first MarkBroken creates it).
+	if v := readCircuitBreakerGauge(serviceID, domain); v != 0 {
+		t.Fatalf("expected gauge=0 initially, got %v", v)
+	}
+
+	// MarkBroken → gauge should flip to 1
+	cb.MarkBroken(ctx, serviceID, domain, "test_reason")
+	if v := readCircuitBreakerGauge(serviceID, domain); v != 1 {
+		t.Fatalf("expected gauge=1 after MarkBroken, got %v", v)
+	}
+
+	// ClearService → gauge drops to 0 for cleared domains
+	cb.ClearService(ctx, serviceID)
+	if v := readCircuitBreakerGauge(serviceID, domain); v != 0 {
+		t.Fatalf("expected gauge=0 after ClearService, got %v", v)
+	}
+
+	// MarkBroken again, then wait for TTL expiry, then refresh — gauge should drop to 0
+	cb.MarkBroken(ctx, serviceID, domain, "test_reason_2")
+	if v := readCircuitBreakerGauge(serviceID, domain); v != 1 {
+		t.Fatalf("expected gauge=1 after second MarkBroken, got %v", v)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	// Force the cache entry to look stale so GetBrokenDomains takes the refresh path.
+	// In production, the same effect happens automatically once cacheTTL elapses
+	// (default 5s) after the entry was last refreshed.
+	cb.mu.Lock()
+	if entry, ok := cb.cache[serviceID]; ok {
+		entry.refreshAt = time.Now().Add(-time.Second)
+	}
+	cb.mu.Unlock()
+	cb.GetBrokenDomains(ctx, serviceID)
+	if v := readCircuitBreakerGauge(serviceID, domain); v != 0 {
+		t.Fatalf("expected gauge=0 after TTL expiry + refresh, got %v", v)
 	}
 }
