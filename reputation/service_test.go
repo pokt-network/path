@@ -1113,7 +1113,7 @@ func TestService_GetArchivalEndpoints_ExpiredEntries(t *testing.T) {
 
 	// Manually set an expired archival entry in the cache
 	svc.mu.Lock()
-	svc.cache[key.String()] = Score{
+	svc.cache[key] = Score{
 		Value:             80,
 		IsArchival:        true,
 		ArchivalExpiresAt: time.Now().Add(-1 * time.Hour), // expired

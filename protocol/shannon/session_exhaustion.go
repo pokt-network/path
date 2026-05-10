@@ -19,6 +19,16 @@ const sessionExhaustionTTL = 30 * time.Minute
 // size to keep the steady-state Mark cost ~O(1).
 const sessionExhaustionEvictThreshold = 1024
 
+// sessionExhaustionKey identifies a flagged (service, session, supplier)
+// tuple. Used directly as a map key so we don't allocate a string on every
+// Mark/IsExhausted — pprof showed the previous string-concat key as ~90 GB
+// cumulative on a busy gateway pod.
+type sessionExhaustionKey struct {
+	ServiceID string
+	SessionID string
+	Supplier  string
+}
+
 // sessionExhaustionTracker records (serviceID, sessionID, supplier) tuples
 // where the supplier's relay-miner has signaled the application's per-session
 // stake budget is exhausted ("over-servicing"). Once flagged, PATH must skip
@@ -34,7 +44,7 @@ const sessionExhaustionEvictThreshold = 1024
 // reaped lazily.
 type sessionExhaustionTracker struct {
 	mu      sync.RWMutex
-	entries map[string]time.Time
+	entries map[sessionExhaustionKey]time.Time
 
 	// markCount is incremented on every Mark and gates the opportunistic GC
 	// frequency without taking the write lock just to bump a counter.
@@ -43,14 +53,8 @@ type sessionExhaustionTracker struct {
 
 func newSessionExhaustionTracker() *sessionExhaustionTracker {
 	return &sessionExhaustionTracker{
-		entries: make(map[string]time.Time),
+		entries: make(map[sessionExhaustionKey]time.Time),
 	}
-}
-
-// sessionExhaustionKey builds the map key. Service ID is included so two
-// services that happen to share a session ID prefix don't cross-contaminate.
-func sessionExhaustionKey(serviceID, sessionID, supplier string) string {
-	return serviceID + "|" + sessionID + "|" + supplier
 }
 
 // Mark flags the (service, session, supplier) tuple as over-serviced for the
@@ -60,7 +64,7 @@ func (t *sessionExhaustionTracker) Mark(serviceID, sessionID, supplier string) {
 	if t == nil || serviceID == "" || sessionID == "" || supplier == "" {
 		return
 	}
-	key := sessionExhaustionKey(serviceID, sessionID, supplier)
+	key := sessionExhaustionKey{ServiceID: serviceID, SessionID: sessionID, Supplier: supplier}
 
 	t.mu.Lock()
 	t.entries[key] = time.Now()
@@ -77,7 +81,7 @@ func (t *sessionExhaustionTracker) IsExhausted(serviceID, sessionID, supplier st
 	if t == nil || serviceID == "" || sessionID == "" || supplier == "" {
 		return false
 	}
-	key := sessionExhaustionKey(serviceID, sessionID, supplier)
+	key := sessionExhaustionKey{ServiceID: serviceID, SessionID: sessionID, Supplier: supplier}
 
 	t.mu.RLock()
 	markedAt, ok := t.entries[key]

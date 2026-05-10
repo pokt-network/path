@@ -994,8 +994,8 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 
 		// Using a single iteration scope for this logger.
 		// Avoids adding all apps in the loop to the logger's fields.
-		// Hydrate the logger with session details.
-		logger := logger.With("valid_app_address", app.Address).With("method", "getSessionsUniqueEndpoints")
+		// "method" is already set on the outer logger above; don't re-add it.
+		logger := logger.With("valid_app_address", app.Address)
 		logger = hydrateLoggerWithSession(logger, &session)
 		logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msgf("Finding unique endpoints for session %s for app %s for service %s.", session.SessionId, app.Address, serviceID)
 

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
-	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
@@ -35,9 +34,11 @@ type service struct {
 	serviceLatencyProfiles   map[string]LatencyConfig
 	serviceLatencyProfilesMu sync.RWMutex
 
-	// Local cache for fast reads
+	// Local cache for fast reads. Keyed by the EndpointKey struct directly so
+	// every read/write avoids allocating an EndpointKey.String() per call —
+	// pprof showed key.String() at ~100 GB cumulative on a busy gateway pod.
 	mu    sync.RWMutex
-	cache map[string]Score
+	cache map[EndpointKey]Score
 
 	// Async write handling
 	writeCh   chan writeRequest
@@ -74,7 +75,7 @@ func NewService(config Config, store Storage) ReputationService {
 		serviceKeyBuilders:     serviceKeyBuilders,
 		serviceConfigs:         make(map[string]ServiceConfig),
 		serviceLatencyProfiles: make(map[string]LatencyConfig),
-		cache:                  make(map[string]Score),
+		cache:                  make(map[EndpointKey]Score),
 		writeCh:                make(chan writeRequest, config.SyncConfig.WriteBufferSize),
 		stopCh:                 make(chan struct{}),
 		stoppedCh:              make(chan struct{}),
@@ -93,7 +94,7 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 	impact := s.calculateImpact(key.ServiceID, signal)
 
 	s.mu.Lock()
-	score, exists := s.cache[key.String()]
+	score, exists := s.cache[key]
 	if !exists {
 		// Use per-service InitialScore if configured, otherwise global default
 		initialScore := s.GetInitialScoreForService(key.ServiceID)
@@ -157,7 +158,7 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 		score.LatencyMetrics.UpdateLatency(signal.Latency)
 	}
 
-	s.cache[key.String()] = score
+	s.cache[key] = score
 	s.mu.Unlock()
 
 	// Queue async write (non-blocking if buffer is full)
@@ -204,7 +205,7 @@ func (s *service) GetScore(ctx context.Context, key EndpointKey) (Score, error) 
 	}
 
 	s.mu.RLock()
-	score, exists := s.cache[key.String()]
+	score, exists := s.cache[key]
 	s.mu.RUnlock()
 
 	if !exists {
@@ -262,7 +263,7 @@ func (s *service) recoverScore(ctx context.Context, key EndpointKey) Score {
 	}
 
 	s.mu.Lock()
-	s.cache[key.String()] = score
+	s.cache[key] = score
 	s.mu.Unlock()
 
 	// Queue async write
@@ -292,7 +293,7 @@ func (s *service) GetScores(ctx context.Context, keys []EndpointKey) (map[Endpoi
 
 	result := make(map[EndpointKey]Score, len(keys))
 	for _, key := range keys {
-		if score, exists := s.cache[key.String()]; exists {
+		if score, exists := s.cache[key]; exists {
 			result[key] = score
 		}
 	}
@@ -319,7 +320,7 @@ func (s *service) RankEndpointsByScore(ctx context.Context, keys []EndpointKey) 
 
 	s.mu.RLock()
 	for i, key := range keys {
-		if cachedScore, exists := s.cache[key.String()]; exists {
+		if cachedScore, exists := s.cache[key]; exists {
 			scored[i] = scoredEndpoint{key: key, score: cachedScore.Value}
 		} else {
 			// Endpoints not in cache get initial score (benefit of the doubt)
@@ -365,7 +366,7 @@ func (s *service) FilterByScore(ctx context.Context, keys []EndpointKey, minThre
 	}
 	keyScores := make([]keyScore, len(keys))
 	for i, key := range keys {
-		score, exists := s.cache[key.String()]
+		score, exists := s.cache[key]
 		keyScores[i] = keyScore{
 			key:          key,
 			score:        score,
@@ -414,7 +415,7 @@ func (s *service) ResetScore(ctx context.Context, key EndpointKey) error {
 	}
 
 	s.mu.Lock()
-	s.cache[key.String()] = score
+	s.cache[key] = score
 	s.mu.Unlock()
 
 	// Queue async write
@@ -735,7 +736,7 @@ func (s *service) refreshFromStorage(ctx context.Context) error {
 
 	s.mu.Lock()
 	for key, score := range scores {
-		s.cache[key.String()] = score
+		s.cache[key] = score
 	}
 	s.mu.Unlock()
 
@@ -746,11 +747,9 @@ func (s *service) refreshFromStorage(ctx context.Context) error {
 // This is called by health checks when an endpoint passes archival validation.
 // The status is shared across all replicas via Redis storage.
 func (s *service) SetArchivalStatus(ctx context.Context, key EndpointKey, isArchival bool, archivalTTL time.Duration) error {
-	cacheKey := key.String()
-
 	// Get existing score or create new one
 	s.mu.Lock()
-	score, exists := s.cache[cacheKey]
+	score, exists := s.cache[key]
 	if !exists {
 		// Create a new score with initial values
 		score = Score{
@@ -769,7 +768,7 @@ func (s *service) SetArchivalStatus(ctx context.Context, key EndpointKey, isArch
 	score.LastUpdated = time.Now()
 
 	// Update cache
-	s.cache[cacheKey] = score
+	s.cache[key] = score
 	s.mu.Unlock()
 
 	// Queue async write to storage
@@ -780,7 +779,7 @@ func (s *service) SetArchivalStatus(ctx context.Context, key EndpointKey, isArch
 		if err := s.storage.Set(ctx, key, score); err != nil {
 			if s.logger != nil {
 				s.logger.Error().Err(err).
-					Str("key", cacheKey).
+					Str("key", key.String()).
 					Bool("is_archival", isArchival).
 					Msg("Failed to persist archival status to storage")
 			}
@@ -790,7 +789,7 @@ func (s *service) SetArchivalStatus(ctx context.Context, key EndpointKey, isArch
 
 	if s.logger != nil {
 		s.logger.Debug().
-			Str("key", cacheKey).
+			Str("key", key.String()).
 			Bool("is_archival", isArchival).
 			Time("expires_at", score.ArchivalExpiresAt).
 			Msg("📜 Set archival status in reputation service")
@@ -806,11 +805,9 @@ func (s *service) SetArchivalStatus(ctx context.Context, key EndpointKey, isArch
 // the local cache, ensuring non-leader replicas can access archival status
 // set by health checks running on the leader replica.
 func (s *service) IsArchivalCapable(ctx context.Context, key EndpointKey) bool {
-	cacheKey := key.String()
-
 	// Check local cache first
 	s.mu.RLock()
-	score, exists := s.cache[cacheKey]
+	score, exists := s.cache[key]
 	s.mu.RUnlock()
 
 	if exists {
@@ -824,7 +821,7 @@ func (s *service) IsArchivalCapable(ctx context.Context, key EndpointKey) bool {
 		if err == nil {
 			// Update local cache with fetched score
 			s.mu.Lock()
-			s.cache[cacheKey] = storedScore
+			s.cache[key] = storedScore
 			s.mu.Unlock()
 
 			return storedScore.IsArchivalCapable()
@@ -833,7 +830,7 @@ func (s *service) IsArchivalCapable(ctx context.Context, key EndpointKey) bool {
 		if s.logger != nil {
 			s.logger.Debug().
 				Err(err).
-				Str("key", cacheKey).
+				Str("key", key.String()).
 				Msg("Failed to fetch archival status from storage")
 		}
 	}
@@ -916,41 +913,18 @@ func (s *service) RemoveEndpointBlockHeights(ctx context.Context, serviceID prot
 // This enables bootstrapping the EVM archival cache at startup when the
 // endpoint store is empty but the reputation cache has been populated from Redis.
 func (s *service) GetArchivalEndpoints(ctx context.Context, serviceID protocol.ServiceID) []EndpointKey {
-	prefix := string(serviceID) + ":"
-
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var result []EndpointKey
-	for cacheKey, score := range s.cache {
-		// Quick prefix check to filter by service
-		if !strings.HasPrefix(cacheKey, prefix) {
+	for key, score := range s.cache {
+		if key.ServiceID != serviceID {
 			continue
 		}
-
 		if !score.IsArchivalCapable() {
 			continue
 		}
-
-		// Parse "serviceID:endpointAddr:rpcType" back to EndpointKey.
-		// EndpointAddr may contain colons (e.g., URLs with ports),
-		// so split and take: first part = serviceID, last part = rpcType, middle = endpointAddr.
-		parts := strings.Split(cacheKey, ":")
-		if len(parts) < 3 {
-			continue
-		}
-
-		rpcTypeStr := parts[len(parts)-1]
-		endpointAddr := strings.Join(parts[1:len(parts)-1], ":")
-
-		rpcTypeUpper := strings.ToUpper(rpcTypeStr)
-		rpcType := sharedtypes.RPCType(sharedtypes.RPCType_value[rpcTypeUpper])
-
-		result = append(result, NewEndpointKey(
-			serviceID,
-			protocol.EndpointAddr(endpointAddr),
-			rpcType,
-		))
+		result = append(result, key)
 	}
 
 	return result
