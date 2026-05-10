@@ -48,14 +48,14 @@ func TestSessionExhaustionTracker_TTLExpiry(t *testing.T) {
 
 	// Fudge the stored timestamp to simulate TTL expiry without sleeping.
 	tr.mu.Lock()
-	tr.entries[sessionExhaustionKey("eth", "session-1", "pokt1abc")] = time.Now().Add(-2 * sessionExhaustionTTL)
+	tr.entries[sessionExhaustionKey{ServiceID: "eth", SessionID: "session-1", Supplier: "pokt1abc"}] = time.Now().Add(-2 * sessionExhaustionTTL)
 	tr.mu.Unlock()
 
 	require.False(t, tr.IsExhausted("eth", "session-1", "pokt1abc"))
 
 	// Lazy reap should have dropped the entry.
 	tr.mu.RLock()
-	_, present := tr.entries[sessionExhaustionKey("eth", "session-1", "pokt1abc")]
+	_, present := tr.entries[sessionExhaustionKey{ServiceID: "eth", SessionID: "session-1", Supplier: "pokt1abc"}]
 	tr.mu.RUnlock()
 	require.False(t, present, "expired entry should be lazily reaped on IsExhausted")
 }
