@@ -99,9 +99,12 @@ func (p *Protocol) BuildWebsocketRequestContextForEndpoint(
 		return nil, nil, err
 	}
 
-	// Create Websocket request context for the pre-selected endpoint
+	// Create Websocket request context for the pre-selected endpoint.
+	// The logger is hydrated once with all connection-level fields (supplier,
+	// URL, app, etc.) — these are immutable for the connection's lifetime, so
+	// re-adding them per message would just churn allocations.
 	wrc := &websocketRequestContext{
-		logger:             logger,
+		logger:             buildWebsocketConnectionLogger(p.logger, serviceID, selectedEndpoint),
 		context:            ctx,
 		fullNode:           p.FullNode,
 		selectedEndpoint:   selectedEndpoint,
@@ -332,33 +335,37 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 	messageObservationsChan chan *observation.RequestResponseObservations,
 	connectionObservationChan chan *protocolobservations.Observations,
 ) error {
-	wrc.hydratedLogger("StartWebSocketBridge")
+	logger := wrc.methodLogger("StartWebSocketBridge")
 
 	// Get the websocket-specific URL from the selected endpoint.
-	websocketEndpointURL, err := getWebsocketEndpointURL(wrc.logger, wrc.selectedEndpoint)
+	websocketEndpointURL, err := getWebsocketEndpointURL(logger, wrc.selectedEndpoint)
 	if err != nil {
 		err = fmt.Errorf("%w: selected endpoint does not support websocket RPC type: %s", errCreatingWebSocketConnection, err.Error())
-		wrc.logger.Error().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
+		logger.Error().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
 
 		// Record critical error signal - endpoint doesn't support required RPC type.
 		// Latency=0 indicates this is a setup/configuration error, not a response time measurement.
 		wrc.recordWebsocketSignal(reputation.NewCriticalErrorSignal("ws_url_not_supported", 0))
-		connectionObservationChan <- getWebsocketConnectionErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, err)
+		connectionObservationChan <- getWebsocketConnectionErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, err)
 
 		return fmt.Errorf("selected endpoint does not support websocket RPC type: %w", err)
 	}
+	// One-shot mutation: bake the resolved websocket URL into the connection
+	// logger so the long-lived bridge goroutine and per-message methods all
+	// inherit it. Per-connection only — never per-message.
 	wrc.logger = wrc.logger.With("websocket_url", websocketEndpointURL)
+	logger = logger.With("websocket_url", websocketEndpointURL)
 
 	// Get the headers for the websocket connection that will be sent to the endpoint.
-	endpointConnectionHeaders, err := getWebsocketConnectionHeaders(wrc.logger, wrc.selectedEndpoint)
+	endpointConnectionHeaders, err := getWebsocketConnectionHeaders(logger, wrc.selectedEndpoint)
 	if err != nil {
 		err = fmt.Errorf("%w: failed to get websocket connection headers: %s", errCreatingWebSocketConnection, err.Error())
-		wrc.logger.Error().Err(err).Msg("❌ Failed to get websocket connection headers")
+		logger.Error().Err(err).Msg("❌ Failed to get websocket connection headers")
 
 		// Record major error signal - header construction failed.
 		// Latency=0 indicates this is a setup error, not a response time measurement.
 		wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_headers_failed", 0))
-		connectionObservationChan <- getWebsocketConnectionErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, err)
+		connectionObservationChan <- getWebsocketConnectionErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, err)
 
 		return fmt.Errorf("failed to get websocket connection headers: %w", err)
 	}
@@ -369,10 +376,10 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		signature, err := wrc.generateHandshakeSignature()
 		if err != nil {
 			err = fmt.Errorf("%w: failed to generate handshake signature: %s", errCreatingWebSocketConnection, err.Error())
-			wrc.logger.Error().Err(err).Msg("❌ Failed to generate handshake signature")
+			logger.Error().Err(err).Msg("❌ Failed to generate handshake signature")
 
 			wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_signature_failed", 0))
-			connectionObservationChan <- getWebsocketConnectionErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, err)
+			connectionObservationChan <- getWebsocketConnectionErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, err)
 
 			return fmt.Errorf("failed to generate handshake signature: %w", err)
 		}
@@ -393,12 +400,12 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 	)
 	if err != nil {
 		err = fmt.Errorf("%w: failed to start websocket bridge: %s", errCreatingWebSocketConnection, err.Error())
-		wrc.logger.Error().Err(err).Msg("❌ Failed to start Websocket bridge")
+		logger.Error().Err(err).Msg("❌ Failed to start Websocket bridge")
 
 		// Record major error signal - connection establishment failed.
 		// Latency=0 indicates this is a connection setup error, not a response time measurement.
 		wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_connection_failed", 0))
-		connectionObservationChan <- getWebsocketConnectionErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, err)
+		connectionObservationChan <- getWebsocketConnectionErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, err)
 
 		return fmt.Errorf("failed to start websocket bridge: %w", err)
 	}
@@ -486,7 +493,7 @@ func getWebsocketEndpointURL(logger polylog.Logger, selectedEndpoint endpoint) (
 // to validate the connection upfront (eager validation) before accepting WebSocket messages.
 // The signature is over the same data that would be in a RelayRequest.Meta with empty payload.
 func (wrc *websocketRequestContext) generateHandshakeSignature() (string, error) {
-	wrc.hydratedLogger("generateHandshakeSignature")
+	logger := wrc.methodLogger("generateHandshakeSignature")
 
 	// Create a relay request with empty payload for signing.
 	// The signature covers the session metadata (same as for regular relay requests).
@@ -500,7 +507,7 @@ func (wrc *websocketRequestContext) generateHandshakeSignature() (string, error)
 
 	app := wrc.selectedEndpoint.Session().GetApplication()
 	if app == nil {
-		wrc.logger.Error().Msg("❌ SHOULD NEVER HAPPEN: session application is nil")
+		logger.Error().Msg("❌ SHOULD NEVER HAPPEN: session application is nil")
 		return "", fmt.Errorf("session application is nil")
 	}
 
@@ -517,7 +524,7 @@ func (wrc *websocketRequestContext) generateHandshakeSignature() (string, error)
 	// Encode as base64 for transport in HTTP header.
 	signatureBase64 := base64.StdEncoding.EncodeToString(signatureBytes)
 
-	wrc.logger.Debug().
+	logger.Debug().
 		Str("session_id", signedHandshake.Meta.SessionHeader.SessionId).
 		Int("signature_length", len(signatureBytes)).
 		Msg("Generated handshake signature")
@@ -530,9 +537,9 @@ func (wrc *websocketRequestContext) generateHandshakeSignature() (string, error)
 // ProcessProtocolClientWebsocketMessage processes a message from the client.
 // Implements gateway.ProtocolRequestContextWebsocket interface.
 func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgData []byte) ([]byte, error) {
-	wrc.hydratedLogger("ProcessClientWebsocketMessage")
+	logger := wrc.methodLogger("ProcessClientWebsocketMessage")
 
-	wrc.logger.Debug().Msgf("received message from client: %s", string(msgData))
+	logger.Debug().Msgf("received message from client: %s", string(msgData))
 
 	// Extract domain for message metrics
 	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
@@ -553,7 +560,7 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 	// If the selected endpoint is a protocol endpoint, we need to sign the message.
 	signedRelayRequest, err := wrc.signClientWebsocketMessage(msgData)
 	if err != nil {
-		wrc.logger.Error().Err(err).Msg("❌ failed to sign request")
+		logger.Error().Err(err).Msg("❌ failed to sign request")
 		// Record message metric for client→endpoint direction with error
 		// Note: signing errors are PATH-side, not endpoint quality issues, but we track for observability
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionClientToEndpoint, metrics.SignalMinorError)
@@ -567,7 +574,7 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 
 // signClientWebsocketMessage signs a message from the client using the Relay Request Signer.
 func (wrc *websocketRequestContext) signClientWebsocketMessage(msgData []byte) ([]byte, error) {
-	wrc.hydratedLogger("signClientWebsocketMessage")
+	logger := wrc.methodLogger("signClientWebsocketMessage")
 
 	unsignedRelayRequest := &servicetypes.RelayRequest{
 		Meta: servicetypes.RelayRequestMetadata{
@@ -579,7 +586,7 @@ func (wrc *websocketRequestContext) signClientWebsocketMessage(msgData []byte) (
 
 	app := wrc.selectedEndpoint.Session().GetApplication()
 	if app == nil {
-		wrc.logger.Error().Msg("❌ SHOULD NEVER HAPPEN: session application is nil")
+		logger.Error().Msg("❌ SHOULD NEVER HAPPEN: session application is nil")
 		return nil, fmt.Errorf("session application is nil")
 	}
 
@@ -602,10 +609,10 @@ func (wrc *websocketRequestContext) signClientWebsocketMessage(msgData []byte) (
 func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 	msgData []byte,
 ) ([]byte, protocolobservations.Observations, error) {
-	wrc.hydratedLogger("ProcessEndpointWebsocketMessage")
+	logger := wrc.methodLogger("ProcessEndpointWebsocketMessage")
 	startTime := time.Now()
 
-	wrc.logger.Debug().Msgf("received message from endpoint: %s", string(msgData))
+	logger.Debug().Msgf("received message from endpoint: %s", string(msgData))
 
 	// Extract domain for message metrics
 	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
@@ -622,84 +629,82 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 		wrc.recordWebsocketSignal(reputation.NewSuccessSignal(time.Since(startTime)))
 		// Record message metric for endpoint→client direction
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalOK)
-		return msgData, getWebsocketMessageSuccessObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+		return msgData, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
 	}
 
 	// If the selected endpoint is a protocol endpoint, we need to validate the message.
 	validatedRelayResponse, err := wrc.validateEndpointWebsocketMessage(msgData)
 	if err != nil {
-		wrc.logger.Error().Err(err).Msg("❌ failed to validate relay response")
+		logger.Error().Err(err).Msg("❌ failed to validate relay response")
 		// Record error signal for message validation failure
 		wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_message_validation_failed", time.Since(startTime)))
 		// Record message metric for endpoint→client direction with error
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMajorError)
-		return nil, getWebsocketMessageErrorObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, msgData, err), err
+		return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, err), err
 	}
 
 	// Record success signal for validated message
 	wrc.recordWebsocketSignal(reputation.NewSuccessSignal(time.Since(startTime)))
 	// Record message metric for endpoint→client direction
 	metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalOK)
-	return validatedRelayResponse, getWebsocketMessageSuccessObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+	return validatedRelayResponse, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
 }
 
 // validateEndpointWebsocketMessage validates a message from the endpoint using the Shannon FullNode.
 // TODO_IMPROVE(@adshmh): Compare this to 'validateAndProcessResponse' and align the two implementations
 // w.r.t design, error handling, etc...
 func (wrc *websocketRequestContext) validateEndpointWebsocketMessage(msgData []byte) ([]byte, error) {
-	wrc.hydratedLogger("validateEndpointWebsocketMessage")
+	logger := wrc.methodLogger("validateEndpointWebsocketMessage")
 
 	// Validate the relay response using the Shannon FullNode
 	relayResponse, err := wrc.fullNode.ValidateRelayResponse(sdk.SupplierAddress(wrc.selectedEndpoint.Supplier()), msgData)
 	if err != nil {
-		wrc.logger.Error().Err(err).Msg("❌ failed to validate relay response in websocket message")
+		logger.Error().Err(err).Msg("❌ failed to validate relay response in websocket message")
 		return nil, fmt.Errorf("%w: %s", errRelayResponseInWebsocketMessageValidationFailed, err.Error())
 	}
-	wrc.logger.Debug().Msgf("received message from protocol endpoint: %s", string(relayResponse.Payload))
+	logger.Debug().Msgf("received message from protocol endpoint: %s", string(relayResponse.Payload))
 
 	return relayResponse.Payload, nil
 }
 
 // ---------- Logger Helpers ----------
 
-// hydratedLogger:
-// - Enhances the base logger with information from the request context.
-// - Includes:
-//   - Method name
-//   - Service ID
-//   - Selected endpoint supplier
-//   - Selected endpoint URL
-func (wrc *websocketRequestContext) hydratedLogger(methodName string) {
-	logger := wrc.logger.With(
+// buildWebsocketConnectionLogger constructs the per-connection logger ONCE,
+// at request-context setup. The supplier, URL, and session app are immutable
+// for the connection's lifetime so adding them here avoids re-allocating the
+// same context on every message.
+//
+// Background: this used to be done per-message inside hydratedLogger, which
+// also reassigned wrc.logger and so accumulated fields over the connection
+// lifetime — pprof showed it as ~36% of all heap allocations on a busy pod.
+func buildWebsocketConnectionLogger(
+	base polylog.Logger,
+	serviceID protocol.ServiceID,
+	selectedEndpoint endpoint,
+) polylog.Logger {
+	logger := base.With(
 		"request_type", "websocket",
-		"method", methodName,
-		"service_id", wrc.serviceID,
+		"service_id", serviceID,
 	)
-
-	defer func() {
-		wrc.logger = logger
-	}()
-
-	// No endpoint specified on request context.
-	// - This should never happen.
-	selectedEndpoint := wrc.selectedEndpoint
 	if selectedEndpoint == nil {
-		return
+		return logger
 	}
-
 	logger = logger.With(
 		"selected_endpoint_supplier", selectedEndpoint.Supplier(),
 		"selected_endpoint_url", selectedEndpoint.PublicURL(),
+		"endpoint_addr", selectedEndpoint.Addr(),
 	)
-
-	sessionHeader := selectedEndpoint.Session().Header
-	if sessionHeader == nil {
-		return
+	if header := selectedEndpoint.Session().GetHeader(); header != nil {
+		logger = logger.With("selected_endpoint_app", header.ApplicationAddress)
 	}
+	return logger
+}
 
-	logger = logger.With(
-		"selected_endpoint_app", sessionHeader.ApplicationAddress,
-	)
+// methodLogger returns a per-method logger derived from the connection logger.
+// Single allocation per call; does NOT mutate wrc.logger (so the connection
+// logger never grows unbounded across messages).
+func (wrc *websocketRequestContext) methodLogger(methodName string) polylog.Logger {
+	return wrc.logger.With("method", methodName)
 }
 
 // ---------- Reputation Signal Recording ----------
