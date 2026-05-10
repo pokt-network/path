@@ -36,10 +36,21 @@ func (p *Protocol) filterByReputation(
 
 	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
 
-	// Build endpoint keys for batch lookup
+	// Build keys + remember each endpoint in a single pass. The second loop
+	// walks this slice instead of re-iterating the map and re-calling BuildKey
+	// (which allocates for non-default key granularities — domain mode parses
+	// URLs and extracts hostnames).
+	type addrKey struct {
+		addr protocol.EndpointAddr
+		ep   endpoint
+		key  reputation.EndpointKey
+	}
+	cached := make([]addrKey, 0, len(endpoints))
 	keys := make([]reputation.EndpointKey, 0, len(endpoints))
-	for addr := range endpoints {
-		keys = append(keys, keyBuilder.BuildKey(serviceID, addr, rpcType))
+	for addr, ep := range endpoints {
+		k := keyBuilder.BuildKey(serviceID, addr, rpcType)
+		cached = append(cached, addrKey{addr: addr, ep: ep, key: k})
+		keys = append(keys, k)
 	}
 
 	// Get scores for all endpoints in a single call
@@ -49,15 +60,17 @@ func (p *Protocol) filterByReputation(
 		return endpoints
 	}
 
+	// Hoist out of the loop; the threshold doesn't change per endpoint.
+	minThreshold := p.getMinThresholdForService(serviceID)
+
 	// Filter endpoints below threshold or in cooldown
 	filtered := make(map[protocol.EndpointAddr]endpoint, len(endpoints))
-	for addr, ep := range endpoints {
-		key := keyBuilder.BuildKey(serviceID, addr, rpcType)
-		score, exists := scores[key]
+	for _, ak := range cached {
+		score, exists := scores[ak.key]
 
 		// If score doesn't exist, the endpoint is new and gets initial score (which is above threshold)
 		if !exists {
-			filtered[addr] = ep
+			filtered[ak.addr] = ak.ep
 			continue
 		}
 
@@ -66,10 +79,10 @@ func (p *Protocol) filterByReputation(
 			// CRITICAL: If this is the pre-selected endpoint, we MUST include it to avoid
 			// the "Selected endpoint is not available" error. This handles the race condition
 			// where an endpoint was selected but then entered cooldown.
-			if addr == requestedEndpointAddr {
-				filtered[addr] = ep
+			if ak.addr == requestedEndpointAddr {
+				filtered[ak.addr] = ak.ep
 				logger.Debug().
-					Str("endpoint", string(addr)).
+					Str("endpoint", string(ak.addr)).
 					Int("strikes", score.CriticalStrikes).
 					Dur("cooldown_remaining", score.CooldownRemaining()).
 					Msg("Including requested endpoint even though it is in cooldown")
@@ -77,7 +90,7 @@ func (p *Protocol) filterByReputation(
 			}
 
 			logger.Debug().
-				Str("endpoint", string(addr)).
+				Str("endpoint", string(ak.addr)).
 				Int("strikes", score.CriticalStrikes).
 				Dur("cooldown_remaining", score.CooldownRemaining()).
 				Msg("Filtering out endpoint in cooldown (strike system)")
@@ -85,19 +98,18 @@ func (p *Protocol) filterByReputation(
 		}
 
 		// Check if score is above the configured minimum threshold (use per-service threshold)
-		minThreshold := p.getMinThresholdForService(serviceID)
-		if score.Value >= minThreshold || addr == requestedEndpointAddr {
-			filtered[addr] = ep
-			if score.Value < minThreshold && addr == requestedEndpointAddr {
+		if score.Value >= minThreshold || ak.addr == requestedEndpointAddr {
+			filtered[ak.addr] = ak.ep
+			if score.Value < minThreshold && ak.addr == requestedEndpointAddr {
 				logger.Debug().
-					Str("endpoint", string(addr)).
+					Str("endpoint", string(ak.addr)).
 					Float64("score", score.Value).
 					Float64("threshold", minThreshold).
 					Msg("Including requested endpoint even though it is below threshold")
 			}
 		} else {
 			logger.Debug().
-				Str("endpoint", string(addr)).
+				Str("endpoint", string(ak.addr)).
 				Float64("score", score.Value).
 				Float64("threshold", minThreshold).
 				Msg("Filtering out low-reputation endpoint")
@@ -131,10 +143,11 @@ func (p *Protocol) getEndpointScores(
 		return nil, err
 	}
 
-	// Convert to score values map
+	// Convert to score values map. Iterate the keys slice we just built so we
+	// don't have to call keyBuilder.BuildKey a second time per endpoint —
+	// that's a non-trivial allocation under domain/supplier granularity.
 	result := make(map[reputation.EndpointKey]float64, len(endpoints))
-	for addr := range endpoints {
-		key := keyBuilder.BuildKey(serviceID, addr, rpcType)
+	for _, key := range keys {
 		if score, exists := scores[key]; exists {
 			result[key] = score.Value
 		} else {
