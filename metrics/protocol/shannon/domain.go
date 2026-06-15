@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/net/publicsuffix"
 )
@@ -35,6 +36,13 @@ func ExtractDomainOrHost(rawURL string) (string, error) {
 	host := parsedURL.Hostname()
 	if host == "" {
 		return "", fmt.Errorf("empty host in URL: %q", rawURL)
+	}
+
+	// prometheus/client_golang panics in WithLabelValues on non-UTF-8 label
+	// values. Reject invalid hosts here so the caller falls back to ErrDomain
+	// rather than feeding raw bytes into the `domain` label.
+	if !utf8.ValidString(host) {
+		return "", fmt.Errorf("host contains invalid UTF-8: %q", host)
 	}
 
 	// Check special cases first (IP addresses, localhost, internal domains)

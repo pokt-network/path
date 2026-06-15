@@ -790,6 +790,17 @@ func (rc *requestContext) BroadcastAllObservations() {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
+			// Belt-and-suspenders: a panic here (e.g. a metrics library rejecting
+			// an unexpected label value) runs in a detached goroutine and would
+			// otherwise be uncaught and take down the whole process. Recover so a
+			// metrics/observation failure can never crash request serving.
+			defer func() {
+				if r := recover(); r != nil {
+					rc.logger.Error().
+						Str("panic", fmt.Sprintf("%v", r)).
+						Msg("recovered from panic while broadcasting observations; dropping metrics for this request")
+				}
+			}()
 			rc.broadcastObservationsInternal()
 		}()
 

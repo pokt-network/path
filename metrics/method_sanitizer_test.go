@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 
@@ -144,6 +145,43 @@ func TestSanitize_LengthCap(t *testing.T) {
 	out = SanitizeMethodLabel(NetworkTypeEVM, rawLong)
 	require.LessOrEqual(t, len(out), MethodLabelMaxLen)
 	require.Equal(t, MethodOtherEVM, out, "long unknown eth_* should bucket")
+}
+
+// TestSanitize_InvalidUTF8 is the regression guard for the crash-loop bug: a
+// web vuln-scanner path-traversal probe with overlong-encoded dots (%C0%AE)
+// and a NUL byte decodes to invalid UTF-8. prometheus/client_golang panics in
+// WithLabelValues on non-UTF-8 label values, so SanitizeMethodLabel MUST always
+// return valid UTF-8 regardless of input.
+func TestSanitize_InvalidUTF8(t *testing.T) {
+	cases := []string{
+		"/\xc0\xae\xc0\xae/\xc0\xae\xc0\xae/\xc0\xae\xc0\xae/etc/passwd\x00", // exact panic trigger from prod
+		"/\xc0\xae/\xc0\xae/WEB-INF/web.xml",
+		"\xff\xfe\xfd",                  // raw invalid bytes, not a path
+		"eth_\xc0\xaeblockNumber",       // invalid bytes mid JSON-RPC method
+		string([]byte{0x80, 0x81, 0x82}), // continuation bytes with no leader
+	}
+	for _, networkType := range []string{NetworkTypeEVM, NetworkTypeCosmos, NetworkTypeSolana, NetworkTypePassthrough} {
+		for _, in := range cases {
+			out := SanitizeMethodLabel(networkType, in)
+			require.Truef(t, utf8.ValidString(out),
+				"output must be valid UTF-8 for network=%q input=%q got=%q", networkType, in, out)
+			require.LessOrEqualf(t, len(out), MethodLabelMaxLen, "output must stay within cap for input=%q", in)
+			// Must not panic when used as an actual Prometheus label value.
+			require.NotPanics(t, func() {
+				ObservationPipeline.WithLabelValues("example.com", "rest", "test-svc", NetworkTypeCosmos, out, SignalOK)
+			}, "sanitized method must be usable as a label value without panic")
+		}
+	}
+}
+
+// TestSanitize_LongValidMultibyteTruncation guards against byte-level truncation
+// splitting a multibyte rune into invalid UTF-8 (the cap previously sliced raw
+// bytes). A long all-multibyte path must still produce valid UTF-8 output.
+func TestSanitize_LongValidMultibyteTruncation(t *testing.T) {
+	long := "/" + strings.Repeat("café/", 30) // each "café" is 5 bytes (é = 2)
+	out := SanitizeMethodLabel(NetworkTypeCosmos, long)
+	require.True(t, utf8.ValidString(out), "truncated multibyte output must remain valid UTF-8: %q", out)
+	require.LessOrEqual(t, len(out), MethodLabelMaxLen)
 }
 
 // TestSanitize_CardinalityRegression is the load-bearing test: 10K adversarial
