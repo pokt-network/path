@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"strings"
+	"unicode/utf8"
 )
 
 // SanitizeMethodLabel bounds the cardinality of the `method` Prometheus label
@@ -271,11 +272,22 @@ func isBech32Like(s string) bool {
 	return isAlphanumeric(data)
 }
 
-// capLen enforces MethodLabelMaxLen as the final safety net on every value
-// returned to the caller.
+// capLen enforces MethodLabelMaxLen and guarantees valid UTF-8 on every value
+// returned to the caller — it is the final safety net on every SanitizeMethodLabel
+// return path.
+//
+// prometheus/client_golang panics inside WithLabelValues when a label value is
+// not valid UTF-8. Attacker-supplied REST paths decode to invalid byte sequences
+// (e.g. overlong-encoded %C0%AE path-traversal probes, embedded NUL bytes), and
+// byte-level truncation here can itself split a multibyte rune. Replace any
+// invalid byte sequence with the Unicode replacement char so a single malformed
+// request can never crash the process on the metrics path.
 func capLen(s string) string {
-	if len(s) <= MethodLabelMaxLen {
-		return s
+	if len(s) > MethodLabelMaxLen {
+		s = s[:MethodLabelMaxLen]
 	}
-	return s[:MethodLabelMaxLen]
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "�")
+	}
+	return s
 }

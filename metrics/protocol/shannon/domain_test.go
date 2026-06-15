@@ -250,6 +250,14 @@ func TestExtractDomainOrHost(t *testing.T) {
 			rawURL:      "https://invalid url.com",
 			expectError: true,
 		},
+		{
+			// Non-UTF-8 host must be rejected so the caller falls back to ErrDomain
+			// instead of feeding raw bytes into the Prometheus `domain` label
+			// (which panics in WithLabelValues).
+			name:        "Host with invalid UTF-8 bytes",
+			rawURL:      "https://exa\xc0\xaemple.com/path",
+			expectError: true,
+		},
 	}
 
 	for _, tt := range tests {
