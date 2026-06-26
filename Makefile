@@ -149,6 +149,7 @@ include ./makefiles/docs.mk
 include ./makefiles/localnet.mk
 include ./makefiles/test.mk
 include ./makefiles/bench.mk
+include ./makefiles/pgo.mk
 include ./makefiles/test_requests.mk
 include ./makefiles/test_load.mk
 include ./makefiles/proto.mk

@@ -1,0 +1,2 @@
+# PGO profile is a binary protobuf; never normalize line endings or diff it.
+cmd/default.pgo binary
