@@ -25,6 +25,10 @@ func TestParseJSONRPCFromRequestBody(t *testing.T) {
 		{name: "malformed single", body: `{not json`, wantErr: true},
 		{name: "malformed batch", body: `[not json`, wantErr: true},
 		{name: "empty batch rejected", body: `[]`, wantErr: true},
+		{name: "duplicate int ids rejected", body: `[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":1}]`, wantErr: true},
+		{name: "duplicate string ids rejected", body: `[{"jsonrpc":"2.0","method":"a","id":"x"},{"jsonrpc":"2.0","method":"b","id":"x"}]`, wantErr: true},
+		{name: "cross-type duplicate ids rejected", body: `[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":"1"}]`, wantErr: true},
+		{name: "distinct ids ok", body: `[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":2}]`, wantBatch: true, wantCount: 2},
 	}
 
 	for _, tt := range tests {
@@ -46,5 +50,16 @@ func TestParseJSONRPCFromRequestBody(t *testing.T) {
 				t.Fatalf("len(reqs) = %d, want %d", len(reqs), tt.wantCount)
 			}
 		})
+	}
+}
+
+// TestParseJSONRPCFromRequestBody_NotificationsAllowed verifies that multiple
+// notifications (requests without an ID) are not treated as duplicate IDs.
+func TestParseJSONRPCFromRequestBody_NotificationsAllowed(t *testing.T) {
+	logger := polyzero.NewLogger(polyzero.WithLevel(polyzero.ParseLevel("warn")))
+	body := []byte(`[{"jsonrpc":"2.0","method":"a"},{"jsonrpc":"2.0","method":"b"}]`)
+
+	if _, _, err := ParseJSONRPCFromRequestBody(logger, body); err != nil {
+		t.Fatalf("notifications without IDs must not be rejected as duplicates: %v", err)
 	}
 }

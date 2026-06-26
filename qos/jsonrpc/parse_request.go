@@ -111,15 +111,25 @@ func validateAndMapRequests(logger polylog.Logger, requests []Request) (map[ID]R
 		return nil, fmt.Errorf("empty batch request not allowed")
 	}
 
-	// Convert to map and validate no duplicate IDs exist
-	requestsMap := make(map[ID]Request)
+	// Convert to map and validate no duplicate IDs exist.
+	//
+	// Duplicate detection is keyed by ID.String(), NOT by the ID struct itself:
+	// ID holds *int/*string pointers, so two IDs with the same value compare
+	// unequal as map keys (different pointer addresses) and duplicates would
+	// slip through. String() collapses to the value and matches the cross-type
+	// semantics of ID.Equal (the integer 1 and the string "1" are treated as
+	// the same ID), keeping detection consistent with response correlation.
+	requestsMap := make(map[ID]Request, len(requests))
+	seenIDs := make(map[string]struct{}, len(requests))
 	for _, req := range requests {
 		// Check for duplicate IDs (skip notifications which have empty IDs)
 		if !req.ID.IsEmpty() {
-			if _, exists := requestsMap[req.ID]; exists {
+			idKey := req.ID.String()
+			if _, exists := seenIDs[idKey]; exists {
 				logger.Error().Msg("❌ Duplicate ID found in batch request")
-				return nil, fmt.Errorf("duplicate ID '%s' found in batch request - IDs must be unique for proper request-response correlation", req.ID.String())
+				return nil, fmt.Errorf("duplicate ID '%s' found in batch request - IDs must be unique for proper request-response correlation", idKey)
 			}
+			seenIDs[idKey] = struct{}{}
 		}
 		requestsMap[req.ID] = req
 	}
