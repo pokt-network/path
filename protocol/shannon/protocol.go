@@ -1102,40 +1102,23 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 			qualifiedEndpoints = filteredEndpoints
 		}
 
+		// The filtering stages below mutate qualifiedEndpoints in place (delete).
+		// When RPC-type filtering ran it already produced a fresh map; otherwise
+		// qualifiedEndpoints still aliases the cached sessionEndpoints map and must
+		// be cloned so the filters cannot corrupt the shared session cache.
+		if filterByRPCType == sharedtypes.RPCType_UNKNOWN_RPC {
+			qualifiedEndpoints = maps.Clone(qualifiedEndpoints)
+		}
+
 		// CONFIG-DRIVEN SUPPLIER BLOCKLIST FILTERING
 		// Permanently exclude suppliers listed in the service's blocked_suppliers config.
 		// This blocks known-malicious suppliers (e.g., serving spam/malware redirects).
 		// Applied before allowlist so that explicitly blocked suppliers cannot be overridden.
-		if blockedSuppliers := p.getBlockedSuppliers(serviceID); len(blockedSuppliers) > 0 {
-			blockedSet := make(map[string]struct{}, len(blockedSuppliers))
-			for _, addr := range blockedSuppliers {
-				blockedSet[addr] = struct{}{}
-			}
-
-			unblockedEndpoints := make(map[protocol.EndpointAddr]endpoint)
-			blockedCount := 0
-
-			for addr, ep := range qualifiedEndpoints {
-				supplierAddr := ep.Supplier()
-				if _, isBlocked := blockedSet[supplierAddr]; isBlocked {
-					blockedCount++
-					logger.Debug().
-						Str("supplier", supplierAddr).
-						Str("endpoint", string(addr)).
-						Msg("Skipping config-blocked supplier")
-				} else {
-					unblockedEndpoints[addr] = ep
-				}
-			}
-
-			if blockedCount > 0 {
-				logger.Info().
-					Int("blocked", blockedCount).
-					Int("remaining", len(unblockedEndpoints)).
-					Msg("Filtered out config-blocked suppliers")
-			}
-
-			qualifiedEndpoints = unblockedEndpoints
+		if blockedCount := removeBlockedSuppliers(qualifiedEndpoints, p.getBlockedSuppliers(serviceID), logger); blockedCount > 0 {
+			logger.Info().
+				Int("blocked", blockedCount).
+				Int("remaining", len(qualifiedEndpoints)).
+				Msg("Filtered out config-blocked suppliers")
 		}
 
 		// ENDPOINT POLICY FILTERING
@@ -1147,37 +1130,9 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		// If allowed suppliers are specified (via header or load testing config),
 		// filter to only those suppliers, bypassing reputation and other logic.
 		if len(effectiveAllowedSuppliers) > 0 {
-			supplierFilteredEndpoints := make(map[protocol.EndpointAddr]endpoint)
-			skippedCount := 0
+			skippedCount := retainAllowedSuppliers(qualifiedEndpoints, effectiveAllowedSuppliers, requestedEndpointAddr, logger)
 
-			for addr, ep := range qualifiedEndpoints {
-				// Extract supplier address from endpoint address (format: "supplierAddr-url")
-				supplierAddr := string(addr)
-				if dashIndex := strings.Index(supplierAddr, "-"); dashIndex > 0 {
-					supplierAddr = supplierAddr[:dashIndex]
-				}
-
-				// Check if supplier is in the allowed list
-				allowed := false
-				for _, allowedSupplier := range effectiveAllowedSuppliers {
-					if supplierAddr == allowedSupplier {
-						allowed = true
-						break
-					}
-				}
-
-				if allowed || addr == requestedEndpointAddr {
-					supplierFilteredEndpoints[addr] = ep
-				} else {
-					skippedCount++
-					logger.Debug().
-						Str("supplier", supplierAddr).
-						Str("endpoint", string(addr)).
-						Msg("Skipping endpoint - supplier not in allowed list")
-				}
-			}
-
-			if len(supplierFilteredEndpoints) == 0 {
+			if len(qualifiedEndpoints) == 0 {
 				logger.Warn().Msgf(
 					"No endpoints match allowed suppliers %v for service %s, app %s (skipped %d endpoints). SKIPPING the app.",
 					effectiveAllowedSuppliers, serviceID, app.Address, skippedCount,
@@ -1187,10 +1142,8 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 
 			logger.Info().Msgf(
 				"Filtered endpoints by allowed suppliers %v for app %s: %d remain, %d skipped",
-				effectiveAllowedSuppliers, app.Address, len(supplierFilteredEndpoints), skippedCount,
+				effectiveAllowedSuppliers, app.Address, len(qualifiedEndpoints), skippedCount,
 			)
-
-			qualifiedEndpoints = supplierFilteredEndpoints
 
 			// IMPORTANT: When supplier filtering is active, skip reputation filtering
 			// to allow the user to explicitly target specific suppliers regardless of reputation.
@@ -1204,30 +1157,21 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		// SKIP this step if filterByReputation=false (health check case):
 		// Health checks need to reach blacklisted suppliers so they can recover.
 		if p.supplierBlacklist != nil && filterByReputation {
-			blacklistFilteredEndpoints := make(map[protocol.EndpointAddr]endpoint)
-			blacklistSkipped := 0
-
-			for addr, ep := range qualifiedEndpoints {
-				supplierAddr := ep.Supplier()
-				if p.supplierBlacklist.IsBlacklisted(serviceID, supplierAddr) && addr != requestedEndpointAddr {
-					blacklistSkipped++
-					logger.Debug().
-						Str("supplier", supplierAddr).
-						Str("endpoint", string(addr)).
-						Msg("Skipping blacklisted supplier")
-				} else {
-					blacklistFilteredEndpoints[addr] = ep
-				}
-			}
+			blacklistSkipped := removeBlacklistedSuppliers(
+				qualifiedEndpoints,
+				requestedEndpointAddr,
+				func(supplierAddr string) bool {
+					return p.supplierBlacklist.IsBlacklisted(serviceID, supplierAddr)
+				},
+				logger,
+			)
 
 			if blacklistSkipped > 0 {
 				logger.Info().
 					Int("blacklisted", blacklistSkipped).
-					Int("remaining", len(blacklistFilteredEndpoints)).
+					Int("remaining", len(qualifiedEndpoints)).
 					Msg("Filtered out blacklisted suppliers")
 			}
-
-			qualifiedEndpoints = blacklistFilteredEndpoints
 		}
 
 		// SESSION EXHAUSTION FILTERING
@@ -1245,30 +1189,23 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		// in poktroll main is the supplier's choice and we can't observe it),
 		// so attempting them is strictly better than returning no endpoints.
 		if p.sessionExhaustion != nil && filterByReputation {
-			exhaustionFilteredEndpoints := make(map[protocol.EndpointAddr]endpoint)
-			exhaustionSkipped := 0
-
-			for addr, ep := range qualifiedEndpoints {
-				supplierAddr := ep.Supplier()
-				session := ep.Session()
-				if session != nil && addr != requestedEndpointAddr &&
-					p.sessionExhaustion.IsExhausted(string(serviceID), session.SessionId, supplierAddr) {
-					exhaustionSkipped++
-					logger.Debug().
-						Str("supplier", supplierAddr).
-						Str("session_id", session.SessionId).
-						Msg("Skipping exhausted (over-serviced) supplier for this session")
-				} else {
-					exhaustionFilteredEndpoints[addr] = ep
-				}
-			}
+			exhaustionSkipped, applied := filterExhaustedSuppliers(
+				qualifiedEndpoints,
+				requestedEndpointAddr,
+				func(ep endpoint) bool {
+					session := ep.Session()
+					return session != nil &&
+						p.sessionExhaustion.IsExhausted(string(serviceID), session.SessionId, ep.Supplier())
+				},
+				logger,
+			)
 
 			switch {
 			case exhaustionSkipped == 0:
 				// No-op: filter did nothing.
-			case len(exhaustionFilteredEndpoints) == 0:
-				// All endpoints in this session are exhausted. Falling through
-				// to the unfiltered set so the request still has somewhere to go.
+			case !applied:
+				// All endpoints in this session are exhausted. Kept as a last resort
+				// so the request still has somewhere to go.
 				logger.Warn().
 					Int("exhausted", exhaustionSkipped).
 					Str("app", app.Address).
@@ -1276,9 +1213,8 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 			default:
 				logger.Info().
 					Int("exhausted", exhaustionSkipped).
-					Int("remaining", len(exhaustionFilteredEndpoints)).
+					Int("remaining", len(qualifiedEndpoints)).
 					Msg("Filtered out suppliers with exhausted per-session stake")
-				qualifiedEndpoints = exhaustionFilteredEndpoints
 			}
 		}
 
