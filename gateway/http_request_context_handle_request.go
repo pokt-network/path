@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -1872,7 +1873,37 @@ func truncateResponse(b []byte, maxLen int) string {
 	return string(b[:maxLen]) + "...(truncated)"
 }
 
+// maxEndpointDomainCacheEntries bounds endpointDomainCache as a safety net;
+// endpoint addresses are a bounded set so this is never expected to be reached.
+const maxEndpointDomainCacheEntries = 1 << 16 // 65536
+
+// endpointDomainCache memoizes extractDomainFromEndpoint. The uncached path does
+// url.Parse, and this runs for every endpoint on hedge/circuit-breaker/retry
+// paths against a bounded set of endpoint addresses.
+var (
+	endpointDomainCache      sync.Map // map[protocol.EndpointAddr]string
+	endpointDomainCacheCount atomic.Int64
+)
+
+// extractDomainFromEndpoint returns the host of the endpoint's URL. Results are
+// memoized; see endpointDomainCache.
 func extractDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
+	if v, ok := endpointDomainCache.Load(endpoint); ok {
+		return v.(string)
+	}
+
+	domain := computeDomainFromEndpoint(endpoint)
+
+	if endpointDomainCacheCount.Load() < maxEndpointDomainCacheEntries {
+		if _, loaded := endpointDomainCache.LoadOrStore(endpoint, domain); !loaded {
+			endpointDomainCacheCount.Add(1)
+		}
+	}
+	return domain
+}
+
+// computeDomainFromEndpoint performs the uncached host extraction.
+func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 	endpointStr := string(endpoint)
 
 	// Find the URL part after the supplier address
