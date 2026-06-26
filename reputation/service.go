@@ -1,7 +1,9 @@
 package reputation
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -329,14 +331,14 @@ func (s *service) RankEndpointsByScore(ctx context.Context, keys []EndpointKey) 
 	}
 	s.mu.RUnlock()
 
-	// Sort by score descending (highest first)
-	for i := 0; i < len(scored)-1; i++ {
-		for j := i + 1; j < len(scored); j++ {
-			if scored[j].score > scored[i].score {
-				scored[i], scored[j] = scored[j], scored[i]
-			}
-		}
-	}
+	// Sort by score descending (highest first).
+	// O(n log n) — replaces a former O(n²) selection sort that dominated CPU
+	// when ranking large session endpoint sets. Generic SortStableFunc avoids
+	// the reflection allocations of sort.SliceStable, and stable ordering
+	// preserves input order for equal scores (matching the old behavior).
+	slices.SortStableFunc(scored, func(a, b scoredEndpoint) int {
+		return cmp.Compare(b.score, a.score)
+	})
 
 	// Extract sorted keys
 	result := make([]EndpointKey, len(scored))

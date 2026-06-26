@@ -701,7 +701,7 @@ func (rc *requestContext) addRelayMetadataHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Archival-Request", strconv.FormatBool(rc.archivalRequestDetected))
 
 	// ALWAYS add retry count header (even on errors, even if 0)
-	w.Header().Set("X-Retry-Count", fmt.Sprintf("%d", rc.retryCount))
+	w.Header().Set("X-Retry-Count", strconv.Itoa(rc.retryCount))
 
 	// ALWAYS add suppliers tried header (even on errors, even if empty)
 	// Use thread-safe getter since suppliersTried may be modified by concurrent batch goroutines

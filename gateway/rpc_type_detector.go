@@ -310,26 +310,46 @@ func extractJSONRPCMethod(body []byte) string {
 	return payload.Method
 }
 
+// cometBFTPrefixes are the method-name prefixes that identify a CometBFT RPC
+// method (abci_*, block*, broadcast_*, consensus_*, etc.). Package-level so the
+// slice is built once rather than on every isCometBFTMethod call.
+var cometBFTPrefixes = []string{
+	"abci_",
+	"block",
+	"broadcast_",
+	"consensus_",
+	"commit",
+	"genesis",
+	"health",
+	"net_",
+	"status",
+	"subscribe",
+	"tx",
+	"unconfirmed_",
+	"validators",
+}
+
+// cometBFTPaths are the URL-path prefixes that identify a CometBFT RPC endpoint.
+// Package-level so the slice is built once rather than on every isCometBFTPath call.
+var cometBFTPaths = []string{
+	"/abci_",
+	"/block",
+	"/broadcast_",
+	"/commit",
+	"/consensus_",
+	"/genesis",
+	"/health",
+	"/net_",
+	"/status",
+	"/subscribe",
+	"/tx",
+	"/unconfirmed_",
+	"/validators",
+}
+
 // isCometBFTMethod checks if a method name is a CometBFT RPC method.
 // CometBFT methods typically match patterns like: abci_*, block*, broadcast_*, consensus_*, etc.
 func isCometBFTMethod(method string) bool {
-	// CometBFT method prefixes
-	cometBFTPrefixes := []string{
-		"abci_",
-		"block",
-		"broadcast_",
-		"consensus_",
-		"commit",
-		"genesis",
-		"health",
-		"net_",
-		"status",
-		"subscribe",
-		"tx",
-		"unconfirmed_",
-		"validators",
-	}
-
 	methodLower := strings.ToLower(method)
 	for _, prefix := range cometBFTPrefixes {
 		if strings.HasPrefix(methodLower, prefix) {
@@ -343,23 +363,6 @@ func isCometBFTMethod(method string) bool {
 // isCometBFTPath checks if a URL path indicates a CometBFT RPC endpoint.
 // CometBFT paths typically look like: /block, /status, /health, etc.
 func isCometBFTPath(path string) bool {
-	// CometBFT path patterns
-	cometBFTPaths := []string{
-		"/abci_",
-		"/block",
-		"/broadcast_",
-		"/commit",
-		"/consensus_",
-		"/genesis",
-		"/health",
-		"/net_",
-		"/status",
-		"/subscribe",
-		"/tx",
-		"/unconfirmed_",
-		"/validators",
-	}
-
 	pathLower := strings.ToLower(path)
 	for _, pattern := range cometBFTPaths {
 		if strings.HasPrefix(pathLower, pattern) {

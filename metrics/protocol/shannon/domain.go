@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"golang.org/x/net/publicsuffix"
@@ -13,10 +15,45 @@ import (
 // ErrDomain is a fallback domain value used when domain extraction fails
 const ErrDomain = "error"
 
+// maxDomainCacheEntries caps the memoization map as a safety net against
+// pathological growth. Endpoint URLs are a bounded set (suppliers per service),
+// so this ceiling is never expected to be reached in practice.
+const maxDomainCacheEntries = 1 << 16 // 65536
+
+// domainCache memoizes ExtractDomainOrHost results keyed by the raw input URL.
+// Extraction is deterministic and expensive (url.Parse + publicsuffix trie
+// lookup, ~620ns/216B), and it runs several times per relay against the same
+// bounded set of supplier URLs, so caching eliminates the bulk of that cost.
+var (
+	domainCache      sync.Map // map[string]string: rawURL -> extracted domain
+	domainCacheCount atomic.Int64
+)
+
 // ExtractDomainOrHost extracts the effective TLD+1 from a URL.
 // It falls back to a reasonable domain extraction for localhost, IP addresses, and other non-standard hosts.
+// Results are memoized; see domainCache.
 // Note: Callers should log the error with full context (supplier, service_id, etc.)
 func ExtractDomainOrHost(rawURL string) (string, error) {
+	if cached, ok := domainCache.Load(rawURL); ok {
+		return cached.(string), nil
+	}
+
+	domain, err := extractDomainOrHost(rawURL)
+	if err != nil {
+		// Errors are rare and cheap relative to a cache entry; don't cache them.
+		return "", err
+	}
+
+	if domainCacheCount.Load() < maxDomainCacheEntries {
+		if _, loaded := domainCache.LoadOrStore(rawURL, domain); !loaded {
+			domainCacheCount.Add(1)
+		}
+	}
+	return domain, nil
+}
+
+// extractDomainOrHost performs the uncached extraction.
+func extractDomainOrHost(rawURL string) (string, error) {
 	if rawURL == "" {
 		return "", fmt.Errorf("empty URL")
 	}
