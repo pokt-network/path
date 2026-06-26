@@ -45,13 +45,14 @@ func parseRequestsFromBody(logger polylog.Logger, requestBody []byte) ([]Request
 		return nil, false, err
 	}
 
-	// Try to unmarshal as batch (array) first - let encoding/json determine the format
-	requests, isBatch, err := tryUnmarshalAsBatch(trimmedBody)
-	if err == nil {
-		return requests, isBatch, nil
+	// Dispatch on the first byte instead of speculatively unmarshaling: a JSON
+	// array ('[') is a batch, anything else is treated as a single object. This
+	// avoids a second full json.Unmarshal on the common single-request path.
+	// trimmedBody is guaranteed non-empty by validateRequestBodyNotEmpty.
+	if trimmedBody[0] == '[' {
+		return tryUnmarshalAsBatch(logger, trimmedBody)
 	}
 
-	// If batch unmarshaling failed, try as single request
 	return tryUnmarshalAsSingle(logger, trimmedBody)
 }
 
@@ -69,10 +70,13 @@ func validateRequestBodyNotEmpty(logger polylog.Logger, requestBody []byte) ([]b
 
 // tryUnmarshalAsBatch attempts to unmarshal the request body as a JSON array.
 // Returns the requests and true if successful, or an error if it's not a valid array.
-func tryUnmarshalAsBatch(requestBody []byte) ([]Request, bool, error) {
+func tryUnmarshalAsBatch(logger polylog.Logger, requestBody []byte) ([]Request, bool, error) {
 	var requests []Request
 	if err := json.Unmarshal(requestBody, &requests); err != nil {
-		// This is expected for single requests - not an error to log
+		logger.Error().
+			Err(err).
+			Str("request_preview", log.Preview(string(requestBody))).
+			Msg("❌ Request failed JSON-RPC validation - malformed batch request")
 		return nil, false, err
 	}
 

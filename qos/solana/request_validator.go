@@ -1,6 +1,7 @@
 package solana
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -74,36 +75,44 @@ func (rv *requestValidator) validateHTTPRequest(req *http.Request, detectedRPCTy
 	// 1. Attempt to parse as a batch of requests
 	// Ref: https://www.jsonrpc.org/specification#batch
 	//
-	var jsonrpcBatchRequest jsonrpc.BatchRequest
-	if err = json.Unmarshal(body, &jsonrpcBatchRequest); err == nil {
-		return &batchJSONRPCRequestContext{
-			logger:               rv.logger,
-			chainID:              rv.chainID,
-			serviceID:            rv.serviceID,
-			requestPayloadLength: uint(len(body)),
-			JSONRPCBatchRequest:  jsonrpcBatchRequest,
-			// Set the origin of the request as USER (i.e. organic relay)
-			// The request is from a user.
-			requestOrigin: qosobservations.RequestOrigin_REQUEST_ORIGIN_ORGANIC,
-			endpointStore: rv.endpointStore,
-		}, true
-	}
+	// Dispatch on the first byte instead of speculatively unmarshaling both
+	// shapes: a JSON array ('[') is a batch, anything else is a single object.
+	// This avoids a second full json.Unmarshal on the common single-request path.
+	trimmedBody := bytes.TrimSpace(body)
+	isBatch := len(trimmedBody) > 0 && trimmedBody[0] == '['
 
-	// 2. Attempt to parse as a single JSONRPC request
-	var jsonrpcRequest jsonrpc.Request
-	if err = json.Unmarshal(body, &jsonrpcRequest); err == nil {
-		// single JSONRPC request is valid, return a fully initialized requestContext
-		return &requestContext{
-			logger:               rv.logger,
-			chainID:              rv.chainID,
-			serviceID:            rv.serviceID,
-			requestPayloadLength: uint(len(body)),
-			JSONRPCReq:           jsonrpcRequest,
-			// Set the origin of the request as USER (i.e. organic relay)
-			// The request is from a user.
-			requestOrigin: qosobservations.RequestOrigin_REQUEST_ORIGIN_ORGANIC,
-			endpointStore: rv.endpointStore,
-		}, true
+	if isBatch {
+		var jsonrpcBatchRequest jsonrpc.BatchRequest
+		if err = json.Unmarshal(body, &jsonrpcBatchRequest); err == nil {
+			return &batchJSONRPCRequestContext{
+				logger:               rv.logger,
+				chainID:              rv.chainID,
+				serviceID:            rv.serviceID,
+				requestPayloadLength: uint(len(body)),
+				JSONRPCBatchRequest:  jsonrpcBatchRequest,
+				// Set the origin of the request as USER (i.e. organic relay)
+				// The request is from a user.
+				requestOrigin: qosobservations.RequestOrigin_REQUEST_ORIGIN_ORGANIC,
+				endpointStore: rv.endpointStore,
+			}, true
+		}
+	} else {
+		// 2. Attempt to parse as a single JSONRPC request
+		var jsonrpcRequest jsonrpc.Request
+		if err = json.Unmarshal(body, &jsonrpcRequest); err == nil {
+			// single JSONRPC request is valid, return a fully initialized requestContext
+			return &requestContext{
+				logger:               rv.logger,
+				chainID:              rv.chainID,
+				serviceID:            rv.serviceID,
+				requestPayloadLength: uint(len(body)),
+				JSONRPCReq:           jsonrpcRequest,
+				// Set the origin of the request as USER (i.e. organic relay)
+				// The request is from a user.
+				requestOrigin: qosobservations.RequestOrigin_REQUEST_ORIGIN_ORGANIC,
+				endpointStore: rv.endpointStore,
+			}, true
+		}
 	}
 
 	// TODO_UPNEXT(@adshmh): Adjust the error response based on request type: single JSONRPC vs. batch JSONRPC.

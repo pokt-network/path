@@ -37,6 +37,11 @@ func NewRPCTypeDetector() *RPCTypeDetector {
 	}
 }
 
+// sharedRPCTypeDetector is a process-wide detector reused across requests.
+// RPCTypeDetector and its mapper are stateless and only read their inputs, so a
+// single shared instance is safe and avoids a per-request allocation.
+var sharedRPCTypeDetector = NewRPCTypeDetector()
+
 // DetectRPCType detects the RPC type from an HTTP request.
 // It uses smart elimination to avoid payload inspection when possible.
 //
