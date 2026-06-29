@@ -91,6 +91,13 @@ func (ra *ResponseAnalyzer) Analyze(responseBytes []byte, httpStatusCode int, rp
 		if indicatorResult.Found && indicatorResult.Category == CategoryBlockchainError {
 			return IndicatorAnalysisToResult(indicatorResult)
 		}
+		// Provider-side auth failures (the supplier's upstream RPC provider rejected
+		// the supplier's API key) are persistent supplier faults even when returned as
+		// a well-formed JSON-RPC error. Retry on a different supplier and surface the
+		// matched pattern so the caller can apply the strike/cooldown system.
+		if indicatorResult.Found && IsProviderAuthError(indicatorResult.Pattern) {
+			return IndicatorAnalysisToResult(indicatorResult)
+		}
 		// Otherwise, trust the protocol analysis (valid error, don't retry)
 		return protocolResult
 	}

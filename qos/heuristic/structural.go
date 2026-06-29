@@ -133,6 +133,21 @@ func isCapabilityLimitationText(content []byte) bool {
 	return false
 }
 
+// matchProviderAuthText returns the provider-auth pattern contained in a plain-text
+// (non-JSON) response, or "" if none. Covers suppliers proxying to a third-party RPC
+// provider whose API key is rejected (e.g. QuickNode: "API key is not allowed to
+// access blockchain"). The returned value is one of IsProviderAuthError's patterns,
+// so callers can surface it as MatchedPattern to drive the strike/cooldown system.
+func matchProviderAuthText(content []byte) string {
+	lower := strings.ToLower(string(content))
+	for _, pattern := range providerAuthErrorPatterns {
+		if strings.Contains(lower, pattern) {
+			return pattern
+		}
+	}
+	return ""
+}
+
 // isWhitespace checks if a byte is JSON whitespace.
 func isWhitespace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
@@ -172,6 +187,21 @@ func StructuralAnalysis(responseBytes []byte) AnalysisResult {
 		}
 
 	case StructureNonJSON:
+		// Provider-side API-key rejection delivered as plain text (e.g. QuickNode
+		// "API key is not allowed to access blockchain"). Persistent supplier fault —
+		// surface the matched pattern so the gateway escalates to the strike/cooldown
+		// system instead of just retrying as a generic non-JSON error.
+		if pattern := matchProviderAuthText(responseBytes); pattern != "" {
+			return AnalysisResult{
+				ShouldRetry:    true,
+				Confidence:     0.95,
+				Reason:         "non_json_provider_auth_error",
+				Structure:      structure,
+				MatchedPattern: pattern,
+				Details:        "Response is plain text indicating upstream provider API-key rejection",
+			}
+		}
+
 		// Check if the plain text response indicates a capability limitation
 		// (e.g., Tron lite fullnodes returning "this API is closed because this node is a lite fullnode").
 		// These should still retry on a different supplier but NOT circuit-break the domain.

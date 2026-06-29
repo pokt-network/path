@@ -123,6 +123,11 @@ var errorPatterns = []errorPattern{
 	{[]byte("invalid api key"), CategoryAuthError, 0.95},
 	{[]byte("authentication failed"), CategoryAuthError, 0.95},
 	{[]byte("not authorized"), CategoryAuthError, 0.90},
+	// Provider-side key rejection: the supplier proxies to a third-party RPC
+	// provider (e.g. QuickNode emits "API key is not allowed to access
+	// blockchain") whose key isn't authorized for this chain. Persistent
+	// supplier fault — see IsProviderAuthError.
+	{[]byte("api key is not allowed"), CategoryAuthError, 0.95},
 
 	// Service Errors (from error_classification.go)
 	{[]byte("service not configured"), CategoryServiceError, 0.95},
@@ -290,6 +295,36 @@ func IsCapabilityLimitationError(pattern string) bool {
 	default:
 		return false
 	}
+}
+
+// providerAuthErrorPatterns are the matched substrings that indicate the supplier's
+// UPSTREAM RPC provider rejected the supplier's API key. Single source of truth for
+// both IsProviderAuthError (matched against AnalysisResult.MatchedPattern) and the
+// plain-text detector in structural.go. All lower-cased.
+var providerAuthErrorPatterns = []string{
+	"api key is not allowed", // QuickNode: "API key is not allowed to access blockchain"
+	"invalid api key",
+}
+
+// IsProviderAuthError reports whether the matched pattern indicates the supplier's
+// UPSTREAM RPC provider rejected the supplier's API key (e.g. a supplier proxying
+// to QuickNode whose key isn't authorized for this chain — "API key is not allowed
+// to access blockchain"). Unlike a capability limitation, this is a persistent
+// supplier-side fault: every relay to this supplier on this service fails the same
+// way until the operator fixes their provider config. Callers should both retry on
+// a different supplier AND feed the strike/cooldown system so the broken supplier
+// is taken out of rotation, rather than applying a one-off reputation ding.
+//
+// Scoped to the explicit provider-key-rejection phrases only — generic auth
+// patterns ("unauthorized", "forbidden") stay non-cooldown because they're more
+// often transient or client-side.
+func IsProviderAuthError(pattern string) bool {
+	for _, p := range providerAuthErrorPatterns {
+		if pattern == p {
+			return true
+		}
+	}
+	return false
 }
 
 // overServicedPatterns are exact substrings emitted by relay miners when a relay

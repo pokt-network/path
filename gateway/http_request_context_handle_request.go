@@ -157,7 +157,11 @@ func recordHeuristicErrorToReputation(
 		// Deceptive response patterns (empty array for scalar methods, empty object results)
 		// get CriticalErrorSignal (-25) which triggers the strike system for exponential cooldowns.
 		// Other high-confidence errors (HTML pages, server errors) stay at MajorErrorSignal (-10).
-		if isDeceptiveResponsePattern(heuristicResult.Reason) {
+		if isDeceptiveResponsePattern(heuristicResult.Reason) || heuristic.IsProviderAuthError(heuristicResult.MatchedPattern) {
+			// Deceptive responses AND provider-side API-key rejections (e.g. supplier's
+			// QuickNode key not authorized for this chain) are persistent supplier faults:
+			// CriticalErrorSignal (-25) drives the strike system into a cooldown so the
+			// broken supplier is taken out of rotation instead of just dinged.
 			signal = reputation.NewCriticalErrorSignal("heuristic_"+heuristicResult.Reason, 0)
 			metricSignal = metrics.SignalCriticalError
 		} else {
