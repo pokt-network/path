@@ -1005,6 +1005,13 @@ func TestIndicatorAnalysis(t *testing.T) {
 			minConfidence:    0.85,
 		},
 		{
+			name:             "Provider key rejection (QuickNode)",
+			content:          "API key is not allowed to access blockchain",
+			expectedFound:    true,
+			expectedCategory: CategoryAuthError,
+			minConfidence:    0.90,
+		},
+		{
 			name:             "EVM pruned state",
 			content:          "missing trie node abc123 (path)",
 			expectedFound:    true,
@@ -1591,4 +1598,59 @@ func TestErrorContainsArchivalPattern_RestProtocolMismatchError(t *testing.T) {
 			assert.Equal(t, tt.expected, ErrorContainsArchivalPattern(tt.errStr))
 		})
 	}
+}
+
+// TestIsProviderAuthError verifies the classifier that drives the strike/cooldown
+// system for suppliers whose upstream RPC provider rejected their API key.
+func TestIsProviderAuthError(t *testing.T) {
+	tests := []struct {
+		name     string
+		pattern  string
+		expected bool
+	}{
+		{name: "QuickNode key not allowed", pattern: "api key is not allowed", expected: true},
+		{name: "invalid api key", pattern: "invalid api key", expected: true},
+		// Generic auth patterns stay non-cooldown (often transient/client-side).
+		{name: "unauthorized is not provider-auth", pattern: "unauthorized", expected: false},
+		{name: "forbidden is not provider-auth", pattern: "forbidden", expected: false},
+		{name: "empty pattern", pattern: "", expected: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, IsProviderAuthError(tt.pattern))
+		})
+	}
+}
+
+// TestAnalyze_ProviderAuthError_WrappedAsJSONRPCError verifies that a provider
+// key-rejection (QuickNode "API key is not allowed to access blockchain") is
+// flagged for retry even when the supplier returns it as a well-formed JSON-RPC
+// error — the jsonrpc_valid_error branch must NOT swallow it. The surfaced
+// MatchedPattern is what the gateway uses to escalate to a critical/cooldown signal.
+func TestAnalyze_ProviderAuthError_WrappedAsJSONRPCError(t *testing.T) {
+	analyzer := NewDefaultAnalyzer()
+
+	// HTTP 200 with a structurally-valid JSON-RPC error carrying the provider message.
+	resp := []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"API key is not allowed to access blockchain"}}`)
+	result := analyzer.Analyze(resp, 200, sharedtypes.RPCType_JSON_RPC, "eth_blockNumber")
+
+	assert.True(t, result.ShouldRetry, "provider key rejection must be retried, not swallowed as a valid error")
+	assert.True(t, IsProviderAuthError(result.MatchedPattern),
+		"MatchedPattern must classify as provider-auth so the gateway escalates to a cooldown signal; got %q", result.MatchedPattern)
+}
+
+// TestAnalyze_ProviderAuthError_PlainTextBody verifies that a provider key-rejection
+// delivered as a plain-text (non-JSON) body still surfaces a provider-auth
+// MatchedPattern so the gateway escalates to a cooldown signal, rather than being
+// retried as a generic non-JSON error with no pattern attached.
+func TestAnalyze_ProviderAuthError_PlainTextBody(t *testing.T) {
+	analyzer := NewDefaultAnalyzer()
+
+	resp := []byte("API key is not allowed to access blockchain")
+	result := analyzer.Analyze(resp, 200, sharedtypes.RPCType_JSON_RPC, "getSlot")
+
+	assert.True(t, result.ShouldRetry, "plain-text provider key rejection must be retried")
+	assert.Equal(t, "non_json_provider_auth_error", result.Reason)
+	assert.True(t, IsProviderAuthError(result.MatchedPattern),
+		"plain-text body must surface a provider-auth MatchedPattern; got %q", result.MatchedPattern)
 }

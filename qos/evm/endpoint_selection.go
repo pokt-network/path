@@ -58,12 +58,15 @@ func (ss *serviceState) SelectMultiple(availableEndpoints protocol.EndpointAddrL
 // When requiresArchival is false, all valid endpoints are considered (same behavior as SelectMultiple).
 // This enables archival requests to be routed only to archival-capable endpoints.
 func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.EndpointAddrList, numEndpoints uint, requiresArchival bool, requestID string) (protocol.EndpointAddrList, error) {
-	logger := ss.logger.With("method", "SelectMultipleWithArchival").
-		With("chain_id", ss.serviceQoSConfig.getEVMChainID()).
-		With("service_id", ss.serviceQoSConfig.GetServiceID()).
-		With("num_endpoints", numEndpoints).
-		With("requires_archival", requiresArchival).
-		With("request_id", requestID)
+	// Single .With call (one context clone) instead of chaining; runs per request.
+	logger := ss.logger.With(
+		"method", "SelectMultipleWithArchival",
+		"chain_id", ss.serviceQoSConfig.getEVMChainID(),
+		"service_id", ss.serviceQoSConfig.GetServiceID(),
+		"num_endpoints", numEndpoints,
+		"requires_archival", requiresArchival,
+		"request_id", requestID,
+	)
 
 	// CODE_PATH: Entry point for endpoint selection
 	if requiresArchival {
@@ -131,11 +134,14 @@ func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.E
 // When requiresArchival is true, only endpoints that have passed the archival check are considered.
 // When requiresArchival is false, the archival check is skipped, allowing all valid endpoints.
 func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointAddrList, requiresArchival bool, requestID string) (EndpointSelectionResult, error) {
-	logger := ss.logger.With("method", "SelectWithMetadata").
-		With("chain_id", ss.serviceQoSConfig.getEVMChainID()).
-		With("service_id", ss.serviceQoSConfig.GetServiceID()).
-		With("requires_archival", requiresArchival).
-		With("request_id", requestID)
+	// Single .With call (one context clone) instead of chaining; runs per request.
+	logger := ss.logger.With(
+		"method", "SelectWithMetadata",
+		"chain_id", ss.serviceQoSConfig.getEVMChainID(),
+		"service_id", ss.serviceQoSConfig.GetServiceID(),
+		"requires_archival", requiresArchival,
+		"request_id", requestID,
+	)
 
 	availableCount := len(availableEndpoints)
 	logger.Debug().Msgf("filtering %d available endpoints.", availableCount)
@@ -197,10 +203,14 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 // Performance: Copies endpoint data under lock, then releases lock before validation loop
 // to minimize lock contention on the hot path.
 func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints protocol.EndpointAddrList, requiresArchival bool, requestID string) (protocol.EndpointAddrList, []*qosobservations.EndpointValidationResult, error) {
-	logger := ss.logger.With("method", "filterValidEndpointsWithDetails").
-		With("qos_instance", "evm").
-		With("requires_archival", requiresArchival).
-		With("request_id", requestID)
+	// Single .With call (one context clone) instead of chaining — each chained
+	// .With clones the logger context, and this runs on every request.
+	logger := ss.logger.With(
+		"method", "filterValidEndpointsWithDetails",
+		"qos_instance", "evm",
+		"requires_archival", requiresArchival,
+		"request_id", requestID,
+	)
 
 	if len(availableEndpoints) == 0 {
 		return nil, nil, errEmptyEndpointListObs
@@ -250,8 +260,12 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 	// TODO_FUTURE: use service-specific metrics to add an endpoint ranking method
 	// which can be used to assign a rank/score to a valid endpoint to guide endpoint selection.
 	for _, data := range endpointsCopy {
-		logger := logger.With("endpoint_addr", data.addr)
-		logger.Debug().Msg("processing endpoint")
+		// No per-endpoint logger.With here: it cloned the logger context for every
+		// endpoint on every request (the largest single source of logging
+		// allocations in mainnet profiles). endpoint_addr is added inline on the
+		// events that emit it instead; debug events are dropped (and allocate
+		// nothing) at the production log level.
+		logger.Debug().Str("endpoint_addr", string(data.addr)).Msg("processing endpoint")
 
 		if !data.found {
 			// For archival requests: only allow fresh endpoints confirmed archival in cache,
@@ -296,6 +310,7 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 							blocksBehind := int64(perceivedBlock) - int64(urlBlock)
 							invalidCount++
 							logger.Warn().
+								Str("endpoint_addr", string(data.addr)).
 								Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 								Str("url", url).
 								Uint64("url_block", urlBlock).
@@ -319,6 +334,7 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 			}
 
 			logger.Debug().
+				Str("endpoint_addr", string(data.addr)).
 				Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
 				Uint64("sync_allowance", ss.serviceQoSConfig.getSyncAllowance()).
 				Msg("Fresh endpoint allowed (not yet in store)")

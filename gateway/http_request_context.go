@@ -334,9 +334,8 @@ func (rc *requestContext) ValidateRPCType(httpReq *http.Request) error {
 		return nil
 	}
 
-	// Detect RPC type from HTTP request
-	detector := NewRPCTypeDetector()
-	rpcType, err := detector.DetectRPCType(httpReq, string(rc.serviceID), serviceRPCTypes)
+	// Detect RPC type from HTTP request (shared stateless detector).
+	rpcType, err := sharedRPCTypeDetector.DetectRPCType(httpReq, string(rc.serviceID), serviceRPCTypes)
 	if err != nil {
 		// Log request details at error level for diagnosing bad traffic patterns.
 		// Read up to 512 bytes of the body for diagnostics, then restore it.
@@ -701,7 +700,7 @@ func (rc *requestContext) addRelayMetadataHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Archival-Request", strconv.FormatBool(rc.archivalRequestDetected))
 
 	// ALWAYS add retry count header (even on errors, even if 0)
-	w.Header().Set("X-Retry-Count", fmt.Sprintf("%d", rc.retryCount))
+	w.Header().Set("X-Retry-Count", strconv.Itoa(rc.retryCount))
 
 	// ALWAYS add suppliers tried header (even on errors, even if empty)
 	// Use thread-safe getter since suppliersTried may be modified by concurrent batch goroutines
@@ -731,6 +730,22 @@ func (rc *requestContext) addRelayMetadataHeaders(w http.ResponseWriter) {
 
 	// Only add relay metadata headers if we have successful relay data
 	if len(rc.relayMetadata) == 0 {
+		return
+	}
+
+	// Fast path for the common single-relay case: no dedup needed, so skip the
+	// three maps + three slices the multi-relay path allocates.
+	if len(rc.relayMetadata) == 1 {
+		md := rc.relayMetadata[0]
+		if md.AppAddress != "" {
+			w.Header().Set("X-App-Address", md.AppAddress)
+		}
+		if md.SupplierAddress != "" {
+			w.Header().Set("X-Supplier-Address", md.SupplierAddress)
+		}
+		if md.SessionID != "" {
+			w.Header().Set("X-Session-ID", md.SessionID)
+		}
 		return
 	}
 

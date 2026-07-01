@@ -1,7 +1,9 @@
 package reputation
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +42,15 @@ type service struct {
 	mu    sync.RWMutex
 	cache map[EndpointKey]Score
 
+	// archivalIndex tracks, per service, the set of endpoint keys whose score has
+	// IsArchival set. It lets GetArchivalEndpoints return a service's archival
+	// endpoints without scanning the entire (global) cache and copying every
+	// Score struct — that full scan was ~10% of gateway CPU on mainnet.
+	// Maintained in lockstep with cache via setScoreLocked; guarded by mu.
+	// Membership tracks the IsArchival flag only; per-entry expiry
+	// (ArchivalExpiresAt) is still checked at read time in GetArchivalEndpoints.
+	archivalIndex map[protocol.ServiceID]map[EndpointKey]struct{}
+
 	// Async write handling
 	writeCh   chan writeRequest
 	stopCh    chan struct{}
@@ -76,6 +87,7 @@ func NewService(config Config, store Storage) ReputationService {
 		serviceConfigs:         make(map[string]ServiceConfig),
 		serviceLatencyProfiles: make(map[string]LatencyConfig),
 		cache:                  make(map[EndpointKey]Score),
+		archivalIndex:          make(map[protocol.ServiceID]map[EndpointKey]struct{}),
 		writeCh:                make(chan writeRequest, config.SyncConfig.WriteBufferSize),
 		stopCh:                 make(chan struct{}),
 		stoppedCh:              make(chan struct{}),
@@ -158,7 +170,7 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 		score.LatencyMetrics.UpdateLatency(signal.Latency)
 	}
 
-	s.cache[key] = score
+	s.setScoreLocked(key, score)
 	s.mu.Unlock()
 
 	// Queue async write (non-blocking if buffer is full)
@@ -263,7 +275,7 @@ func (s *service) recoverScore(ctx context.Context, key EndpointKey) Score {
 	}
 
 	s.mu.Lock()
-	s.cache[key] = score
+	s.setScoreLocked(key, score)
 	s.mu.Unlock()
 
 	// Queue async write
@@ -329,14 +341,14 @@ func (s *service) RankEndpointsByScore(ctx context.Context, keys []EndpointKey) 
 	}
 	s.mu.RUnlock()
 
-	// Sort by score descending (highest first)
-	for i := 0; i < len(scored)-1; i++ {
-		for j := i + 1; j < len(scored); j++ {
-			if scored[j].score > scored[i].score {
-				scored[i], scored[j] = scored[j], scored[i]
-			}
-		}
-	}
+	// Sort by score descending (highest first).
+	// O(n log n) — replaces a former O(n²) selection sort that dominated CPU
+	// when ranking large session endpoint sets. Generic SortStableFunc avoids
+	// the reflection allocations of sort.SliceStable, and stable ordering
+	// preserves input order for equal scores (matching the old behavior).
+	slices.SortStableFunc(scored, func(a, b scoredEndpoint) int {
+		return cmp.Compare(b.score, a.score)
+	})
 
 	// Extract sorted keys
 	result := make([]EndpointKey, len(scored))
@@ -415,7 +427,7 @@ func (s *service) ResetScore(ctx context.Context, key EndpointKey) error {
 	}
 
 	s.mu.Lock()
-	s.cache[key] = score
+	s.setScoreLocked(key, score)
 	s.mu.Unlock()
 
 	// Queue async write
@@ -736,7 +748,7 @@ func (s *service) refreshFromStorage(ctx context.Context) error {
 
 	s.mu.Lock()
 	for key, score := range scores {
-		s.cache[key] = score
+		s.setScoreLocked(key, score)
 	}
 	s.mu.Unlock()
 
@@ -768,7 +780,7 @@ func (s *service) SetArchivalStatus(ctx context.Context, key EndpointKey, isArch
 	score.LastUpdated = time.Now()
 
 	// Update cache
-	s.cache[key] = score
+	s.setScoreLocked(key, score)
 	s.mu.Unlock()
 
 	// Queue async write to storage
@@ -821,7 +833,7 @@ func (s *service) IsArchivalCapable(ctx context.Context, key EndpointKey) bool {
 		if err == nil {
 			// Update local cache with fetched score
 			s.mu.Lock()
-			s.cache[key] = storedScore
+			s.setScoreLocked(key, storedScore)
 			s.mu.Unlock()
 
 			return storedScore.IsArchivalCapable()
@@ -916,18 +928,41 @@ func (s *service) GetArchivalEndpoints(ctx context.Context, serviceID protocol.S
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var result []EndpointKey
-	for key, score := range s.cache {
-		if key.ServiceID != serviceID {
-			continue
+	idx := s.archivalIndex[serviceID]
+	if len(idx) == 0 {
+		return nil
+	}
+
+	// Iterate only this service's archival-flagged keys (not the whole global
+	// cache), and confirm each is still archival-capable (the index tracks the
+	// IsArchival flag; ArchivalExpiresAt expiry is verified here).
+	result := make([]EndpointKey, 0, len(idx))
+	for key := range idx {
+		if score, ok := s.cache[key]; ok && score.IsArchivalCapable() {
+			result = append(result, key)
 		}
-		if !score.IsArchivalCapable() {
-			continue
-		}
-		result = append(result, key)
 	}
 
 	return result
+}
+
+// setScoreLocked writes a score to the local cache and keeps archivalIndex in
+// sync. The caller MUST hold s.mu for writing.
+func (s *service) setScoreLocked(key EndpointKey, score Score) {
+	s.cache[key] = score
+
+	// Maintain the per-service archival index. Track the IsArchival flag here;
+	// time-based expiry is handled at read time in GetArchivalEndpoints.
+	if score.IsArchival {
+		idx := s.archivalIndex[key.ServiceID]
+		if idx == nil {
+			idx = make(map[EndpointKey]struct{})
+			s.archivalIndex[key.ServiceID] = idx
+		}
+		idx[key] = struct{}{}
+	} else if idx := s.archivalIndex[key.ServiceID]; idx != nil {
+		delete(idx, key)
+	}
 }
 
 // clamp constrains a value between min and max.

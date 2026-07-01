@@ -23,17 +23,19 @@ func hydrateLoggerWithSession(
 		return logger
 	}
 
-	// Start with basic session fields
-	hydratedLogger := logger.With(
+	// Build all fields then attach with a single .With call (one context clone).
+	// Chaining a second .With for the header fields would clone the context
+	// twice; this runs per session, per request.
+	fields := []any{
 		"session_id", session.SessionId,
 		"session_number", session.SessionNumber,
 		"num_blocks_per_session", session.NumBlocksPerSession,
 		"supplier_count", len(session.Suppliers),
-	)
+	}
 
 	// Add session header details if available
 	if session.Header != nil {
-		hydratedLogger = hydratedLogger.With(
+		fields = append(fields,
 			"app_addr", session.Header.ApplicationAddress,
 			"service_id", session.Header.ServiceId,
 			"session_start_height", session.Header.SessionStartBlockHeight,
@@ -41,5 +43,5 @@ func hydrateLoggerWithSession(
 		)
 	}
 
-	return hydratedLogger
+	return logger.With(fields...)
 }

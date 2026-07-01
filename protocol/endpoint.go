@@ -60,14 +60,17 @@ func (e EndpointAddr) String() string {
 // - Given the endpoint address "pokt1eetcwfv2agdl2nvpf4cprhe89rdq3cxdf037wq-https://relayminer.shannon-mainnet.eu.nodefleet.net"
 // - Would return "https://relayminer.shannon-mainnet.eu.nodefleet.net"
 func (e EndpointAddr) GetURL() (string, error) {
-	// Split by dash to separate the address part from the URL part
-	endpointAddrParts := strings.SplitN(e.String(), "-", 2)
-	if len(endpointAddrParts) < 2 {
-		return "", fmt.Errorf("endpoint address %s does not contain a dash separator", e.String())
+	// Find the first dash separating the address part from the URL part.
+	// IndexByte + slicing avoids the slice allocation that strings.SplitN does
+	// on this per-endpoint, per-request hot path.
+	s := e.String()
+	i := strings.IndexByte(s, '-')
+	if i < 0 {
+		return "", fmt.Errorf("endpoint address %s does not contain a dash separator", s)
 	}
 
 	// Take everything after the first dash as the URL
-	return endpointAddrParts[1], nil
+	return s[i+1:], nil
 }
 
 // GetAddress returns the address of the endpoint.
@@ -75,12 +78,16 @@ func (e EndpointAddr) GetURL() (string, error) {
 // - Given the endpoint address "pokt1eetcwfv2agdl2nvpf4cprhe89rdq3cxdf037wq-https://relayminer.shannon-mainnet.eu.nodefleet.net"
 // - Would return "pokt1eetcwfv2agdl2nvpf4cprhe89rdq3cxdf037wq"
 func (e EndpointAddr) GetAddress() (string, error) {
-	// Split by dash to separate the address part from the URL part
-	endpointAddrParts := strings.Split(e.String(), "-")
-	if len(endpointAddrParts) < 2 {
-		return "", fmt.Errorf("endpoint address %s does not contain a dash separator", e.String())
+	// Find the first dash separating the address part from the URL part.
+	// IndexByte + slicing avoids the slice allocation that strings.Split does on
+	// this per-endpoint, per-request hot path (the single largest source of
+	// strings.Split bytes in mainnet alloc profiles).
+	s := e.String()
+	i := strings.IndexByte(s, '-')
+	if i < 0 {
+		return "", fmt.Errorf("endpoint address %s does not contain a dash separator", s)
 	}
 
 	// Take everything before the first dash as the address
-	return endpointAddrParts[0], nil
+	return s[:i], nil
 }

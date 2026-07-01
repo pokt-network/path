@@ -4,6 +4,8 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
@@ -71,8 +73,38 @@ func isSecureURL(rawURL string) bool {
 	return strings.HasPrefix(rawURL, "https://") || strings.HasPrefix(rawURL, "wss://")
 }
 
-// isRawIP returns true if the URL's host is an IP address rather than a domain name.
+// maxRawIPCacheEntries bounds rawIPCache as a safety net; endpoint URLs are a
+// bounded set so this ceiling is never expected to be reached.
+const maxRawIPCacheEntries = 1 << 16 // 65536
+
+// rawIPCache memoizes isRawIP results keyed by URL. The policy filter runs
+// isRawIP for every endpoint on every request against a bounded set of static
+// endpoint URLs, and the uncached path does url.Parse + net.ParseIP (a notable
+// per-request allocation source in mainnet alloc profiles).
+var (
+	rawIPCache      sync.Map // map[string]bool: url -> isRawIP
+	rawIPCacheCount atomic.Int64
+)
+
+// isRawIP returns true if the URL's host is an IP address rather than a domain
+// name. Results are memoized; see rawIPCache.
 func isRawIP(rawURL string) bool {
+	if v, ok := rawIPCache.Load(rawURL); ok {
+		return v.(bool)
+	}
+
+	result := computeIsRawIP(rawURL)
+
+	if rawIPCacheCount.Load() < maxRawIPCacheEntries {
+		if _, loaded := rawIPCache.LoadOrStore(rawURL, result); !loaded {
+			rawIPCacheCount.Add(1)
+		}
+	}
+	return result
+}
+
+// computeIsRawIP performs the uncached host check.
+func computeIsRawIP(rawURL string) bool {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return false

@@ -3,6 +3,7 @@ package jsonrpc
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 // ID represents a JSON-RPC request/response identifier.
@@ -23,7 +24,7 @@ type ID struct {
 // Priority order: integers first, then strings, then "null" for unset IDs.
 func (id ID) String() string {
 	if id.intID != nil {
-		return fmt.Sprintf("%d", *id.intID)
+		return strconv.Itoa(*id.intID)
 	}
 	if id.strID != nil {
 		return *id.strID

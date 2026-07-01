@@ -119,34 +119,20 @@ func (p *Protocol) filterByReputation(
 	return filtered
 }
 
-// getEndpointScores retrieves reputation scores for all endpoints and returns them
-// as a map suitable for the TieredSelector.
-func (p *Protocol) getEndpointScores(
+// endpointScoresForKeys fetches reputation scores for the given keys and projects
+// them to the value map the TieredSelector needs. New endpoints (no stored score)
+// get the initial score. Callers build the keys once and reuse them, avoiding a
+// second BuildKey pass per endpoint.
+func (p *Protocol) endpointScoresForKeys(
 	ctx context.Context,
-	serviceID protocol.ServiceID,
-	endpoints map[protocol.EndpointAddr]endpoint,
-	rpcType sharedtypes.RPCType,
-	_ polylog.Logger, // logger reserved for future debug logging
+	keys []reputation.EndpointKey,
 ) (map[reputation.EndpointKey]float64, error) {
-	// Use the key builder to respect key_granularity setting
-	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
-
-	// Build endpoint keys for batch lookup
-	keys := make([]reputation.EndpointKey, 0, len(endpoints))
-	for addr := range endpoints {
-		keys = append(keys, keyBuilder.BuildKey(serviceID, addr, rpcType))
-	}
-
-	// Get scores from reputation service
 	scores, err := p.reputationService.GetScores(ctx, keys)
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert to score values map. Iterate the keys slice we just built so we
-	// don't have to call keyBuilder.BuildKey a second time per endpoint —
-	// that's a non-trivial allocation under domain/supplier granularity.
-	result := make(map[reputation.EndpointKey]float64, len(endpoints))
+	result := make(map[reputation.EndpointKey]float64, len(keys))
 	for _, key := range keys {
 		if score, exists := scores[key]; exists {
 			result[key] = score.Value
@@ -222,22 +208,27 @@ func (p *Protocol) filterToHighestTier(
 		return endpoints
 	}
 
-	// Get scores for all endpoints
-	endpointScores, err := p.getEndpointScores(ctx, serviceID, endpoints, rpcType, logger)
+	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+
+	// Build reputation keys once, together with the aggregated-key -> full-address
+	// mapping. With per-domain/supplier granularity the reputation keys contain
+	// domains (e.g., "dopokt.com") while we must return endpoints by their full
+	// addresses (e.g., "pokt1abc-https://relay.dopokt.com"), and several addresses
+	// can share one key. Reusing this single pass for both score lookup and result
+	// reconstruction means BuildKey runs once per endpoint instead of twice.
+	keys := make([]reputation.EndpointKey, 0, len(endpoints))
+	keyToEndpoints := make(map[protocol.EndpointAddr][]protocol.EndpointAddr, len(endpoints))
+	for addr := range endpoints {
+		key := keyBuilder.BuildKey(serviceID, addr, rpcType)
+		keys = append(keys, key)
+		keyToEndpoints[key.EndpointAddr] = append(keyToEndpoints[key.EndpointAddr], addr)
+	}
+
+	// Fetch scores once and project to the value map the tiered selector needs.
+	endpointScores, err := p.endpointScoresForKeys(ctx, keys)
 	if err != nil {
 		logger.Warn().Err(err).Msg("Failed to get endpoint scores for tiered filtering, returning all endpoints")
 		return endpoints
-	}
-
-	// Build a mapping from aggregated keys (e.g., domain) to full endpoint addresses.
-	// This is needed because with per-domain granularity, the reputation keys contain
-	// domains (e.g., "dopokt.com") but we need to return endpoints keyed by their full
-	// addresses (e.g., "pokt1abc-https://relay.dopokt.com").
-	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
-	keyToEndpoints := make(map[protocol.EndpointAddr][]protocol.EndpointAddr)
-	for addr := range endpoints {
-		key := keyBuilder.BuildKey(serviceID, addr, rpcType)
-		keyToEndpoints[key.EndpointAddr] = append(keyToEndpoints[key.EndpointAddr], addr)
 	}
 
 	// Update probation status and get a list of endpoints currently in probation
