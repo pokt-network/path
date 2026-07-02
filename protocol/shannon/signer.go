@@ -63,8 +63,11 @@ func (s *signer) SignRelayRequest(req *servicetypes.RelayRequest, app apptypes.A
 		return nil, fmt.Errorf("SignRequest: error getting ring for app %s: %w", app.Address, err)
 	}
 
-	// Sign using the cached ring (enables SignerContext cache hits)
-	req, err = s.sdkSigner.SignWithRing(context.Background(), req, appRing)
+	// Sign using the cached ring (enables SignerContext cache hits).
+	// SignOffChainWithRing uses ring-go's hash-cache fast path — safe here because
+	// PATH relay signing is off-chain (not consensus-critical). The deterministic
+	// Signer.Sign path is intentionally not used on this hot path.
+	req, err = s.sdkSigner.SignOffChainWithRing(context.Background(), req, appRing)
 	if err != nil {
 		return nil, fmt.Errorf("SignRequest: error signing relay request: %w", err)
 	}
