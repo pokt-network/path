@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	"github.com/pokt-network/poktroll/pkg/crypto/rings"
@@ -36,6 +37,13 @@ type signer struct {
 	// This ensures the same ring pointer is reused within a session,
 	// while allowing new rings when sessions change (delegations may differ).
 	ringCache sync.Map // map[ringCacheKey]*ring.Ring
+
+	// highestSessionEnd is the newest session end height observed. Used to
+	// detect session rollover and evict stale per-session cache entries.
+	highestSessionEnd atomic.Uint64
+	// rolloverMu serializes rollover eviction so a single goroutine prunes
+	// per new session.
+	rolloverMu sync.Mutex
 }
 
 // newSigner creates a new signer instance with a pre-initialized SDK signer.
@@ -78,6 +86,10 @@ func (s *signer) SignRelayRequest(req *servicetypes.RelayRequest, app apptypes.A
 // getOrCreateRing returns a cached ring for the application and session, or creates and caches a new one.
 // The ring is cached by (appAddress, sessionEndHeight) since delegation changes take effect at session boundaries.
 func (s *signer) getOrCreateRing(app apptypes.Application, sessionEndHeight uint64) (*ring.Ring, error) {
+	// Bound the per-session caches (ringCache + the SDK's SignerContext cache)
+	// by evicting stale entries when a new session is observed.
+	s.evictStaleRingsOnRollover(sessionEndHeight)
+
 	cacheKey := ringCacheKey{
 		appAddress:       app.Address,
 		sessionEndHeight: sessionEndHeight,
@@ -119,4 +131,40 @@ func (s *signer) getOrCreateRing(app apptypes.Application, sessionEndHeight uint
 	// Cache it (use LoadOrStore to handle concurrent creation)
 	actual, _ := s.ringCache.LoadOrStore(cacheKey, newRing)
 	return actual.(*ring.Ring), nil
+}
+
+// evictStaleRingsOnRollover bounds the per-session caches. Both s.ringCache and
+// the SDK's SignerContext cache are keyed per session/ring and would otherwise
+// grow without bound as sessions roll over (~hourly). On observing a session end
+// height newer than any seen, it drops rings older than the previous session
+// (keeping current + previous for in-flight/grace-period requests) and clears the
+// SDK's SignerContext cache. The SDK exposes only a full clear; rings still in
+// ringCache rebuild their context lazily on the next sign.
+func (s *signer) evictStaleRingsOnRollover(sessionEndHeight uint64) {
+	// Fast path (hot): no newer session, nothing to evict. Atomic load only.
+	if sessionEndHeight <= s.highestSessionEnd.Load() {
+		return
+	}
+
+	s.rolloverMu.Lock()
+	defer s.rolloverMu.Unlock()
+
+	// Re-check under the lock; another goroutine may have handled this rollover.
+	prevHighest := s.highestSessionEnd.Load()
+	if sessionEndHeight <= prevHighest {
+		return
+	}
+	s.highestSessionEnd.Store(sessionEndHeight)
+
+	// Drop rings older than the previous session (keep current + previous).
+	s.ringCache.Range(func(k, _ any) bool {
+		if k.(ringCacheKey).sessionEndHeight < prevHighest {
+			s.ringCache.Delete(k)
+		}
+		return true
+	})
+
+	// Release the SDK's per-ring SignerContexts. Only a full clear is exposed;
+	// rings kept in ringCache rebuild their context on next sign.
+	s.sdkSigner.ClearSignerContextCache()
 }
