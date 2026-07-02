@@ -27,8 +27,8 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/pokt-network/poktroll v0.1.34
-	github.com/pokt-network/ring-go v0.1.1-0.20260702105609-0830a5c5fb3c
-	github.com/pokt-network/shannon-sdk v0.0.0-20260702122557-7b0ece921787
+	github.com/pokt-network/ring-go v0.2.0
+	github.com/pokt-network/shannon-sdk v0.0.0-20260702172744-c2af5007ed72
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/stretchr/testify v1.11.1
