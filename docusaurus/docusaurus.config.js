@@ -31,9 +31,12 @@ const config = {
     ],
   ],
 
-  // Set the production url of your site here
-  url: "https://grove.city",
-  baseUrl: "/",
+  // Set the production url of your site here.
+  // Deployed via GitHub Pages to https://pokt-network.github.io/path/,
+  // so baseUrl must be the "/path/" project subpath — otherwise assets
+  // resolve to the domain root and 404.
+  url: "https://pokt-network.github.io",
+  baseUrl: "/path/",
 
   onBrokenLinks: "throw",
 
