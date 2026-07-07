@@ -19,6 +19,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Enable Corepack (Yarn 4)
+        run: corepack enable
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -49,6 +52,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Enable Corepack (Yarn 4)
+        run: corepack enable
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
