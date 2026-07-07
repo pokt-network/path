@@ -54,3 +54,8 @@ jobs:
           reporter: github-check
           level: warning
           locale: "US"
+          # Generated lockfiles contain third-party package strings we don't
+          # control (e.g. "optimise" in dependency metadata). Don't spell-check them.
+          exclude: |
+            ./**/yarn.lock
+            ./**/package-lock.json
