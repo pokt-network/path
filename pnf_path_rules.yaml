@@ -1644,6 +1644,16 @@
       reputation_signal: critical_error
       sync_check: true
 
+    - name: chainId
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+      expected_status_code: 200
+      expected_response_contains: '0x2b6653dc'
+      timeout: 5s
+      reputation_signal: critical_error
+
 # ==========================================
 # COSMOS SDK CHAINS
 # ==========================================
