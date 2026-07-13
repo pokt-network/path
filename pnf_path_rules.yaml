@@ -2284,9 +2284,11 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
-      expected_response_contains: '"0x'
+      # Was '"0x' — which matched ANY hex chain ID and so asserted nothing.
+      # Sei mainnet is 1329 = 0x531 (verified against evm-rpc.sei-apis.com).
+      expected_response_contains: '0x531"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: shentu
   # Block time: ~6s | Source: Cosmos SDK default
