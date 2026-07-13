@@ -2,7 +2,7 @@
 # Pocket Network Health Check Configuration
 # ==========================================
 # Generated for all supported chains at api.pocket.network
-# Last updated: January 30, 2026
+# Last updated: July 13, 2026
 #
 # Service IDs match the subdomain of each endpoint URL
 # Template format: gateway/health_check_config.go
@@ -56,8 +56,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x1"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     - name: eth_syncing
       type: json_rpc
       method: POST
@@ -104,8 +108,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x89"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     - name: eth_syncing
       type: json_rpc
       method: POST
@@ -150,8 +158,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x38"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     - name: eth_syncing
       type: json_rpc
       method: POST
@@ -198,8 +210,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xa86a"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - queries balance at historical block 5,000,000
     # Address: 0x9f8c163cBA728e99993ABe7495F06c0A3c8Ac8b9 (from E2E tests)
     # Block: 0x4c4b40 (5,000,000)
@@ -263,8 +279,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x138de"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - queries balance at historical block 2,000,000
     # Address: 0x6969696969696969696969696969696969696969 (from E2E tests)
     # Block: 0x1e8480 (2,000,000)
@@ -302,8 +322,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x92"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - queries balance at historical block 10,769,279
     # Address: 0xfc00face00000000000000000000000000000000 (from E2E tests)
     # Block: 0xa4537f (10,769,279)
@@ -341,8 +365,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xdef1"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - queries balance at historical block 4,500,000
     # Address: 0x4200000000000000000000000000000000000006 (from E2E tests)
     # Block: 0x44aa20 (4,500,000)
@@ -380,8 +408,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x504"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 677,000
     # Address: 0xf89d7b9c864f589bbf53a82105107622b35eaa40 (from E2E tests)
     # Block: 0xa5488 (677,000)
@@ -418,8 +450,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x505"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: gnosis
   # Block time: ~5s | Source: gnosisscan.io, gnosis chain docs
@@ -443,8 +479,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x64"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 20,000,000
     # Address: 0xe91d153e0b41518a2ce8dd3d7944fa863463a97d (from E2E tests)
     # Block: 0x1312d00 (20,000,000)
@@ -481,8 +521,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xa4ec"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 20,000,000
     # Address: 0xf89d7b9c864f589bbF53a82105107622B35EaA40 (from E2E tests)
     # Block: 0x1312d00 (20,000,000)
@@ -519,8 +563,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xfa"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 110,633,000
     # Address: 0xaabf86ab3646a7064aa2f61e5959e39129ca46b6 (from E2E tests)
     # Block: 0x6982028 (110,633,000)
@@ -582,8 +630,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x7a"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: iotex
   # Block time: ~5s | Source: chainspect.app, iotexscan.io
@@ -607,8 +659,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x1251"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: oasys
   # Block time: ~15s | Source: docs.oasys.games (Hub-Layer same as Ethereum)
@@ -632,8 +688,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xf8"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 424,300
     # Address: 0xf89d7b9c864f589bbF53a82105107622B35EaA40 (from E2E tests)
     # Block: 0x6796c (424,300)
@@ -670,8 +730,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x2019"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 170,000,000
     # Address: 0x0051ef9259c7ec0644a80e866ab748a2f30841b3 (from E2E tests)
     # Block: 0xa21fe80 (170,000,000)
@@ -708,8 +772,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x15f900"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 1,002,479
     # Address: 0x7C21a90E3eCD3215d16c3BBe76a491f8f792d4Bf (from E2E tests)
     # Block: 0xf4bef (1,002,479)
@@ -748,8 +816,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x3e7"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 # ==========================================
 # LAYER 2 CHAINS
@@ -777,8 +849,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xa4b1"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     - name: eth_syncing
       type: json_rpc
       method: POST
@@ -823,8 +899,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xa"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     - name: eth_syncing
       type: json_rpc
       method: POST
@@ -869,8 +949,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x2105"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     - name: eth_syncing
       type: json_rpc
       method: POST
@@ -915,8 +999,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x44d"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: zksync-era
   # Block time: ~1s | Source: era.zksync.network explorer
@@ -940,8 +1028,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x144"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: zklink-nova
   # Block time: ~2s | Source: zkLink Nova explorer
@@ -965,8 +1057,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xc5cc4"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: scroll
   # Block time: ~3s | Source: scrollscan.com
@@ -990,8 +1086,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x82750"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 5,000,000
     # Address: 0x5300000000000000000000000000000000000004 (from E2E tests)
     # Block: 0x4c4b40 (5,000,000)
@@ -1028,8 +1128,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xe708"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 10,000,000
     # Address: 0xf89d7b9c864f589bbf53a82105107622b35eaa40 (from E2E tests)
     # Block: 0x989680 (10,000,000)
@@ -1067,8 +1171,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x1388"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: blast
   # Block time: ~2s | Source: blastscan.io (OP Stack default)
@@ -1092,8 +1200,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x13e31"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 1,000,000
     # Address: 0x4300000000000000000000000000000000000004 (from E2E tests)
     # Block: 0xf4240 (1,000,000)
@@ -1168,8 +1280,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x440"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 15,000,000
     # Address: 0xfad31cd4d45Ac7C4B5aC6A0044AA05Ca7C017e62 (from E2E tests)
     # Block: 0xe4e1c0 (15,000,000)
@@ -1206,8 +1322,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x28c58"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 170,163
     # Address: 0x1670000000000000000000000000000000000001 (from E2E tests)
     # Block: 0x298b3 (170,163)
@@ -1244,8 +1364,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x82"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: opbnb
   # Block time: ~1s | Source: opbnbscan.com
@@ -1269,8 +1393,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xcc"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
     # Archival check - block 20,000,000
     # Address: 0x001ceb373c83ae75b9f5cf78fc2aba3e185d09e2 (from E2E tests)
     # Block: 0x1312d00 (20,000,000)
@@ -1307,8 +1435,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xfc"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 # ==========================================
 # TESTNET CHAINS
@@ -1336,8 +1468,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xaa36a7"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 # DEPRECATED from public portal but retained for operators
 - service_id: eth-holesky-testnet
@@ -1387,8 +1523,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x13882"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: arb-sepolia-testnet
   # Block time: ~0.25s | Source: Same as Arbitrum mainnet
@@ -1412,8 +1552,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x66eee"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: op-sepolia-testnet
   # Block time: ~2s | Source: Same as Optimism mainnet
@@ -1437,8 +1581,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xaa37dc"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: base-sepolia-testnet
   # Block time: ~2s | Source: Same as Base mainnet
@@ -1462,8 +1610,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x14a34"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: xrplevm-testnet
   # Block time: ~4s | Source: Same as XRPL EVM mainnet
@@ -1487,8 +1639,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x161c28"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 - service_id: giwa-sepolia-testnet
   # Block time: ~12s | Source: Ethereum L2 testnet
@@ -1512,8 +1668,12 @@
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x164ce"'
       timeout: 5s
-      reputation_signal: major_error
+      reputation_signal: critical_error
 
 # ==========================================
 # NON-EVM CHAINS
@@ -1651,6 +1811,39 @@
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
       expected_status_code: 200
       expected_response_contains: '0x2b6653dc'
+      timeout: 5s
+      reputation_signal: critical_error
+
+- service_id: manta
+  # Manta Pacific. Previously had NO health check rules at all: all 50 endpoints
+  # were unreachable by any check and stayed at score 100 permanently.
+  # Block time: ~8s (measured live 2026-07-12, small sample) | Formula: 300s / 8s ~= 37
+  # Rounded up to 50 to avoid false-flagging healthy endpoints as stale.
+  sync_allowance: 50
+  # 30s (not 10s): health checks are billable synthetic relays, so probe volume has
+  # a direct POKT cost. 30s keeps detection well inside the sync window at 1/3 the cost.
+  check_interval: 30s
+  enabled: true
+  checks:
+    - name: eth_blockNumber
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: critical_error
+      sync_check: true
+    - name: eth_chainId
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+      expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0xa9"'
       timeout: 5s
       reputation_signal: critical_error
 
@@ -2162,3 +2355,132 @@
       expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: major_error
+
+# ==========================================
+# PREVIOUSLY UNCHECKED SERVICES
+# Added 2026-07-12. Each of these had NO health check rules at all: no check
+# could reach their endpoints, so every endpoint sat at score 100 permanently
+# and could never be penalized, no matter how it behaved.
+# All paths/assertions below were verified against live suppliers before landing.
+# ==========================================
+
+- service_id: cosmoshub
+  # Block time: ~6s (measured live 2026-07-12) | Formula: 300s / 6s = 50
+  sync_allowance: 50
+  check_interval: 30s
+  enabled: true
+  checks:
+    - name: health
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"health"}'
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: minor_error
+    - name: status
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
+      expected_status_code: 200
+      # Chain-identity assertion: CometBFT `status` reports the network it is on.
+      # This is the Cosmos analogue of the eth_chainId assertion, and guards against
+      # a supplier serving a DIFFERENT Cosmos chain under this service ID.
+      expected_response_contains: '"network":"cosmoshub-4"'
+      timeout: 5s
+      reputation_signal: critical_error
+      sync_check: true
+    - name: syncing
+      type: rest
+      method: GET
+      path: /cosmos/base/tendermint/v1beta1/syncing
+      expected_status_code: 200
+      expected_response_contains: '"syncing"'
+      timeout: 5s
+      reputation_signal: major_error
+
+- service_id: provenance
+  # Block time: ~6s (measured live 2026-07-12) | Formula: 300s / 6s = 50
+  sync_allowance: 50
+  check_interval: 30s
+  enabled: true
+  checks:
+    - name: health
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"health"}'
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: minor_error
+    - name: status
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
+      expected_status_code: 200
+      # Chain-identity assertion. Provenance mainnet network id is pio-mainnet-1.
+      expected_response_contains: '"network":"pio-mainnet-1"'
+      timeout: 5s
+      reputation_signal: critical_error
+      sync_check: true
+    - name: syncing
+      type: rest
+      method: GET
+      path: /cosmos/base/tendermint/v1beta1/syncing
+      expected_status_code: 200
+      expected_response_contains: '"syncing"'
+      timeout: 5s
+      reputation_signal: major_error
+
+- service_id: eth-beacon
+  # Ethereum Beacon Chain (consensus layer) - Beacon REST API, not EVM JSON-RPC.
+  # Slot time is a fixed 12s protocol constant | Formula: 300s / 12s = 25 slots.
+  # NOTE: head_slot is not an EVM block height, so sync-allowance filtering may be
+  # inert here even with sync_check set. The checks still gate liveness/reputation.
+  sync_allowance: 25
+  check_interval: 30s
+  enabled: true
+  checks:
+    - name: node_syncing
+      type: rest
+      method: GET
+      path: /eth/v1/node/syncing
+      expected_status_code: 200
+      expected_response_contains: '"is_syncing"'
+      timeout: 5s
+      reputation_signal: critical_error
+      sync_check: true
+    - name: node_version
+      type: rest
+      method: GET
+      path: /eth/v1/node/version
+      expected_status_code: 200
+      expected_response_contains: '"version"'
+      timeout: 5s
+      reputation_signal: major_error
+
+- service_id: taiko-hekla-testnet
+  # WARNING: this service looks DEFUNCT as of 2026-07-12. All 4 session endpoints
+  # return: service "taiko-hekla-testnet" not configured: service endpoint not
+  # handled by relayer proxy -- the relay miner has no config for it. Public Taiko
+  # Hekla RPCs were also unreachable, so the testnet itself may be retired.
+  # Recommend `enabled: false` or deregistering the service entirely.
+  # These checks exist so the dead endpoints drop from score 100 instead of being
+  # advertised as healthy and handed live traffic.
+  # Deliberately NO chain-ID assertion: the canonical chain ID could not be verified
+  # against any live source, and asserting an unverified value would be worse than
+  # asserting nothing.
+  sync_allowance: 0
+  check_interval: 30s
+  enabled: true
+  checks:
+    - name: eth_blockNumber
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: critical_error
