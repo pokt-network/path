@@ -24,8 +24,10 @@ var (
 	errEmptyEndpointListObs     = errors.New("received empty list of endpoints to select from")
 )
 
-// TODO_UPNEXT(@adshmh): make the invalid response timeout duration configurable
-// It is set to 5 minutes because that is the session time as of #321.
+// TODO_UPNEXT(@adshmh): make the invalid response timeout duration configurable.
+// Fixed cooldown applied after an endpoint returns an empty/invalid response.
+// Intentionally kept shorter than a Shannon session so an endpoint can recover
+// within the same session; it is NOT derived from session length.
 const invalidResponseTimeout = 5 * time.Minute
 
 // EndpointSelectionResult contains endpoint selection results and metadata.
@@ -453,7 +455,7 @@ func (ss *serviceState) categorizeValidationFailure(err error) qosobservations.E
 //
 // It returns an error if:
 // - The endpoint has returned an empty response in the past.
-// - The endpoint has returned an invalid response within the last 30 minutes.
+// - The endpoint has returned an invalid response within the invalidResponseTimeout window.
 // - The endpoint's response to an `eth_chainId` request is not the expected chain ID.
 // - The endpoint's response to an `eth_blockNumber` request is greater than the perceived block number.
 // - The endpoint's archival check is invalid, if requiresArchival is true and archival checks are enabled.
