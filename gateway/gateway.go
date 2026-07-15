@@ -233,6 +233,9 @@ func (g Gateway) handleWebSocketRequest(
 		// Note: We do NOT close messageObservationsChan here because Websocket connections
 		// outlive the HTTP handler. The channel will be closed when the Websocket actually disconnects.
 		messageObservationsChan: make(chan *observation.RequestResponseObservations, websocketBufferSize),
+		// ready is closed once the protocol context is assigned; message
+		// processors block on it to avoid the setup-window race.
+		ready: make(chan struct{}),
 	}
 
 	// Initialize the websocket request context using the HTTP request.

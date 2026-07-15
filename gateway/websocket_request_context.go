@@ -70,6 +70,16 @@ type websocketRequestContext struct {
 	protocolCtxMu sync.RWMutex
 	protocolCtx   ProtocolRequestContextWebsocket
 
+	// ready is closed once protocolCtx has been assigned. Message processors
+	// block on it before touching protocolCtx: the bridge can deliver a frame
+	// (e.g. an endpoint-speaks-first backend pushing on connect) before
+	// BuildWebsocketRequestContextForEndpoint returns and protocolCtx is set.
+	// Gating here — rather than rejecting a nil protocolCtx — prevents that
+	// setup-window frame from failing message processing and tearing the whole
+	// connection down (close 1011). The wait is bounded by the connection
+	// context, which is canceled on every failure path.
+	ready chan struct{}
+
 	// gatewayObservations stores gateway related observations.
 	gatewayObservations *observation.GatewayObservations
 
@@ -232,6 +242,11 @@ func (wrc *websocketRequestContext) buildProtocolContextAndStartBridge(
 	wrc.protocolCtxMu.Lock()
 	wrc.protocolCtx = protocolCtx
 	wrc.protocolCtxMu.Unlock()
+	// Unblock any message processors waiting on setup. Closing happens-after the
+	// assignment above, so a processor that observes the close is guaranteed to
+	// read the assigned protocolCtx. Only ever closed here (the single success
+	// path), so no double-close: failure paths cancel the context instead.
+	close(wrc.ready)
 	logger.Debug().Msgf("Successfully built protocol context and started bridge for websocket endpoint: %s", selectedEndpoint)
 	return connectionObservationChan, nil
 }
@@ -251,17 +266,28 @@ func (wrc *websocketRequestContext) ProcessClientWebsocketMessage(msgData []byte
 
 	logger.Debug().Msgf("received message from client: %s", string(msgData))
 
-	// Acquire read lock to safely check protocolCtx. The bridge goroutine can
-	// deliver messages before BuildWebsocketRequestContextForEndpoint returns and
-	// assigns protocolCtx. Without this lock, a concurrent unsynchronized read of
-	// the interface field can observe a partially-written value (type pointer set,
-	// data pointer nil) causing a nil-receiver panic in the Shannon layer.
+	// Wait for protocol context setup to complete before processing. The bridge
+	// can deliver a message before BuildWebsocketRequestContextForEndpoint returns
+	// and protocolCtx is assigned; gating here (rather than rejecting) keeps a
+	// message that arrives in the setup window from tearing down the connection.
+	// The wait is bounded by the connection context, canceled on every failure path.
+	select {
+	case <-wrc.ready:
+		// Setup complete: protocolCtx is assigned.
+	case <-wrc.context.Done():
+		logger.Error().Msg("❌ websocket context canceled before setup completed")
+		return nil, errWebsocketProtocolContextNotReady
+	}
+
+	// Acquire read lock to safely read protocolCtx. The lock still guards against
+	// a torn read of the interface value; the ready gate above guarantees the
+	// value has been assigned by the time we get here.
 	wrc.protocolCtxMu.RLock()
 	pCtx := wrc.protocolCtx
 	wrc.protocolCtxMu.RUnlock()
 
 	if pCtx == nil {
-		logger.Error().Msg("❌ protocol context is nil — message arrived before websocket setup completed")
+		logger.Error().Msg("❌ SHOULD NEVER HAPPEN: protocol context is nil after ready signal")
 		return nil, errWebsocketProtocolContextNotReady
 	}
 
@@ -281,13 +307,26 @@ func (wrc *websocketRequestContext) ProcessClientWebsocketMessage(msgData []byte
 func (wrc *websocketRequestContext) ProcessEndpointWebsocketMessage(msgData []byte) ([]byte, *observation.RequestResponseObservations, error) {
 	logger := wrc.logger.With("method", "ProcessEndpointWebsocketMessage")
 
-	// Acquire read lock — same race condition guard as ProcessClientWebsocketMessage.
+	// Wait for protocol context setup to complete — same setup-window guard as
+	// ProcessClientWebsocketMessage. This is the frame that actually triggered the
+	// original defect: an endpoint-speaks-first backend pushes a frame on connect,
+	// which lands here before protocolCtx is assigned.
+	select {
+	case <-wrc.ready:
+		// Setup complete: protocolCtx is assigned.
+	case <-wrc.context.Done():
+		logger.Error().Msg("❌ websocket context canceled before setup completed")
+		return nil, nil, errWebsocketProtocolContextNotReady
+	}
+
+	// Acquire read lock to safely read protocolCtx (torn-read guard; the ready
+	// gate above guarantees the value has been assigned).
 	wrc.protocolCtxMu.RLock()
 	pCtx := wrc.protocolCtx
 	wrc.protocolCtxMu.RUnlock()
 
 	if pCtx == nil {
-		logger.Error().Msg("❌ protocol context is nil — message arrived before websocket setup completed")
+		logger.Error().Msg("❌ SHOULD NEVER HAPPEN: protocol context is nil after ready signal")
 		return nil, nil, errWebsocketProtocolContextNotReady
 	}
 
