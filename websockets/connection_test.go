@@ -146,6 +146,51 @@ func Test_Connection_HandleDisconnect(t *testing.T) {
 	c.NotNil(connection)
 }
 
+// Test_Connection_ReadLimit verifies that a single frame larger than
+// maxMessageBytes does not get buffered/forwarded: the read fails, the
+// connection is torn down (context canceled) and no message reaches msgChan.
+// This guards against the unbounded-read OOM (a peer sending a huge frame).
+func Test_Connection_ReadLimit(t *testing.T) {
+	c := require.New(t)
+
+	// Server sends one frame that exceeds the read limit.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Error("Error during connection upgrade:", err)
+			return
+		}
+		// Server has no read limit set, so it can send an oversized frame.
+		oversized := make([]byte, maxMessageBytes+100)
+		_ = conn.WriteMessage(websocket.BinaryMessage, oversized)
+		// Keep the handler open briefly so the client can process the frame.
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	c.NoError(err)
+
+	msgChan := make(chan message, 1)
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	newConnection(ctx, cancelCtx, polyzero.NewLogger(), conn, messageSourceEndpoint, msgChan)
+
+	// The oversized frame must NOT be forwarded, and the read failure must
+	// tear the connection down via context cancellation.
+	select {
+	case msg := <-msgChan:
+		t.Fatalf("oversized frame should have been rejected, but %d bytes were forwarded", len(msg.data))
+	case <-ctx.Done():
+		// Expected: connLoop hit the read-limit error and called handleDisconnect → cancelCtx.
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: connection was not torn down after oversized frame")
+	}
+}
+
 // createTestConnection creates a websocket connection for testing
 func Test_ConnectWebsocketEndpoint(t *testing.T) {
 	tests := []struct {

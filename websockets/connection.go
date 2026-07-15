@@ -25,6 +25,20 @@ const (
 	// Send pings to peer with this period over the websocket connection
 	// Must be greater than pongWaitDuration
 	pingPeriodDuration = (pongWaitDuration * 9) / 10
+
+	// maxMessageBytes caps the size of a single websocket frame read from either
+	// peer. Without a limit, gorilla/websocket buffers an entire frame in memory,
+	// so one oversized frame — from a malicious client or a compromised/malicious
+	// endpoint — can OOM the process. 15MB matches go-ethereum's WS message size
+	// limit (wsMessageSizeLimit): large enough for legitimate EVM responses (e.g.
+	// a big eth_getLogs) carried over a subscription connection, but bounded.
+	//
+	// Polygon is the primary WS service on PATH; its bor client is a go-ethereum
+	// fork that inherits the same 15MB wsMessageSizeLimit, so a poly endpoint will
+	// never send a frame larger than this — the cap cannot break legitimate poly
+	// traffic. When exceeded, ReadMessage returns an error and the connection is
+	// torn down via the existing handleDisconnect path.
+	maxMessageBytes = 15 * 1024 * 1024
 )
 
 // messageSource is used to identify the source of a message in a bidirectional websocket connection.
@@ -151,10 +165,33 @@ func newConnection(
 		msgChan: msgChan,
 	}
 
+	// Bound the size of a single inbound frame to prevent a single oversized
+	// message from OOMing the process. Applied to both client and endpoint
+	// connections since either peer can send an abusive frame.
+	conn.SetReadLimit(maxMessageBytes)
+
 	go c.connLoop()
 	go c.pingLoop()
 
 	return c
+}
+
+// writeMessage sets a write deadline and then writes a data message to the peer.
+//
+// Without a deadline, gorilla's WriteMessage blocks indefinitely when the peer
+// stops reading (its TCP receive buffer fills). That would wedge the bridge's
+// single message-processing goroutine — which does not select on ctx during the
+// write — so a slow or stalled reader could hang the connection and hold all of
+// its resources until the OS-level TCP timeout. The deadline bounds that wait so
+// the write fails fast and the bridge shuts the connection down.
+//
+// Note: gorilla's control-frame writes (ping/close) already pass their own
+// deadline; this covers the data-frame path used by the bridge.
+func (c *websocketConnection) writeMessage(messageType int, data []byte) error {
+	if err := c.SetWriteDeadline(time.Now().Add(writeWaitDuration)); err != nil {
+		return err
+	}
+	return c.WriteMessage(messageType, data)
 }
 
 // connLoop reads messages from the websocket connection and sends them to the bridge's msgChan.

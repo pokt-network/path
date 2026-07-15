@@ -351,7 +351,7 @@ func (b *bridge) handleClientMessage(msg message) {
 	b.logger.Debug().Msgf("🔗 client message successfully processed, sending message to endpoint: %s", string(processedData))
 
 	// Send the processed message to the endpoint
-	if err := b.endpointConn.WriteMessage(msg.messageType, processedData); err != nil {
+	if err := b.endpointConn.writeMessage(msg.messageType, processedData); err != nil {
 		b.logger.Error().Err(err).Msg("❌ error writing client message to endpoint, shutting down bridge")
 
 		b.shutdown(fmt.Errorf("%w: failed to write client message to endpoint: %w", ErrBridgeConnectionFailed, err))
@@ -390,7 +390,7 @@ func (b *bridge) handleEndpointMessage(msg message) {
 	// Send the processed message to the client
 	// NOTE: On session rollover, the Endpoint will disconnect the Endpoint connection, which will trigger this
 	// error. This is expected and the Client is expected to handle the reconnection in their connection logic.
-	if err := b.clientConn.WriteMessage(msg.messageType, processedData); err != nil {
+	if err := b.clientConn.writeMessage(msg.messageType, processedData); err != nil {
 		b.logger.Error().Err(err).Msg("❌ error writing endpoint message to client, shutting down bridge")
 		b.shutdown(fmt.Errorf("%w: failed to write endpoint message to client: %w", ErrBridgeConnectionFailed, err))
 		return
