@@ -919,6 +919,33 @@ func (rc *requestContext) handleBatchRelayRequest(payloads []protocol.Payload) e
 	startTime := time.Now()
 	rpcType := payloads[0].RPCType
 
+	// Resolve the concurrency limits. max_batch_payloads supports a per-service
+	// override; max_concurrent_relays is global only.
+	maxBatchPayloads := rc.protocol.GetConcurrencyConfig().MaxBatchPayloads
+	maxConcurrentRelays := rc.protocol.GetConcurrencyConfig().MaxConcurrentRelays
+	if cc := rc.getConcurrencyConfigForService(); cc != nil && cc.MaxBatchPayloads != nil {
+		maxBatchPayloads = *cc.MaxBatchPayloads
+	}
+
+	// Enforce the batch cap BEFORE spawning any goroutines. Previously the cap was
+	// only checked deep inside each spawned goroutine, so an oversized batch spawned
+	// one goroutine per payload (each fanning out further via retry/hedge) before any
+	// rejection — a goroutine bomb. Reject early instead.
+	if maxBatchPayloads > 0 && len(payloads) > maxBatchPayloads {
+		err := fmt.Errorf("batch size %d exceeds the configured max_batch_payloads %d", len(payloads), maxBatchPayloads)
+		logger.Error().Err(err).Msg("❌ rejecting oversized batch request")
+		return err
+	}
+
+	// Bound the number of payload goroutines alive at once so the batch fan-out
+	// (amplified by per-payload retry/hedge) cannot exhaust goroutines/FDs. The
+	// slot is acquired BEFORE spawning, so at most maxConcurrentRelays payload
+	// goroutines exist concurrently. nil = unbounded (limit disabled).
+	var sem chan struct{}
+	if maxConcurrentRelays > 0 {
+		sem = make(chan struct{}, maxConcurrentRelays)
+	}
+
 	// Process each payload in parallel
 	resultChan := make(chan batchPayloadResult, len(payloads))
 	var wg sync.WaitGroup
@@ -935,9 +962,15 @@ func (rc *requestContext) handleBatchRelayRequest(payloads []protocol.Payload) e
 			}()).
 			Msg("Processing batch payload")
 
+		if sem != nil {
+			sem <- struct{}{} // blocks here (not in a spawned goroutine) once at capacity
+		}
 		wg.Add(1)
 		go func(index int, p protocol.Payload) {
 			defer wg.Done()
+			if sem != nil {
+				defer func() { <-sem }()
+			}
 			response, err := rc.processSinglePayloadWithRetry(p, index, rpcType, logger)
 			resultChan <- batchPayloadResult{
 				index:    index,
