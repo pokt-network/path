@@ -73,6 +73,10 @@ type Gateway struct {
 	// on initial attempts for a TTL window, avoiding wasted relay attempts.
 	// Optional - if nil, no cross-pod domain circuit breaking occurs.
 	DomainCircuitBreaker *DomainCircuitBreaker
+
+	// WebsocketConnectionLimiter bounds the number of concurrent live websocket
+	// connections held open by this gateway. Optional - if nil, no limit is applied.
+	WebsocketConnectionLimiter *WebsocketConnectionLimiter
 }
 
 // HandleServiceRequest implements PATH gateway's service request processing.
@@ -207,6 +211,26 @@ func (g Gateway) handleWebSocketRequest(
 ) {
 	logger := g.Logger.With("method", "handleWebSocketRequest")
 
+	// Bound the number of concurrent live websocket connections (defense-in-depth
+	// against goroutine/FD exhaustion). Reserve a slot up front; release it either
+	// immediately if setup fails, or when the connection terminates if it succeeds.
+	if !g.WebsocketConnectionLimiter.Acquire() {
+		logger.Warn().
+			Int64("active_websocket_connections", g.WebsocketConnectionLimiter.Active()).
+			Msg("⚠️ rejecting websocket connection: concurrent connection limit reached")
+		http.Error(w, "too many concurrent websocket connections", http.StatusServiceUnavailable)
+		return
+	}
+	// established gates the slot release: while false, any early return releases the
+	// slot immediately (connection never went live); once true, the slot is released
+	// asynchronously when the connection terminates (see the goroutine below).
+	established := false
+	defer func() {
+		if !established {
+			g.WebsocketConnectionLimiter.Release()
+		}
+	}()
+
 	// Use a cancellable background context for the long-lived Websocket connection lifecycle.
 	// Unlike HTTP requests, Websocket connections are long-lived and should not be tied to the HTTP request context.
 	// The HTTP request context gets canceled when the HTTP handler returns, which would stop the observation listener.
@@ -271,10 +295,21 @@ func (g Gateway) handleWebSocketRequest(
 		return
 	}
 
-	// At this point, the Websocket connection has terminated and the bridge has shut down.
-	// The defer block above will now execute and broadcast connection observations with:
-	//   - Complete connection duration (from establishment to termination)
-	//   - Final connection status and termination reason
-	// This ensures we send only ONE connection observation per Websocket connection.
-	logger.Debug().Msg("Websocket connection and bridge shutdown complete, ready to broadcast final observations")
+	// The connection is now live and owned by background bridge/listener goroutines.
+	// Hand the concurrency slot off to the connection's lifecycle: websocketCtx is
+	// canceled when the connection fully terminates (websocketRequestContext.cancelCtx),
+	// so release the slot then. established=true disarms the immediate-release defer,
+	// guaranteeing exactly one Release per successful Acquire.
+	established = true
+	go func() {
+		<-websocketCtx.Done()
+		g.WebsocketConnectionLimiter.Release()
+	}()
+
+	// The connection is now live and self-managed by the background bridge and
+	// listener goroutines; this handler returns immediately (the upgraded conn is
+	// detached from the HTTP request lifecycle via websocketCtx). Connection
+	// establishment/closure observations are emitted by those goroutines over the
+	// lifetime of the connection, not here.
+	logger.Debug().Msg("Websocket connection established; bridge running in background")
 }

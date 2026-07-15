@@ -475,6 +475,15 @@ func (wrc *websocketRequestContext) handleConnectionObservation(protocolObs *pro
 
 // BroadcastMessageObservations delivers the collected details regarding all aspects
 // of the websocket message to all the interested parties.
+//
+// This runs synchronously in the caller's goroutine (listenForMessageNotifications),
+// which already processes messageObservationsChan sequentially — one per connection.
+// It is deliberately NOT wrapped in a per-message goroutine: doing so spawned an
+// unbounded number of goroutines under a high-frequency subscription (e.g. a
+// Polygon logs/newHeads firehose), each racing on the shared observation state.
+// Running inline bounds concurrency to one per connection and lets the buffered
+// messageObservationsChan (plus the bridge's non-blocking, drop-on-full send)
+// absorb bursts.
 func (wrc *websocketRequestContext) BroadcastMessageObservations(
 	messageObservations *observation.RequestResponseObservations,
 ) {
@@ -484,32 +493,29 @@ func (wrc *websocketRequestContext) BroadcastMessageObservations(
 		return
 	}
 
-	// observation-related tasks are called in Goroutines to avoid potentially blocking the handler.
-	go func() {
-		if protocolObservations := messageObservations.GetProtocol(); protocolObservations != nil {
-			err := wrc.protocol.ApplyWebSocketObservations(protocolObservations)
-			if err != nil {
-				wrc.logger.Warn().Err(err).Msg("error applying protocol observations for websocket.")
-			}
+	if protocolObservations := messageObservations.GetProtocol(); protocolObservations != nil {
+		err := wrc.protocol.ApplyWebSocketObservations(protocolObservations)
+		if err != nil {
+			wrc.logger.Warn().Err(err).Msg("error applying protocol observations for websocket.")
 		}
+	}
 
-		// Apply QoS observations
-		if qosObservations := messageObservations.GetQos(); qosObservations != nil {
-			if err := wrc.serviceQoS.ApplyObservations(qosObservations); err != nil {
-				wrc.logger.Warn().Err(err).Msg("error applying QoS observations for websocket.")
-			}
+	// Apply QoS observations
+	if qosObservations := messageObservations.GetQos(); qosObservations != nil {
+		if err := wrc.serviceQoS.ApplyObservations(qosObservations); err != nil {
+			wrc.logger.Warn().Err(err).Msg("error applying QoS observations for websocket.")
 		}
+	}
 
-		// Prepare and publish observations to both the metrics and data reporters.
-		observations := &observation.RequestResponseObservations{
-			Gateway:  wrc.gatewayObservations,
-			Protocol: messageObservations.Protocol,
-			Qos:      messageObservations.Qos,
-		}
-		if wrc.metricsReporter != nil {
-			wrc.metricsReporter.Publish(observations)
-		}
-	}()
+	// Prepare and publish observations to both the metrics and data reporters.
+	observations := &observation.RequestResponseObservations{
+		Gateway:  wrc.gatewayObservations,
+		Protocol: messageObservations.Protocol,
+		Qos:      messageObservations.Qos,
+	}
+	if wrc.metricsReporter != nil {
+		wrc.metricsReporter.Publish(observations)
+	}
 }
 
 // initializeMessageObservations creates a copy of observations.

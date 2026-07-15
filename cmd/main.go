@@ -302,6 +302,7 @@ func main() {
 		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
 		ObservationQueue:           observationQueue,
 		DomainCircuitBreaker:       domainCircuitBreaker,
+		WebsocketConnectionLimiter: gateway.NewWebsocketConnectionLimiter(config.GetRouterConfig().MaxConcurrentWebsocketConnections),
 	}
 
 	// Until all components are ready, the `/healthz` endpoint will return a 503 Service

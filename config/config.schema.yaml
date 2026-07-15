@@ -663,6 +663,9 @@ properties:
       websocket_message_buffer_size:
         description: "Buffer size for websocket messages."
         type: integer
+      max_concurrent_websocket_connections:
+        description: "Maximum number of concurrent live websocket connections per gateway pod (defense-in-depth against goroutine/FD exhaustion). Defaults to 10000; set to a negative value to disable the limit."
+        type: integer
 
   # Concurrency Configuration (optional)
   concurrency_config:

@@ -93,13 +93,14 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 					},
 				},
 				Router: RouterConfig{
-					Port:                            defaultPort,
-					MaxRequestHeaderBytes:           defaultMaxRequestHeaderBytes,
-					ReadTimeout:                     30 * time.Second,  // Matches example config
-					WriteTimeout:                    30 * time.Second,  // Matches example config
-					IdleTimeout:                     120 * time.Second, // Matches example config
-					SystemOverheadAllowanceDuration: defaultSystemOverheadAllowanceDuration,
-					WebsocketMessageBufferSize:      8192, // Matches example config
+					Port:                              defaultPort,
+					MaxRequestHeaderBytes:             defaultMaxRequestHeaderBytes,
+					ReadTimeout:                       30 * time.Second,  // Matches example config
+					WriteTimeout:                      30 * time.Second,  // Matches example config
+					IdleTimeout:                       120 * time.Second, // Matches example config
+					SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
+					WebsocketMessageBufferSize:        8192, // Matches example config
+					MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 				},
 				Logger: LoggerConfig{
 					Level: "info", // Matches example config
@@ -191,13 +192,14 @@ logger_config:
 					},
 				},
 				Router: RouterConfig{
-					Port:                            defaultPort,
-					MaxRequestHeaderBytes:           defaultMaxRequestHeaderBytes,
-					ReadTimeout:                     defaultHTTPServerReadTimeout,
-					WriteTimeout:                    defaultHTTPServerWriteTimeout,
-					IdleTimeout:                     defaultHTTPServerIdleTimeout,
-					SystemOverheadAllowanceDuration: defaultSystemOverheadAllowanceDuration,
-					WebsocketMessageBufferSize:      defaultWebsocketMessageBufferSize,
+					Port:                              defaultPort,
+					MaxRequestHeaderBytes:             defaultMaxRequestHeaderBytes,
+					ReadTimeout:                       defaultHTTPServerReadTimeout,
+					WriteTimeout:                      defaultHTTPServerWriteTimeout,
+					IdleTimeout:                       defaultHTTPServerIdleTimeout,
+					SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
+					WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
+					MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 				},
 				Logger: LoggerConfig{
 					Level: "debug",
@@ -404,13 +406,14 @@ logger_config:
 					},
 				},
 				Router: RouterConfig{
-					Port:                            defaultPort,
-					MaxRequestHeaderBytes:           defaultMaxRequestHeaderBytes,
-					ReadTimeout:                     defaultHTTPServerReadTimeout,
-					WriteTimeout:                    defaultHTTPServerWriteTimeout,
-					IdleTimeout:                     defaultHTTPServerIdleTimeout,
-					SystemOverheadAllowanceDuration: defaultSystemOverheadAllowanceDuration,
-					WebsocketMessageBufferSize:      defaultWebsocketMessageBufferSize,
+					Port:                              defaultPort,
+					MaxRequestHeaderBytes:             defaultMaxRequestHeaderBytes,
+					ReadTimeout:                       defaultHTTPServerReadTimeout,
+					WriteTimeout:                      defaultHTTPServerWriteTimeout,
+					IdleTimeout:                       defaultHTTPServerIdleTimeout,
+					SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
+					WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
+					MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 				},
 				Logger: LoggerConfig{
 					Level: "info",
