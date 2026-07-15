@@ -288,6 +288,28 @@ var ResponseBytesSent = promauto.NewCounterVec(
 	[]string{LabelRPCType, LabelServiceID},
 )
 
+// RequestBodySizeBytes is the distribution of request body sizes, complementing
+// the request_bytes_received_total counter (which only yields totals/averages).
+// It exists to make p50/p99/max request sizes observable — e.g. to size the
+// max_request_body_bytes limit against real traffic.
+//
+// Cardinality is bounded: it reuses the same fixed rpc_type/service_id labels as
+// the counter (no new label dimensions) and a small, fixed bucket set. Buckets
+// span from ~256B to 128MB so the common case (single-KB), the tail (single-digit
+// MB), and anything approaching the request-size limit are all visible.
+var RequestBodySizeBytes = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name: MetricPrefix + "request_body_size_bytes",
+		Help: "Distribution of HTTP request body sizes in bytes by rpc_type and service_id.",
+		Buckets: []float64{
+			256, 1024, 4096, 16384, 65536, // 256B .. 64KB
+			262144, 1048576, 4194304, 16777216, // 256KB .. 16MB
+			67108864, 134217728, // 64MB, 128MB
+		},
+	},
+	[]string{LabelRPCType, LabelServiceID},
+)
+
 // =============================================================================
 // Probation Events (Counter)
 // Labels: domain, rpc_type, service_id, event
@@ -323,6 +345,7 @@ var DomainCircuitBreakerState = promauto.NewGaugeVec(
 // SetCircuitBreakerState sets the per-domain circuit-breaker gauge.
 //   - broken=true → 1 (domain is currently locked out)
 //   - broken=false → 0 (domain is healthy / has been recovered)
+//
 // Skipped silently when domain is empty (which would happen for endpoints whose
 // URL parse fails and only happens in error paths anyway).
 func SetCircuitBreakerState(serviceID, domain string, broken bool) {
@@ -352,8 +375,8 @@ func SetCircuitBreakerState(serviceID, domain string, broken bool) {
 // =============================================================================
 
 const (
-	LabelReasonCategory       = "reason_category"
-	LabelCircuitBreakerEvent  = "event"
+	LabelReasonCategory          = "reason_category"
+	LabelCircuitBreakerEvent     = "event"
 	CircuitBreakerEventBroken    = "broken"
 	CircuitBreakerEventRecovered = "recovered"
 )
@@ -363,12 +386,12 @@ const (
 // how variable the underlying reason strings are. Add new categories here
 // when MarkBroken call sites grow new reason prefixes.
 const (
-	CircuitBreakReasonRetry            = "retry"             // failure during retry path
-	CircuitBreakReasonBatchTransport   = "batch_transport"   // batch path: transport-level error
-	CircuitBreakReasonBatchHeuristic   = "batch_heuristic"   // batch path: heuristic flagged response
-	CircuitBreakReasonParallelRetry   = "parallel_retry"    // parallel-retry path failure
-	CircuitBreakReasonHeuristic        = "heuristic"         // top-level heuristic break
-	CircuitBreakReasonUnknown          = "unknown"           // anything we can't classify
+	CircuitBreakReasonRetry          = "retry"           // failure during retry path
+	CircuitBreakReasonBatchTransport = "batch_transport" // batch path: transport-level error
+	CircuitBreakReasonBatchHeuristic = "batch_heuristic" // batch path: heuristic flagged response
+	CircuitBreakReasonParallelRetry  = "parallel_retry"  // parallel-retry path failure
+	CircuitBreakReasonHeuristic      = "heuristic"       // top-level heuristic break
+	CircuitBreakReasonUnknown        = "unknown"         // anything we can't classify
 )
 
 var DomainCircuitBreakerEventsTotal = promauto.NewCounterVec(
@@ -843,6 +866,13 @@ func batchCountBucket(batchCount int) string {
 func RecordRequestSize(rpcType, serviceID string, bytesReceived, bytesSent int64) {
 	RequestBytesReceived.WithLabelValues(rpcType, serviceID).Add(float64(bytesReceived))
 	ResponseBytesSent.WithLabelValues(rpcType, serviceID).Add(float64(bytesSent))
+
+	// Also record the per-request size distribution (for p99/max visibility).
+	// Only observe real request bodies; skip zero to avoid diluting the histogram
+	// with sizeless requests that carry no signal.
+	if bytesReceived > 0 {
+		RequestBodySizeBytes.WithLabelValues(rpcType, serviceID).Observe(float64(bytesReceived))
+	}
 }
 
 // RecordProbationEvent records a probation event (entered, exited, or routed)
