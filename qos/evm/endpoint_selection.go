@@ -14,6 +14,7 @@ import (
 	"github.com/pokt-network/path/metrics"
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
 	"github.com/pokt-network/path/qos/selector"
 	"github.com/pokt-network/path/reputation"
 )
@@ -307,7 +308,7 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 			if syncAllowance > 0 && perceivedBlock > 0 {
 				if url, err := data.addr.GetURL(); err == nil {
 					if urlBlock, ok := urlBlockHeights[url]; ok {
-						minAllowed := perceivedBlock - syncAllowance
+						minAllowed := qos.MinAllowedBlockNumber(perceivedBlock, syncAllowance)
 						if urlBlock < minAllowed {
 							blocksBehind := int64(perceivedBlock) - int64(urlBlock)
 							invalidCount++
@@ -604,7 +605,7 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 
 	// If the endpoint's block height is less than the perceived block height minus the sync allowance,
 	// then the endpoint is behind the chain and should be filtered out.
-	minAllowedBlockNumber := perceivedBlock - syncAllowance
+	minAllowedBlockNumber := qos.MinAllowedBlockNumber(perceivedBlock, syncAllowance)
 
 	if parsedBlockNumber < minAllowedBlockNumber {
 		blocksBehind := int64(perceivedBlock) - int64(parsedBlockNumber)
@@ -794,7 +795,7 @@ func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrL
 			Msg("filterStaleURLEndpoints: perceived_block is 0, skipping stale URL filtering")
 		return endpoints
 	}
-	minAllowed := perceivedBlock - syncAllowance
+	minAllowed := qos.MinAllowedBlockNumber(perceivedBlock, syncAllowance)
 
 	urlBlockHeights := ss.buildURLBlockHeightMap()
 

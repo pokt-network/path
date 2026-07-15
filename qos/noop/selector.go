@@ -7,6 +7,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
 	"github.com/pokt-network/path/qos/selector"
 )
 
@@ -126,7 +127,7 @@ func (fs *filteringSelector) filterValidEndpoints(endpoints protocol.EndpointAdd
 		return endpoints
 	}
 
-	minAllowedBlock := perceivedBlock - syncAllowance
+	minAllowedBlock := qos.MinAllowedBlockNumber(perceivedBlock, syncAllowance)
 
 	fs.endpointStore.mu.RLock()
 

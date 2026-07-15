@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pokt-network/path/qos"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
 
@@ -246,7 +247,7 @@ func (ss *serviceState) validateBlockHeightSyncAllowance(latestBlockHeight uint6
 		Uint64("endpoint_block", latestBlockHeight).
 		Msg("🔍 Sync allowance check ENABLED")
 
-	minAllowedBlockNumber := ss.perceivedBlockNumber - syncAllowance
+	minAllowedBlockNumber := qos.MinAllowedBlockNumber(ss.perceivedBlockNumber, syncAllowance)
 	if latestBlockHeight < minAllowedBlockNumber {
 		ss.logger.Warn().
 			Str("service_id", string(ss.serviceQoSConfig.GetServiceID())).
