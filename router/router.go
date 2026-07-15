@@ -230,6 +230,15 @@ func (r *router) removeGrovePortalPrefixMiddleware(next http.HandlerFunc) http.H
 // 2. Prevents empty responses on long operations
 // 3. Forwards request to gateway handler
 func (r *router) handleServiceRequest(w http.ResponseWriter, req *http.Request) {
+	// Bound the request body size to prevent a single oversized body from OOMing
+	// the process. This wraps the underlying body before any handler reads it, so
+	// every downstream read (RPC-type detection, observation capture, relay) draws
+	// from a capped source; a read past the limit fails rather than allocating
+	// without bound. Harmless for websocket upgrades, which do not read req.Body.
+	if r.config.MaxRequestBodyBytes > 0 && req.Body != nil {
+		req.Body = http.MaxBytesReader(w, req.Body, r.config.MaxRequestBodyBytes)
+	}
+
 	// Reserve time for system overhead and apply it to the business logic operations.
 	processingTimeout := r.config.WriteTimeout - r.config.SystemOverheadAllowanceDuration
 

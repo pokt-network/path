@@ -69,6 +69,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
 				WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 				MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
+				MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
 			},
 			wantErr: false,
 		},
@@ -86,6 +87,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
 				WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 				MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
+				MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
 			},
 			wantErr: false,
 		},
@@ -121,6 +123,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
 				WebsocketMessageBufferSize:        500, // Custom value should be preserved
 				MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
+				MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
 			},
 			wantErr: false,
 		},
@@ -138,6 +141,25 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
 				WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 				MaxConcurrentWebsocketConnections: -1, // Negative preserved: limit disabled
+				MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
+			},
+			wantErr: false,
+		},
+		{
+			name: "should preserve a negative max request body bytes (limit disabled)",
+			cfg: RouterConfig{
+				MaxRequestBodyBytes: -1,
+			},
+			want: RouterConfig{
+				Port:                              defaultPort,
+				MaxRequestHeaderBytes:             defaultMaxRequestHeaderBytes,
+				ReadTimeout:                       defaultHTTPServerReadTimeout,
+				WriteTimeout:                      defaultHTTPServerWriteTimeout,
+				IdleTimeout:                       defaultHTTPServerIdleTimeout,
+				SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
+				WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
+				MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
+				MaxRequestBodyBytes:               -1, // Negative preserved: limit disabled
 			},
 			wantErr: false,
 		},

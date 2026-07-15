@@ -666,6 +666,9 @@ properties:
       max_concurrent_websocket_connections:
         description: "Maximum number of concurrent live websocket connections per gateway pod (defense-in-depth against goroutine/FD exhaustion). Defaults to 10000; set to a negative value to disable the limit."
         type: integer
+      max_request_body_bytes:
+        description: "Maximum size in bytes of an HTTP request body PATH will read into memory (prevents OOM from oversized bodies). Defaults to 10485760 (10MB); set to a negative value to disable the limit."
+        type: integer
 
   # Concurrency Configuration (optional)
   concurrency_config:

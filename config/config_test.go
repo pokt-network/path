@@ -101,6 +101,7 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 					SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
 					WebsocketMessageBufferSize:        8192, // Matches example config
 					MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
+					MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
 				},
 				Logger: LoggerConfig{
 					Level: "info", // Matches example config
@@ -200,6 +201,7 @@ logger_config:
 					SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
 					WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 					MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
+					MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
 				},
 				Logger: LoggerConfig{
 					Level: "debug",
@@ -414,6 +416,7 @@ logger_config:
 					SystemOverheadAllowanceDuration:   defaultSystemOverheadAllowanceDuration,
 					WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 					MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
+					MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
 				},
 				Logger: LoggerConfig{
 					Level: "info",
