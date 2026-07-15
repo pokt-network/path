@@ -37,13 +37,18 @@ func (l *WebsocketConnectionLimiter) Acquire() bool {
 	if l == nil {
 		return true
 	}
-	// Optimistically claim a slot; roll back if we exceeded the cap. This keeps
-	// Acquire lock-free while remaining exact under concurrency.
-	if l.active.Add(1) > l.max {
-		l.active.Add(-1)
-		return false
+	// Lock-free CAS loop: only increment when strictly below the cap. Unlike an
+	// optimistic add-then-rollback, this never lets the counter overshoot the cap
+	// even transiently, so a concurrent Active() read can never exceed max.
+	for {
+		cur := l.active.Load()
+		if cur >= l.max {
+			return false
+		}
+		if l.active.CompareAndSwap(cur, cur+1) {
+			return true
+		}
 	}
-	return true
 }
 
 // Release frees a slot previously reserved by a successful Acquire. It must be
