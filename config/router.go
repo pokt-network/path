@@ -35,11 +35,12 @@ const (
 	// defaultMaxRequestBodyBytes caps the size of an HTTP request body PATH will
 	// read into memory. Without a limit, a single request with a multi-GB body
 	// OOMs the process (the body is buffered whole, and observation/detection
-	// paths read it before any downstream limit applies). 10MB is well above any
-	// legitimate JSON-RPC payload — including large batches and raw transactions —
-	// while bounding a single request's allocation. Reads past the limit fail
-	// (request rejected) rather than growing memory without bound.
-	defaultMaxRequestBodyBytes = 10 * 1024 * 1024
+	// paths read it before any downstream limit applies). 75MB leaves generous
+	// headroom for the largest legitimate payloads (big batches, large
+	// eth_getLogs/debug traces, contract deploys) while still bounding a single
+	// request's allocation. Reads past the limit fail (request rejected) rather
+	// than growing memory without bound.
+	defaultMaxRequestBodyBytes = 75 * 1024 * 1024
 
 	// defaultMaxConcurrentWebsocketConnections caps concurrent live websocket
 	// connections per gateway pod (defense-in-depth against goroutine/FD
