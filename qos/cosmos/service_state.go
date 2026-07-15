@@ -9,6 +9,7 @@ import (
 	"github.com/pokt-network/path/metrics/devtools"
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
 )
 
 var _ protocol.EndpointSelector = &serviceState{}
@@ -97,8 +98,15 @@ func (ss *serviceState) updateFromEndpoints(updatedEndpoints map[protocol.Endpoi
 		// Per perceivedBlockNumber field documentation, it should be "the maximum of block height reported by any endpoint"
 		// but code was incorrectly overwriting with each endpoint, causing validation failures.
 		if blockNumber > ss.perceivedBlockNumber {
-			logger.Debug().Msgf("Updating perceived block number from %d to %d", ss.perceivedBlockNumber, blockNumber)
-			ss.perceivedBlockNumber = blockNumber
+			if !qos.IsPlausibleBlockHeight(blockNumber, ss.perceivedBlockNumber) {
+				logger.Warn().
+					Uint64("reported_block", blockNumber).
+					Uint64("perceived_block", ss.perceivedBlockNumber).
+					Msg("⚠️ ignoring implausible block height (possible poisoning attempt)")
+			} else {
+				logger.Debug().Msgf("Updating perceived block number from %d to %d", ss.perceivedBlockNumber, blockNumber)
+				ss.perceivedBlockNumber = blockNumber
+			}
 		}
 	}
 
