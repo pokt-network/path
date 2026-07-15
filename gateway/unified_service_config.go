@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -204,12 +205,12 @@ type ServiceHealthCheckOverride struct {
 // ensuring behind-on-block suppliers are correctly filtered even when
 // all session endpoints are equally stale.
 type ExternalBlockSource struct {
-	URL         string        `yaml:"url"`                  // RPC endpoint URL
-	Type        string        `yaml:"type,omitempty"`       // "jsonrpc" (default) or "rest". REST uses GET, JSON-RPC uses POST.
-	Method      string        `yaml:"method,omitempty"`     // JSON-RPC method. Default: "eth_blockNumber". Use "status" for Cosmos, "getBlockHeight" for Solana.
-	Path        string        `yaml:"path,omitempty"`       // Request path appended to URL. Default: "/"
-	Interval    time.Duration `yaml:"interval,omitempty"`   // Poll interval. Default: 30s
-	Timeout     time.Duration `yaml:"timeout,omitempty"`    // HTTP timeout. Default: 5s
+	URL         string        `yaml:"url"`                    // RPC endpoint URL
+	Type        string        `yaml:"type,omitempty"`         // "jsonrpc" (default) or "rest". REST uses GET, JSON-RPC uses POST.
+	Method      string        `yaml:"method,omitempty"`       // JSON-RPC method. Default: "eth_blockNumber". Use "status" for Cosmos, "getBlockHeight" for Solana.
+	Path        string        `yaml:"path,omitempty"`         // Request path appended to URL. Default: "/"
+	Interval    time.Duration `yaml:"interval,omitempty"`     // Poll interval. Default: 30s
+	Timeout     time.Duration `yaml:"timeout,omitempty"`      // HTTP timeout. Default: 5s
 	GracePeriod time.Duration `yaml:"grace_period,omitempty"` // Wait after startup before applying external floor. Default: 60s
 }
 
@@ -222,36 +223,36 @@ type ServiceFallbackConfig struct {
 
 // ServiceDefaults contains default settings inherited by all services.
 type ServiceDefaults struct {
-	Type                ServiceType                  `yaml:"type,omitempty"`
-	RPCTypes            []string                     `yaml:"rpc_types,omitempty"`
-	LatencyProfile      string                       `yaml:"latency_profile,omitempty"`
-	ReputationConfig    ServiceReputationConfig      `yaml:"reputation_config,omitempty"`
-	Latency             ServiceLatencyConfig         `yaml:"latency,omitempty"`
-	TieredSelection     ServiceTieredSelectionConfig `yaml:"tiered_selection,omitempty"`
-	Probation           ServiceProbationConfig       `yaml:"probation,omitempty"`
-	RetryConfig         ServiceRetryConfig           `yaml:"retry_config,omitempty"`
-	ObservationPipeline ServiceObservationConfig     `yaml:"observation_pipeline,omitempty"`
-	ConcurrencyConfig   ServiceConcurrencyConfig     `yaml:"concurrency_config,omitempty"`
-	TimeoutConfig       ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
-	ActiveHealthChecks   ServiceHealthCheckOverride `yaml:"active_health_checks,omitempty"`
-	ExternalBlockSources []ExternalBlockSource      `yaml:"external_block_sources,omitempty"`
+	Type                 ServiceType                  `yaml:"type,omitempty"`
+	RPCTypes             []string                     `yaml:"rpc_types,omitempty"`
+	LatencyProfile       string                       `yaml:"latency_profile,omitempty"`
+	ReputationConfig     ServiceReputationConfig      `yaml:"reputation_config,omitempty"`
+	Latency              ServiceLatencyConfig         `yaml:"latency,omitempty"`
+	TieredSelection      ServiceTieredSelectionConfig `yaml:"tiered_selection,omitempty"`
+	Probation            ServiceProbationConfig       `yaml:"probation,omitempty"`
+	RetryConfig          ServiceRetryConfig           `yaml:"retry_config,omitempty"`
+	ObservationPipeline  ServiceObservationConfig     `yaml:"observation_pipeline,omitempty"`
+	ConcurrencyConfig    ServiceConcurrencyConfig     `yaml:"concurrency_config,omitempty"`
+	TimeoutConfig        ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
+	ActiveHealthChecks   ServiceHealthCheckOverride   `yaml:"active_health_checks,omitempty"`
+	ExternalBlockSources []ExternalBlockSource        `yaml:"external_block_sources,omitempty"`
 }
 
 // ServiceConfig defines configuration for a single service.
 type ServiceConfig struct {
-	ID                  protocol.ServiceID            `yaml:"id"`
-	Type                ServiceType                   `yaml:"type,omitempty"`
-	RPCTypes            []string                      `yaml:"rpc_types,omitempty"`
-	RPCTypeFallbacks    map[string]string             `yaml:"rpc_type_fallbacks,omitempty"`
-	LatencyProfile      string                        `yaml:"latency_profile,omitempty"`
-	ReputationConfig    *ServiceReputationConfig      `yaml:"reputation_config,omitempty"`
-	Latency             *ServiceLatencyConfig         `yaml:"latency,omitempty"`
-	TieredSelection     *ServiceTieredSelectionConfig `yaml:"tiered_selection,omitempty"`
-	Probation           *ServiceProbationConfig       `yaml:"probation,omitempty"`
-	RetryConfig         *ServiceRetryConfig           `yaml:"retry_config,omitempty"`
-	ObservationPipeline *ServiceObservationConfig     `yaml:"observation_pipeline,omitempty"`
-	ConcurrencyConfig   *ServiceConcurrencyConfig     `yaml:"concurrency_config,omitempty"`
-	TimeoutConfig       *ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
+	ID                   protocol.ServiceID            `yaml:"id"`
+	Type                 ServiceType                   `yaml:"type,omitempty"`
+	RPCTypes             []string                      `yaml:"rpc_types,omitempty"`
+	RPCTypeFallbacks     map[string]string             `yaml:"rpc_type_fallbacks,omitempty"`
+	LatencyProfile       string                        `yaml:"latency_profile,omitempty"`
+	ReputationConfig     *ServiceReputationConfig      `yaml:"reputation_config,omitempty"`
+	Latency              *ServiceLatencyConfig         `yaml:"latency,omitempty"`
+	TieredSelection      *ServiceTieredSelectionConfig `yaml:"tiered_selection,omitempty"`
+	Probation            *ServiceProbationConfig       `yaml:"probation,omitempty"`
+	RetryConfig          *ServiceRetryConfig           `yaml:"retry_config,omitempty"`
+	ObservationPipeline  *ServiceObservationConfig     `yaml:"observation_pipeline,omitempty"`
+	ConcurrencyConfig    *ServiceConcurrencyConfig     `yaml:"concurrency_config,omitempty"`
+	TimeoutConfig        *ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
 	Fallback             *ServiceFallbackConfig        `yaml:"fallback,omitempty"`
 	HealthChecks         *ServiceHealthCheckOverride   `yaml:"health_checks,omitempty"`
 	ExternalBlockSources []ExternalBlockSource         `yaml:"external_block_sources,omitempty"`
@@ -269,6 +270,41 @@ type UnifiedServicesConfig struct {
 	LatencyProfiles map[string]LatencyProfileConfig `yaml:"latency_profiles,omitempty"`
 	Defaults        ServiceDefaults                 `yaml:"defaults,omitempty"`
 	Services        []ServiceConfig                 `yaml:"services,omitempty"`
+
+	// servicesMu guards concurrent access to Services. The external health-check
+	// refresh mutates Services at runtime (SetServiceSyncAllowance) while every
+	// request reads it (GetServiceConfig etc.); without synchronization the
+	// append path races a concurrent slice-header read → torn header → panic.
+	// It is a pointer (not a value sync.RWMutex) so this struct — which is
+	// returned by value from LoadGatewayConfigFromYAML during load — stays
+	// copylock-safe. Initialized in HydrateDefaults (called once at startup
+	// before any concurrency); the lock helpers no-op if it is nil so
+	// directly-constructed configs in tests remain usable.
+	servicesMu *sync.RWMutex
+}
+
+// rlock/runlock/lock/unlock guard Services access. They are nil-safe: a config
+// built without HydrateDefaults (e.g. in tests) is used single-threaded, so
+// skipping the lock there is safe.
+func (c *UnifiedServicesConfig) rlock() {
+	if c.servicesMu != nil {
+		c.servicesMu.RLock()
+	}
+}
+func (c *UnifiedServicesConfig) runlock() {
+	if c.servicesMu != nil {
+		c.servicesMu.RUnlock()
+	}
+}
+func (c *UnifiedServicesConfig) lock() {
+	if c.servicesMu != nil {
+		c.servicesMu.Lock()
+	}
+}
+func (c *UnifiedServicesConfig) unlock() {
+	if c.servicesMu != nil {
+		c.servicesMu.Unlock()
+	}
 }
 
 // Validate validates the UnifiedServicesConfig.
@@ -341,6 +377,11 @@ func IsBuiltInLatencyProfile(name string) bool {
 
 // HydrateDefaults applies default values to UnifiedServicesConfig.
 func (c *UnifiedServicesConfig) HydrateDefaults() {
+	// Initialize the Services mutex once, before the config is shared with the
+	// request path and the health-check refresh goroutine.
+	if c.servicesMu == nil {
+		c.servicesMu = &sync.RWMutex{}
+	}
 	if c.Defaults.Type == "" {
 		c.Defaults.Type = ServiceTypePassthrough
 	}
@@ -506,9 +547,16 @@ func (c *UnifiedServicesConfig) HydrateDefaults() {
 
 // GetServiceConfig returns the configuration for a specific service.
 func (c *UnifiedServicesConfig) GetServiceConfig(serviceID protocol.ServiceID) *ServiceConfig {
+	c.rlock()
+	defer c.runlock()
 	for i := range c.Services {
 		if c.Services[i].ID == serviceID {
-			return &c.Services[i]
+			// Return a copy, not &c.Services[i]: a pointer into the slice would
+			// let the caller read the element after the lock is released, racing
+			// a concurrent SetServiceSyncAllowance. The writer copy-on-writes the
+			// HealthChecks pointer, so this shallow copy stays stable.
+			cfg := c.Services[i]
+			return &cfg
 		}
 	}
 	return nil
@@ -536,6 +584,8 @@ func (c *UnifiedServicesConfig) GetServiceRPCTypes(serviceID protocol.ServiceID)
 
 // GetConfiguredServiceIDs returns a list of all configured service IDs.
 func (c *UnifiedServicesConfig) GetConfiguredServiceIDs() []protocol.ServiceID {
+	c.rlock()
+	defer c.runlock()
 	ids := make([]protocol.ServiceID, len(c.Services))
 	for i, svc := range c.Services {
 		ids[i] = svc.ID
@@ -803,12 +853,21 @@ func (c *UnifiedServicesConfig) GetSyncAllowanceForService(serviceID protocol.Se
 // This is called when external health check rules are loaded to propagate
 // the sync_allowance to the unified config for use by the QoS layer.
 func (c *UnifiedServicesConfig) SetServiceSyncAllowance(serviceID protocol.ServiceID, syncAllowance int) {
+	c.lock()
+	defer c.unlock()
 	for i := range c.Services {
 		if c.Services[i].ID == serviceID {
-			if c.Services[i].HealthChecks == nil {
-				c.Services[i].HealthChecks = &ServiceHealthCheckOverride{}
+			// Copy-on-write the HealthChecks pointer rather than mutating the
+			// existing one in place: a concurrent reader may hold a copy of this
+			// ServiceConfig (with the old pointer), and mutating that shared
+			// override in place would race its read. Publishing a fresh pointer
+			// leaves the old one immutable.
+			hc := ServiceHealthCheckOverride{}
+			if c.Services[i].HealthChecks != nil {
+				hc = *c.Services[i].HealthChecks
 			}
-			c.Services[i].HealthChecks.SyncAllowance = &syncAllowance
+			hc.SyncAllowance = &syncAllowance
+			c.Services[i].HealthChecks = &hc
 			return
 		}
 	}

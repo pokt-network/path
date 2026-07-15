@@ -113,8 +113,23 @@ func (ss *serviceState) getDisqualifiedEndpointsResponse(serviceID protocol.Serv
 		DisqualifiedEndpoints: make(map[protocol.EndpointAddr]devtools.QoSDisqualifiedEndpoint),
 	}
 
-	// Populate the data response object using the endpoints in the endpoint store.
-	for endpointAddr, endpoint := range ss.endpointStore.endpoints {
+	// Snapshot the endpoints under the store lock, then validate outside it.
+	// Ranging ss.endpointStore.endpoints directly (as this did) without holding
+	// endpointsMu races with the writers that update the map on every observation
+	// — Go's runtime turns a concurrent iterate+write into an unrecoverable
+	// `fatal error: concurrent map iteration and map write` that crashes the pod
+	// (reachable via GET /disqualified_endpoints). basicEndpointValidation takes
+	// serviceStateLock, so we copy first and release endpointsMu before calling it
+	// to avoid holding two locks across the call.
+	ss.endpointStore.endpointsMu.RLock()
+	endpointsSnapshot := make(map[protocol.EndpointAddr]endpoint, len(ss.endpointStore.endpoints))
+	for addr, ep := range ss.endpointStore.endpoints {
+		endpointsSnapshot[addr] = ep
+	}
+	ss.endpointStore.endpointsMu.RUnlock()
+
+	// Populate the data response object using the snapshot.
+	for endpointAddr, endpoint := range endpointsSnapshot {
 		if err := ss.basicEndpointValidation(endpoint); err != nil {
 			qosLevelDataResponse.DisqualifiedEndpoints[endpointAddr] = devtools.QoSDisqualifiedEndpoint{
 				EndpointAddr: endpointAddr,
