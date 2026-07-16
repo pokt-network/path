@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -81,6 +82,13 @@ type websocketConnection struct {
 	source  messageSource
 	msgChan chan<- message
 
+	// closeInfoMu guards lastCloseCode/lastCloseText. Both connLoop and pingLoop
+	// can call handleDisconnect concurrently on a broken socket (write/write), and
+	// the bridge shutdown path reads them via GetCloseInfo while the other
+	// connection's loops may still be writing (read/write). Without this lock those
+	// accesses race — a torn read of the lastCloseText string header is undefined
+	// behavior, and CI's -race build flags it.
+	closeInfoMu sync.Mutex
 	// lastCloseCode stores the close code from the last disconnect.
 	// This is used to propagate close codes from endpoint to client.
 	lastCloseCode int
@@ -239,8 +247,10 @@ func (c *websocketConnection) handleDisconnect(err error) {
 	closeCode, closeText := extractCloseInfo(err)
 	if closeCode != 0 {
 		// Store close code for propagation to the other side of the bridge
+		c.closeInfoMu.Lock()
 		c.lastCloseCode = closeCode
 		c.lastCloseText = closeText
+		c.closeInfoMu.Unlock()
 		c.logger.Info().
 			Int("close_code", closeCode).
 			Str("close_text", closeText).
@@ -255,6 +265,8 @@ func (c *websocketConnection) handleDisconnect(err error) {
 // GetCloseInfo returns the close code and text from the last disconnect.
 // Returns 0 and empty string if no close code was received.
 func (c *websocketConnection) GetCloseInfo() (int, string) {
+	c.closeInfoMu.Lock()
+	defer c.closeInfoMu.Unlock()
 	return c.lastCloseCode, c.lastCloseText
 }
 
