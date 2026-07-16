@@ -258,8 +258,13 @@ func (b *bridge) shutdown(err error) {
 		// from sending on msgChan after it's no longer being read.
 		b.cancelCtx()
 
-		// Determine appropriate close code and message for client reconnection guidance
+		// Determine appropriate close code and message for client reconnection guidance.
+		// Sanitize at this single emit choke point so a reserved code (e.g. a 1006
+		// propagated from an abnormal peer disconnect) never reaches the wire, where
+		// the relay miner rejects it ("websocket: bad close code 1006") and clients
+		// see a malformed frame.
 		closeCode, errMsg := b.determineCloseCodeAndMessage(err)
+		closeCode = sanitizeCloseCode(closeCode)
 		closeMsg := websocket.FormatCloseMessage(closeCode, errMsg)
 
 		// Write close messages with timeout to prevent hanging on broken connections
@@ -289,6 +294,25 @@ func (b *bridge) shutdown(err error) {
 			close(b.messageObservationsChan)
 		}
 	})
+}
+
+// sanitizeCloseCode maps RFC 6455 §7.4.1 reserved status codes — which are for
+// internal endpoint use and MUST NOT appear in a close frame on the wire — to a
+// valid code (1011 Internal Error). gorilla/websocket synthesizes a
+// *CloseError{Code: 1006} when a peer drops the TCP connection without a close
+// handshake; extractCloseInfo caches that code and determineCloseCodeAndMessage
+// would otherwise propagate it verbatim to the other peer. Relay miners reject a
+// 1006 close frame ("websocket: bad close code 1006") and clients see a malformed
+// frame. Reserved: 1005 (no status), 1006 (abnormal closure), 1015 (TLS handshake).
+func sanitizeCloseCode(code int) int {
+	switch code {
+	case websocket.CloseNoStatusReceived, // 1005
+		websocket.CloseAbnormalClosure, // 1006
+		websocket.CloseTLSHandshake:    // 1015
+		return websocket.CloseInternalServerErr // 1011
+	default:
+		return code
+	}
 }
 
 // determineCloseCodeAndMessage determines the appropriate Websocket close code and message
