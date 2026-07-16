@@ -694,9 +694,12 @@ var WebsocketConnectionEventsTotal = promauto.NewCounterVec(
 
 var WebsocketConnectionDuration = promauto.NewHistogramVec(
 	prometheus.HistogramOpts{
-		Name:    MetricPrefix + "websocket_connection_duration_seconds",
-		Help:    "WebSocket connection duration in seconds by domain and service_id.",
-		Buckets: []float64{1, 5, 10, 30, 60, 300, 600, 1800, 3600}, // 1s to 1h
+		Name: MetricPrefix + "websocket_connection_duration_seconds",
+		Help: "WebSocket connection duration in seconds by domain and service_id.",
+		// Sub-second buckets (0.1/0.25/0.5) make immediate supplier resets — a
+		// connection that establishes then dies in well under a second — visible
+		// and distinguishable from healthy long-lived subscriptions.
+		Buckets: []float64{0.1, 0.25, 0.5, 1, 5, 10, 30, 60, 300, 600, 1800, 3600}, // 100ms to 1h
 	},
 	[]string{LabelDomain, LabelServiceID},
 )
