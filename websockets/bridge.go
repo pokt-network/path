@@ -105,10 +105,19 @@ func StartBridge(
 	endpointConn, err := ConnectWebsocketEndpoint(logger, websocketURL, headers)
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ error connecting to websocket endpoint")
-		// Clean up the client connection that was successfully upgraded
-		if closeErr := clientConn.Close(); closeErr != nil {
-			logger.Warn().Err(closeErr).Msg("error closing client connection after endpoint connection failure")
-		}
+		// The client upgrade already succeeded, so the client is a live Websocket
+		// peer. Send a legible close frame BEFORE closing: without one, gorilla
+		// drops the TCP connection with no close handshake, which clients surface
+		// as an abnormal closure (1006) or a protocol error (1002) rather than a
+		// meaningful reason. 1013 (Try Again Later) tells the client to reconnect
+		// — a fresh connection typically draws a different supplier — which is the
+		// correct guidance when a randomly selected upstream endpoint is down.
+		closeClientConnWithReason(
+			logger,
+			clientConn,
+			websocket.CloseTryAgainLater,
+			"upstream endpoint unavailable, please reconnect",
+		)
 		cancelCtx() // Clean up context on error
 		return nil, fmt.Errorf("createWebsocketBridge: %w", err)
 	}
@@ -161,6 +170,26 @@ func StartBridge(
 
 	// Return the completion channel so the caller can wait for bridge shutdown
 	return completionChan, nil
+}
+
+// closeClientConnWithReason sends a best-effort Websocket close frame carrying a
+// legible status code to an already-upgraded client connection, then closes it.
+//
+// Used on connection-establishment failures that occur AFTER the client upgrade
+// succeeds but BEFORE the bridge exists (so the normal shutdown() close-frame
+// path is not yet available). Without an explicit close frame, gorilla's Close()
+// tears down the TCP connection with no close handshake, which clients report as
+// an abnormal closure (1006) or a protocol error (1002) — misleading, since the
+// real cause is an unavailable upstream endpoint, not a client protocol fault.
+func closeClientConnWithReason(logger polylog.Logger, conn *websocket.Conn, closeCode int, reason string) {
+	deadline := time.Now().Add(1 * time.Second)
+	closeMsg := websocket.FormatCloseMessage(closeCode, reason)
+	if err := conn.WriteControl(websocket.CloseMessage, closeMsg, deadline); err != nil {
+		logger.Warn().Err(err).Msg("⚠️ could not write close frame to client connection after endpoint connection failure")
+	}
+	if err := conn.Close(); err != nil {
+		logger.Warn().Err(err).Msg("error closing client connection after endpoint connection failure")
+	}
 }
 
 // validateComponents ensures the Bridge is not created with nil components.
