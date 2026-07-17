@@ -13,6 +13,7 @@ import (
 	"github.com/pokt-network/path/metrics/devtools"
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
 	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
 )
@@ -142,8 +143,17 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 	q.serviceStateLock.Lock()
 	defer q.serviceStateLock.Unlock()
 
-	// Update perceived block height to maximum across all endpoints
-	if blockHeight > q.perceivedBlockHeight {
+	// Update perceived block height to maximum across all endpoints.
+	// Guard against poisoning: ignore an implausibly high report so one endpoint
+	// cannot set the perceived height arbitrarily high and filter out all honest
+	// endpoints. The per-endpoint Redis write below still runs regardless.
+	if blockHeight > q.perceivedBlockHeight && !qos.IsPlausibleBlockHeight(blockHeight, q.perceivedBlockHeight) {
+		q.logger.Warn().
+			Str("endpoint", string(endpointAddr)).
+			Uint64("reported_block", blockHeight).
+			Uint64("perceived_block", q.perceivedBlockHeight).
+			Msg("⚠️ ignoring implausible block height (possible poisoning attempt)")
+	} else if blockHeight > q.perceivedBlockHeight {
 		q.logger.Debug().
 			Str("endpoint", string(endpointAddr)).
 			Uint64("old_block", q.perceivedBlockHeight).

@@ -14,6 +14,10 @@ func setupMetricsServer(logger polylog.Logger, addr string) (*metrics.Prometheus
 		Logger: logger,
 	}
 
+	// Wire the logger used for the one-time WARN a cardinality guard emits when
+	// it first saturates (otherwise a capped metric silently goes incomplete).
+	metrics.SetCardinalityGuardLogger(logger)
+
 	if err := pmr.ServeMetrics(addr); err != nil {
 		return nil, err
 	}

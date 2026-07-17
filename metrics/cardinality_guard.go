@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -42,6 +43,17 @@ var MetricsLabelDropped = promauto.NewCounterVec(
 	[]string{"metric"},
 )
 
+// guardLogger emits a one-time WARN when a cardinality guard first trips. Set
+// once at startup via SetCardinalityGuardLogger, before any traffic; read-only
+// afterwards, so a plain package var is safe (no concurrent writer). Nil until
+// set — guards simply skip the WARN in that window (they cannot trip before a
+// pod serves traffic anyway).
+var guardLogger polylog.Logger
+
+// SetCardinalityGuardLogger wires the logger used for the one-time
+// guard-tripped WARN. Call once during metrics startup.
+func SetCardinalityGuardLogger(l polylog.Logger) { guardLogger = l }
+
 // cardinalityGuard is a per-metric label-tuple counter. allow() reports
 // whether a given label tuple should be admitted to the underlying metric.
 // Tuples seen before are always admitted via a lock-free fast path; novel
@@ -50,11 +62,12 @@ var MetricsLabelDropped = promauto.NewCounterVec(
 // The slow path is rare in steady state — once a workload's active suppliers
 // are all in the seen-set, every call returns from the fast path.
 type cardinalityGuard struct {
-	name  string
-	limit int64
-	seen  sync.Map
-	count atomic.Int64
-	addMu sync.Mutex
+	name   string
+	limit  int64
+	seen   sync.Map
+	count  atomic.Int64
+	addMu  sync.Mutex
+	warned bool // guarded by addMu; ensures the trip WARN fires exactly once
 }
 
 func newCardinalityGuard(name string, limit int64) *cardinalityGuard {
@@ -80,6 +93,20 @@ func (g *cardinalityGuard) allow(labelValues ...string) bool {
 		return true
 	}
 	if g.count.Load() >= g.limit {
+		// Fire a single WARN the first time this guard saturates. Past this
+		// point the metric silently stops counting novel tuples and looks
+		// identical to a healthy one on the wire; the log (and the
+		// path_metrics_label_dropped_total counter) are the only signals that
+		// it has gone incomplete.
+		if !g.warned {
+			g.warned = true
+			if guardLogger != nil {
+				guardLogger.Warn().
+					Str("metric", g.name).
+					Int64("series_limit", g.limit).
+					Msg("cardinality guard tripped: metric is now incomplete, novel label tuples are being dropped. Watch path_metrics_label_dropped_total{metric} for the drop rate.")
+			}
+		}
 		MetricsLabelDropped.WithLabelValues(g.name).Inc()
 		return false
 	}

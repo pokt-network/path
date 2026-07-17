@@ -22,7 +22,10 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: rymndhng/release-on-push-action@master
+      # Pinned to an immutable commit SHA (v0.28.0) rather than a mutable branch.
+      # A moving @master ref means a compromised upstream repo would get arbitrary
+      # code execution in CI with GITHUB_TOKEN.
+      - uses: rymndhng/release-on-push-action@aebba2bbce07a9474bf95e8710e5ee8a9e922fe2 # v0.28.0
         with:
           bump_version_scheme: patch
           release_body: ":rocket: Release Notes !:fireworks: "

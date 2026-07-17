@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alitto/pond/v2"
@@ -77,16 +78,24 @@ type requestContext struct {
 	// currentRPCType:
 	//   - Tracks the RPC type of the current relay being processed.
 	//   - Set during relay execution and used when building observations.
-	currentRPCType sharedtypes.RPCType
+	//   - Atomic: written per-relay (RPC-type fallback) and read to build
+	//     observations concurrently across the parallel-batch relay goroutines,
+	//     which all target the single selected endpoint. Stored as its int32
+	//     underlying value.
+	currentRPCType atomic.Int32
 
 	// heuristicRPCType preserves the original detected RPC type before any
 	// fallback was applied. Used for heuristic response analysis so that
 	// CometBFT requests routed through JSON_RPC are still analyzed correctly.
+	// Set once before parallelization (happens-before the relay goroutines), so
+	// it is only read — never written — during parallel execution.
 	heuristicRPCType sharedtypes.RPCType
 
 	// requestErrorObservation:
 	//   - Tracks any errors encountered during request processing.
-	requestErrorObservation *protocolobservations.ShannonRequestError
+	//   - Atomic: handleInternalError may write it from a parallel relay goroutine
+	//     while it is read to build observations.
+	requestErrorObservation atomic.Pointer[protocolobservations.ShannonRequestError]
 
 	// endpointObservations:
 	//   - Captures observations about endpoints used during request handling.
@@ -101,7 +110,10 @@ type requestContext struct {
 	// currentRelayMinerError:
 	//   - Tracks RelayMinerError data from the current relay response for reporting.
 	//   - Set by trackRelayMinerError method and used when building observations.
-	currentRelayMinerError *protocolobservations.ShannonRelayMinerError
+	//   - Atomic: written per-relay (trackRelayMinerError) and read to build
+	//     observations / detect over-servicing concurrently across parallel-batch
+	//     relay goroutines. A plain pointer field allowed a torn read → crash.
+	currentRelayMinerError atomic.Pointer[protocolobservations.ShannonRelayMinerError]
 
 	// HTTP client used for sending relay requests to endpoints while also capturing various debug metrics
 	httpClient *pathhttp.HTTPClientWithDebugMetrics
@@ -165,6 +177,14 @@ type requestContext struct {
 //   - Handles both single requests and JSON-RPC batch requests concurrently when beneficial.
 //   - Returns responses as an array to match interface, but gateway currently expects single response.
 //   - Captures RelayMinerError data when available for reporting purposes.
+//
+// getCurrentRPCType returns the current relay's RPC type via an atomic read.
+// currentRPCType is written per-relay and read concurrently across the parallel
+// batch relay goroutines, so all access goes through the atomic.
+func (rc *requestContext) getCurrentRPCType() sharedtypes.RPCType {
+	return sharedtypes.RPCType(rc.currentRPCType.Load())
+}
+
 func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]protocol.Response, error) {
 	// Internal error: No endpoint selected.
 	if rc.getSelectedEndpoint() == nil {
@@ -184,7 +204,7 @@ func (rc *requestContext) HandleServiceRequest(payloads []protocol.Payload) ([]p
 	// Only override if payload has an explicit RPC type (non-zero value).
 	// This preserves the default set in BuildHTTPRequestContextForEndpoint for health checks.
 	if payloads[0].RPCType != sharedtypes.RPCType_UNKNOWN_RPC {
-		rc.currentRPCType = payloads[0].RPCType
+		rc.currentRPCType.Store(int32(payloads[0].RPCType))
 		rc.heuristicRPCType = payloads[0].EffectiveRPCType()
 	}
 
@@ -423,7 +443,7 @@ func (rc *requestContext) GetObservations() protocolobservations.Observations {
 			Observations: []*protocolobservations.ShannonRequestObservations{
 				{
 					ServiceId:    string(rc.serviceID),
-					RequestError: rc.requestErrorObservation,
+					RequestError: rc.requestErrorObservation.Load(),
 					ObservationData: &protocolobservations.ShannonRequestObservations_HttpObservations{
 						HttpObservations: &protocolobservations.ShannonHTTPEndpointObservations{
 							EndpointObservations: rc.endpointObservations,
@@ -609,7 +629,7 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 		}
 	// Default: use the RPC-type-specific URL from the selected endpoint
 	default:
-		targetServerURL = selectedEndpoint.GetURL(rc.currentRPCType)
+		targetServerURL = selectedEndpoint.GetURL(rc.getCurrentRPCType())
 
 		// FALLBACK HANDLING: If the URL is empty, it means the endpoint doesn't support
 		// the originally requested RPC type. This happens when RPC type fallback occurred
@@ -628,11 +648,11 @@ func (rc *requestContext) sendProtocolRelay(payload protocol.Payload) (protocol.
 				if url := selectedEndpoint.GetURL(rpcType); url != "" {
 					targetServerURL = url
 					rc.logger.Debug().
-						Str("requested_rpc_type", rc.currentRPCType.String()).
+						Str("requested_rpc_type", rc.getCurrentRPCType().String()).
 						Str("actual_rpc_type", rpcType.String()).
 						Str("endpoint", string(selectedEndpoint.Addr())).
 						Msg("Endpoint doesn't support requested RPC type, using supported type from endpoint")
-					rc.currentRPCType = rpcType // Update to the actual RPC type
+					rc.currentRPCType.Store(int32(rpcType)) // Update to the actual RPC type
 					break
 				}
 			}
@@ -1085,11 +1105,11 @@ func (rc *requestContext) trackRelayMinerError(relayResponse *servicetypes.Relay
 	).Debug().Msg("RelayMiner returned an error in RelayResponse (captured for reporting)")
 
 	// Store RelayMinerError data in request context for use in observations
-	rc.currentRelayMinerError = &protocolobservations.ShannonRelayMinerError{
+	rc.currentRelayMinerError.Store(&protocolobservations.ShannonRelayMinerError{
 		Codespace: relayMinerErr.Codespace,
 		Code:      relayMinerErr.Code,
 		Message:   relayMinerErr.Message,
-	}
+	})
 }
 
 // handleInternalError:
@@ -1104,7 +1124,7 @@ func (rc *requestContext) handleInternalError(internalErr error) (protocol.Respo
 	rc.logger.Error().Err(internalErr).Msg("Internal error occurred. This should be investigated as a bug.")
 
 	// Set request processing error for generating observations.
-	rc.requestErrorObservation = buildInternalRequestProcessingErrorObservation(internalErr)
+	rc.requestErrorObservation.Store(buildInternalRequestProcessingErrorObservation(internalErr))
 
 	return protocol.Response{}, internalErr
 }
@@ -1137,8 +1157,9 @@ func (rc *requestContext) handleEndpointError(
 	// (service, session, supplier) tuple so endpoint selection skips it for
 	// the rest of the session, and let the classifier (which now returns
 	// SuccessSignal for over-serviced payloads) handle the no-penalty path.
-	overServiced := rc.currentRelayMinerError != nil &&
-		heuristic.IsOverServicedRelayMinerError(rc.currentRelayMinerError.Codespace, rc.currentRelayMinerError.Code)
+	relayMinerErr := rc.currentRelayMinerError.Load()
+	overServiced := relayMinerErr != nil &&
+		heuristic.IsOverServicedRelayMinerError(relayMinerErr.Codespace, relayMinerErr.Code)
 	if !overServiced && endpointErr != nil && heuristic.IsOverServicedError(endpointErr.Error()) {
 		overServiced = true
 	}
@@ -1179,8 +1200,8 @@ func (rc *requestContext) handleEndpointError(
 		time.Now(), // Timestamp: endpoint query completed.
 		endpointErrorType,
 		fmt.Sprintf("relay error: %v", endpointErr),
-		rc.currentRelayMinerError, // Use RelayMinerError data from request context
-		rc.currentRPCType,         // Use RPC type from request context
+		rc.currentRelayMinerError.Load(), // Use RelayMinerError data from request context
+		rc.getCurrentRPCType(),           // Use RPC type from request context
 	)
 
 	// Track endpoint error observation for metrics
@@ -1202,7 +1223,7 @@ func (rc *requestContext) handleEndpointError(
 
 	if rc.reputationService != nil && !isBlacklisted {
 		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
-		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
+		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.getCurrentRPCType())
 
 		// Fire-and-forget: don't block request on reputation recording
 		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
@@ -1219,7 +1240,7 @@ func (rc *requestContext) handleEndpointError(
 	if domainErr != nil {
 		domain = shannonmetrics.ErrDomain
 	}
-	rpcTypeStr := metrics.NormalizeRPCType(rc.currentRPCType.String())
+	rpcTypeStr := metrics.NormalizeRPCType(rc.getCurrentRPCType().String())
 	reputationSignal := mapSignalTypeToMetricSignal(signal.Type)
 
 	// Extract status code from error if possible, otherwise use "error"
@@ -1271,8 +1292,8 @@ func (rc *requestContext) handleEndpointSuccess(
 		endpointQueryTime,
 		time.Now(), // Timestamp: endpoint query completed.
 		endpointResponse,
-		rc.currentRelayMinerError, // Use RelayMinerError data from request context
-		rc.currentRPCType,         // Use RPC type from request context
+		rc.currentRelayMinerError.Load(), // Use RelayMinerError data from request context
+		rc.getCurrentRPCType(),           // Use RPC type from request context
 	)
 
 	// Track endpoint success observation for metrics
@@ -1296,7 +1317,7 @@ func (rc *requestContext) handleEndpointSuccess(
 
 	if rc.reputationService != nil {
 		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
-		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.currentRPCType)
+		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.getCurrentRPCType())
 
 		var signal reputation.Signal
 
@@ -1329,7 +1350,7 @@ func (rc *requestContext) handleEndpointSuccess(
 			if probationDomain == "" {
 				probationDomain = shannonmetrics.ErrDomain
 			}
-			metrics.RecordProbationEvent(probationDomain, metrics.NormalizeRPCType(rc.currentRPCType.String()), string(rc.serviceID), metrics.ProbationEventRouted)
+			metrics.RecordProbationEvent(probationDomain, metrics.NormalizeRPCType(rc.getCurrentRPCType().String()), string(rc.serviceID), metrics.ProbationEventRouted)
 
 			rc.logger.Debug().
 				Str("endpoint", string(selectedEndpointAddr)).
@@ -1375,7 +1396,7 @@ func (rc *requestContext) handleEndpointSuccess(
 		domain = shannonmetrics.ErrDomain
 	}
 	statusCodeStr := metrics.GetStatusCodeCategory(endpointResponse.HTTPStatusCode)
-	rpcTypeStr := metrics.NormalizeRPCType(rc.currentRPCType.String())
+	rpcTypeStr := metrics.NormalizeRPCType(rc.getCurrentRPCType().String())
 	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
 	// Return relay response received from endpoint.

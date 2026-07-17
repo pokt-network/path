@@ -414,15 +414,20 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 	go func() {
 		defer close(connectionObservationChan)
 
+		// Capture the establishment time once and carry it through to the closure
+		// observation so the gateway can compute a real connection duration
+		// (closedAt - establishedAt). The bridge is live at this point.
+		establishedAt := time.Now()
+
 		// Send establishment observation immediately (buffered channel ensures it's captured)
 		wrc.logger.Debug().Msg("Websocket bridge started successfully, sending establishment observation")
-		connectionObservationChan <- getWebsocketConnectionEstablishedObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint)
+		connectionObservationChan <- getWebsocketConnectionEstablishedObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, establishedAt)
 
 		// Wait for the bridge to complete (blocks until Websocket connection terminates)
 		<-bridgeCompletionChan
-		// Send closure observation
+		// Send closure observation, stamping the actual close time.
 		wrc.logger.Debug().Msg("Websocket connection closed, sending closure observation")
-		connectionObservationChan <- getWebsocketConnectionClosedObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint)
+		connectionObservationChan <- getWebsocketConnectionClosedObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, establishedAt, time.Now())
 	}()
 
 	return nil

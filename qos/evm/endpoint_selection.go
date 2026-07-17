@@ -14,6 +14,7 @@ import (
 	"github.com/pokt-network/path/metrics"
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
 	"github.com/pokt-network/path/qos/selector"
 	"github.com/pokt-network/path/reputation"
 )
@@ -24,8 +25,10 @@ var (
 	errEmptyEndpointListObs     = errors.New("received empty list of endpoints to select from")
 )
 
-// TODO_UPNEXT(@adshmh): make the invalid response timeout duration configurable
-// It is set to 5 minutes because that is the session time as of #321.
+// TODO_UPNEXT(@adshmh): make the invalid response timeout duration configurable.
+// Fixed cooldown applied after an endpoint returns an empty/invalid response.
+// Intentionally kept shorter than a Shannon session so an endpoint can recover
+// within the same session; it is NOT derived from session length.
 const invalidResponseTimeout = 5 * time.Minute
 
 // EndpointSelectionResult contains endpoint selection results and metadata.
@@ -305,7 +308,7 @@ func (ss *serviceState) filterValidEndpointsWithDetails(availableEndpoints proto
 			if syncAllowance > 0 && perceivedBlock > 0 {
 				if url, err := data.addr.GetURL(); err == nil {
 					if urlBlock, ok := urlBlockHeights[url]; ok {
-						minAllowed := perceivedBlock - syncAllowance
+						minAllowed := qos.MinAllowedBlockNumber(perceivedBlock, syncAllowance)
 						if urlBlock < minAllowed {
 							blocksBehind := int64(perceivedBlock) - int64(urlBlock)
 							invalidCount++
@@ -453,7 +456,7 @@ func (ss *serviceState) categorizeValidationFailure(err error) qosobservations.E
 //
 // It returns an error if:
 // - The endpoint has returned an empty response in the past.
-// - The endpoint has returned an invalid response within the last 30 minutes.
+// - The endpoint has returned an invalid response within the invalidResponseTimeout window.
 // - The endpoint's response to an `eth_chainId` request is not the expected chain ID.
 // - The endpoint's response to an `eth_blockNumber` request is greater than the perceived block number.
 // - The endpoint's archival check is invalid, if requiresArchival is true and archival checks are enabled.
@@ -602,7 +605,7 @@ func (ss *serviceState) isBlockNumberValid(check endpointCheckBlockNumber) error
 
 	// If the endpoint's block height is less than the perceived block height minus the sync allowance,
 	// then the endpoint is behind the chain and should be filtered out.
-	minAllowedBlockNumber := perceivedBlock - syncAllowance
+	minAllowedBlockNumber := qos.MinAllowedBlockNumber(perceivedBlock, syncAllowance)
 
 	if parsedBlockNumber < minAllowedBlockNumber {
 		blocksBehind := int64(perceivedBlock) - int64(parsedBlockNumber)
@@ -792,7 +795,7 @@ func (ss *serviceState) filterStaleURLEndpoints(endpoints protocol.EndpointAddrL
 			Msg("filterStaleURLEndpoints: perceived_block is 0, skipping stale URL filtering")
 		return endpoints
 	}
-	minAllowed := perceivedBlock - syncAllowance
+	minAllowed := qos.MinAllowedBlockNumber(perceivedBlock, syncAllowance)
 
 	urlBlockHeights := ss.buildURLBlockHeightMap()
 

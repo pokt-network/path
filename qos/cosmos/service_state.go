@@ -9,6 +9,7 @@ import (
 	"github.com/pokt-network/path/metrics/devtools"
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
 )
 
 var _ protocol.EndpointSelector = &serviceState{}
@@ -97,8 +98,15 @@ func (ss *serviceState) updateFromEndpoints(updatedEndpoints map[protocol.Endpoi
 		// Per perceivedBlockNumber field documentation, it should be "the maximum of block height reported by any endpoint"
 		// but code was incorrectly overwriting with each endpoint, causing validation failures.
 		if blockNumber > ss.perceivedBlockNumber {
-			logger.Debug().Msgf("Updating perceived block number from %d to %d", ss.perceivedBlockNumber, blockNumber)
-			ss.perceivedBlockNumber = blockNumber
+			if !qos.IsPlausibleBlockHeight(blockNumber, ss.perceivedBlockNumber) {
+				logger.Warn().
+					Uint64("reported_block", blockNumber).
+					Uint64("perceived_block", ss.perceivedBlockNumber).
+					Msg("⚠️ ignoring implausible block height (possible poisoning attempt)")
+			} else {
+				logger.Debug().Msgf("Updating perceived block number from %d to %d", ss.perceivedBlockNumber, blockNumber)
+				ss.perceivedBlockNumber = blockNumber
+			}
 		}
 	}
 
@@ -113,8 +121,23 @@ func (ss *serviceState) getDisqualifiedEndpointsResponse(serviceID protocol.Serv
 		DisqualifiedEndpoints: make(map[protocol.EndpointAddr]devtools.QoSDisqualifiedEndpoint),
 	}
 
-	// Populate the data response object using the endpoints in the endpoint store.
-	for endpointAddr, endpoint := range ss.endpointStore.endpoints {
+	// Snapshot the endpoints under the store lock, then validate outside it.
+	// Ranging ss.endpointStore.endpoints directly (as this did) without holding
+	// endpointsMu races with the writers that update the map on every observation
+	// — Go's runtime turns a concurrent iterate+write into an unrecoverable
+	// `fatal error: concurrent map iteration and map write` that crashes the pod
+	// (reachable via GET /disqualified_endpoints). basicEndpointValidation takes
+	// serviceStateLock, so we copy first and release endpointsMu before calling it
+	// to avoid holding two locks across the call.
+	ss.endpointStore.endpointsMu.RLock()
+	endpointsSnapshot := make(map[protocol.EndpointAddr]endpoint, len(ss.endpointStore.endpoints))
+	for addr, ep := range ss.endpointStore.endpoints {
+		endpointsSnapshot[addr] = ep
+	}
+	ss.endpointStore.endpointsMu.RUnlock()
+
+	// Populate the data response object using the snapshot.
+	for endpointAddr, endpoint := range endpointsSnapshot {
 		if err := ss.basicEndpointValidation(endpoint); err != nil {
 			qosLevelDataResponse.DisqualifiedEndpoints[endpointAddr] = devtools.QoSDisqualifiedEndpoint{
 				EndpointAddr: endpointAddr,

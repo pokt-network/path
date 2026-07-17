@@ -105,10 +105,19 @@ func StartBridge(
 	endpointConn, err := ConnectWebsocketEndpoint(logger, websocketURL, headers)
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ error connecting to websocket endpoint")
-		// Clean up the client connection that was successfully upgraded
-		if closeErr := clientConn.Close(); closeErr != nil {
-			logger.Warn().Err(closeErr).Msg("error closing client connection after endpoint connection failure")
-		}
+		// The client upgrade already succeeded, so the client is a live Websocket
+		// peer. Send a legible close frame BEFORE closing: without one, gorilla
+		// drops the TCP connection with no close handshake, which clients surface
+		// as an abnormal closure (1006) or a protocol error (1002) rather than a
+		// meaningful reason. 1013 (Try Again Later) tells the client to reconnect
+		// — a fresh connection typically draws a different supplier — which is the
+		// correct guidance when a randomly selected upstream endpoint is down.
+		closeClientConnWithReason(
+			logger,
+			clientConn,
+			websocket.CloseTryAgainLater,
+			"upstream endpoint unavailable, please reconnect",
+		)
 		cancelCtx() // Clean up context on error
 		return nil, fmt.Errorf("createWebsocketBridge: %w", err)
 	}
@@ -161,6 +170,26 @@ func StartBridge(
 
 	// Return the completion channel so the caller can wait for bridge shutdown
 	return completionChan, nil
+}
+
+// closeClientConnWithReason sends a best-effort Websocket close frame carrying a
+// legible status code to an already-upgraded client connection, then closes it.
+//
+// Used on connection-establishment failures that occur AFTER the client upgrade
+// succeeds but BEFORE the bridge exists (so the normal shutdown() close-frame
+// path is not yet available). Without an explicit close frame, gorilla's Close()
+// tears down the TCP connection with no close handshake, which clients report as
+// an abnormal closure (1006) or a protocol error (1002) — misleading, since the
+// real cause is an unavailable upstream endpoint, not a client protocol fault.
+func closeClientConnWithReason(logger polylog.Logger, conn *websocket.Conn, closeCode int, reason string) {
+	deadline := time.Now().Add(1 * time.Second)
+	closeMsg := websocket.FormatCloseMessage(closeCode, reason)
+	if err := conn.WriteControl(websocket.CloseMessage, closeMsg, deadline); err != nil {
+		logger.Warn().Err(err).Msg("⚠️ could not write close frame to client connection after endpoint connection failure")
+	}
+	if err := conn.Close(); err != nil {
+		logger.Warn().Err(err).Msg("error closing client connection after endpoint connection failure")
+	}
 }
 
 // validateComponents ensures the Bridge is not created with nil components.
@@ -229,8 +258,13 @@ func (b *bridge) shutdown(err error) {
 		// from sending on msgChan after it's no longer being read.
 		b.cancelCtx()
 
-		// Determine appropriate close code and message for client reconnection guidance
+		// Determine appropriate close code and message for client reconnection guidance.
+		// Sanitize at this single emit choke point so a reserved code (e.g. a 1006
+		// propagated from an abnormal peer disconnect) never reaches the wire, where
+		// the relay miner rejects it ("websocket: bad close code 1006") and clients
+		// see a malformed frame.
 		closeCode, errMsg := b.determineCloseCodeAndMessage(err)
+		closeCode = sanitizeCloseCode(closeCode)
 		closeMsg := websocket.FormatCloseMessage(closeCode, errMsg)
 
 		// Write close messages with timeout to prevent hanging on broken connections
@@ -260,6 +294,25 @@ func (b *bridge) shutdown(err error) {
 			close(b.messageObservationsChan)
 		}
 	})
+}
+
+// sanitizeCloseCode maps RFC 6455 §7.4.1 reserved status codes — which are for
+// internal endpoint use and MUST NOT appear in a close frame on the wire — to a
+// valid code (1011 Internal Error). gorilla/websocket synthesizes a
+// *CloseError{Code: 1006} when a peer drops the TCP connection without a close
+// handshake; extractCloseInfo caches that code and determineCloseCodeAndMessage
+// would otherwise propagate it verbatim to the other peer. Relay miners reject a
+// 1006 close frame ("websocket: bad close code 1006") and clients see a malformed
+// frame. Reserved: 1005 (no status), 1006 (abnormal closure), 1015 (TLS handshake).
+func sanitizeCloseCode(code int) int {
+	switch code {
+	case websocket.CloseNoStatusReceived, // 1005
+		websocket.CloseAbnormalClosure, // 1006
+		websocket.CloseTLSHandshake:    // 1015
+		return websocket.CloseInternalServerErr // 1011
+	default:
+		return code
+	}
 }
 
 // determineCloseCodeAndMessage determines the appropriate Websocket close code and message
@@ -351,7 +404,7 @@ func (b *bridge) handleClientMessage(msg message) {
 	b.logger.Debug().Msgf("🔗 client message successfully processed, sending message to endpoint: %s", string(processedData))
 
 	// Send the processed message to the endpoint
-	if err := b.endpointConn.WriteMessage(msg.messageType, processedData); err != nil {
+	if err := b.endpointConn.writeMessage(msg.messageType, processedData); err != nil {
 		b.logger.Error().Err(err).Msg("❌ error writing client message to endpoint, shutting down bridge")
 
 		b.shutdown(fmt.Errorf("%w: failed to write client message to endpoint: %w", ErrBridgeConnectionFailed, err))
@@ -390,7 +443,7 @@ func (b *bridge) handleEndpointMessage(msg message) {
 	// Send the processed message to the client
 	// NOTE: On session rollover, the Endpoint will disconnect the Endpoint connection, which will trigger this
 	// error. This is expected and the Client is expected to handle the reconnection in their connection logic.
-	if err := b.clientConn.WriteMessage(msg.messageType, processedData); err != nil {
+	if err := b.clientConn.writeMessage(msg.messageType, processedData); err != nil {
 		b.logger.Error().Err(err).Msg("❌ error writing endpoint message to client, shutting down bridge")
 		b.shutdown(fmt.Errorf("%w: failed to write endpoint message to client: %w", ErrBridgeConnectionFailed, err))
 		return

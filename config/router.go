@@ -31,6 +31,25 @@ const (
 	// Reduced from 1000 to prevent OOM. At 100: 100 × ~3KB × 100 connections = ~30MB.
 	// Can be tuned based on expected concurrent websocket connections and message frequency.
 	defaultWebsocketMessageBufferSize = 100
+
+	// defaultMaxRequestBodyBytes caps the size of an HTTP request body PATH will
+	// read into memory. Without a limit, a single request with a multi-GB body
+	// OOMs the process (the body is buffered whole, and observation/detection
+	// paths read it before any downstream limit applies). 75MB leaves generous
+	// headroom for the largest legitimate payloads (big batches, large
+	// eth_getLogs/debug traces, contract deploys) while still bounding a single
+	// request's allocation. Reads past the limit fail (request rejected) rather
+	// than growing memory without bound.
+	defaultMaxRequestBodyBytes = 75 * 1024 * 1024
+
+	// defaultMaxConcurrentWebsocketConnections caps concurrent live websocket
+	// connections per gateway pod (defense-in-depth against goroutine/FD
+	// exhaustion). Each connection costs ~5-7 goroutines + 2 sockets + buffers
+	// (~50-100KB), so 10000 ≈ 0.5-1GB worst case — a generous ceiling well above
+	// normal load that still bounds catastrophic runaway. Tune to observed
+	// concurrent websocket load (Polygon is the primary websocket service).
+	// Set to a negative value in config to disable the limit entirely.
+	defaultMaxConcurrentWebsocketConnections = 10000
 )
 
 /* --------------------------------- Router Config Struct -------------------------------- */
@@ -48,6 +67,13 @@ type RouterConfig struct {
 	// Larger values use more memory but can handle higher message throughput.
 	// Default: 50 (prevents OOM while maintaining reasonable throughput)
 	WebsocketMessageBufferSize int `yaml:"websocket_message_buffer_size"`
+	// MaxConcurrentWebsocketConnections caps the number of concurrent live
+	// websocket connections per gateway pod. Default: 10000. A negative value
+	// disables the limit.
+	MaxConcurrentWebsocketConnections int `yaml:"max_concurrent_websocket_connections"`
+	// MaxRequestBodyBytes caps the size (in bytes) of an HTTP request body PATH
+	// will read into memory. Default: 10MB. A negative value disables the limit.
+	MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 }
 
 /* --------------------------------- Router Config Private Helpers -------------------------------- */
@@ -75,6 +101,14 @@ func (c *RouterConfig) hydrateRouterDefaults() error {
 	}
 	if c.WebsocketMessageBufferSize == 0 {
 		c.WebsocketMessageBufferSize = defaultWebsocketMessageBufferSize
+	}
+	// Only an unset (zero) value takes the default; a negative value is preserved
+	// so operators can explicitly disable the limit.
+	if c.MaxConcurrentWebsocketConnections == 0 {
+		c.MaxConcurrentWebsocketConnections = defaultMaxConcurrentWebsocketConnections
+	}
+	if c.MaxRequestBodyBytes == 0 {
+		c.MaxRequestBodyBytes = defaultMaxRequestBodyBytes
 	}
 	if c.SystemOverheadAllowanceDuration >= c.ReadTimeout || c.SystemOverheadAllowanceDuration >= c.WriteTimeout {
 		return fmt.Errorf("system overhead allowance duration %v must be less than read timeout %v and write timeout %v", c.SystemOverheadAllowanceDuration, c.ReadTimeout, c.WriteTimeout)

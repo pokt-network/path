@@ -806,7 +806,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 	}
 
 	// Return new request context for the pre-selected endpoint
-	return &requestContext{
+	rc := &requestContext{
 		logger:                fullyHydratedLogger, // Use fully-hydrated logger
 		context:               ctx,
 		fullNode:              p.FullNode,
@@ -823,8 +823,11 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		tieredSelector:        tieredSelector,
 		supplierBlacklist:     p.supplierBlacklist,
 		sessionExhaustion:     p.sessionExhaustion,
-		currentRPCType:        actualRPCType, // Use actual RPC type after fallback (may differ from requested)
-	}, protocolobservations.Observations{}, nil
+	}
+	// currentRPCType is atomic; set it after construction.
+	// Use actual RPC type after fallback (may differ from requested).
+	rc.currentRPCType.Store(int32(actualRPCType))
+	return rc, protocolobservations.Observations{}, nil
 }
 
 // ApplyHTTPObservations updates protocol instance state based on endpoint observations.

@@ -34,6 +34,7 @@ const (
 	LabelBatchCount         = "batch_count"
 	LabelSupplier           = "supplier"
 	LabelSignalType         = "signal_type"
+	LabelSeverity           = "severity"
 
 	// --- Latency signal values
 
@@ -288,6 +289,28 @@ var ResponseBytesSent = promauto.NewCounterVec(
 	[]string{LabelRPCType, LabelServiceID},
 )
 
+// RequestBodySizeBytes is the distribution of request body sizes, complementing
+// the request_bytes_received_total counter (which only yields totals/averages).
+// It exists to make p50/p99/max request sizes observable — e.g. to size the
+// max_request_body_bytes limit against real traffic.
+//
+// Cardinality is bounded: it reuses the same fixed rpc_type/service_id labels as
+// the counter (no new label dimensions) and a small, fixed bucket set. Buckets
+// span from ~256B to 128MB so the common case (single-KB), the tail (single-digit
+// MB), and anything approaching the request-size limit are all visible.
+var RequestBodySizeBytes = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name: MetricPrefix + "request_body_size_bytes",
+		Help: "Distribution of HTTP request body sizes in bytes by rpc_type and service_id.",
+		Buckets: []float64{
+			256, 1024, 4096, 16384, 65536, // 256B .. 64KB
+			262144, 1048576, 4194304, 16777216, // 256KB .. 16MB
+			67108864, 134217728, // 64MB, 128MB
+		},
+	},
+	[]string{LabelRPCType, LabelServiceID},
+)
+
 // =============================================================================
 // Probation Events (Counter)
 // Labels: domain, rpc_type, service_id, event
@@ -323,6 +346,7 @@ var DomainCircuitBreakerState = promauto.NewGaugeVec(
 // SetCircuitBreakerState sets the per-domain circuit-breaker gauge.
 //   - broken=true → 1 (domain is currently locked out)
 //   - broken=false → 0 (domain is healthy / has been recovered)
+//
 // Skipped silently when domain is empty (which would happen for endpoints whose
 // URL parse fails and only happens in error paths anyway).
 func SetCircuitBreakerState(serviceID, domain string, broken bool) {
@@ -352,8 +376,8 @@ func SetCircuitBreakerState(serviceID, domain string, broken bool) {
 // =============================================================================
 
 const (
-	LabelReasonCategory       = "reason_category"
-	LabelCircuitBreakerEvent  = "event"
+	LabelReasonCategory          = "reason_category"
+	LabelCircuitBreakerEvent     = "event"
 	CircuitBreakerEventBroken    = "broken"
 	CircuitBreakerEventRecovered = "recovered"
 )
@@ -363,12 +387,12 @@ const (
 // how variable the underlying reason strings are. Add new categories here
 // when MarkBroken call sites grow new reason prefixes.
 const (
-	CircuitBreakReasonRetry            = "retry"             // failure during retry path
-	CircuitBreakReasonBatchTransport   = "batch_transport"   // batch path: transport-level error
-	CircuitBreakReasonBatchHeuristic   = "batch_heuristic"   // batch path: heuristic flagged response
-	CircuitBreakReasonParallelRetry   = "parallel_retry"    // parallel-retry path failure
-	CircuitBreakReasonHeuristic        = "heuristic"         // top-level heuristic break
-	CircuitBreakReasonUnknown          = "unknown"           // anything we can't classify
+	CircuitBreakReasonRetry          = "retry"           // failure during retry path
+	CircuitBreakReasonBatchTransport = "batch_transport" // batch path: transport-level error
+	CircuitBreakReasonBatchHeuristic = "batch_heuristic" // batch path: heuristic flagged response
+	CircuitBreakReasonParallelRetry  = "parallel_retry"  // parallel-retry path failure
+	CircuitBreakReasonHeuristic      = "heuristic"       // top-level heuristic break
+	CircuitBreakReasonUnknown        = "unknown"         // anything we can't classify
 )
 
 var DomainCircuitBreakerEventsTotal = promauto.NewCounterVec(
@@ -588,13 +612,44 @@ var SupplierReputationScore = promauto.NewGaugeVec(
 	[]string{LabelSupplier, LabelServiceID},
 )
 
+// Severity classes for supplier_signal_total. The reputation layer emits 8
+// distinct signal-type strings; carrying all 8 as a label multiplies this
+// counter's cardinality 8× on top of the (supplier × service_id) base — the
+// base already accumulates toward the full network supplier set as sessions
+// rotate, so the extra 8× is what pushes the metric into the 25K guard within
+// ~15 min of pod start. Collapsing to 3 severity classes cuts the fan to 3×
+// while preserving the only distinction this per-supplier view needs: is the
+// supplier working, degraded-but-serving, or failing. Full error taxonomy
+// (5xx vs timeout vs config) remains available per-domain on relays_total
+// (status_code + reputation_signal).
+const (
+	SupplierSeverityOK    = "ok"    // success, recovery_success
+	SupplierSeveritySlow  = "slow"  // slow_response, very_slow_response
+	SupplierSeverityError = "error" // minor/major/critical/fatal error
+)
+
 var SupplierSignalTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "supplier_signal_total",
-		Help: "Reputation signals emitted by supplier, service_id, and signal_type (success/minor_error/major_error/critical_error/fatal_error/recovery_success/slow_response/very_slow_response).",
+		Help: "Reputation signals emitted by supplier and service_id, collapsed to a severity class (ok/slow/error). Full error taxonomy is available per-domain on relays_total.",
 	},
-	[]string{LabelSupplier, LabelServiceID, LabelSignalType},
+	[]string{LabelSupplier, LabelServiceID, LabelSeverity},
 )
+
+// supplierSignalSeverity collapses a reputation signal-type string (the 8
+// reputation.SignalType wire values) into one of three severity classes.
+// Unknown/new signal types fall through to "error" so a mis-added type shows
+// up loudly rather than silently vanishing, and cardinality stays bounded.
+func supplierSignalSeverity(signalType string) string {
+	switch signalType {
+	case "success", "recovery_success":
+		return SupplierSeverityOK
+	case "slow_response", "very_slow_response":
+		return SupplierSeveritySlow
+	default: // minor_error, major_error, critical_error, fatal_error, unknown
+		return SupplierSeverityError
+	}
+}
 
 // =============================================================================
 // Relays (Counter + Histogram)
@@ -671,9 +726,12 @@ var WebsocketConnectionEventsTotal = promauto.NewCounterVec(
 
 var WebsocketConnectionDuration = promauto.NewHistogramVec(
 	prometheus.HistogramOpts{
-		Name:    MetricPrefix + "websocket_connection_duration_seconds",
-		Help:    "WebSocket connection duration in seconds by domain and service_id.",
-		Buckets: []float64{1, 5, 10, 30, 60, 300, 600, 1800, 3600}, // 1s to 1h
+		Name: MetricPrefix + "websocket_connection_duration_seconds",
+		Help: "WebSocket connection duration in seconds by domain and service_id.",
+		// Sub-second buckets (0.1/0.25/0.5) make immediate supplier resets — a
+		// connection that establishes then dies in well under a second — visible
+		// and distinguishable from healthy long-lived subscriptions.
+		Buckets: []float64{0.1, 0.25, 0.5, 1, 5, 10, 30, 60, 300, 600, 1800, 3600}, // 100ms to 1h
 	},
 	[]string{LabelDomain, LabelServiceID},
 )
@@ -755,17 +813,21 @@ var HedgeWinningLatency = promauto.NewHistogramVec(
 )
 
 // =============================================================================
-// Hedge per-supplier outcome (Histogram)
-// Labels: supplier, role (winner|loser)
-// Purpose: Answers "am I losing races, and by how much?" — a question the
-// existing path_hedge_* metrics cannot answer because they don't carry a
-// supplier label. Use win-rate = count{role=winner} / count{role=*}.
+// Hedge per-supplier outcome (Counter) + role latency (Histogram)
+// Purpose: Answers "am I losing races, and by how much?".
 //
-// Cardinality: deliberately omits service_id. With service_id, observed
-// production cardinality was ~79K unique tuples × 12 histogram series each
-// = 945K series for this one metric (audit 2026-04-28). Per-supplier latency
-// across all services answers the operator question; service-level breakdown
-// is available without supplier on path_hedge_winning_latency_seconds.
+// Split into two metrics to bound cardinality. The per-supplier signal is a
+// win-rate — a ratio of counts — which needs no buckets, so it lives on a plain
+// COUNTER (supplier × role = 2 series/supplier, ~10K series network-wide,
+// well under the 25K guard → complete, not first-seen-biased). The "by how
+// much" is a latency distribution that does NOT need per-supplier resolution,
+// so it lives on a HISTOGRAM keyed by role only (~2×12 series total).
+//
+// This replaces the earlier single per-supplier HistogramVec, which multiplied
+// ~8K supplier×role tuples by ~12 bucket series each = the largest single
+// metric family in the gateway (~585K series, ~39% of all gateway cardinality;
+// with service_id it was 945K — audit 2026-04-28). Win-rate = winner /
+// (winner + loser) on the counter; loser-vs-winner latency gap on the histogram.
 // =============================================================================
 
 const (
@@ -773,13 +835,26 @@ const (
 	HedgeRoleLoser  = "loser"
 )
 
-var HedgeSupplierLatency = promauto.NewHistogramVec(
-	prometheus.HistogramOpts{
-		Name:    MetricPrefix + "hedge_supplier_latency_seconds",
-		Help:    "Per-supplier hedge race outcome latency. role=winner|loser. service_id intentionally omitted to bound cardinality.",
-		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+// HedgeSupplierOutcomeTotal is the per-supplier win/loss counter. Bounded and
+// complete: supplier × {winner,loser} stays well under the guard cap.
+var HedgeSupplierOutcomeTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "hedge_supplier_outcome_total",
+		Help: "Per-supplier hedge race outcomes. role=winner|loser. Win-rate = winner/(winner+loser).",
 	},
 	[]string{LabelSupplier, "role"},
+)
+
+// HedgeRoleLatency is the hedge outcome latency distribution by role, aggregated
+// across all suppliers (no supplier label → tiny, fixed cardinality). Pairs
+// with HedgeSupplierOutcomeTotal for the per-supplier win-rate.
+var HedgeRoleLatency = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "hedge_role_latency_seconds",
+		Help:    "Hedge race outcome latency by role (winner|loser), aggregated across suppliers. Pairs with hedge_supplier_outcome_total for per-supplier win-rate.",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+	},
+	[]string{"role"},
 )
 
 // RecordHedgeRequest records a hedge request outcome
@@ -796,17 +871,23 @@ func RecordHedgeLatencySavings(rpcType, serviceID string, savingsSeconds float64
 	HedgeLatencySavings.WithLabelValues(rpcType, serviceID).Observe(savingsSeconds)
 }
 
-// RecordHedgeSupplierOutcome records a per-supplier hedge race outcome.
-// role must be HedgeRoleWinner or HedgeRoleLoser. Skipped when supplier is
-// empty or when the cardinality guard has tripped for this metric.
+// RecordHedgeSupplierOutcome records a hedge race outcome. role must be
+// HedgeRoleWinner or HedgeRoleLoser. The latency distribution is recorded per
+// role (no supplier label, always). The per-supplier win/loss count is recorded
+// only when supplier is known and the cardinality guard admits it.
 func RecordHedgeSupplierOutcome(supplier, role string, latencySeconds float64) {
+	// Role-only latency distribution: fixed, tiny cardinality — always recorded.
+	HedgeRoleLatency.WithLabelValues(role).Observe(latencySeconds)
+
+	// Per-supplier win/loss counter: 2 series/supplier, still guarded as a
+	// backstop against a supplier-address label leak.
 	if supplier == "" {
 		return
 	}
 	if !hedgeSupplierGuard.allow(supplier, role) {
 		return
 	}
-	HedgeSupplierLatency.WithLabelValues(supplier, role).Observe(latencySeconds)
+	HedgeSupplierOutcomeTotal.WithLabelValues(supplier, role).Inc()
 }
 
 // RecordBatchSize records a batch request with latency.
@@ -843,6 +924,13 @@ func batchCountBucket(batchCount int) string {
 func RecordRequestSize(rpcType, serviceID string, bytesReceived, bytesSent int64) {
 	RequestBytesReceived.WithLabelValues(rpcType, serviceID).Add(float64(bytesReceived))
 	ResponseBytesSent.WithLabelValues(rpcType, serviceID).Add(float64(bytesSent))
+
+	// Also record the per-request size distribution (for p99/max visibility).
+	// Only observe real request bodies; skip zero to avoid diluting the histogram
+	// with sizeless requests that carry no signal.
+	if bytesReceived > 0 {
+		RequestBodySizeBytes.WithLabelValues(rpcType, serviceID).Observe(float64(bytesReceived))
+	}
 }
 
 // RecordProbationEvent records a probation event (entered, exited, or routed)
@@ -898,17 +986,19 @@ func SetSupplierReputationScore(supplier, serviceID string, score float64) {
 	SupplierReputationScore.WithLabelValues(supplier, serviceID).Set(score)
 }
 
-// RecordSupplierSignal increments the per-supplier signal counter.
-// Skipped silently when supplier is empty (e.g., per-domain reputation key)
-// or when the cardinality guard has tripped for this metric.
+// RecordSupplierSignal increments the per-supplier signal counter, collapsing
+// the reputation signal type to a severity class (ok/slow/error) to bound
+// cardinality. Skipped silently when supplier is empty (e.g., per-domain
+// reputation key) or when the cardinality guard has tripped for this metric.
 func RecordSupplierSignal(supplier, serviceID, signalType string) {
 	if supplier == "" {
 		return
 	}
-	if !supplierSignalGuard.allow(supplier, serviceID, signalType) {
+	severity := supplierSignalSeverity(signalType)
+	if !supplierSignalGuard.allow(supplier, serviceID, severity) {
 		return
 	}
-	SupplierSignalTotal.WithLabelValues(supplier, serviceID, signalType).Inc()
+	SupplierSignalTotal.WithLabelValues(supplier, serviceID, severity).Inc()
 }
 
 // RecordRelay records an outgoing relay to a supplier endpoint with latency

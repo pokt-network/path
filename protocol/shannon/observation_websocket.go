@@ -89,6 +89,7 @@ func getWebsocketConnectionEstablishedObservation(
 	logger polylog.Logger,
 	serviceID protocol.ServiceID,
 	selectedEndpoint endpoint,
+	establishedAt time.Time,
 ) *protocolobservations.Observations {
 	return &protocolobservations.Observations{
 		Shannon: &protocolobservations.ShannonObservationsList{
@@ -100,6 +101,8 @@ func getWebsocketConnectionEstablishedObservation(
 							logger,
 							selectedEndpoint,
 							protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_ESTABLISHED,
+							establishedAt,
+							time.Time{}, // no close timestamp on establishment
 						),
 					},
 				},
@@ -112,6 +115,8 @@ func getWebsocketConnectionClosedObservation(
 	logger polylog.Logger,
 	serviceID protocol.ServiceID,
 	selectedEndpoint endpoint,
+	establishedAt time.Time,
+	closedAt time.Time,
 ) *protocolobservations.Observations {
 	return &protocolobservations.Observations{
 		Shannon: &protocolobservations.ShannonObservationsList{
@@ -123,6 +128,8 @@ func getWebsocketConnectionClosedObservation(
 							logger,
 							selectedEndpoint,
 							protocolobservations.ShannonWebsocketConnectionObservation_CONNECTION_CLOSED,
+							establishedAt,
+							closedAt,
 						),
 					},
 				},
@@ -234,15 +241,24 @@ func buildWebsocketMessageErrorObservation(
 // buildWebsocketConnectionObservation creates a Shannon websocket connection observation for connection lifecycle events.
 // It includes endpoint details and session information for connection-level tracking.
 // Used when websocket connection setup succeeds or when connection closes.
+//
+// establishedAt is the real connection-establishment time and is carried on BOTH
+// the ESTABLISHED and CLOSED events. closedAt is set only on the CLOSED event
+// (zero otherwise); the gateway computes connection duration as closedAt-establishedAt,
+// so the CLOSED observation must carry both. Previously this stamped
+// ConnectionEstablishedTimestamp=now on every event and never set
+// ConnectionClosedTimestamp, so the duration metric always recorded 0.
 func buildWebsocketConnectionObservation(
 	_ polylog.Logger,
 	endpoint endpoint,
 	eventType protocolobservations.ShannonWebsocketConnectionObservation_ConnectionEventType,
+	establishedAt time.Time,
+	closedAt time.Time,
 ) *protocolobservations.ShannonWebsocketConnectionObservation {
 	session := *endpoint.Session()
 	sessionHeader := session.GetHeader()
 
-	return &protocolobservations.ShannonWebsocketConnectionObservation{
+	obs := &protocolobservations.ShannonWebsocketConnectionObservation{
 		// Endpoint information
 		Supplier:           endpoint.Supplier(),
 		EndpointUrl:        endpoint.PublicURL(),
@@ -256,9 +272,18 @@ func buildWebsocketConnectionObservation(
 		SessionEndHeight:   sessionHeader.SessionEndBlockHeight,
 
 		// Connection lifecycle
-		ConnectionEstablishedTimestamp: timestamppb.New(time.Now()),
+		ConnectionEstablishedTimestamp: timestamppb.New(establishedAt),
 		EventType:                      eventType,
 	}
+
+	// Only the CLOSED event carries a close timestamp; its presence (together with
+	// the established timestamp above) is what lets the gateway record a non-zero
+	// connection duration.
+	if !closedAt.IsZero() {
+		obs.ConnectionClosedTimestamp = timestamppb.New(closedAt)
+	}
+
+	return obs
 }
 
 // buildWebsocketConnectionErrorObservation creates a Shannon websocket connection observation for failed connection events.

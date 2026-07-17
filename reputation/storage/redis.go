@@ -47,6 +47,15 @@ const (
 	fieldArchivalExpires = "archival_expires_at"
 )
 
+// perceivedBlockTTL bounds how long a perceived block-height entry lives in
+// Redis without being superseded by a higher write. A normally-advancing chain
+// refreshes this every write cycle (seconds), so it never expires under normal
+// operation; a stuck or poisoned value that no honest write can beat receives no
+// further writes and expires, self-healing. 1h is far above the write cadence
+// and ≈3 Shannon sessions (a session is ~20 blocks / ~20 min), so a perceived
+// height stuck this long is unambiguously stale.
+const perceivedBlockTTL = 1 * time.Hour
+
 // NewRedisStorage creates a new Redis-backed storage.
 // It validates the connection by sending a PING command.
 func NewRedisStorage(ctx context.Context, config reputation.RedisConfig, ttl time.Duration) (*RedisStorage, error) {
@@ -392,18 +401,30 @@ func (s *RedisStorage) SetPerceivedBlockNumber(ctx context.Context, serviceID pr
 	key := s.perceivedBlockKey(serviceID)
 
 	// Use Lua script for atomic compare-and-set (only update if higher)
-	// This ensures that across all replicas, the max value always wins
+	// This ensures that across all replicas, the max value always wins.
+	//
+	// The SET carries a TTL (ARGV[2] seconds) so a stuck perceived height
+	// self-heals instead of persisting forever. A poisoned/too-high value would
+	// otherwise never recover: max-wins means honest lower writes are dropped
+	// (return 0) and every replica re-reads the bad value from Redis on restart,
+	// needing a manual DEL. Crucially the TTL is refreshed ONLY on the update
+	// path (return 1): a normally-advancing chain writes a higher value each
+	// cycle and keeps the key alive, while a value that no honest write can beat
+	// (because it is above the real tip) receives no further writes and expires.
+	// Refreshing the TTL on the no-op path would keep a poison alive forever.
 	script := redis.NewScript(`
 		local current = redis.call('GET', KEYS[1])
 		local newVal = tonumber(ARGV[1])
+		local ttl = tonumber(ARGV[2])
 		if current == false or tonumber(current) < newVal then
-			redis.call('SET', KEYS[1], ARGV[1])
+			redis.call('SET', KEYS[1], ARGV[1], 'EX', ttl)
 			return 1
 		end
 		return 0
 	`)
 
-	_, err := script.Run(ctx, s.client, []string{key}, blockNumber).Result()
+	ttlSeconds := int(perceivedBlockTTL.Seconds())
+	_, err := script.Run(ctx, s.client, []string{key}, blockNumber, ttlSeconds).Result()
 	if err != nil {
 		return fmt.Errorf("failed to set perceived block number: %w", err)
 	}

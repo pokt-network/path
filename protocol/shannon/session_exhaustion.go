@@ -7,9 +7,13 @@ import (
 )
 
 // sessionExhaustionTTL bounds how long an entry stays in the tracker before
-// being lazily reaped on the next Mark or IsExhausted call. Sessions on
-// Shannon are short (~10 blocks ≈ 10 min); 30 min covers ~3 session
-// lifecycles which is enough to absorb clock skew and session-boundary races
+// being lazily reaped on the next Mark or IsExhausted call. Entries are keyed
+// by (service, session, supplier), so a new session never reuses an old key —
+// the TTL only bounds memory growth, it does not affect correctness (a stale
+// entry from a past session is dead weight until reaped, never a false
+// exhaustion). It is set comfortably longer than a single Shannon session
+// (session length is a chain param) so a flagged supplier stays skipped for the
+// whole remaining session plus slack for clock skew and session-boundary races,
 // while preventing the map from growing unbounded if the reaping path is
 // somehow not triggered.
 const sessionExhaustionTTL = 30 * time.Minute

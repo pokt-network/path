@@ -208,6 +208,115 @@ func Test_Bridge_NoPanicOnProcessingError(t *testing.T) {
 	}
 }
 
+// Test_Bridge_ClientGetsCloseFrameOnEndpointConnectFailure verifies that when the
+// upstream endpoint connection fails AFTER the client upgrade has succeeded, the
+// client receives a legible Websocket close frame (1013 Try Again Later) instead
+// of an abnormal/protocol-error closure. This mirrors production: a randomly
+// selected supplier resets the bridge connection, and the client should be told
+// to reconnect (which draws a different supplier) rather than see a 1002/1006.
+func Test_Bridge_ClientGetsCloseFrameOnEndpointConnectFailure(t *testing.T) {
+	c := require.New(t)
+
+	// Stand up an endpoint server, capture its address, then close it so the
+	// bridge's upstream dial is refused — simulating a supplier that refuses/resets
+	// the connection right after the client upgrade succeeds.
+	endpointServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	endpointURL := "ws" + strings.TrimPrefix(endpointServer.URL, "http")
+	endpointServer.Close() // dials to this address now fail (connection refused)
+
+	messageProcessor := &mockWebsocketMessageProcessor{}
+	observationsChan := make(chan *observation.RequestResponseObservations, 10)
+
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// StartBridge upgrades the client, then fails to reach the (dead) upstream.
+		_, _ = StartBridge(
+			context.Background(),
+			polyzero.NewLogger(),
+			r,
+			w,
+			endpointURL,
+			http.Header{},
+			messageProcessor,
+			observationsChan,
+		)
+	}))
+	defer clientServer.Close()
+
+	clientURL := "ws" + strings.TrimPrefix(clientServer.URL, "http")
+	clientConn, _, err := websocket.DefaultDialer.Dial(clientURL, nil)
+	c.NoError(err, "client upgrade should succeed before the upstream failure")
+	defer clientConn.Close()
+
+	// The client must receive a well-formed close frame with code 1013, not an
+	// abnormal closure (1006) or protocol error (1002).
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, readErr := clientConn.ReadMessage()
+	c.Error(readErr, "expected a close frame from the gateway")
+	c.True(
+		websocket.IsCloseError(readErr, websocket.CloseTryAgainLater),
+		"client should receive a 1013 (Try Again Later) close frame, got: %v", readErr,
+	)
+}
+
+// Test_Bridge_SanitizesReservedCloseCode verifies that when the endpoint drops its
+// TCP connection with no close handshake — gorilla surfaces this as a reserved
+// *CloseError{Code: 1006} — PATH does NOT forward the reserved 1006 to the client.
+// Instead the client receives a valid 1011 (Internal Error) close frame. Without
+// sanitization the relay miner rejects the forwarded frame ("bad close code 1006")
+// and clients see a malformed close.
+func Test_Bridge_SanitizesReservedCloseCode(t *testing.T) {
+	c := require.New(t)
+
+	// Endpoint upgrades, then abruptly closes the underlying TCP connection with no
+	// close frame — the exact condition that makes gorilla synthesize a 1006.
+	endpointServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		up := websocket.Upgrader{}
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.UnderlyingConn().Close()
+	}))
+	defer endpointServer.Close()
+
+	messageProcessor := &mockWebsocketMessageProcessor{}
+	observationsChan := make(chan *observation.RequestResponseObservations, 10)
+	endpointURL := "ws" + strings.TrimPrefix(endpointServer.URL, "http")
+
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = StartBridge(
+			context.Background(),
+			polyzero.NewLogger(),
+			r,
+			w,
+			endpointURL,
+			http.Header{},
+			messageProcessor,
+			observationsChan,
+		)
+	}))
+	defer clientServer.Close()
+
+	clientURL := "ws" + strings.TrimPrefix(clientServer.URL, "http")
+	clientConn, _, err := websocket.DefaultDialer.Dial(clientURL, nil)
+	c.NoError(err)
+	defer clientConn.Close()
+
+	// The client must receive a valid (non-reserved) close code. Before the fix it
+	// would receive the reserved 1006 propagated straight from the endpoint.
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, readErr := clientConn.ReadMessage()
+	c.Error(readErr, "expected a close frame from the gateway")
+	c.False(
+		websocket.IsCloseError(readErr, websocket.CloseAbnormalClosure),
+		"client must NOT receive a reserved 1006 close code, got: %v", readErr,
+	)
+	c.True(
+		websocket.IsCloseError(readErr, websocket.CloseInternalServerErr),
+		"reserved endpoint code should be sanitized to 1011, got: %v", readErr,
+	)
+}
+
 // Mock implementations for testing
 
 type mockWebsocketMessageProcessor struct{}

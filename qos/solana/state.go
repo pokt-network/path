@@ -7,6 +7,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos"
 )
 
 // ServiceState keeps the expected current state of the Solana blockchain
@@ -71,9 +72,18 @@ func (s *ServiceState) UpdateFromEndpoints(updatedEndpoints map[protocol.Endpoin
 			continue
 		}
 
-		// TODO_TECHDEBT: use a more resilient method for updating block height.
-		// e.g. one endpoint returning a very large number as block height should
-		// not result in all other endpoints being marked as invalid.
+		// Defense-in-depth against block-height poisoning: ignore implausibly high
+		// reports so one endpoint cannot set the perceived height arbitrarily high
+		// and filter out every honest endpoint. (Small over-reports still require
+		// median-anchored consensus — see qos.IsPlausibleBlockHeight.)
+		if !qos.IsPlausibleBlockHeight(endpoint.BlockHeight, s.perceivedBlockHeight) {
+			s.logger.Warn().
+				Uint64("reported_block", endpoint.BlockHeight).
+				Uint64("perceived_block", s.perceivedBlockHeight).
+				Msg("⚠️ ignoring implausible block height (possible poisoning attempt)")
+			continue
+		}
+
 		s.perceivedEpoch = endpoint.Epoch
 		s.perceivedBlockHeight = endpoint.BlockHeight
 
