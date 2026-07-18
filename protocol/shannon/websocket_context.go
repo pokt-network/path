@@ -1,6 +1,7 @@
 package shannon
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -638,7 +639,7 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 	}
 
 	// If the selected endpoint is a protocol endpoint, we need to validate the message.
-	validatedRelayResponse, err := wrc.validateEndpointWebsocketMessage(msgData)
+	endpointMessageBz, statusCode, err := wrc.validateEndpointWebsocketMessage(msgData)
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ failed to validate relay response")
 		// Record error signal for message validation failure
@@ -648,28 +649,99 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 		return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, err), err
 	}
 
+	// A non-2xx status carried in a POKTHTTPResponse envelope (e.g. "session
+	// expired" / 410 when a connection lands on an already-expired session) is an
+	// endpoint/session control error, NOT a healthy message. Previously the whole
+	// path returned the raw payload with no status, so this case (a) leaked the
+	// undecoded protobuf envelope to the client and (b) recorded a SUCCESS signal —
+	// rewarding the supplier for returning an error.
+	//
+	// Do not record success. Do not penalize either: a session-expiry is a
+	// session-boundary / PATH-timing issue, not a supplier fault (penalizing here
+	// would just be a new reputation leak). Record the metric for observability and
+	// forward the DECODED body so the client receives readable JSON instead of a
+	// protobuf blob; the endpoint's close frame follows and the client reconnects.
+	if statusCode < 200 || statusCode >= 300 {
+		logger.Warn().
+			Int("http_status_code", statusCode).
+			Str("body", string(endpointMessageBz)).
+			Msg("⚠️ endpoint returned a non-2xx response over websocket — forwarding decoded body, no reputation change")
+		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMinorError)
+		return endpointMessageBz,
+			getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, fmt.Errorf("endpoint returned HTTP %d over websocket", statusCode)),
+			nil
+	}
+
 	// Record success signal for validated message
 	wrc.recordWebsocketSignal(reputation.NewSuccessSignal(time.Since(startTime)))
 	// Record message metric for endpoint→client direction
 	metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalOK)
-	return validatedRelayResponse, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+	return endpointMessageBz, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
 }
 
-// validateEndpointWebsocketMessage validates a message from the endpoint using the Shannon FullNode.
-// TODO_IMPROVE(@adshmh): Compare this to 'validateAndProcessResponse' and align the two implementations
-// w.r.t design, error handling, etc...
-func (wrc *websocketRequestContext) validateEndpointWebsocketMessage(msgData []byte) ([]byte, error) {
+// validateEndpointWebsocketMessage validates a message from the endpoint using the
+// Shannon FullNode and returns the decoded response body plus the HTTP status the
+// relay miner reported (200 for a raw streaming frame).
+//
+// Normal websocket data frames are delivered as the raw payload (a JSON-RPC response
+// or subscription push). Control/error responses — e.g. "session expired" when a
+// connection lands on an already-expired session — are delivered as a serialized
+// POKTHTTPResponse envelope (status + headers + body) in the SAME payload field.
+// Returning that verbatim (as this used to) ships an undecoded protobuf blob to the
+// client and hides the real status, so a non-2xx error is recorded as a healthy
+// message. Unwrap the envelope so the caller sees the status and the client always
+// gets the decoded body.
+//
+// Discriminator: a raw data frame is JSON and starts with '{' or '['; a serialized
+// POKTHTTPResponse starts with a protobuf tag byte (never '{'/'['). Only non-JSON
+// payloads are decoded as an envelope, and only when they actually parse as one, so a
+// normal frame is never misparsed. Raw frames report status 200.
+//
+// TODO_IMPROVE(@adshmh): Compare this to 'validateAndProcessResponse' and align the two
+// implementations w.r.t design, error handling, etc...
+func (wrc *websocketRequestContext) validateEndpointWebsocketMessage(msgData []byte) ([]byte, int, error) {
 	logger := wrc.methodLogger("validateEndpointWebsocketMessage")
 
-	// Validate the relay response using the Shannon FullNode
+	// Validate the relay response using the Shannon FullNode (verifies the supplier
+	// signature and unwraps the RelayResponse envelope).
 	relayResponse, err := wrc.fullNode.ValidateRelayResponse(sdk.SupplierAddress(wrc.selectedEndpoint.Supplier()), msgData)
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ failed to validate relay response in websocket message")
-		return nil, fmt.Errorf("%w: %s", errRelayResponseInWebsocketMessageValidationFailed, err.Error())
+		return nil, 0, fmt.Errorf("%w: %s", errRelayResponseInWebsocketMessageValidationFailed, err.Error())
 	}
-	logger.Debug().Msgf("received message from protocol endpoint: %s", string(relayResponse.Payload))
 
-	return relayResponse.Payload, nil
+	body, statusCode, unwrapped := extractWebsocketMessageBody(relayResponse.Payload)
+	if unwrapped {
+		logger.Debug().
+			Int("http_status_code", statusCode).
+			Msgf("unwrapped POKTHTTPResponse envelope from endpoint websocket message: %s", string(body))
+	} else {
+		logger.Debug().Msgf("received message from protocol endpoint: %s", string(body))
+	}
+	return body, statusCode, nil
+}
+
+// extractWebsocketMessageBody returns the response body and HTTP status carried by a
+// validated relay-response payload, plus whether it was a POKTHTTPResponse envelope.
+//
+// Normal streaming frames are raw JSON (a JSON-RPC response or a subscription push)
+// and are returned as-is with status 200. Control/error responses — e.g. "session
+// expired" (HTTP 410) when a connection lands on an already-expired session — are
+// delivered as a serialized POKTHTTPResponse envelope (status + headers + body) in
+// the SAME payload field; they are decoded so the caller sees the real status and the
+// client receives the decoded body rather than an undecoded protobuf blob.
+//
+// Discriminator: a raw data frame is JSON and starts with '{' or '['; a serialized
+// POKTHTTPResponse starts with a protobuf tag byte (never '{'/'['). Only non-JSON
+// payloads are considered, and only when they actually parse as an envelope, so a
+// normal frame is never misparsed.
+func extractWebsocketMessageBody(payload []byte) (body []byte, statusCode int, unwrapped bool) {
+	if trimmed := bytes.TrimSpace(payload); len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' {
+		if httpResp, err := deserializeRelayResponse(payload); err == nil {
+			return httpResp.Bytes, httpResp.HTTPStatusCode, true
+		}
+	}
+	return payload, http.StatusOK, false
 }
 
 // ---------- Logger Helpers ----------
