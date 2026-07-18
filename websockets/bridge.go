@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -212,6 +213,21 @@ func StartBridge(
 	// Start the bridge in a goroutine
 	go func() {
 		defer close(completionChan) // Signal completion when bridge shuts down
+		// Bound any panic in message processing or session-rebind reconnect to THIS
+		// connection: recover, close the client cleanly (1011), and let the bridge shut
+		// down — never let one connection's bug crash the whole process. Runs before the
+		// deferred close(completionChan) above (LIFO), so shutdown's close frames are sent
+		// first. Especially important with experimental session rebind running in this
+		// goroutine.
+		defer func() {
+			if r := recover(); r != nil {
+				b.logger.Error().
+					Str("panic", fmt.Sprintf("%v", r)).
+					Str("stack", string(debug.Stack())).
+					Msg("🔥 websocket bridge panic recovered — closing connection")
+				b.shutdown(fmt.Errorf("%w: bridge panic: %v", ErrBridgeConnectionFailed, r))
+			}
+		}()
 		b.start()
 	}()
 

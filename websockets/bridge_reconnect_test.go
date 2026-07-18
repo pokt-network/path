@@ -195,6 +195,61 @@ func Test_Bridge_ReconnectExhaustionClosesClient(t *testing.T) {
 	c.Equal(int32(0), atomic.LoadInt32(&reconnector.outcomeSuccess))
 }
 
+// panicProcessor panics on a client message — models a bug in message processing or
+// (by extension) the rebind path that runs on the same bridge goroutine.
+type panicProcessor struct{}
+
+func (panicProcessor) ProcessClientWebsocketMessage([]byte) ([]byte, error) {
+	panic("boom in client message processing")
+}
+
+func (panicProcessor) ProcessEndpointWebsocketMessage(b []byte) ([]byte, *observation.RequestResponseObservations, error) {
+	return b, nil, nil
+}
+
+// Test_Bridge_PanicRecoveredClosesClient verifies that a panic on the bridge goroutine
+// is recovered and closes the client connection cleanly instead of crashing the whole
+// process. If recovery were missing, the panic would take down the test binary.
+func Test_Bridge_PanicRecoveredClosesClient(t *testing.T) {
+	c := require.New(t)
+
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer endpoint.Close()
+
+	obsChan := make(chan *observation.RequestResponseObservations, 10)
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = StartBridge(
+			context.Background(), polyzero.NewLogger(), r, w,
+			wsURL(endpoint), http.Header{}, panicProcessor{}, obsChan, nil,
+		)
+	}))
+	defer clientServer.Close()
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL(clientServer), nil)
+	c.NoError(err)
+	defer clientConn.Close()
+
+	// Trigger the panic path; the client message is processed on the bridge goroutine.
+	_ = clientConn.WriteMessage(websocket.TextMessage, []byte("trigger-panic"))
+
+	// The client must be closed (recovered), and — critically — reaching this assertion
+	// at all proves the process did not crash.
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _, readErr := clientConn.ReadMessage()
+	c.Error(readErr, "client should be closed after a recovered bridge panic")
+}
+
 // swallowProcessor swallows (returns nil, no error) any endpoint message equal to
 // "SWALLOW" and echoes everything else. Models the subscription registry consuming a
 // replay response so the client never sees it.
