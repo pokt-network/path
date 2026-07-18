@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	gorillaws "github.com/gorilla/websocket"
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	"github.com/pokt-network/poktroll/pkg/relayer/proxy"
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
@@ -31,6 +32,10 @@ import (
 // For example, client messages are signed and endpoint messages are validated.
 var _ gateway.ProtocolRequestContextWebsocket = &websocketRequestContext{}
 
+// It also implements websockets.EndpointReconnector so the bridge can rebind the
+// endpoint connection across a Shannon session rollover (when session rebind is enabled).
+var _ websockets.EndpointReconnector = &websocketRequestContext{}
+
 type websocketRequestContext struct {
 	logger polylog.Logger
 
@@ -46,15 +51,43 @@ type websocketRequestContext struct {
 	// relayRequestSigner is used for signing relay requests.
 	relayRequestSigner RelayRequestSigner
 
-	// selectedEndpoint:
-	//   - Endpoint selected for sending a relay.
-	//   - Must be set via setSelectedEndpoint before sending a relay (otherwise sending fails).
-	//   - Protected by selectedEndpointMutex for thread safety.
+	// selectedEndpoint is the endpoint chosen at connect time. It is IMMUTABLE for the
+	// connection's life (set once at construction, never mutated), so the concurrent
+	// connection-observation goroutine reads it race-free. Session rebind does NOT touch
+	// it — it updates reconnectEndpoint instead. Used for observations, metrics, and
+	// logging.
 	selectedEndpoint endpoint
+
+	// reconnectEndpoint is the endpoint bound to the CURRENT session after a rebind. It
+	// is nil until the first reconnect. Written only by ReconnectEndpoint and read only
+	// by signingEndpoint() — both on the bridge's single message-processing goroutine —
+	// so no mutex is needed. The signing/validation path uses signingEndpoint() so it
+	// always operates on the live session.
+	reconnectEndpoint endpoint
+
+	// registry tracks JSON-RPC subscriptions so they can be replayed after a rollover.
+	// Non-nil only when session rebind is enabled.
+	registry *websockets.SubscriptionRegistry
+
+	// reconnectProvider re-selects the endpoint for the CURRENT session (same supplier)
+	// on a rollover. Non-nil only when session rebind is enabled; its presence is what
+	// makes this context act as an EndpointReconnector.
+	reconnectProvider func(context.Context) (endpoint, error)
 
 	// reputationService tracks endpoint reputation scores.
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
 	reputationService reputation.ReputationService
+}
+
+// signingEndpoint returns the endpoint whose session must be used to sign/validate
+// messages: the rebound endpoint if a reconnect has happened, else the original. Called
+// only on the bridge's message-processing goroutine (the sole writer of
+// reconnectEndpoint), so it needs no synchronization.
+func (wrc *websocketRequestContext) signingEndpoint() endpoint {
+	if wrc.reconnectEndpoint != nil {
+		return wrc.reconnectEndpoint
+	}
+	return wrc.selectedEndpoint
 }
 
 // ---------- Websocket Request Context Setup  ----------
@@ -112,6 +145,18 @@ func (p *Protocol) BuildWebsocketRequestContextForEndpoint(
 		serviceID:          serviceID,
 		relayRequestSigner: permittedSigner,
 		reputationService:  p.reputationService,
+	}
+
+	// Enable websocket session rebind: track subscriptions and give the bridge a way to
+	// re-select the endpoint for the current session on a rollover. When disabled, both
+	// stay nil and the bridge tears the connection down on a rollover (pre-rebind
+	// behavior). getPreSelectedEndpoint re-fetches the current session and returns the
+	// same-supplier endpoint bound to it, erroring if that supplier left the session.
+	if p.websocketSessionRebindEnabled {
+		wrc.registry = websockets.NewSubscriptionRegistry()
+		wrc.reconnectProvider = func(reconnectCtx context.Context) (endpoint, error) {
+			return p.getPreSelectedEndpoint(reconnectCtx, serviceID, selectedEndpointAddr, httpReq, sharedtypes.RPCType_WEBSOCKET)
+		}
 	}
 
 	// Create observation channel for connection-level observations only
@@ -389,8 +434,14 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 
 	// Start the websocket bridge and get a completion channel.
 	// The websocketRequestContext handles message processing.
-	// reconnector is nil for now: session rebind is wired in a later change. With nil,
-	// an endpoint session-rollover disconnect closes the client (pre-rebind behavior).
+	// When session rebind is enabled, this context is the bridge's EndpointReconnector so
+	// an endpoint session-rollover disconnect rebinds the endpoint and replays
+	// subscriptions instead of closing the client. Nil (rebind disabled) preserves the
+	// pre-rebind behavior where the disconnect closes the client.
+	var reconnector websockets.EndpointReconnector
+	if wrc.reconnectProvider != nil {
+		reconnector = wrc
+	}
 	bridgeCompletionChan, err := websockets.StartBridge(
 		ctx,
 		wrc.logger,
@@ -400,7 +451,7 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		endpointConnectionHeaders,
 		websocketMessageProcessor,
 		messageObservationsChan,
-		nil,
+		reconnector,
 	)
 	if err != nil {
 		err = fmt.Errorf("%w: failed to start websocket bridge: %s", errCreatingWebSocketConnection, err.Error())
@@ -506,15 +557,17 @@ func (wrc *websocketRequestContext) generateHandshakeSignature() (string, error)
 
 	// Create a relay request with empty payload for signing.
 	// The signature covers the session metadata (same as for regular relay requests).
+	// Uses the live session so a reconnect handshake is signed for the new session.
+	signingEndpoint := wrc.signingEndpoint()
 	handshakeRelayRequest := &servicetypes.RelayRequest{
 		Meta: servicetypes.RelayRequestMetadata{
-			SessionHeader:           wrc.selectedEndpoint.Session().GetHeader(),
-			SupplierOperatorAddress: wrc.selectedEndpoint.Supplier(),
+			SessionHeader:           signingEndpoint.Session().GetHeader(),
+			SupplierOperatorAddress: signingEndpoint.Supplier(),
 		},
 		Payload: nil, // Empty payload for handshake
 	}
 
-	app := wrc.selectedEndpoint.Session().GetApplication()
+	app := signingEndpoint.Session().GetApplication()
 	if app == nil {
 		logger.Error().Msg("❌ SHOULD NEVER HAPPEN: session application is nil")
 		return "", fmt.Errorf("session application is nil")
@@ -541,6 +594,97 @@ func (wrc *websocketRequestContext) generateHandshakeSignature() (string, error)
 	return signatureBase64, nil
 }
 
+// ---------- Session Rebind (EndpointReconnector) ----------
+
+// ReconnectEndpoint re-establishes the endpoint connection for the CURRENT session
+// after a rollover, implementing websockets.EndpointReconnector. It re-selects the
+// same-supplier endpoint bound to the new session, updates the signing endpoint so
+// subsequent frames sign against it, and dials a fresh endpoint websocket connection
+// with new-session headers and a re-signed handshake.
+//
+// Runs on the bridge's message-processing goroutine (the only reader/writer of
+// reconnectEndpoint), so the endpoint swap needs no synchronization.
+func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context) (*gorillaws.Conn, error) {
+	logger := wrc.methodLogger("ReconnectEndpoint")
+
+	if wrc.reconnectProvider == nil {
+		return nil, fmt.Errorf("websocket session rebind not configured")
+	}
+
+	// Re-select the endpoint for the current session (same supplier). Errors if that
+	// supplier is not in the new session — the bridge then falls back to closing the
+	// client with reconnect guidance.
+	ep, err := wrc.reconnectProvider(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("re-select endpoint for current session: %w", err)
+	}
+
+	// Update the signing endpoint FIRST so the URL/headers/handshake below (and all
+	// subsequent message signing) use the new session.
+	wrc.reconnectEndpoint = ep
+
+	websocketEndpointURL, err := getWebsocketEndpointURL(logger, ep)
+	if err != nil {
+		return nil, fmt.Errorf("resolve websocket URL for reconnect: %w", err)
+	}
+
+	endpointConnectionHeaders, err := getWebsocketConnectionHeaders(logger, ep)
+	if err != nil {
+		return nil, fmt.Errorf("build websocket headers for reconnect: %w", err)
+	}
+
+	// Non-fallback endpoints carry a handshake signature over the new session.
+	if !ep.IsFallback() {
+		signature, err := wrc.generateHandshakeSignature() // signs with signingEndpoint() == ep
+		if err != nil {
+			return nil, fmt.Errorf("generate handshake signature for reconnect: %w", err)
+		}
+		endpointConnectionHeaders.Set(request.HTTPHeaderSignature, signature)
+	}
+
+	conn, err := websockets.ConnectWebsocketEndpoint(logger, websocketEndpointURL, endpointConnectionHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("dial reconnect endpoint: %w", err)
+	}
+
+	logger.Info().
+		Str("endpoint_addr", string(ep.Addr())).
+		Str("supplier", ep.Supplier()).
+		Msg("🔁 re-established websocket endpoint connection for current session")
+	return conn, nil
+}
+
+// SubscriptionReplayFrames returns the client's active subscribe frames, signed for the
+// CURRENT session, to be replayed onto the reconnected endpoint. Implements
+// websockets.EndpointReconnector. Called after ReconnectEndpoint, so signingEndpoint()
+// already points at the new session.
+func (wrc *websocketRequestContext) SubscriptionReplayFrames() ([][]byte, error) {
+	if wrc.registry == nil {
+		return nil, nil
+	}
+
+	rawFrames := wrc.registry.ActiveSubscribeFrames()
+	if len(rawFrames) == 0 {
+		return nil, nil
+	}
+
+	// Fallback endpoints bypass the protocol, so their frames are replayed unsigned —
+	// mirroring ProcessProtocolClientWebsocketMessage.
+	if wrc.signingEndpoint().IsFallback() {
+		return rawFrames, nil
+	}
+
+	signedFrames := make([][]byte, 0, len(rawFrames))
+	for i, frame := range rawFrames {
+		signed, err := wrc.signClientWebsocketMessage(frame)
+		if err != nil {
+			return nil, fmt.Errorf("sign replay subscribe frame %d: %w", i, err)
+		}
+		signedFrames = append(signedFrames, signed)
+	}
+	return signedFrames, nil
+}
+
 // ---------- Client Message Processing ----------
 
 // ProcessProtocolClientWebsocketMessage processes a message from the client.
@@ -556,6 +700,15 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 		domain = shannonmetrics.ErrDomain
 	}
 	serviceID := string(wrc.serviceID)
+
+	// Session rebind: record an eth_subscribe for later replay, and rewrite an
+	// eth_unsubscribe's client-facing subscription id to the current supplier's id. This
+	// must run BEFORE signing so the signed frame carries the rewritten id. No-op
+	// (frame returned unchanged) when rebind is disabled or the frame is not a
+	// subscribe/unsubscribe.
+	if wrc.registry != nil {
+		msgData = wrc.registry.TrackClientMessage(msgData)
+	}
 
 	// If the selected endpoint is a fallback endpoint, skip signing the message.
 	// Fallback endpoints bypass the protocol so the raw message is sent to the endpoint.
@@ -585,15 +738,17 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 func (wrc *websocketRequestContext) signClientWebsocketMessage(msgData []byte) ([]byte, error) {
 	logger := wrc.methodLogger("signClientWebsocketMessage")
 
+	// Sign against the live session (the rebound endpoint after a rollover, else the original).
+	signingEndpoint := wrc.signingEndpoint()
 	unsignedRelayRequest := &servicetypes.RelayRequest{
 		Meta: servicetypes.RelayRequestMetadata{
-			SessionHeader:           wrc.selectedEndpoint.Session().GetHeader(),
-			SupplierOperatorAddress: wrc.selectedEndpoint.Supplier(),
+			SessionHeader:           signingEndpoint.Session().GetHeader(),
+			SupplierOperatorAddress: signingEndpoint.Supplier(),
 		},
 		Payload: msgData,
 	}
 
-	app := wrc.selectedEndpoint.Session().GetApplication()
+	app := signingEndpoint.Session().GetApplication()
 	if app == nil {
 		logger.Error().Msg("❌ SHOULD NEVER HAPPEN: session application is nil")
 		return nil, fmt.Errorf("session application is nil")
@@ -675,10 +830,24 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 			nil
 	}
 
+	// Session rebind: remap a subscription notification's id back to the client-facing
+	// id, or swallow a replay subscribe response the client must not see (forward=false).
+	// No-op when rebind is disabled.
+	forward := true
+	if wrc.registry != nil {
+		endpointMessageBz, forward = wrc.registry.TranslateEndpointMessage(endpointMessageBz)
+	}
+
 	// Record success signal for validated message
 	wrc.recordWebsocketSignal(reputation.NewSuccessSignal(time.Since(startTime)))
 	// Record message metric for endpoint→client direction
 	metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalOK)
+
+	// A swallowed replay response is a valid, successful endpoint reply (recorded above)
+	// that must not reach the client — return a nil body so the bridge drops it.
+	if !forward {
+		return nil, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+	}
 	return endpointMessageBz, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
 }
 
@@ -706,8 +875,9 @@ func (wrc *websocketRequestContext) validateEndpointWebsocketMessage(msgData []b
 	logger := wrc.methodLogger("validateEndpointWebsocketMessage")
 
 	// Validate the relay response using the Shannon FullNode (verifies the supplier
-	// signature and unwraps the RelayResponse envelope).
-	relayResponse, err := wrc.fullNode.ValidateRelayResponse(sdk.SupplierAddress(wrc.selectedEndpoint.Supplier()), msgData)
+	// signature and unwraps the RelayResponse envelope). Uses the live session's supplier
+	// so a response from a rebound endpoint validates against the correct supplier.
+	relayResponse, err := wrc.fullNode.ValidateRelayResponse(sdk.SupplierAddress(wrc.signingEndpoint().Supplier()), msgData)
 	if err != nil {
 		logger.Error().Err(err).Msg("❌ failed to validate relay response in websocket message")
 		return nil, 0, fmt.Errorf("%w: %s", errRelayResponseInWebsocketMessageValidationFailed, err.Error())
@@ -792,23 +962,25 @@ func (wrc *websocketRequestContext) methodLogger(methodName string) polylog.Logg
 // recordWebsocketSignal records a reputation signal for the websocket endpoint.
 // This tracks the health of endpoints used for websocket connections.
 func (wrc *websocketRequestContext) recordWebsocketSignal(signal reputation.Signal) {
-	if wrc.reputationService == nil || wrc.selectedEndpoint == nil {
+	// Attribute the signal to the live endpoint (the rebound one after a rollover).
+	signalEndpoint := wrc.signingEndpoint()
+	if wrc.reputationService == nil || signalEndpoint == nil {
 		return
 	}
 
 	// Build endpoint key using key builder to respect key_granularity setting
 	rpcType := sharedtypes.RPCType_WEBSOCKET
 	keyBuilder := wrc.reputationService.KeyBuilderForService(wrc.serviceID)
-	endpointKey := keyBuilder.BuildKey(wrc.serviceID, wrc.selectedEndpoint.Addr(), rpcType)
+	endpointKey := keyBuilder.BuildKey(wrc.serviceID, signalEndpoint.Addr(), rpcType)
 
 	// Extract domain for metrics
-	endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
+	endpointDomain, domainErr := shannonmetrics.ExtractDomainOrHost(signalEndpoint.PublicURL())
 	if domainErr != nil {
 		endpointDomain = shannonmetrics.ErrDomain
 	}
 
 	wrc.logger.Debug().
-		Str("endpoint_addr", string(wrc.selectedEndpoint.Addr())).
+		Str("endpoint_addr", string(signalEndpoint.Addr())).
 		Str("endpoint_domain", endpointDomain).
 		Str("signal_type", string(signal.Type)).
 		Msg("Recording websocket reputation signal")

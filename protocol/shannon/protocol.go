@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -170,6 +171,13 @@ type Protocol struct {
 	// Used by GetServiceEndpointDetails to query archival status for endpoints.
 	// Set via SetQoSServiceRegistry after initialization.
 	qosServiceRegistry gateway.QoSServiceRegistry
+
+	// websocketSessionRebindEnabled turns on transparent websocket session rebind:
+	// on a Shannon session rollover the endpoint connection is re-established and
+	// subscriptions replayed, instead of closing the client. Experimental; gated by the
+	// PATH_WEBSOCKET_SESSION_REBIND env var (canary toggle) until validated and promoted
+	// to YAML config. Default false = pre-rebind behavior.
+	websocketSessionRebindEnabled bool
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -299,6 +307,14 @@ func NewProtocol(
 		return nil, fmt.Errorf("failed to create relay signer: %w", err)
 	}
 	protocolInstance.relaySigner = relaySigner
+
+	// Experimental websocket session rebind, gated by env var (canary toggle) until
+	// validated and promoted to YAML config. When on, a websocket connection survives a
+	// Shannon session rollover by rebinding the endpoint and replaying subscriptions.
+	if os.Getenv("PATH_WEBSOCKET_SESSION_REBIND") == "true" {
+		protocolInstance.websocketSessionRebindEnabled = true
+		shannonLogger.Warn().Msg("⚠️ PATH_WEBSOCKET_SESSION_REBIND=true: experimental websocket session rebind ENABLED")
+	}
 
 	// Initialize reputation service if enabled.
 	// Reputation is the primary endpoint quality system - it tracks endpoint scores
