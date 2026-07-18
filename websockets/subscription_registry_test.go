@@ -21,12 +21,12 @@ func Test_SubscriptionRegistry_PassthroughTraffic(t *testing.T) {
 	r := NewSubscriptionRegistry()
 
 	cases := []string{
-		`{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`, // normal request
-		`{"jsonrpc":"2.0","id":1,"result":"0x1"}`,                         // normal response
+		`{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`,           // normal request
+		`{"jsonrpc":"2.0","id":1,"result":"0x1"}`,                                   // normal response
 		`[{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}]`, // batch (untracked)
-		`not-json`,     // malformed
-		``,             // empty
-		`  `,           // whitespace only
+		`not-json`, // malformed
+		``,         // empty
+		`  `,       // whitespace only
 	}
 	for _, c := range cases {
 		require.Equal(t, c, track(r, c), "client frame must pass through unchanged")

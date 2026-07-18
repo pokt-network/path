@@ -392,7 +392,8 @@ func getSessionCacheKey(serviceID protocol.ServiceID, appAddr string, height int
 // derive a stable cache key that doesn't change within a session window.
 //
 // Uses Shannon's 1-based session formula (sessions start at block 1, not 0):
-//   sessionStartHeight = currentHeight - ((currentHeight - 1) % numBlocksPerSession)
+//
+//	sessionStartHeight = currentHeight - ((currentHeight - 1) % numBlocksPerSession)
 //
 // For example, with NumBlocksPerSession=60:
 //
