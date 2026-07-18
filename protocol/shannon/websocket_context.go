@@ -72,11 +72,13 @@ type websocketRequestContext struct {
 	// reconnectProvider re-selects an endpoint for the CURRENT session on a rollover. It
 	// prefers the original supplier+URL (seamless) and, if that supplier rotated out of
 	// the new session, falls back to the best-available endpoint (tier-2) so the client's
-	// connection survives regardless of Shannon supplier rotation. Returns the endpoint,
-	// whether a different supplier was chosen, and (on failure) a metrics reason label.
-	// Non-nil only when session rebind is enabled; its presence is what makes this context
-	// act as an EndpointReconnector.
-	reconnectProvider func(context.Context) (ep endpoint, differentSupplier bool, failureReason string, err error)
+	// connection survives regardless of Shannon supplier rotation. avoidCurrent forces a
+	// different supplier than the one currently bound (used by the staleness watchdog,
+	// where the current supplier is the one stalling). Returns the endpoint, whether a
+	// different supplier was chosen, and (on failure) a metrics reason label. Non-nil only
+	// when session rebind is enabled; its presence is what makes this context act as an
+	// EndpointReconnector.
+	reconnectProvider func(ctx context.Context, avoidCurrent bool) (ep endpoint, differentSupplier bool, failureReason string, err error)
 
 	// lastReconnectDifferentSupplier records whether the most recent successful reconnect
 	// fell back to a different supplier (tier-2). Read by OnReconnectOutcome to tag the
@@ -168,8 +170,8 @@ func (p *Protocol) BuildWebsocketRequestContextForEndpoint(
 	// rotated out of the new session.
 	if p.websocketSessionRebindEnabled {
 		wrc.registry = websockets.NewSubscriptionRegistry()
-		wrc.reconnectProvider = func(reconnectCtx context.Context) (endpoint, bool, string, error) {
-			return p.getReconnectEndpoint(reconnectCtx, serviceID, selectedEndpointAddr, httpReq)
+		wrc.reconnectProvider = func(reconnectCtx context.Context, avoidCurrent bool) (endpoint, bool, string, error) {
+			return p.getReconnectEndpoint(reconnectCtx, serviceID, selectedEndpointAddr, httpReq, avoidCurrent)
 		}
 	}
 
@@ -321,11 +323,17 @@ func (p *Protocol) getPreSelectedEndpoint(
 //
 // Returns (endpoint, differentSupplier, failureReason, error): differentSupplier is true
 // when tier-2 chose a new supplier; failureReason is a metrics label on error.
+//
+// avoidPreferred skips tier-1 and excludes preferredAddr from the candidate set: the
+// staleness watchdog sets it because the currently bound supplier is the one stalling, so
+// reselecting it would just stall again. When it is the only endpoint in the new session,
+// selection fails with WSRebindFailedNoEndpoints and the bridge closes the client.
 func (p *Protocol) getReconnectEndpoint(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	preferredAddr protocol.EndpointAddr,
 	httpReq *http.Request,
+	avoidPreferred bool,
 ) (endpoint, bool, string, error) {
 	logger := p.logger.With("method", "getReconnectEndpoint", "service_id", serviceID)
 
@@ -350,6 +358,24 @@ func (p *Protocol) getReconnectEndpoint(
 	if len(endpoints) == 0 {
 		err := fmt.Errorf("%w: service %s new session has no websocket endpoints", protocol.ErrEndpointUnavailable, serviceID)
 		return nil, false, metrics.WSRebindFailedNoEndpoints, err
+	}
+
+	// Staleness rebind: the current supplier is the one stalling, so exclude it and force
+	// a different supplier. If it was the session's only endpoint, there is nothing to
+	// escape to → fail so the bridge closes the client.
+	if avoidPreferred {
+		delete(endpoints, preferredAddr)
+		if len(endpoints) == 0 {
+			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape a stalling supplier", protocol.ErrEndpointUnavailable, serviceID)
+			return nil, false, metrics.WSRebindFailedNoEndpoints, err
+		}
+		ep := selectBestReconnectEndpoint(endpoints)
+		logger.Warn().
+			Str("stalling_endpoint", string(preferredAddr)).
+			Str("replacement_endpoint", string(ep.Addr())).
+			Str("replacement_supplier", ep.Supplier()).
+			Msg("🔀 [WS-STALL] excluding stalling supplier — rebinding to a different supplier for the current session")
+		return ep, true, "", nil
 	}
 
 	// Tier 1: original supplier+URL still present → seamless rebind.
@@ -707,7 +733,7 @@ func (wrc *websocketRequestContext) generateHandshakeSignature() (string, error)
 //
 // Runs on the bridge's message-processing goroutine (the only reader/writer of
 // reconnectEndpoint), so the endpoint swap needs no synchronization.
-func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context) (*gorillaws.Conn, error) {
+func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoidCurrentSupplier bool) (*gorillaws.Conn, error) {
 	logger := wrc.methodLogger("ReconnectEndpoint")
 
 	if wrc.reconnectProvider == nil {
@@ -715,10 +741,12 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context) (*gor
 	}
 
 	// Re-select an endpoint for the current session: the original supplier if it is still
-	// in the new session (seamless), else the best-available endpoint (tier-2). Only a
-	// session lookup failure or a session with no endpoints errors here — the bridge then
-	// falls back to closing the client with reconnect guidance.
-	ep, differentSupplier, failureReason, err := wrc.reconnectProvider(ctx)
+	// in the new session (seamless), else the best-available endpoint (tier-2). When
+	// avoidCurrentSupplier is set (staleness watchdog), the original supplier is excluded
+	// so the rebind escapes it. Only a session lookup failure or a session with no usable
+	// endpoints errors here — the bridge then falls back to closing the client with
+	// reconnect guidance.
+	ep, differentSupplier, failureReason, err := wrc.reconnectProvider(ctx, avoidCurrentSupplier)
 	if err != nil {
 		wrc.lastReconnectReason = failureReason
 		return nil, fmt.Errorf("re-select endpoint for current session: %w", err)
@@ -835,6 +863,33 @@ func (wrc *websocketRequestContext) reconnectResultLabel(success bool, stage web
 		}
 		return metrics.WSRebindFailedSelect
 	}
+}
+
+// HasActiveSubscriptions reports whether the client holds at least one established
+// subscription that a rebind could replay. Implements websockets.EndpointReconnector; the
+// staleness watchdog uses it to decide whether a silent endpoint is worth rebinding.
+func (wrc *websocketRequestContext) HasActiveSubscriptions() bool {
+	return wrc.registry != nil && wrc.registry.HasActiveSubscriptions()
+}
+
+// OnEndpointStallDetected records that the staleness watchdog fired, for canary
+// observability. gaveUp=false: forcing a rebind onto a different supplier; gaveUp=true:
+// the endpoint stayed silent across repeated rebinds and the bridge is closing the client.
+// Implements websockets.EndpointReconnector.
+func (wrc *websocketRequestContext) OnEndpointStallDetected(gaveUp bool) {
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.signingEndpoint().PublicURL())
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	serviceID := string(wrc.serviceID)
+
+	metrics.RecordWebsocketEndpointStall(domain, serviceID, gaveUp)
+
+	// Error level ON PURPOSE for canary visibility. Temporary — downgrade once validated.
+	wrc.logger.Error().
+		Str("domain", domain).
+		Bool("gave_up", gaveUp).
+		Msg("📉 [WS-STALL] endpoint stall recorded")
 }
 
 // ---------- Client Message Processing ----------

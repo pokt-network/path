@@ -23,16 +23,23 @@ import (
 type mockReconnector struct {
 	url                 string
 	replay              [][]byte
+	hasSubs             bool // value returned by HasActiveSubscriptions (arms the watchdog)
 	calls               int32
 	errN                int32
 	outcomeSuccess      int32
 	outcomeFailed       int32
 	replayedReported    int32
 	selectStageReported int32
+	avoidCurrentCalls   int32 // ReconnectEndpoint calls that requested a different supplier
+	stallRebindReported int32 // OnEndpointStallDetected(gaveUp=false)
+	stallGiveupReported int32 // OnEndpointStallDetected(gaveUp=true)
 }
 
-func (m *mockReconnector) ReconnectEndpoint(_ context.Context) (*websocket.Conn, error) {
+func (m *mockReconnector) ReconnectEndpoint(_ context.Context, avoidCurrentSupplier bool) (*websocket.Conn, error) {
 	n := atomic.AddInt32(&m.calls, 1)
+	if avoidCurrentSupplier {
+		atomic.AddInt32(&m.avoidCurrentCalls, 1)
+	}
 	if n <= atomic.LoadInt32(&m.errN) {
 		return nil, fmt.Errorf("mock reconnect failure %d", n)
 	}
@@ -42,6 +49,10 @@ func (m *mockReconnector) ReconnectEndpoint(_ context.Context) (*websocket.Conn,
 
 func (m *mockReconnector) SubscriptionReplayFrames() ([][]byte, error) {
 	return m.replay, nil
+}
+
+func (m *mockReconnector) HasActiveSubscriptions() bool {
+	return m.hasSubs
 }
 
 func (m *mockReconnector) OnReconnectOutcome(success bool, replayedSubscriptions int, stage ReconnectFailureStage) {
@@ -54,6 +65,14 @@ func (m *mockReconnector) OnReconnectOutcome(success bool, replayedSubscriptions
 		}
 	}
 	atomic.AddInt32(&m.replayedReported, int32(replayedSubscriptions))
+}
+
+func (m *mockReconnector) OnEndpointStallDetected(gaveUp bool) {
+	if gaveUp {
+		atomic.AddInt32(&m.stallGiveupReported, 1)
+	} else {
+		atomic.AddInt32(&m.stallRebindReported, 1)
+	}
 }
 
 // upgradeAndClose upgrades a websocket request then immediately closes it, simulating
@@ -198,6 +217,139 @@ func Test_Bridge_ReconnectExhaustionClosesClient(t *testing.T) {
 	c.Equal(int32(1), atomic.LoadInt32(&reconnector.outcomeFailed), "failed outcome reported once")
 	c.Equal(int32(0), atomic.LoadInt32(&reconnector.outcomeSuccess))
 	c.Equal(int32(1), atomic.LoadInt32(&reconnector.selectStageReported), "failure stage should be 'select' (reconnect/dial)")
+}
+
+// upgradeAndStaySilent upgrades a websocket request then reads forever without ever
+// writing a data frame — modeling a silent supplier stall: the connection is
+// transport-alive (gorilla's read loop auto-answers pings with pongs) but delivers no
+// subscription data, which ping/pong liveness cannot detect.
+func upgradeAndStaySilent(w http.ResponseWriter, r *http.Request) {
+	conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+// Test_Bridge_StallWatchdogRebindsToDifferentSupplier proves the staleness watchdog: an
+// endpoint that stays connected but delivers no subscription data past the threshold is
+// rebound onto a DIFFERENT supplier (avoidCurrentSupplier=true), and the client stays
+// open and receives data from the replacement.
+func Test_Bridge_StallWatchdogRebindsToDifferentSupplier(t *testing.T) {
+	// Shrink the watchdog bounds so the stall is detected in milliseconds. Not parallel:
+	// mutates package vars.
+	origThresh, origInterval := endpointStalenessThreshold, stalenessCheckInterval
+	endpointStalenessThreshold = 40 * time.Millisecond
+	stalenessCheckInterval = 10 * time.Millisecond
+	defer func() {
+		endpointStalenessThreshold, stalenessCheckInterval = origThresh, origInterval
+	}()
+
+	c := require.New(t)
+
+	// Replacement endpoint (healthy): pushes a head and stays alive.
+	endpoint2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("post-stall-head"))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer endpoint2.Close()
+
+	// Original endpoint: connects then goes silent (the stalling supplier).
+	endpoint1 := httptest.NewServer(http.HandlerFunc(upgradeAndStaySilent))
+	defer endpoint1.Close()
+
+	reconnector := &mockReconnector{url: wsURL(endpoint2), hasSubs: true}
+	processor := &mockWebsocketMessageProcessor{}
+	obsChan := make(chan *observation.RequestResponseObservations, 100)
+
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := StartBridge(
+			context.Background(), polyzero.NewLogger(), r, w,
+			wsURL(endpoint1), http.Header{}, processor, obsChan, reconnector,
+		)
+		c.NoError(err)
+	}))
+	defer clientServer.Close()
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL(clientServer), nil)
+	c.NoError(err)
+	defer clientConn.Close()
+
+	// The client stays open across the stall rebind and receives the replacement's head.
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, msg, err := clientConn.ReadMessage()
+	c.NoError(err, "client must stay open across a stall-triggered rebind")
+	c.Equal("post-stall-head", string(msg))
+
+	// The rebind requested a DIFFERENT supplier, was reported as a stall rebind, and
+	// succeeded.
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&reconnector.avoidCurrentCalls) == 1 &&
+			atomic.LoadInt32(&reconnector.stallRebindReported) == 1 &&
+			atomic.LoadInt32(&reconnector.outcomeSuccess) == 1
+	}, 2*time.Second, 10*time.Millisecond, "stall rebind should avoid the current supplier and succeed")
+	c.Equal(int32(0), atomic.LoadInt32(&reconnector.stallGiveupReported))
+}
+
+// Test_Bridge_StallWatchdogGivesUpAfterMaxRebinds verifies that when every replacement
+// supplier is also silent, the watchdog stops after maxConsecutiveStallRebinds and closes
+// the client with 1012 rather than churning forever.
+func Test_Bridge_StallWatchdogGivesUpAfterMaxRebinds(t *testing.T) {
+	origThresh, origInterval, origMax := endpointStalenessThreshold, stalenessCheckInterval, maxConsecutiveStallRebinds
+	endpointStalenessThreshold = 40 * time.Millisecond
+	stalenessCheckInterval = 10 * time.Millisecond
+	maxConsecutiveStallRebinds = 2
+	defer func() {
+		endpointStalenessThreshold, stalenessCheckInterval, maxConsecutiveStallRebinds = origThresh, origInterval, origMax
+	}()
+
+	c := require.New(t)
+
+	// One silent server used for the original connection AND every reconnect: nothing
+	// ever delivers data, so each rebind stalls again.
+	silent := httptest.NewServer(http.HandlerFunc(upgradeAndStaySilent))
+	defer silent.Close()
+
+	reconnector := &mockReconnector{url: wsURL(silent), hasSubs: true}
+	processor := &mockWebsocketMessageProcessor{}
+	obsChan := make(chan *observation.RequestResponseObservations, 10)
+
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = StartBridge(
+			context.Background(), polyzero.NewLogger(), r, w,
+			wsURL(silent), http.Header{}, processor, obsChan, reconnector,
+		)
+	}))
+	defer clientServer.Close()
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL(clientServer), nil)
+	c.NoError(err)
+	defer clientConn.Close()
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, readErr := clientConn.ReadMessage()
+	c.Error(readErr, "client should be closed after the watchdog gives up")
+	c.True(
+		websocket.IsCloseError(readErr, websocket.CloseServiceRestart),
+		"give-up should close client with 1012, got: %v", readErr,
+	)
+	c.Equal(int32(2), atomic.LoadInt32(&reconnector.stallRebindReported), "two stall rebinds before giving up")
+	c.Equal(int32(1), atomic.LoadInt32(&reconnector.stallGiveupReported), "give-up reported once")
+	c.GreaterOrEqual(atomic.LoadInt32(&reconnector.avoidCurrentCalls), int32(2), "each stall rebind avoids the current supplier")
 }
 
 // panicProcessor panics on a client message — models a bug in message processing or

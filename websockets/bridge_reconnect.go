@@ -2,6 +2,7 @@ package websockets
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -20,13 +21,25 @@ type EndpointReconnector interface {
 	// ReconnectEndpoint opens a fresh endpoint websocket connection bound to the
 	// CURRENT session. Called after the previous endpoint connection dropped at a
 	// session boundary; it must NOT reuse the expired session.
-	ReconnectEndpoint(ctx context.Context) (*websocket.Conn, error)
+	//
+	// avoidCurrentSupplier asks the reconnector to reselect a DIFFERENT supplier than
+	// the one currently bound, skipping the seamless same-supplier (tier-1) path. The
+	// staleness watchdog sets it: a silent stall means the current supplier is the
+	// problem, so reconnecting to it would just stall again. An ordinary session-rollover
+	// reconnect passes false to prefer supplier continuity.
+	ReconnectEndpoint(ctx context.Context, avoidCurrentSupplier bool) (*websocket.Conn, error)
 
 	// SubscriptionReplayFrames returns the wire frames to send over the new endpoint
 	// connection to restore the client's active subscriptions, already signed for the
 	// current session. Empty when there is nothing to replay. Called after
 	// ReconnectEndpoint succeeds, so the frames are signed against the new session.
 	SubscriptionReplayFrames() ([][]byte, error)
+
+	// HasActiveSubscriptions reports whether the client currently holds at least one
+	// ESTABLISHED subscription (one that a rebind could actually replay). The staleness
+	// watchdog only arms when this is true: with nothing to keep flowing, a quiet
+	// endpoint connection is legitimate and must not be rebound.
+	HasActiveSubscriptions() bool
 
 	// OnReconnectOutcome reports the terminal result of a rebind episode so the
 	// implementer (which knows service/domain) can emit metrics/observability.
@@ -36,6 +49,12 @@ type EndpointReconnector interface {
 	// implementer can distinguish a selection/dial failure from a replay failure; the
 	// implementer holds the finer-grained selection reason itself.
 	OnReconnectOutcome(success bool, replayedSubscriptions int, stage ReconnectFailureStage)
+
+	// OnEndpointStallDetected reports that the staleness watchdog fired for observability.
+	// gaveUp=false: the watchdog is forcing a rebind onto a different supplier.
+	// gaveUp=true: the endpoint stayed silent across repeated rebinds and the bridge is
+	// closing the client (1012). The implementer knows service/domain for the metric.
+	OnEndpointStallDetected(gaveUp bool)
 }
 
 // ReconnectFailureStage identifies where in a rebind episode a failure happened, so the
@@ -73,6 +92,33 @@ var (
 	// up to reconnectMaxBackoff.
 	reconnectBaseBackoff = 250 * time.Millisecond
 	reconnectMaxBackoff  = 3 * time.Second
+)
+
+// Endpoint data-staleness watchdog bounds. Package-level vars (not consts) so tests can
+// shrink them; production never mutates them.
+//
+// The bridge's ping/pong liveness (connection.go) is transport-level: it only detects a
+// dead socket. A supplier can keep answering pings while its upstream subscription feed
+// goes silent (stops pushing eth_subscription notifications). These bounds add
+// application-level liveness: if an endpoint connection with ≥1 established subscription
+// delivers no data frame for endpointStalenessThreshold, the watchdog forces a rebind to
+// a different supplier — up to maxConsecutiveStallRebinds times before giving up.
+var (
+	// endpointStalenessThreshold is the maximum silence (no endpoint→client data frame)
+	// tolerated on a connection with an active subscription before a rebind is forced.
+	// 60s is 2× pongWaitDuration — comfortably beyond transport-level liveness and beyond
+	// the newHeads cadence of every high-throughput WS chain (poly ~2s, bsc ~3s, eth ~12s),
+	// so a live feed never trips it. Flat for now; a per-service / adaptive threshold
+	// (k × observed inter-notification interval) is a planned refinement.
+	endpointStalenessThreshold = 60 * time.Second
+	// stalenessCheckInterval is how often the watchdog evaluates staleness. Worst-case
+	// detection latency is endpointStalenessThreshold + stalenessCheckInterval.
+	stalenessCheckInterval = 15 * time.Second
+	// maxConsecutiveStallRebinds caps rebinds triggered by staleness with no intervening
+	// data. Reaching it means the replacement suppliers are also silent (or the chain is
+	// quiet network-wide); the bridge then closes the client (1012) rather than churn
+	// forever. Reset to 0 by any endpoint data frame.
+	maxConsecutiveStallRebinds = 3
 )
 
 // endpointDisconnectFunc returns the onDisconnect callback for an endpoint connection
@@ -115,9 +161,17 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		return
 	}
 
+	// A stall-triggered disconnect (raised by the staleness watchdog) means the current
+	// supplier is the problem, so the reconnect must avoid reselecting it. An ordinary
+	// session-rollover disconnect prefers supplier continuity (tier-1).
+	avoidCurrentSupplier := errors.Is(down.err, ErrEndpointStalled)
+
 	// NOTE: logged at Error level ON PURPOSE so rebind activity is visible on canary
 	// (LOG_LEVEL=error). Downgrade or remove once the feature is validated.
-	b.logger.Error().Err(down.err).Msg("🔁 [WS-REBIND] endpoint disconnected — attempting session rebind (client stays connected)")
+	b.logger.Error().
+		Err(down.err).
+		Bool("avoid_current_supplier", avoidCurrentSupplier).
+		Msg("🔁 [WS-REBIND] endpoint disconnected — attempting session rebind (client stays connected)")
 
 	// Stop the old endpoint loops and close the old connection before dialing a new one.
 	// Clear endpointConn so that, if the reconnect fails, shutdown's close-code logic
@@ -132,7 +186,7 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		b.endpointConn = nil
 	}
 
-	newConn, err := b.reconnectWithBackoff()
+	newConn, err := b.reconnectWithBackoff(avoidCurrentSupplier)
 	if err != nil {
 		b.logger.Error().Err(err).Msg("❌ [WS-REBIND] endpoint session rebind failed after retries — closing client")
 		b.reconnector.OnReconnectOutcome(false, 0, ReconnectStageSelect)
@@ -174,6 +228,10 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		b.endpointDisconnectFunc(b.endpointGen),
 	)
 
+	// Give the freshly reconnected endpoint a full staleness window before the watchdog
+	// can fire again, regardless of how long ago the OLD endpoint last sent data.
+	b.lastEndpointDataAt = time.Now()
+
 	// Error level ON PURPOSE for canary visibility (LOG_LEVEL=error). Temporary.
 	b.logger.Error().
 		Int("endpoint_gen", b.endpointGen).
@@ -184,7 +242,7 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 
 // reconnectWithBackoff calls the reconnector with bounded retries and exponential
 // backoff, aborting early if the bridge context is canceled.
-func (b *bridge) reconnectWithBackoff() (*websocket.Conn, error) {
+func (b *bridge) reconnectWithBackoff(avoidCurrentSupplier bool) (*websocket.Conn, error) {
 	backoff := reconnectBaseBackoff
 	var lastErr error
 	for attempt := 1; attempt <= reconnectMaxAttempts; attempt++ {
@@ -192,7 +250,7 @@ func (b *bridge) reconnectWithBackoff() (*websocket.Conn, error) {
 			return nil, b.ctx.Err()
 		}
 
-		conn, err := b.reconnector.ReconnectEndpoint(b.ctx)
+		conn, err := b.reconnector.ReconnectEndpoint(b.ctx, avoidCurrentSupplier)
 		if err == nil {
 			return conn, nil
 		}

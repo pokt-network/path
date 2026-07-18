@@ -95,6 +95,19 @@ type bridge struct {
 	// (and never selected) when reconnector == nil.
 	endpointDown chan endpointDisconnect
 
+	// lastEndpointDataAt is the time the endpoint last delivered a data frame toward the
+	// client. The staleness watchdog compares it against endpointStalenessThreshold to
+	// detect a silent supplier stall (transport alive, no subscription data). Mutated
+	// only on the start() goroutine (handleEndpointMessage, the watchdog, and a rebind
+	// swap), so it needs no synchronization.
+	lastEndpointDataAt time.Time
+
+	// consecutiveStallRebinds counts staleness-triggered rebinds with no intervening
+	// endpoint data. Reset to 0 by any endpoint data frame; when it reaches
+	// maxConsecutiveStallRebinds the bridge stops rebinding and closes the client.
+	// Mutated only on the start() goroutine.
+	consecutiveStallRebinds int
+
 	// shutdownOnce ensures shutdown() is only called once to prevent panics from double-closing channels
 	shutdownOnce sync.Once
 }
@@ -276,6 +289,19 @@ func (b *bridge) validateComponents() error {
 func (b *bridge) start() {
 	b.logger.Info().Msg("Websocket bridge operation started successfully")
 
+	// Start the fresh-data clock so the watchdog measures silence from bridge start.
+	b.lastEndpointDataAt = time.Now()
+
+	// The staleness watchdog runs only when rebind is enabled (it needs the reconnect
+	// machinery to escape a stalling supplier). When disabled, stalenessC stays nil and
+	// its select case blocks forever.
+	var stalenessC <-chan time.Time
+	if b.reconnector != nil {
+		ticker := time.NewTicker(stalenessCheckInterval)
+		defer ticker.Stop()
+		stalenessC = ticker.C
+	}
+
 	for {
 		select {
 		case msg := <-b.msgChan:
@@ -294,11 +320,64 @@ func (b *bridge) start() {
 		case down := <-b.endpointDown:
 			b.handleEndpointDown(down)
 
+		// Application-level liveness check: detect a silent supplier stall (endpoint
+		// transport alive but no subscription data) and force a rebind. Runs inline on
+		// this goroutine, serialized with message processing and reconnects.
+		case <-stalenessC:
+			b.checkEndpointStaleness()
+
 		case <-b.ctx.Done():
 			b.shutdown(ErrBridgeContextCanceled)
 			return
 		}
 	}
+}
+
+// checkEndpointStaleness detects a silent supplier stall — the endpoint connection is
+// transport-alive (still answering pings) but has pushed no subscription data past
+// endpointStalenessThreshold — and forces a rebind onto a DIFFERENT supplier. This
+// covers the gap left by ping/pong liveness, which only detects a dead socket.
+//
+// It arms only when the client holds an established subscription (something that should
+// be producing data and that a rebind can replay); a quiet connection with no active
+// subscription is legitimate. After maxConsecutiveStallRebinds with no intervening data
+// — the replacement suppliers are also silent, or the chain is quiet network-wide — it
+// stops rebinding and closes the client (1012), the pre-rebind fallback.
+//
+// Runs on the start() goroutine, so all state access is unsynchronized.
+func (b *bridge) checkEndpointStaleness() {
+	// No reconnector, or nothing that should be flowing → a quiet connection is fine.
+	if b.reconnector == nil || !b.reconnector.HasActiveSubscriptions() {
+		return
+	}
+	if time.Since(b.lastEndpointDataAt) < endpointStalenessThreshold {
+		return
+	}
+
+	if b.consecutiveStallRebinds >= maxConsecutiveStallRebinds {
+		b.logger.Error().
+			Int("consecutive_stall_rebinds", b.consecutiveStallRebinds).
+			Dur("staleness_threshold", endpointStalenessThreshold).
+			Msg("❌ [WS-STALL] endpoint still silent after repeated rebinds — closing client")
+		b.reconnector.OnEndpointStallDetected(true)
+		b.shutdown(fmt.Errorf("%w: endpoint silent after %d stall rebinds", ErrBridgeEndpointUnavailable, b.consecutiveStallRebinds))
+		return
+	}
+
+	b.consecutiveStallRebinds++
+	// Reset the data clock up front so the incoming rebind's new endpoint gets a full
+	// window; a real data frame will also reset it (and the counter) via
+	// handleEndpointMessage.
+	b.lastEndpointDataAt = time.Now()
+	b.logger.Error().
+		Dur("silence_threshold", endpointStalenessThreshold).
+		Int("stall_rebind_attempt", b.consecutiveStallRebinds).
+		Msg("⚠️ [WS-STALL] no subscription data past threshold — forcing rebind to a different supplier")
+	b.reconnector.OnEndpointStallDetected(false)
+
+	// Reuse the standard rebind path; ErrEndpointStalled marks it so the reconnect avoids
+	// the current (stalling) supplier.
+	b.handleEndpointDown(endpointDisconnect{gen: b.endpointGen, err: ErrEndpointStalled})
 }
 
 // shutdown performs immediate and complete bridge cleanup.
@@ -514,10 +593,24 @@ func (b *bridge) handleEndpointMessage(msg message) {
 	// message — e.g. the subscription registry consuming a replay subscribe response
 	// after a reconnect, which the client (already holding its subscription id) must
 	// not see. Nothing to forward.
+	//
+	// A swallowed frame deliberately does NOT reset the staleness clock: a post-reconnect
+	// replay ack only proves the supplier accepted the subscribe, not that its data feed
+	// is alive. Resetting on it would zero the stall-rebind counter after every rebind and
+	// defeat the give-up cap — a supplier that acks but never pushes data would be rotated
+	// to forever. Only client-facing data (below) counts as feed liveness.
 	if processedData == nil {
 		b.logger.Debug().Msg("endpoint message swallowed by processor, not forwarding to client")
 		return
 	}
+
+	// A real, client-facing data frame proves the supplier's subscription feed is alive:
+	// clear the staleness clock and the stall-rebind counter. Control frames (pings/pongs)
+	// never reach here — they are handled in the connection read loop — so a supplier that
+	// only answers pings but stops pushing data does NOT reset this, which is what lets the
+	// watchdog detect a silent stall.
+	b.lastEndpointDataAt = time.Now()
+	b.consecutiveStallRebinds = 0
 
 	// Send the processed message to the client
 	// NOTE: On session rollover, the Endpoint will disconnect the Endpoint connection, which will trigger this

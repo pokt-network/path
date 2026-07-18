@@ -285,6 +285,22 @@ func (r *SubscriptionRegistry) Len() int {
 	return len(r.byReqID)
 }
 
+// HasActiveSubscriptions reports whether at least one ESTABLISHED subscription exists —
+// one that has received its client-facing id and would therefore be replayed on a
+// rebind. It mirrors the filter in ActiveSubscribeFrames: a subscribe still awaiting its
+// first response does not count, so the staleness watchdog does not rebind a connection
+// whose only subscription could not yet be restored.
+func (r *SubscriptionRegistry) HasActiveSubscriptions() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, sub := range r.order {
+		if sub.clientSubID != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // removeLocked deletes a subscription from every index and the order slice. Caller
 // must hold r.mu.
 func (r *SubscriptionRegistry) removeLocked(sub *subscription) {

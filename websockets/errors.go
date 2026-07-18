@@ -19,4 +19,13 @@ var (
 	// ErrBridgeEndpointUnavailable indicates the bridge was shut down because the endpoint became unavailable
 	// This includes endpoint disconnections or endpoint-side errors
 	ErrBridgeEndpointUnavailable = errors.New("bridge endpoint unavailable")
+
+	// ErrEndpointStalled indicates the endpoint connection is transport-alive (still
+	// answering pings) but has delivered no subscription data past the staleness
+	// threshold — a silent supplier stall that ping/pong liveness cannot detect. It is
+	// raised by the staleness watchdog as a synthetic disconnect to force a session
+	// rebind onto a DIFFERENT supplier, and is distinguished from an ordinary
+	// (session-rollover) disconnect via errors.Is so the reconnect avoids reselecting
+	// the stalling supplier.
+	ErrEndpointStalled = errors.New("endpoint stalled: no subscription data past staleness threshold")
 )

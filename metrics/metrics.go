@@ -722,6 +722,13 @@ const (
 	WSRebindFailedDial         = "failed_dial"          // endpoint selected but the websocket dial failed after retries
 	WSRebindFailedReplay       = "failed_replay"        // reconnected, but building/writing subscription replay frames failed
 	WSRebindFailedSelect       = "failed_select"        // generic selection failure with no more specific reason
+
+	// --- WebSocket endpoint-staleness watchdog result labels (experimental)
+	// The `result` dimension of WebsocketEndpointStallTotal. A stall is a silent supplier
+	// (endpoint transport alive, no subscription data past the staleness threshold) that
+	// ping/pong liveness cannot detect.
+	WSStallRebind = "rebind" // watchdog forced a rebind onto a different supplier
+	WSStallGaveUp = "giveup" // endpoint stayed silent across repeated rebinds; client closed (1012)
 )
 
 var WebsocketConnectionsActive = promauto.NewGaugeVec(
@@ -783,6 +790,20 @@ var WebsocketSubscriptionsReplayedTotal = promauto.NewCounterVec(
 		Help: "Subscriptions replayed onto a reconnected websocket endpoint during rebind, by domain and service_id. EXPERIMENTAL.",
 	},
 	[]string{LabelDomain, LabelServiceID},
+)
+
+// WebsocketEndpointStallTotal counts endpoint-staleness watchdog firings by outcome.
+// EXPERIMENTAL / canary observability for the silent-supplier-stall detector: a supplier
+// that keeps answering pings but stops delivering subscription data (invisible to
+// ping/pong liveness). result is WSStallRebind (forced a rebind onto a different supplier)
+// or WSStallGaveUp (silent across repeated rebinds → client closed with 1012). The
+// downstream rebind outcome is captured separately in WebsocketRebindTotal.
+var WebsocketEndpointStallTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_endpoint_stall_total",
+		Help: "WebSocket silent-endpoint-stall watchdog firings by domain, service_id, and result (rebind/giveup). EXPERIMENTAL.",
+	},
+	[]string{LabelDomain, LabelServiceID, "result"},
 )
 
 // =============================================================================
@@ -1087,6 +1108,16 @@ func RecordWebsocketRebind(domain, serviceID, result string, replayedSubscriptio
 	if replayedSubscriptions > 0 {
 		WebsocketSubscriptionsReplayedTotal.WithLabelValues(domain, serviceID).Add(float64(replayedSubscriptions))
 	}
+}
+
+// RecordWebsocketEndpointStall records a staleness-watchdog firing. gaveUp distinguishes a
+// forced rebind (false) from giving up and closing the client (true).
+func RecordWebsocketEndpointStall(domain, serviceID string, gaveUp bool) {
+	result := WSStallRebind
+	if gaveUp {
+		result = WSStallGaveUp
+	}
+	WebsocketEndpointStallTotal.WithLabelValues(domain, serviceID, result).Inc()
 }
 
 // LatencyThresholds defines thresholds for latency signal categorization.
