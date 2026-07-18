@@ -820,6 +820,21 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 	// forward the DECODED body so the client receives readable JSON instead of a
 	// protobuf blob; the endpoint's close frame follows and the client reconnects.
 	if statusCode < 200 || statusCode >= 300 {
+		// When session rebind is enabled, swallow the relay miner's session-expiry
+		// advisory (HTTP 410 "session expired"). The miner sends this envelope frame
+		// immediately BEFORE the 4000 close frame (see relay-miner websocket.go
+		// handleSessionExpiration → sendSessionExpirationMessage then closeWithReason).
+		// The 4000 close drives a transparent reconnect, so forwarding the 410 would show
+		// the client a spurious "session expired" error mid-stream. Drop it (nil body);
+		// the client sees only the continuous stream. If the reconnect ultimately fails
+		// the bridge still closes the client with 1012. Non-410 errors are still forwarded
+		// so genuine endpoint errors reach the client.
+		if wrc.registry != nil && statusCode == http.StatusGone {
+			logger.Debug().Msg("swallowing session-expiry (410) advisory — session rebind will reconnect transparently")
+			metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMinorError)
+			return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, fmt.Errorf("session expired (rebind pending)")), nil
+		}
+
 		logger.Warn().
 			Int("http_status_code", statusCode).
 			Str("body", string(endpointMessageBz)).
