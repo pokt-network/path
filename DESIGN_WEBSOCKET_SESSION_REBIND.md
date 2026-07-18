@@ -1,8 +1,62 @@
 # Design: WebSocket Session Rebind (survive Shannon session rollover)
 
-Status: **designed. Phase 0 (grace tuning) applied on branch; Phase 1 (subscription registry) +
-Phase 2 (bridge/protocol rebind wiring) specified, not yet implemented.**
+Status: **Phase 0 (grace tuning) applied + canary-validated (WS lifetime 7.3s→22.7s,
+churn −70%, HTTP err flat). Phase 1 (subscription registry) BUILT + unit-tested. Phase 2
+bridge reconnect engine BUILT + race-tested (branch `feat/ws-session-rebind`). Remaining:
+Phase 2 Shannon wiring (reconnect provider + registry driving + flag) — specified below,
+canary-gated, not yet implemented.**
 Origin: 2026-07-18 investigation of the Polygon WS teardown (see memory `websocket_session_teardown`).
+
+## Implementation status (branch `feat/ws-session-rebind`, on top of `fix/ws-error-envelope-and-archival-leak`)
+
+- ✅ **Phase 1 — `websockets/subscription_registry.go`** (commit `c65d5176`). Pure JSON-RPC
+  subscription tracker: records eth_subscribe for replay, freezes the client-facing
+  subscription id, remaps notifications (current→client id), rewrites eth_unsubscribe,
+  swallows replay responses. 12 unit tests.
+- ✅ **Phase 2 seam — `websockets/connection.go`** (commit `1442b7bb`). Connection disconnect
+  is an injected `onDisconnect(error)` callback (was a hardcoded `cancelCtx()`). Pure
+  refactor, behavior identical.
+- ✅ **Phase 2 engine — `websockets/bridge.go` + `bridge_reconnect.go`** (commit `5495eea6`).
+  Optional `EndpointReconnector`: endpoint disconnect → dedicated child-ctx endpoint loops
+  → generation-tagged reconnect with bounded retries+backoff → replay subscriptions → client
+  stays open. Falls back to 1012 on exhaustion. Bridge also drops a swallowed (nil) endpoint
+  message. `reconnector == nil` everywhere in production today, so no behavior change.
+  Reconnect / retry-exhaustion / swallow paths race-tested with in-process WS servers.
+
+### Remaining — Phase 2 Shannon wiring (`protocol/shannon/websocket_context.go`), canary-gated
+
+The `websocketRequestContext` (wrc) becomes the `EndpointReconnector` and drives the registry:
+
+1. **`ReconnectEndpoint(ctx)`**: call a `reconnectProvider` closure (captured at build:
+   `p.getPreSelectedEndpoint(ctx, serviceID, selectedEndpointAddr, httpReq, WEBSOCKET)` — this
+   already re-fetches the CURRENT session and returns the same-supplier endpoint bound to it,
+   erroring if that supplier is not in the new session → reconnect fails → 1012 fallback), set
+   the current endpoint, rebuild URL+headers+handshake sig (reuse `getWebsocketEndpointURL` /
+   `getWebsocketConnectionHeaders` / `generateHandshakeSignature`), dial via
+   `websockets.ConnectWebsocketEndpoint`.
+2. **`SubscriptionReplayFrames()`**: `registry.ActiveSubscribeFrames()` → sign each with
+   `signClientWebsocketMessage` (uses the now-current session) → return.
+3. **Drive registry**: in `ProcessProtocolClientWebsocketMessage`, `registry.TrackClientMessage`
+   BEFORE signing (tracks subscribe, rewrites unsubscribe). In
+   `ProcessProtocolEndpointWebsocketMessage` (2xx path), `registry.TranslateEndpointMessage` on
+   the decoded body; if `forward == false`, return a nil body so the bridge swallows the replay
+   response.
+4. **Wire**: pass `wrc` (not nil) as the reconnector to `StartBridge` when enabled; build the
+   registry + reconnectProvider in `BuildWebsocketRequestContextForEndpoint`.
+5. **Flag**: gate on a Protocol bool (env `PATH_WEBSOCKET_SESSION_REBIND=true` for the canary
+   toggle; promote to YAML once validated). Default off → registry/reconnector nil → today's
+   behavior.
+
+⚠️ **BLOCKER discovered — `selectedEndpoint` mutation race.** Reconnect must update
+`wrc.selectedEndpoint` so subsequent frames sign with the new session, but it is read at ~20
+sites INCLUDING the connection-observation goroutine (`startWebSocketBridge`, establishment/
+closure reads). Today the field is write-once (set at construction, never mutated) so there is
+no mutex despite the struct comment claiming one. Enabling reconnect therefore REQUIRES adding a
+`sync.RWMutex` + `currentEndpoint()` getter / `setCurrentEndpoint()` setter and converting every
+concurrent read site. This is a mechanical but wide change to the most race-sensitive path in the
+repo and must land with `go test -race ./protocol/shannon/...` green AND canary `-race`
+validation. It is the reason this step is its own focused, canary-gated increment rather than
+part of the engine PR.
 
 ## Problem (mechanical, evidence-locked)
 
