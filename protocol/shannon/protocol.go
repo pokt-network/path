@@ -174,9 +174,9 @@ type Protocol struct {
 
 	// websocketSessionRebindEnabled turns on transparent websocket session rebind:
 	// on a Shannon session rollover the endpoint connection is re-established and
-	// subscriptions replayed, instead of closing the client. Experimental; gated by the
-	// PATH_WEBSOCKET_SESSION_REBIND env var (canary toggle) until validated and promoted
-	// to YAML config. Default false = pre-rebind behavior.
+	// subscriptions replayed, instead of closing the client. Experimental. DEFAULT ON
+	// (canary testing); PATH_WEBSOCKET_SESSION_REBIND=false disables. Graduates to YAML
+	// config once canary-validated.
 	websocketSessionRebindEnabled bool
 }
 
@@ -308,12 +308,22 @@ func NewProtocol(
 	}
 	protocolInstance.relaySigner = relaySigner
 
-	// Experimental websocket session rebind, gated by env var (canary toggle) until
-	// validated and promoted to YAML config. When on, a websocket connection survives a
-	// Shannon session rollover by rebinding the endpoint and replaying subscriptions.
-	if os.Getenv("PATH_WEBSOCKET_SESSION_REBIND") == "true" {
+	// Experimental websocket session rebind. When on, a websocket connection survives a
+	// Shannon session rollover by rebinding the endpoint and replaying subscriptions
+	// instead of closing the client.
+	//
+	// DEFAULT ON to make canary testing frictionless; set PATH_WEBSOCKET_SESSION_REBIND=false
+	// to disable (kill switch — takes effect on restart, no rebuild).
+	//
+	// WARNING: the LIVE reconnect path (session re-fetch, dial, handshake acceptance) is
+	// validated only on canary. Do NOT promote an image carrying this default to mainnet
+	// until canary-validated — or pin PATH_WEBSOCKET_SESSION_REBIND=false in the mainnet
+	// manifest. Once validated this graduates to a YAML config field.
+	if os.Getenv("PATH_WEBSOCKET_SESSION_REBIND") == "false" {
+		shannonLogger.Info().Msg("websocket session rebind DISABLED via PATH_WEBSOCKET_SESSION_REBIND=false")
+	} else {
 		protocolInstance.websocketSessionRebindEnabled = true
-		shannonLogger.Warn().Msg("⚠️ PATH_WEBSOCKET_SESSION_REBIND=true: experimental websocket session rebind ENABLED")
+		shannonLogger.Warn().Msg("⚠️ EXPERIMENTAL websocket session rebind ENABLED (default-on; set PATH_WEBSOCKET_SESSION_REBIND=false to disable)")
 	}
 
 	// Initialize reputation service if enabled.
