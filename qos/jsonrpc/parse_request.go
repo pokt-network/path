@@ -102,7 +102,18 @@ func tryUnmarshalAsSingle(logger polylog.Logger, requestBody []byte) ([]Request,
 }
 
 // validateAndMapRequests validates batch constraints and converts requests to a map.
-// Ensures no duplicate IDs exist and batch is not empty per JSON-RPC specification.
+//
+// Duplicate IDs are intentionally NOT rejected. Public RPC nodes accept and
+// serve batches with repeated IDs (and cross-type IDs such as 1 and "1"), so
+// PATH mirrors that behavior and stays a transparent pass-through — rejecting
+// them made PATH stricter than the JSON-RPC 2.0 spec (which does not require a
+// server to reject duplicates) and stricter than the very nodes it fronts.
+// Response correlation is best-effort by ID; a client that reuses IDs owns the
+// resulting ambiguity, exactly as it would talking to a node directly. Each
+// parsed request carries its own ID pointer, so same-value IDs remain distinct
+// map keys and every payload is preserved (N requests → N relays → N responses).
+//
+// An empty batch is still rejected per the JSON-RPC 2.0 spec.
 func validateAndMapRequests(logger polylog.Logger, requests []Request) (map[ID]Request, error) {
 	// Validate batch is not empty (per JSON-RPC spec)
 	if len(requests) == 0 {
@@ -111,26 +122,8 @@ func validateAndMapRequests(logger polylog.Logger, requests []Request) (map[ID]R
 		return nil, fmt.Errorf("empty batch request not allowed")
 	}
 
-	// Convert to map and validate no duplicate IDs exist.
-	//
-	// Duplicate detection is keyed by ID.String(), NOT by the ID struct itself:
-	// ID holds *int/*string pointers, so two IDs with the same value compare
-	// unequal as map keys (different pointer addresses) and duplicates would
-	// slip through. String() collapses to the value and matches the cross-type
-	// semantics of ID.Equal (the integer 1 and the string "1" are treated as
-	// the same ID), keeping detection consistent with response correlation.
 	requestsMap := make(map[ID]Request, len(requests))
-	seenIDs := make(map[string]struct{}, len(requests))
 	for _, req := range requests {
-		// Check for duplicate IDs (skip notifications which have empty IDs)
-		if !req.ID.IsEmpty() {
-			idKey := req.ID.String()
-			if _, exists := seenIDs[idKey]; exists {
-				logger.Error().Msg("❌ Duplicate ID found in batch request")
-				return nil, fmt.Errorf("duplicate ID '%s' found in batch request - IDs must be unique for proper request-response correlation", idKey)
-			}
-			seenIDs[idKey] = struct{}{}
-		}
 		requestsMap[req.ID] = req
 	}
 

@@ -25,9 +25,12 @@ func TestParseJSONRPCFromRequestBody(t *testing.T) {
 		{name: "malformed single", body: `{not json`, wantErr: true},
 		{name: "malformed batch", body: `[not json`, wantErr: true},
 		{name: "empty batch rejected", body: `[]`, wantErr: true},
-		{name: "duplicate int ids rejected", body: `[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":1}]`, wantErr: true},
-		{name: "duplicate string ids rejected", body: `[{"jsonrpc":"2.0","method":"a","id":"x"},{"jsonrpc":"2.0","method":"b","id":"x"}]`, wantErr: true},
-		{name: "cross-type duplicate ids rejected", body: `[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":"1"}]`, wantErr: true},
+		// Duplicate IDs are accepted (node-equivalent): public RPC nodes serve
+		// these, so PATH does too. Each request keeps its own ID pointer, so both
+		// payloads survive as distinct map entries (N requests → N responses).
+		{name: "duplicate int ids accepted", body: `[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":1}]`, wantBatch: true, wantCount: 2},
+		{name: "duplicate string ids accepted", body: `[{"jsonrpc":"2.0","method":"a","id":"x"},{"jsonrpc":"2.0","method":"b","id":"x"}]`, wantBatch: true, wantCount: 2},
+		{name: "cross-type duplicate ids accepted", body: `[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":"1"}]`, wantBatch: true, wantCount: 2},
 		{name: "distinct ids ok", body: `[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":2}]`, wantBatch: true, wantCount: 2},
 	}
 
