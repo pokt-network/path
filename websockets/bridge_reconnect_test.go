@@ -21,13 +21,14 @@ import (
 // connection (after failing the first `errN` attempts) and returns `replay` as the
 // subscription replay frames.
 type mockReconnector struct {
-	url              string
-	replay           [][]byte
-	calls            int32
-	errN             int32
-	outcomeSuccess   int32
-	outcomeFailed    int32
-	replayedReported int32
+	url                 string
+	replay              [][]byte
+	calls               int32
+	errN                int32
+	outcomeSuccess      int32
+	outcomeFailed       int32
+	replayedReported    int32
+	selectStageReported int32
 }
 
 func (m *mockReconnector) ReconnectEndpoint(_ context.Context) (*websocket.Conn, error) {
@@ -43,11 +44,14 @@ func (m *mockReconnector) SubscriptionReplayFrames() ([][]byte, error) {
 	return m.replay, nil
 }
 
-func (m *mockReconnector) OnReconnectOutcome(success bool, replayedSubscriptions int) {
+func (m *mockReconnector) OnReconnectOutcome(success bool, replayedSubscriptions int, stage ReconnectFailureStage) {
 	if success {
 		atomic.AddInt32(&m.outcomeSuccess, 1)
 	} else {
 		atomic.AddInt32(&m.outcomeFailed, 1)
+		if stage == ReconnectStageSelect {
+			atomic.AddInt32(&m.selectStageReported, 1)
+		}
 	}
 	atomic.AddInt32(&m.replayedReported, int32(replayedSubscriptions))
 }
@@ -193,6 +197,7 @@ func Test_Bridge_ReconnectExhaustionClosesClient(t *testing.T) {
 	c.Equal(int32(reconnectMaxAttempts), atomic.LoadInt32(&reconnector.calls), "all attempts made")
 	c.Equal(int32(1), atomic.LoadInt32(&reconnector.outcomeFailed), "failed outcome reported once")
 	c.Equal(int32(0), atomic.LoadInt32(&reconnector.outcomeSuccess))
+	c.Equal(int32(1), atomic.LoadInt32(&reconnector.selectStageReported), "failure stage should be 'select' (reconnect/dial)")
 }
 
 // panicProcessor panics on a client message — models a bug in message processing or

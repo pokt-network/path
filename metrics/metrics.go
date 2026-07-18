@@ -707,9 +707,21 @@ const (
 	WSDirectionClientToEndpoint = "client_to_endpoint"
 	WSDirectionEndpointToClient = "endpoint_to_client"
 
-	// --- WebSocket session-rebind outcome (experimental; see PATH_WEBSOCKET_SESSION_REBIND)
-	WSRebindSuccess = "success"
-	WSRebindFailed  = "failed"
+	// --- WebSocket session-rebind result labels (experimental; see PATH_WEBSOCKET_SESSION_REBIND)
+	// The `result` dimension of WebsocketRebindTotal. Split by supplier-continuity and
+	// failure stage so canary directly measures how often the original supplier persists
+	// across a Shannon session boundary (persistence rate = same / (same + different)) and
+	// why a rebind fell back to closing the client.
+	//
+	// Successes:
+	WSRebindSuccessSameSupplier      = "success_same_supplier"      // tier-1: original supplier+URL still in the new session (seamless)
+	WSRebindSuccessDifferentSupplier = "success_different_supplier" // tier-2: original supplier rotated out; rebound to best-available endpoint
+	// Failures (bridge gave up → client closed with 1012):
+	WSRebindFailedNoEndpoints  = "failed_no_endpoints"  // new session had zero usable websocket endpoints
+	WSRebindFailedSessionError = "failed_session_error" // could not fetch/build the new session
+	WSRebindFailedDial         = "failed_dial"          // endpoint selected but the websocket dial failed after retries
+	WSRebindFailedReplay       = "failed_replay"        // reconnected, but building/writing subscription replay frames failed
+	WSRebindFailedSelect       = "failed_select"        // generic selection failure with no more specific reason
 )
 
 var WebsocketConnectionsActive = promauto.NewGaugeVec(
@@ -750,14 +762,15 @@ var WebsocketMessagesTotal = promauto.NewCounterVec(
 
 // WebsocketRebindTotal counts websocket session-rebind episodes by outcome.
 // EXPERIMENTAL / canary observability for the session-rebind feature
-// (PATH_WEBSOCKET_SESSION_REBIND). result = success | failed. A "success" means the
-// endpoint was reconnected across a Shannon session rollover and subscriptions
-// replayed with the client kept open; "failed" means the bridge gave up and closed
-// the client (1012). Safe to remove once rebind is validated and promoted.
+// (PATH_WEBSOCKET_SESSION_REBIND). result is one of the WSRebind* labels above:
+// success_same_supplier / success_different_supplier on success (client kept open,
+// subscriptions replayed), or failed_* when the bridge gave up and closed the client
+// (1012). The same/different split measures supplier persistence across Shannon session
+// boundaries. Safe to remove once rebind is validated and promoted.
 var WebsocketRebindTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "websocket_rebind_total",
-		Help: "WebSocket session-rebind episodes by domain, service_id, and result (success/failed). EXPERIMENTAL.",
+		Help: "WebSocket session-rebind episodes by domain, service_id, and result (success_same_supplier/success_different_supplier/failed_*). EXPERIMENTAL.",
 	},
 	[]string{LabelDomain, LabelServiceID, "result"},
 )
@@ -1068,7 +1081,7 @@ func RecordWebsocketMessage(domain, serviceID, direction, reputationSignal strin
 
 // RecordWebsocketRebind records a websocket session-rebind episode outcome and, on
 // success, the number of subscriptions replayed. EXPERIMENTAL / canary observability
-// for the session-rebind feature. result should be WSRebindSuccess or WSRebindFailed.
+// for the session-rebind feature. result should be one of the WSRebind* labels.
 func RecordWebsocketRebind(domain, serviceID, result string, replayedSubscriptions int) {
 	WebsocketRebindTotal.WithLabelValues(domain, serviceID, result).Inc()
 	if replayedSubscriptions > 0 {

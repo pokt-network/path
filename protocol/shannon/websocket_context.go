@@ -69,10 +69,23 @@ type websocketRequestContext struct {
 	// Non-nil only when session rebind is enabled.
 	registry *websockets.SubscriptionRegistry
 
-	// reconnectProvider re-selects the endpoint for the CURRENT session (same supplier)
-	// on a rollover. Non-nil only when session rebind is enabled; its presence is what
-	// makes this context act as an EndpointReconnector.
-	reconnectProvider func(context.Context) (endpoint, error)
+	// reconnectProvider re-selects an endpoint for the CURRENT session on a rollover. It
+	// prefers the original supplier+URL (seamless) and, if that supplier rotated out of
+	// the new session, falls back to the best-available endpoint (tier-2) so the client's
+	// connection survives regardless of Shannon supplier rotation. Returns the endpoint,
+	// whether a different supplier was chosen, and (on failure) a metrics reason label.
+	// Non-nil only when session rebind is enabled; its presence is what makes this context
+	// act as an EndpointReconnector.
+	reconnectProvider func(context.Context) (ep endpoint, differentSupplier bool, failureReason string, err error)
+
+	// lastReconnectDifferentSupplier records whether the most recent successful reconnect
+	// fell back to a different supplier (tier-2). Read by OnReconnectOutcome to tag the
+	// metric. Bridge-goroutine only (sole reader/writer), so it needs no synchronization.
+	lastReconnectDifferentSupplier bool
+
+	// lastReconnectReason holds the failure-reason metric label from the most recent
+	// failed selection or dial, consumed by OnReconnectOutcome. Bridge-goroutine only.
+	lastReconnectReason string
 
 	// reputationService tracks endpoint reputation scores.
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
@@ -148,14 +161,15 @@ func (p *Protocol) BuildWebsocketRequestContextForEndpoint(
 	}
 
 	// Enable websocket session rebind: track subscriptions and give the bridge a way to
-	// re-select the endpoint for the current session on a rollover. When disabled, both
+	// re-select an endpoint for the current session on a rollover. When disabled, both
 	// stay nil and the bridge tears the connection down on a rollover (pre-rebind
-	// behavior). getPreSelectedEndpoint re-fetches the current session and returns the
-	// same-supplier endpoint bound to it, erroring if that supplier left the session.
+	// behavior). getReconnectEndpoint re-fetches the current session and prefers the
+	// original supplier, falling back to the best-available endpoint if that supplier
+	// rotated out of the new session.
 	if p.websocketSessionRebindEnabled {
 		wrc.registry = websockets.NewSubscriptionRegistry()
-		wrc.reconnectProvider = func(reconnectCtx context.Context) (endpoint, error) {
-			return p.getPreSelectedEndpoint(reconnectCtx, serviceID, selectedEndpointAddr, httpReq, sharedtypes.RPCType_WEBSOCKET)
+		wrc.reconnectProvider = func(reconnectCtx context.Context) (endpoint, bool, string, error) {
+			return p.getReconnectEndpoint(reconnectCtx, serviceID, selectedEndpointAddr, httpReq)
 		}
 	}
 
@@ -289,6 +303,94 @@ func (p *Protocol) getPreSelectedEndpoint(
 	}
 
 	return selectedEndpoint, nil
+}
+
+// getReconnectEndpoint re-selects a websocket endpoint for the CURRENT session on a
+// session rollover. It is the tier-1/tier-2 rebind selector:
+//
+//   - Tier 1 (seamless): if the ORIGINAL supplier+URL is still in the new session, reuse
+//     it. Same node → no data seam for the client's subscriptions.
+//   - Tier 2 (survive rotation): if that supplier rotated out — the common case for
+//     large-pool services, where the pinned supplier persists only ~NumSuppliersPerSession
+//     / poolSize of the time — fall back to the best-available endpoint in the new session
+//     so the client's connection survives regardless. Shannon supplier rotation is a
+//     protocol detail; the client only wants uninterrupted RPC data.
+//
+// Only when the new session has zero usable endpoints (or session lookup fails) does it
+// error, letting the bridge fall back to closing the client with reconnect guidance.
+//
+// Returns (endpoint, differentSupplier, failureReason, error): differentSupplier is true
+// when tier-2 chose a new supplier; failureReason is a metrics label on error.
+func (p *Protocol) getReconnectEndpoint(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	preferredAddr protocol.EndpointAddr,
+	httpReq *http.Request,
+) (endpoint, bool, string, error) {
+	logger := p.logger.With("method", "getReconnectEndpoint", "service_id", serviceID)
+
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	if err != nil {
+		logger.Error().Err(err).Msg("rebind: failed to retrieve active sessions for the new session")
+		return nil, false, metrics.WSRebindFailedSessionError, err
+	}
+
+	// Honor a Target-Suppliers pin if the original request carried one; tier-2 stays
+	// within the same allowed set.
+	allowedSuppliers := parseAllowedSuppliersHeader(httpReq)
+
+	// WebSocket endpoints have no health checks yet, so selection is not reputation-filtered
+	// (matches getPreSelectedEndpoint for RPCType_WEBSOCKET).
+	const filterByReputation = false
+	endpoints, _, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers, preferredAddr)
+	if err != nil {
+		logger.Error().Err(err).Msg("rebind: failed to build endpoint set for the new session")
+		return nil, false, metrics.WSRebindFailedSessionError, err
+	}
+	if len(endpoints) == 0 {
+		err := fmt.Errorf("%w: service %s new session has no websocket endpoints", protocol.ErrEndpointUnavailable, serviceID)
+		return nil, false, metrics.WSRebindFailedNoEndpoints, err
+	}
+
+	// Tier 1: original supplier+URL still present → seamless rebind.
+	if ep, ok := endpoints[preferredAddr]; ok {
+		return ep, false, "", nil
+	}
+
+	// Tier 2: original supplier rotated out of the new session → best-available fallback.
+	ep := selectBestReconnectEndpoint(endpoints)
+	logger.Warn().
+		Str("original_endpoint", string(preferredAddr)).
+		Str("fallback_endpoint", string(ep.Addr())).
+		Str("fallback_supplier", ep.Supplier()).
+		Msg("🔀 [WS-REBIND] original supplier rotated out — rebinding to a different supplier for the current session")
+	return ep, true, "", nil
+}
+
+// selectBestReconnectEndpoint deterministically chooses an endpoint from the new session
+// for a tier-2 rebind (original supplier rotated out). Prefers protocol (non-fallback)
+// endpoints and breaks ties by the lexicographically smallest address, so the choice is
+// reproducible across pods and replays.
+//
+// TODO_IMPROVE(@commoddity,@adshmh): once websocket endpoints have health checks, rank by
+// reputation / head freshness here to avoid rebinding onto a lagging node.
+func selectBestReconnectEndpoint(endpoints map[protocol.EndpointAddr]endpoint) endpoint {
+	var best endpoint
+	for _, ep := range endpoints {
+		if best == nil || betterReconnectCandidate(ep, best) {
+			best = ep
+		}
+	}
+	return best
+}
+
+// betterReconnectCandidate reports whether a is a better tier-2 rebind target than b:
+// non-fallback endpoints win over fallback; ties break on the smaller address.
+func betterReconnectCandidate(a, b endpoint) bool {
+	if a.IsFallback() != b.IsFallback() {
+		return !a.IsFallback()
+	}
+	return a.Addr() < b.Addr()
 }
 
 // ApplyWebSocketObservations updates protocol instance state based on endpoint observations.
@@ -597,10 +699,11 @@ func (wrc *websocketRequestContext) generateHandshakeSignature() (string, error)
 // ---------- Session Rebind (EndpointReconnector) ----------
 
 // ReconnectEndpoint re-establishes the endpoint connection for the CURRENT session
-// after a rollover, implementing websockets.EndpointReconnector. It re-selects the
-// same-supplier endpoint bound to the new session, updates the signing endpoint so
-// subsequent frames sign against it, and dials a fresh endpoint websocket connection
-// with new-session headers and a re-signed handshake.
+// after a rollover, implementing websockets.EndpointReconnector. It re-selects an endpoint
+// bound to the new session — the original supplier if it is still present, else the
+// best-available one (tier-2) — updates the signing endpoint so subsequent frames sign
+// against it, and dials a fresh endpoint websocket connection with new-session headers and
+// a re-signed handshake.
 //
 // Runs on the bridge's message-processing goroutine (the only reader/writer of
 // reconnectEndpoint), so the endpoint swap needs no synchronization.
@@ -611,25 +714,31 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context) (*gor
 		return nil, fmt.Errorf("websocket session rebind not configured")
 	}
 
-	// Re-select the endpoint for the current session (same supplier). Errors if that
-	// supplier is not in the new session — the bridge then falls back to closing the
-	// client with reconnect guidance.
-	ep, err := wrc.reconnectProvider(ctx)
+	// Re-select an endpoint for the current session: the original supplier if it is still
+	// in the new session (seamless), else the best-available endpoint (tier-2). Only a
+	// session lookup failure or a session with no endpoints errors here — the bridge then
+	// falls back to closing the client with reconnect guidance.
+	ep, differentSupplier, failureReason, err := wrc.reconnectProvider(ctx)
 	if err != nil {
+		wrc.lastReconnectReason = failureReason
 		return nil, fmt.Errorf("re-select endpoint for current session: %w", err)
 	}
 
 	// Update the signing endpoint FIRST so the URL/headers/handshake below (and all
-	// subsequent message signing) use the new session.
+	// subsequent message signing) use the new session. Record whether this is a
+	// different-supplier (tier-2) rebind so OnReconnectOutcome can tag the metric.
 	wrc.reconnectEndpoint = ep
+	wrc.lastReconnectDifferentSupplier = differentSupplier
 
 	websocketEndpointURL, err := getWebsocketEndpointURL(logger, ep)
 	if err != nil {
+		wrc.lastReconnectReason = metrics.WSRebindFailedSelect
 		return nil, fmt.Errorf("resolve websocket URL for reconnect: %w", err)
 	}
 
 	endpointConnectionHeaders, err := getWebsocketConnectionHeaders(logger, ep)
 	if err != nil {
+		wrc.lastReconnectReason = metrics.WSRebindFailedSelect
 		return nil, fmt.Errorf("build websocket headers for reconnect: %w", err)
 	}
 
@@ -637,6 +746,7 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context) (*gor
 	if !ep.IsFallback() {
 		signature, err := wrc.generateHandshakeSignature() // signs with signingEndpoint() == ep
 		if err != nil {
+			wrc.lastReconnectReason = metrics.WSRebindFailedSelect
 			return nil, fmt.Errorf("generate handshake signature for reconnect: %w", err)
 		}
 		endpointConnectionHeaders.Set(request.HTTPHeaderSignature, signature)
@@ -644,6 +754,7 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context) (*gor
 
 	conn, err := websockets.ConnectWebsocketEndpoint(logger, websocketEndpointURL, endpointConnectionHeaders)
 	if err != nil {
+		wrc.lastReconnectReason = metrics.WSRebindFailedDial
 		return nil, fmt.Errorf("dial reconnect endpoint: %w", err)
 	}
 
@@ -688,25 +799,42 @@ func (wrc *websocketRequestContext) SubscriptionReplayFrames() ([][]byte, error)
 // OnReconnectOutcome records the terminal result of a rebind episode for canary
 // observability (metric + a log visible at LOG_LEVEL=error). Implements
 // websockets.EndpointReconnector.
-func (wrc *websocketRequestContext) OnReconnectOutcome(success bool, replayedSubscriptions int) {
+func (wrc *websocketRequestContext) OnReconnectOutcome(success bool, replayedSubscriptions int, stage websockets.ReconnectFailureStage) {
 	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.signingEndpoint().PublicURL())
 	if domainErr != nil {
 		domain = shannonmetrics.ErrDomain
 	}
 	serviceID := string(wrc.serviceID)
 
-	result := metrics.WSRebindSuccess
-	if !success {
-		result = metrics.WSRebindFailed
-	}
+	result := wrc.reconnectResultLabel(success, stage)
 	metrics.RecordWebsocketRebind(domain, serviceID, result, replayedSubscriptions)
 
 	// Error level ON PURPOSE for canary visibility. Temporary — downgrade once validated.
 	wrc.logger.Error().
 		Bool("success", success).
+		Bool("different_supplier", wrc.lastReconnectDifferentSupplier).
 		Int("replayed_subscriptions", replayedSubscriptions).
 		Str("result", result).
 		Msg("📈 [WS-REBIND] rebind outcome recorded")
+}
+
+// reconnectResultLabel maps a rebind outcome to a WSRebind* metric label, combining the
+// bridge-reported failure stage with the selection detail stashed during ReconnectEndpoint
+// (same- vs different-supplier on success; the specific reason on a selection failure).
+func (wrc *websocketRequestContext) reconnectResultLabel(success bool, stage websockets.ReconnectFailureStage) string {
+	switch {
+	case success && wrc.lastReconnectDifferentSupplier:
+		return metrics.WSRebindSuccessDifferentSupplier
+	case success:
+		return metrics.WSRebindSuccessSameSupplier
+	case stage == websockets.ReconnectStageReplay:
+		return metrics.WSRebindFailedReplay
+	default: // ReconnectStageSelect — use the specific reason stashed by ReconnectEndpoint
+		if wrc.lastReconnectReason != "" {
+			return wrc.lastReconnectReason
+		}
+		return metrics.WSRebindFailedSelect
+	}
 }
 
 // ---------- Client Message Processing ----------

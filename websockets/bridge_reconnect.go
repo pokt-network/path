@@ -32,8 +32,27 @@ type EndpointReconnector interface {
 	// implementer (which knows service/domain) can emit metrics/observability.
 	// success=false means the bridge is giving up and closing the client.
 	// replayedSubscriptions is the number of subscriptions replayed on success.
-	OnReconnectOutcome(success bool, replayedSubscriptions int)
+	// stage identifies where a failure occurred (ReconnectStageNone on success) so the
+	// implementer can distinguish a selection/dial failure from a replay failure; the
+	// implementer holds the finer-grained selection reason itself.
+	OnReconnectOutcome(success bool, replayedSubscriptions int, stage ReconnectFailureStage)
 }
+
+// ReconnectFailureStage identifies where in a rebind episode a failure happened, so the
+// reconnector can emit a precise failure-reason metric. The bridge knows only the stage;
+// the reconnector (protocol layer) knows the specific selection/dial reason.
+type ReconnectFailureStage string
+
+const (
+	// ReconnectStageNone is passed on a successful rebind.
+	ReconnectStageNone ReconnectFailureStage = ""
+	// ReconnectStageSelect means ReconnectEndpoint failed — session lookup, endpoint
+	// selection, or the endpoint dial. The reconnector supplies the specific reason.
+	ReconnectStageSelect ReconnectFailureStage = "select"
+	// ReconnectStageReplay means the endpoint reconnected but building or writing the
+	// subscription replay frames failed.
+	ReconnectStageReplay ReconnectFailureStage = "replay"
+)
 
 // endpointDisconnect carries a recoverable endpoint disconnect to the bridge's start()
 // loop, tagged with the endpoint generation it was raised for so a late signal from an
@@ -116,7 +135,7 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 	newConn, err := b.reconnectWithBackoff()
 	if err != nil {
 		b.logger.Error().Err(err).Msg("❌ [WS-REBIND] endpoint session rebind failed after retries — closing client")
-		b.reconnector.OnReconnectOutcome(false, 0)
+		b.reconnector.OnReconnectOutcome(false, 0, ReconnectStageSelect)
 		b.shutdown(fmt.Errorf("%w: endpoint reconnect failed: %w", ErrBridgeEndpointUnavailable, err))
 		return
 	}
@@ -129,14 +148,14 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		// is unusable without restored subscriptions; close the client to reconnect.
 		newConn.Close()
 		b.logger.Error().Err(replayErr).Msg("❌ [WS-REBIND] failed to build subscription replay frames — closing client")
-		b.reconnector.OnReconnectOutcome(false, 0)
+		b.reconnector.OnReconnectOutcome(false, 0, ReconnectStageReplay)
 		b.shutdown(fmt.Errorf("%w: subscription replay failed: %w", ErrBridgeEndpointUnavailable, replayErr))
 		return
 	}
 	if err := writeReplayFrames(newConn, replayFrames); err != nil {
 		newConn.Close()
 		b.logger.Error().Err(err).Msg("❌ [WS-REBIND] failed to replay subscriptions onto new endpoint — closing client")
-		b.reconnector.OnReconnectOutcome(false, 0)
+		b.reconnector.OnReconnectOutcome(false, 0, ReconnectStageReplay)
 		b.shutdown(fmt.Errorf("%w: subscription replay write failed: %w", ErrBridgeEndpointUnavailable, err))
 		return
 	}
@@ -160,7 +179,7 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		Int("endpoint_gen", b.endpointGen).
 		Int("replayed_subscriptions", len(replayFrames)).
 		Msg("✅ [WS-REBIND] endpoint session rebind succeeded — client kept open")
-	b.reconnector.OnReconnectOutcome(true, len(replayFrames))
+	b.reconnector.OnReconnectOutcome(true, len(replayFrames), ReconnectStageNone)
 }
 
 // reconnectWithBackoff calls the reconnector with bounded retries and exponential
