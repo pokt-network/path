@@ -55,11 +55,11 @@ func Test_Connection_MessageHandling(t *testing.T) {
 
 			wsConn := newConnection(
 				ctx,
-				cancelCtx,
 				polyzero.NewLogger().With("conn", test.source),
 				conn,
 				test.source,
 				msgChan,
+				func(error) { cancelCtx() },
 			)
 			require.NotNil(t, wsConn)
 
@@ -98,11 +98,11 @@ func Test_Connection_ContextCancellation(t *testing.T) {
 
 	connection := newConnection(
 		ctx,
-		cancelCtx,
 		polyzero.NewLogger(),
 		conn,
 		messageSourceClient,
 		msgChan,
+		func(error) { cancelCtx() },
 	)
 
 	// Cancel the context
@@ -129,11 +129,11 @@ func Test_Connection_HandleDisconnect(t *testing.T) {
 
 	connection := newConnection(
 		ctx,
-		cancelCtx,
 		polyzero.NewLogger(),
 		conn,
 		messageSourceClient,
 		msgChan,
+		func(error) { cancelCtx() },
 	)
 
 	// Simulate disconnect by closing the connection
@@ -177,7 +177,7 @@ func Test_Connection_ReadLimit(t *testing.T) {
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	defer cancelCtx()
 
-	newConnection(ctx, cancelCtx, polyzero.NewLogger(), conn, messageSourceEndpoint, msgChan)
+	newConnection(ctx, polyzero.NewLogger(), conn, messageSourceEndpoint, msgChan, func(error) { cancelCtx() })
 
 	// The oversized frame must NOT be forwarded, and the read failure must
 	// tear the connection down via context cancellation.

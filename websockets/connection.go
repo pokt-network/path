@@ -74,8 +74,15 @@ type message struct {
 type websocketConnection struct {
 	*websocket.Conn
 
-	ctx       context.Context
-	cancelCtx context.CancelFunc
+	ctx context.Context
+
+	// onDisconnect is invoked (once the close info is recorded) when this connection
+	// fails at the network level — a read error, a peer close, or a ping timeout.
+	// The bridge decides what a disconnect means: the client connection cancels the
+	// whole bridge, while the endpoint connection may instead trigger a reconnect
+	// (session rollover) without tearing down the client. Decoupling the action from
+	// the connection is what lets the endpoint side rebind while the client stays up.
+	onDisconnect func(error)
 
 	logger polylog.Logger
 
@@ -153,17 +160,22 @@ func ConnectWebsocketEndpoint(
 }
 
 // newConnection creates a new websocket connection wrapper.
+//
+// ctx stops the connection's read/ping loops (its Done channel). onDisconnect is
+// called when the connection fails at the network level; the bridge supplies the
+// action (cancel the bridge, or trigger an endpoint reconnect).
 func newConnection(
 	ctx context.Context,
-	cancelCtx context.CancelFunc,
 	logger polylog.Logger,
 	conn *websocket.Conn,
 	source messageSource,
 	msgChan chan message,
+	onDisconnect func(error),
 ) *websocketConnection {
 	c := &websocketConnection{
-		ctx:       ctx,
-		cancelCtx: cancelCtx,
+		ctx: ctx,
+
+		onDisconnect: onDisconnect,
 
 		logger: logger.With("connection", source),
 
@@ -259,7 +271,9 @@ func (c *websocketConnection) handleDisconnect(err error) {
 	} else {
 		c.logger.Warn().Err(err).Msg("🔌 Handling websocket disconnection")
 	}
-	c.cancelCtx() // Cancel the context to signal the bridge to handle shutdown
+	// Hand the disconnect to the bridge-supplied action. For the client connection
+	// this cancels the bridge; for the endpoint connection it may trigger a reconnect.
+	c.onDisconnect(err)
 }
 
 // GetCloseInfo returns the close code and text from the last disconnect.

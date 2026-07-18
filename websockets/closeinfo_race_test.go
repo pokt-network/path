@@ -18,9 +18,9 @@ func Test_CloseInfo_DataRace(t *testing.T) {
 	defer cancel()
 
 	c := &websocketConnection{
-		logger:    polylog.Ctx(context.Background()),
-		cancelCtx: cancel,
-		source:    messageSourceEndpoint,
+		logger:       polylog.Ctx(context.Background()),
+		onDisconnect: func(error) { cancel() },
+		source:       messageSourceEndpoint,
 	}
 
 	// A close error so handleDisconnect takes the write path (closeCode != 0).

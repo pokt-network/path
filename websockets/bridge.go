@@ -144,22 +144,26 @@ func StartBridge(
 		return nil, fmt.Errorf("❌ invalid bridge components: %w", err)
 	}
 
-	// Initialize connections with bridge context and cancel function
+	// Initialize connections with the bridge context. A network-level disconnect on
+	// either connection cancels the bridge (current behavior). The endpoint side's
+	// disconnect action is upgraded to a reconnect trigger only when session rebind
+	// is enabled (see startWithReconnect); by default both sides simply cancel.
+	cancelOnDisconnect := func(error) { cancelCtx() }
 	b.endpointConn = newConnection(
 		b.ctx,
-		cancelCtx,
 		logger.With("conn", "endpoint"),
 		endpointConn,
 		messageSourceEndpoint,
 		msgChan,
+		cancelOnDisconnect,
 	)
 	b.clientConn = newConnection(
 		b.ctx,
-		cancelCtx,
 		logger.With("conn", "client"),
 		clientConn,
 		messageSourceClient,
 		msgChan,
+		cancelOnDisconnect,
 	)
 
 	// Start the bridge in a goroutine
