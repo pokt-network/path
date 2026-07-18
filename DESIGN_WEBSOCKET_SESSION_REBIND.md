@@ -1,10 +1,11 @@
 # Design: WebSocket Session Rebind (survive Shannon session rollover)
 
-Status: **Phase 0 (grace tuning) applied + canary-validated (WS lifetime 7.3s→22.7s,
-churn −70%, HTTP err flat). Phase 1 (subscription registry) BUILT + unit-tested. Phase 2
-bridge reconnect engine BUILT + race-tested (branch `feat/ws-session-rebind`). Remaining:
-Phase 2 Shannon wiring (reconnect provider + registry driving + flag) — specified below,
-canary-gated, not yet implemented.**
+Status: **Phase 0 (grace tuning) applied + canary-validated (robust view: p50 lifetime
+0.86s→2.29s ≈2.7×, closes/window −4×, HTTP err flat; the point-mean "22.7s/+211%" was
+outlier noise at low canary WS volume — do NOT quote it). Phase 1 (registry) + Phase 2
+(bridge reconnect engine + Shannon provider/registry wiring) ALL BUILT + tested on branch
+`feat/ws-session-rebind`, gated OFF by env `PATH_WEBSOCKET_SESSION_REBIND`. Remaining:
+enable on canary and validate the live reconnect (session re-fetch, dial, handshake).**
 Origin: 2026-07-18 investigation of the Polygon WS teardown (see memory `websocket_session_teardown`).
 
 ## Implementation status (branch `feat/ws-session-rebind`, on top of `fix/ws-error-envelope-and-archival-leak`)
@@ -23,7 +24,34 @@ Origin: 2026-07-18 investigation of the Polygon WS teardown (see memory `websock
   message. `reconnector == nil` everywhere in production today, so no behavior change.
   Reconnect / retry-exhaustion / swallow paths race-tested with in-process WS servers.
 
-### Remaining — Phase 2 Shannon wiring (`protocol/shannon/websocket_context.go`), canary-gated
+- ✅ **Phase 2 Shannon wiring — `protocol/shannon/websocket_context.go` + `protocol.go`**
+  (commit `625e41da`). wrc implements `EndpointReconnector` (ReconnectEndpoint via
+  `getPreSelectedEndpoint` for the current session + re-signed handshake dial;
+  SubscriptionReplayFrames re-signs the registry's active subscribes). Registry driven in
+  `ProcessProtocolClientWebsocketMessage` (track/rewrite before signing) and
+  `ProcessProtocolEndpointWebsocketMessage` (remap notification ids, swallow replay
+  responses via nil body). **The `selectedEndpoint` race was avoided WITHOUT the mutex
+  refactor** (see resolved note below). Gated off by env `PATH_WEBSOCKET_SESSION_REBIND`;
+  nil-by-default means byte-for-byte unchanged behavior. Builds + vet + race green.
+
+### Resolved — the `selectedEndpoint` race (WS-only field, no mutex refactor)
+
+The earlier "~20-site RWMutex" plan was an overcount: ~18 of those reads run on the
+bridge's single message-processing goroutine (serialized with reconnect). The ONLY
+concurrent reader is the connection-observation goroutine, and it needs only cosmetic
+endpoint info. Solution: keep `selectedEndpoint` IMMUTABLE (write-once → the observation
+goroutine reads it race-free) and add a `reconnectEndpoint` field that reconnect mutates.
+A `signingEndpoint()` helper returns `reconnectEndpoint` if set else `selectedEndpoint`;
+only the 4 signing/validation reads use it, and those + the reconnect writer are all on
+the one bridge goroutine → no mutex. ~4 localized edits instead of a repo-wide refactor.
+
+### Remaining — enable + validate on canary
+
+Set `PATH_WEBSOCKET_SESSION_REBIND=true` on canary. Unit tests cover the registry and the
+bridge reconnect/replay/swallow; what only canary can prove is the LIVE reconnect:
+`getPreSelectedEndpoint` re-fetching a real session, dialing the miner, and the re-signed
+handshake being accepted. Watch `path_websocket_connection_events_total{event}` (fewer
+forced reconnects), messages-per-connection (up), and reconnect-failure fallbacks. Was:
 
 The `websocketRequestContext` (wrc) becomes the `EndpointReconnector` and drives the registry:
 
@@ -47,16 +75,9 @@ The `websocketRequestContext` (wrc) becomes the `EndpointReconnector` and drives
    toggle; promote to YAML once validated). Default off → registry/reconnector nil → today's
    behavior.
 
-⚠️ **BLOCKER discovered — `selectedEndpoint` mutation race.** Reconnect must update
-`wrc.selectedEndpoint` so subsequent frames sign with the new session, but it is read at ~20
-sites INCLUDING the connection-observation goroutine (`startWebSocketBridge`, establishment/
-closure reads). Today the field is write-once (set at construction, never mutated) so there is
-no mutex despite the struct comment claiming one. Enabling reconnect therefore REQUIRES adding a
-`sync.RWMutex` + `currentEndpoint()` getter / `setCurrentEndpoint()` setter and converting every
-concurrent read site. This is a mechanical but wide change to the most race-sensitive path in the
-repo and must land with `go test -race ./protocol/shannon/...` green AND canary `-race`
-validation. It is the reason this step is its own focused, canary-gated increment rather than
-part of the engine PR.
+(The `selectedEndpoint` mutation race that this step first appeared to require a wide mutex
+refactor for was instead solved by the WS-only `reconnectEndpoint` field + `signingEndpoint()`
+helper — see the "Resolved" note above.)
 
 ## Problem (mechanical, evidence-locked)
 
