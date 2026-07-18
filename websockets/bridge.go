@@ -71,12 +71,40 @@ type bridge struct {
 	// messageObservationsChan receives message observations from the websocketMessageProcessor.
 	messageObservationsChan chan *observation.RequestResponseObservations
 
+	// reconnector, when non-nil, enables session rebind: a recoverable endpoint
+	// disconnect (Shannon session rollover) re-establishes the endpoint connection and
+	// replays subscriptions instead of tearing down the client. Nil = the endpoint
+	// disconnect cancels the bridge (default, pre-rebind behavior).
+	reconnector EndpointReconnector
+
+	// endpointCtx / endpointCancel scope ONLY the endpoint connection's read/ping
+	// loops (a child of the bridge ctx). On a reconnect they are replaced so the old
+	// endpoint loops stop while the client connection — scoped to the bridge ctx —
+	// stays alive. Set only when reconnector != nil.
+	endpointCtx    context.Context
+	endpointCancel context.CancelFunc
+
+	// endpointGen is the generation of the current endpoint connection, incremented on
+	// each reconnect. A disconnect signal carries the generation it was raised for, so
+	// a late signal from an already-replaced connection is ignored. Mutated only on the
+	// bridge's start() goroutine.
+	endpointGen int
+
+	// endpointDown carries recoverable endpoint disconnects to the start() loop. Nil
+	// (and never selected) when reconnector == nil.
+	endpointDown chan endpointDisconnect
+
 	// shutdownOnce ensures shutdown() is only called once to prevent panics from double-closing channels
 	shutdownOnce sync.Once
 }
 
 // StartBridge creates a new Bridge instance with connections to both client and endpoint
 // and starts the bridge. Returns a channel that will be closed when the bridge shuts down.
+//
+// reconnector is optional (may be nil): when supplied, a recoverable endpoint
+// disconnect (session rollover) rebinds the endpoint connection and replays
+// subscriptions instead of closing the client. Nil preserves the pre-rebind
+// behavior where an endpoint disconnect cancels the whole bridge.
 func StartBridge(
 	ctx context.Context,
 	logger polylog.Logger,
@@ -86,6 +114,7 @@ func StartBridge(
 	headers http.Header,
 	websocketMessageProcessor WebsocketMessageProcessor,
 	messageObservationsChan chan *observation.RequestResponseObservations,
+	reconnector EndpointReconnector,
 ) (<-chan struct{}, error) {
 	logger = logger.With("component", "websocket_bridge")
 
@@ -138,24 +167,38 @@ func StartBridge(
 		websocketMessageProcessor: websocketMessageProcessor,
 
 		messageObservationsChan: messageObservationsChan,
+		reconnector:             reconnector,
 	}
 	if err := b.validateComponents(); err != nil {
 		cancelCtx() // Clean up context on error
 		return nil, fmt.Errorf("❌ invalid bridge components: %w", err)
 	}
 
-	// Initialize connections with the bridge context. A network-level disconnect on
-	// either connection cancels the bridge (current behavior). The endpoint side's
-	// disconnect action is upgraded to a reconnect trigger only when session rebind
-	// is enabled (see startWithReconnect); by default both sides simply cancel.
+	// The client connection's disconnect always cancels the bridge (a departed client
+	// ends the connection).
 	cancelOnDisconnect := func(error) { cancelCtx() }
+
+	// The endpoint connection's disconnect action depends on whether rebind is enabled:
+	//   - rebind on:  signal the start() loop to reconnect the endpoint (client stays up).
+	//                 The endpoint loops run under a dedicated child context so they can
+	//                 be stopped on reconnect without touching the client.
+	//   - rebind off: cancel the bridge, exactly as before.
+	endpointLoopCtx := b.ctx
+	endpointOnDisconnect := cancelOnDisconnect
+	if reconnector != nil {
+		b.endpointDown = make(chan endpointDisconnect, 1)
+		b.endpointCtx, b.endpointCancel = context.WithCancel(b.ctx)
+		endpointLoopCtx = b.endpointCtx
+		endpointOnDisconnect = b.endpointDisconnectFunc(b.endpointGen)
+	}
+
 	b.endpointConn = newConnection(
-		b.ctx,
+		endpointLoopCtx,
 		logger.With("conn", "endpoint"),
 		endpointConn,
 		messageSourceEndpoint,
 		msgChan,
-		cancelOnDisconnect,
+		endpointOnDisconnect,
 	)
 	b.clientConn = newConnection(
 		b.ctx,
@@ -227,6 +270,13 @@ func (b *bridge) start() {
 			case messageSourceEndpoint:
 				b.handleEndpointMessage(msg)
 			}
+
+		// Recoverable endpoint disconnect (session rollover). Only ever selected when
+		// rebind is enabled (endpointDown is nil otherwise, so this case blocks
+		// forever). Handled inline on this single goroutine, so no client or endpoint
+		// message is processed concurrently with a reconnect.
+		case down := <-b.endpointDown:
+			b.handleEndpointDown(down)
 
 		case <-b.ctx.Done():
 			b.shutdown(ErrBridgeContextCanceled)
@@ -441,6 +491,15 @@ func (b *bridge) handleEndpointMessage(msg message) {
 	if err != nil {
 		b.logger.Error().Err(err).Msg("❌ error processing endpoint message, shutting down bridge")
 		b.shutdown(fmt.Errorf("%w: endpoint message processing failed: %w", ErrBridgeMessageProcessingFailed, err))
+		return
+	}
+
+	// A nil payload with no error means the processor intentionally swallowed the
+	// message — e.g. the subscription registry consuming a replay subscribe response
+	// after a reconnect, which the client (already holding its subscription id) must
+	// not see. Nothing to forward.
+	if processedData == nil {
+		b.logger.Debug().Msg("endpoint message swallowed by processor, not forwarding to client")
 		return
 	}
 

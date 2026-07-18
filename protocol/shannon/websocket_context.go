@@ -389,6 +389,8 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 
 	// Start the websocket bridge and get a completion channel.
 	// The websocketRequestContext handles message processing.
+	// reconnector is nil for now: session rebind is wired in a later change. With nil,
+	// an endpoint session-rollover disconnect closes the client (pre-rebind behavior).
 	bridgeCompletionChan, err := websockets.StartBridge(
 		ctx,
 		wrc.logger,
@@ -398,6 +400,7 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		endpointConnectionHeaders,
 		websocketMessageProcessor,
 		messageObservationsChan,
+		nil,
 	)
 	if err != nil {
 		err = fmt.Errorf("%w: failed to start websocket bridge: %s", errCreatingWebSocketConnection, err.Error())
