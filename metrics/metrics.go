@@ -706,6 +706,10 @@ const (
 
 	WSDirectionClientToEndpoint = "client_to_endpoint"
 	WSDirectionEndpointToClient = "endpoint_to_client"
+
+	// --- WebSocket session-rebind outcome (experimental; see PATH_WEBSOCKET_SESSION_REBIND)
+	WSRebindSuccess = "success"
+	WSRebindFailed  = "failed"
 )
 
 var WebsocketConnectionsActive = promauto.NewGaugeVec(
@@ -742,6 +746,30 @@ var WebsocketMessagesTotal = promauto.NewCounterVec(
 		Help: "WebSocket messages by domain, service_id, direction (client_to_endpoint/endpoint_to_client), and reputation_signal.",
 	},
 	[]string{LabelDomain, LabelServiceID, "direction", LabelReputationSignal},
+)
+
+// WebsocketRebindTotal counts websocket session-rebind episodes by outcome.
+// EXPERIMENTAL / canary observability for the session-rebind feature
+// (PATH_WEBSOCKET_SESSION_REBIND). result = success | failed. A "success" means the
+// endpoint was reconnected across a Shannon session rollover and subscriptions
+// replayed with the client kept open; "failed" means the bridge gave up and closed
+// the client (1012). Safe to remove once rebind is validated and promoted.
+var WebsocketRebindTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_rebind_total",
+		Help: "WebSocket session-rebind episodes by domain, service_id, and result (success/failed). EXPERIMENTAL.",
+	},
+	[]string{LabelDomain, LabelServiceID, "result"},
+)
+
+// WebsocketSubscriptionsReplayedTotal counts subscriptions replayed onto a
+// reconnected endpoint during rebind. EXPERIMENTAL / canary observability.
+var WebsocketSubscriptionsReplayedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_subscriptions_replayed_total",
+		Help: "Subscriptions replayed onto a reconnected websocket endpoint during rebind, by domain and service_id. EXPERIMENTAL.",
+	},
+	[]string{LabelDomain, LabelServiceID},
 )
 
 // =============================================================================
@@ -1036,6 +1064,16 @@ func RecordWebsocketConnectionFailed(domain, serviceID string) {
 // direction should be WSDirectionClientToEndpoint or WSDirectionEndpointToClient
 func RecordWebsocketMessage(domain, serviceID, direction, reputationSignal string) {
 	WebsocketMessagesTotal.WithLabelValues(domain, serviceID, direction, reputationSignal).Inc()
+}
+
+// RecordWebsocketRebind records a websocket session-rebind episode outcome and, on
+// success, the number of subscriptions replayed. EXPERIMENTAL / canary observability
+// for the session-rebind feature. result should be WSRebindSuccess or WSRebindFailed.
+func RecordWebsocketRebind(domain, serviceID, result string, replayedSubscriptions int) {
+	WebsocketRebindTotal.WithLabelValues(domain, serviceID, result).Inc()
+	if replayedSubscriptions > 0 {
+		WebsocketSubscriptionsReplayedTotal.WithLabelValues(domain, serviceID).Add(float64(replayedSubscriptions))
+	}
 }
 
 // LatencyThresholds defines thresholds for latency signal categorization.

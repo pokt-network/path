@@ -21,10 +21,13 @@ import (
 // connection (after failing the first `errN` attempts) and returns `replay` as the
 // subscription replay frames.
 type mockReconnector struct {
-	url    string
-	replay [][]byte
-	calls  int32
-	errN   int32
+	url              string
+	replay           [][]byte
+	calls            int32
+	errN             int32
+	outcomeSuccess   int32
+	outcomeFailed    int32
+	replayedReported int32
 }
 
 func (m *mockReconnector) ReconnectEndpoint(_ context.Context) (*websocket.Conn, error) {
@@ -38,6 +41,15 @@ func (m *mockReconnector) ReconnectEndpoint(_ context.Context) (*websocket.Conn,
 
 func (m *mockReconnector) SubscriptionReplayFrames() ([][]byte, error) {
 	return m.replay, nil
+}
+
+func (m *mockReconnector) OnReconnectOutcome(success bool, replayedSubscriptions int) {
+	if success {
+		atomic.AddInt32(&m.outcomeSuccess, 1)
+	} else {
+		atomic.AddInt32(&m.outcomeFailed, 1)
+	}
+	atomic.AddInt32(&m.replayedReported, int32(replayedSubscriptions))
 }
 
 // upgradeAndClose upgrades a websocket request then immediately closes it, simulating
@@ -131,6 +143,13 @@ func Test_Bridge_ReconnectKeepsClientAliveAndReplays(t *testing.T) {
 	c.True(got[`{"id":1,"method":"eth_subscribe","params":["newHeads"]}`], "newHeads subscribe replayed")
 	c.True(got[`{"id":2,"method":"eth_subscribe","params":["logs"]}`], "logs subscribe replayed")
 	c.Equal(int32(1), atomic.LoadInt32(&reconnector.calls), "exactly one reconnect")
+
+	// Instrumentation: the success outcome + replayed count are reported for metrics.
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&reconnector.outcomeSuccess) == 1 &&
+			atomic.LoadInt32(&reconnector.replayedReported) == 2
+	}, 2*time.Second, 10*time.Millisecond, "rebind success outcome (2 subs) should be reported")
+	c.Equal(int32(0), atomic.LoadInt32(&reconnector.outcomeFailed))
 }
 
 // Test_Bridge_ReconnectExhaustionClosesClient verifies that when every reconnect
@@ -172,6 +191,8 @@ func Test_Bridge_ReconnectExhaustionClosesClient(t *testing.T) {
 		"exhausted reconnect should close client with 1012, got: %v", readErr,
 	)
 	c.Equal(int32(reconnectMaxAttempts), atomic.LoadInt32(&reconnector.calls), "all attempts made")
+	c.Equal(int32(1), atomic.LoadInt32(&reconnector.outcomeFailed), "failed outcome reported once")
+	c.Equal(int32(0), atomic.LoadInt32(&reconnector.outcomeSuccess))
 }
 
 // swallowProcessor swallows (returns nil, no error) any endpoint message equal to

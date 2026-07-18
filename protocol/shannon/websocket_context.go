@@ -685,6 +685,30 @@ func (wrc *websocketRequestContext) SubscriptionReplayFrames() ([][]byte, error)
 	return signedFrames, nil
 }
 
+// OnReconnectOutcome records the terminal result of a rebind episode for canary
+// observability (metric + a log visible at LOG_LEVEL=error). Implements
+// websockets.EndpointReconnector.
+func (wrc *websocketRequestContext) OnReconnectOutcome(success bool, replayedSubscriptions int) {
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.signingEndpoint().PublicURL())
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	serviceID := string(wrc.serviceID)
+
+	result := metrics.WSRebindSuccess
+	if !success {
+		result = metrics.WSRebindFailed
+	}
+	metrics.RecordWebsocketRebind(domain, serviceID, result, replayedSubscriptions)
+
+	// Error level ON PURPOSE for canary visibility. Temporary — downgrade once validated.
+	wrc.logger.Error().
+		Bool("success", success).
+		Int("replayed_subscriptions", replayedSubscriptions).
+		Str("result", result).
+		Msg("📈 [WS-REBIND] rebind outcome recorded")
+}
+
 // ---------- Client Message Processing ----------
 
 // ProcessProtocolClientWebsocketMessage processes a message from the client.
@@ -830,7 +854,8 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 		// the bridge still closes the client with 1012. Non-410 errors are still forwarded
 		// so genuine endpoint errors reach the client.
 		if wrc.registry != nil && statusCode == http.StatusGone {
-			logger.Debug().Msg("swallowing session-expiry (410) advisory — session rebind will reconnect transparently")
+			// Error level for canary visibility (LOG_LEVEL=error). Temporary.
+			logger.Error().Msg("🤫 [WS-REBIND] swallowing session-expiry (410) advisory — rebind will reconnect transparently")
 			metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMinorError)
 			return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, fmt.Errorf("session expired (rebind pending)")), nil
 		}

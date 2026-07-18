@@ -27,6 +27,12 @@ type EndpointReconnector interface {
 	// current session. Empty when there is nothing to replay. Called after
 	// ReconnectEndpoint succeeds, so the frames are signed against the new session.
 	SubscriptionReplayFrames() ([][]byte, error)
+
+	// OnReconnectOutcome reports the terminal result of a rebind episode so the
+	// implementer (which knows service/domain) can emit metrics/observability.
+	// success=false means the bridge is giving up and closing the client.
+	// replayedSubscriptions is the number of subscriptions replayed on success.
+	OnReconnectOutcome(success bool, replayedSubscriptions int)
 }
 
 // endpointDisconnect carries a recoverable endpoint disconnect to the bridge's start()
@@ -90,7 +96,9 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		return
 	}
 
-	b.logger.Warn().Err(down.err).Msg("🔁 endpoint disconnected — attempting session rebind (client stays connected)")
+	// NOTE: logged at Error level ON PURPOSE so rebind activity is visible on canary
+	// (LOG_LEVEL=error). Downgrade or remove once the feature is validated.
+	b.logger.Error().Err(down.err).Msg("🔁 [WS-REBIND] endpoint disconnected — attempting session rebind (client stays connected)")
 
 	// Stop the old endpoint loops and close the old connection before dialing a new one.
 	// Clear endpointConn so that, if the reconnect fails, shutdown's close-code logic
@@ -107,7 +115,8 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 
 	newConn, err := b.reconnectWithBackoff()
 	if err != nil {
-		b.logger.Error().Err(err).Msg("❌ endpoint session rebind failed after retries — closing client")
+		b.logger.Error().Err(err).Msg("❌ [WS-REBIND] endpoint session rebind failed after retries — closing client")
+		b.reconnector.OnReconnectOutcome(false, 0)
 		b.shutdown(fmt.Errorf("%w: endpoint reconnect failed: %w", ErrBridgeEndpointUnavailable, err))
 		return
 	}
@@ -119,13 +128,15 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		// Replay-frame construction failed (e.g. re-signing error). The new connection
 		// is unusable without restored subscriptions; close the client to reconnect.
 		newConn.Close()
-		b.logger.Error().Err(replayErr).Msg("❌ failed to build subscription replay frames — closing client")
+		b.logger.Error().Err(replayErr).Msg("❌ [WS-REBIND] failed to build subscription replay frames — closing client")
+		b.reconnector.OnReconnectOutcome(false, 0)
 		b.shutdown(fmt.Errorf("%w: subscription replay failed: %w", ErrBridgeEndpointUnavailable, replayErr))
 		return
 	}
 	if err := writeReplayFrames(newConn, replayFrames); err != nil {
 		newConn.Close()
-		b.logger.Error().Err(err).Msg("❌ failed to replay subscriptions onto new endpoint — closing client")
+		b.logger.Error().Err(err).Msg("❌ [WS-REBIND] failed to replay subscriptions onto new endpoint — closing client")
+		b.reconnector.OnReconnectOutcome(false, 0)
 		b.shutdown(fmt.Errorf("%w: subscription replay write failed: %w", ErrBridgeEndpointUnavailable, err))
 		return
 	}
@@ -144,10 +155,12 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		b.endpointDisconnectFunc(b.endpointGen),
 	)
 
-	b.logger.Info().
+	// Error level ON PURPOSE for canary visibility (LOG_LEVEL=error). Temporary.
+	b.logger.Error().
 		Int("endpoint_gen", b.endpointGen).
 		Int("replayed_subscriptions", len(replayFrames)).
-		Msg("✅ endpoint session rebind succeeded")
+		Msg("✅ [WS-REBIND] endpoint session rebind succeeded — client kept open")
+	b.reconnector.OnReconnectOutcome(true, len(replayFrames))
 }
 
 // reconnectWithBackoff calls the reconnector with bounded retries and exponential
@@ -165,11 +178,13 @@ func (b *bridge) reconnectWithBackoff() (*websocket.Conn, error) {
 			return conn, nil
 		}
 		lastErr = err
-		b.logger.Warn().
+		// Error level for canary visibility — a burst of these on poktroll suppliers
+		// signals a PATH<->miner session-height skew (validation/session mismatch).
+		b.logger.Error().
 			Err(err).
 			Int("attempt", attempt).
 			Int("max_attempts", reconnectMaxAttempts).
-			Msg("endpoint reconnect attempt failed")
+			Msg("⚠️ [WS-REBIND] endpoint reconnect attempt failed")
 
 		if attempt == reconnectMaxAttempts {
 			break
