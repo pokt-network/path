@@ -376,7 +376,7 @@ func (p *Protocol) getReconnectEndpoint(
 			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape a stalling supplier", protocol.ErrEndpointUnavailable, serviceID)
 			return nil, false, metrics.WSRebindFailedNoEndpoints, err
 		}
-		ep := selectBestReconnectEndpoint(endpoints)
+		ep := selectBestReconnectEndpoint(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints))
 		logger.Warn().
 			Str("stalling_endpoint", string(preferredAddr)).
 			Str("replacement_endpoint", string(ep.Addr())).
@@ -391,7 +391,7 @@ func (p *Protocol) getReconnectEndpoint(
 	}
 
 	// Tier 2: original supplier rotated out of the new session → best-available fallback.
-	ep := selectBestReconnectEndpoint(endpoints)
+	ep := selectBestReconnectEndpoint(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints))
 	logger.Warn().
 		Str("original_endpoint", string(preferredAddr)).
 		Str("fallback_endpoint", string(ep.Addr())).
@@ -400,30 +400,78 @@ func (p *Protocol) getReconnectEndpoint(
 	return ep, true, "", nil
 }
 
-// selectBestReconnectEndpoint deterministically chooses an endpoint from the new session
-// for a tier-2 rebind (original supplier rotated out). Prefers protocol (non-fallback)
-// endpoints and breaks ties by the lexicographically smallest address, so the choice is
-// reproducible across pods and replays.
+// selectBestReconnectEndpoint chooses an endpoint from the new session for a tier-2 rebind
+// (original supplier rotated out) or a stall escape. Prefers protocol (non-fallback)
+// endpoints, then higher WEBSOCKET reputation score (S2a), then the lexicographically
+// smallest address so the choice stays reproducible across pods and replays when scores tie.
 //
-// TODO_IMPROVE(@commoddity,@adshmh): once websocket endpoints have health checks, rank by
-// reputation / head freshness here to avoid rebinding onto a lagging node.
-func selectBestReconnectEndpoint(endpoints map[protocol.EndpointAddr]endpoint) endpoint {
+// scoreOf reports each candidate's WEBSOCKET reputation score (higher = healthier); when
+// reputation is unavailable it returns an equal value for all endpoints, collapsing the
+// ordering back to (non-fallback, then smallest address) — the pre-S2a behavior.
+//
+// TODO_IMPROVE(@commoddity,@adshmh): once websocket endpoints have active health checks,
+// also factor head freshness here to avoid rebinding onto a reachable-but-lagging node.
+func selectBestReconnectEndpoint(endpoints map[protocol.EndpointAddr]endpoint, scoreOf func(endpoint) float64) endpoint {
 	var best endpoint
 	for _, ep := range endpoints {
-		if best == nil || betterReconnectCandidate(ep, best) {
+		if best == nil || betterReconnectCandidate(ep, best, scoreOf) {
 			best = ep
 		}
 	}
 	return best
 }
 
-// betterReconnectCandidate reports whether a is a better tier-2 rebind target than b:
-// non-fallback endpoints win over fallback; ties break on the smaller address.
-func betterReconnectCandidate(a, b endpoint) bool {
+// betterReconnectCandidate reports whether a is a better rebind target than b:
+// non-fallback endpoints win over fallback; among the same fallback status the higher
+// reputation score wins; ties break on the smaller address (deterministic).
+func betterReconnectCandidate(a, b endpoint, scoreOf func(endpoint) float64) bool {
 	if a.IsFallback() != b.IsFallback() {
 		return !a.IsFallback()
 	}
+	if sa, sb := scoreOf(a), scoreOf(b); sa != sb {
+		return sa > sb
+	}
 	return a.Addr() < b.Addr()
+}
+
+// websocketReconnectScoreFunc returns a scoring function over the reconnect candidate
+// endpoints keyed by their WEBSOCKET reputation score — the same per-endpoint scores S0
+// populates from stall / dial-failure signals. A tier-2 or stall-escape rebind then prefers
+// a proven-good endpoint over a degraded one instead of picking by address order.
+//
+// Missing (never-scored) endpoints default to the service's InitialScore — benefit of the
+// doubt, matching RankEndpointsByScore — so a fresh endpoint is not ranked below a scored
+// one. When reputation is unavailable (service nil, or a batch lookup error) every endpoint
+// scores 0 equally, so selectBestReconnectEndpoint falls back to its deterministic ordering.
+func (p *Protocol) websocketReconnectScoreFunc(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	endpoints map[protocol.EndpointAddr]endpoint,
+) func(endpoint) float64 {
+	if p.reputationService == nil || len(endpoints) == 0 {
+		return func(endpoint) float64 { return 0 }
+	}
+
+	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+	keyByAddr := make(map[protocol.EndpointAddr]reputation.EndpointKey, len(endpoints))
+	keys := make([]reputation.EndpointKey, 0, len(endpoints))
+	for addr, ep := range endpoints {
+		k := keyBuilder.BuildKey(serviceID, ep.Addr(), sharedtypes.RPCType_WEBSOCKET)
+		keyByAddr[addr] = k
+		keys = append(keys, k)
+	}
+
+	scores, err := p.reputationService.GetScores(ctx, keys)
+	if err != nil {
+		return func(endpoint) float64 { return 0 }
+	}
+	initialScore := p.reputationService.GetInitialScoreForService(serviceID)
+	return func(ep endpoint) float64 {
+		if s, ok := scores[keyByAddr[ep.Addr()]]; ok {
+			return s.Value
+		}
+		return initialScore
+	}
 }
 
 // ApplyWebSocketObservations updates protocol instance state based on endpoint observations.
