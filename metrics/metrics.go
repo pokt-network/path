@@ -670,6 +670,11 @@ const (
 	// fast endpoints are picked as hedge again and again. Dashboards filter to
 	// request_type="normal" by default to show fair primary-traffic distribution.
 	RelayTypeHedge = "hedge"
+	// RelayTypeRetry tags relays issued as a sequential retry to a different
+	// endpoint after a prior attempt failed. Like hedge, retry overflow otherwise
+	// hides inside "normal" and inflates a single endpoint's apparent RPS during
+	// upstream degradation — its own label makes the overflow measurable.
+	RelayTypeRetry = "retry"
 )
 
 var RelaysTotal = promauto.NewCounterVec(

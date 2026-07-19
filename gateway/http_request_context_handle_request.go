@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"strconv"
 	"strings"
@@ -388,8 +389,8 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	var lastErr error
 	var lastStatusCode int
 	var lastEndpointAddr protocol.EndpointAddr
-	var lastCircuitBreakReason string              // reason for circuit breaking the previous endpoint's domain
-	var lastResponseSnippet string                 // truncated response that triggered the break
+	var lastCircuitBreakReason string                 // reason for circuit breaking the previous endpoint's domain
+	var lastResponseSnippet string                    // truncated response that triggered the break
 	var lastHeuristicResult *heuristic.AnalysisResult // heuristic result from the last failed attempt
 
 	// Track endpoints and domains already tried to ensure retry rotation.
@@ -522,6 +523,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				break
 			}
 
+			// Tag the rebuilt context as a retry so its relay metric is recorded with
+			// request_type="retry" instead of "normal" — keeps retry overflow visible.
+			newProtocolCtx.MarkAsRetry()
 			currentProtocolCtx = newProtocolCtx
 
 			logger.Debug().
@@ -1964,9 +1968,20 @@ func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 	return parsed.Hostname()
 }
 
-// selectTopRankedEndpoint selects the highest-reputation endpoint for retry.
-// This maximizes the chance of getting a successful response on retry by
-// prioritizing the best-performing endpoints based on their reputation scores.
+// retryHedgeScoreEpsilon is the reputation-score window (0-100 scale) within which
+// endpoints are treated as effectively tied for retry/hedge selection. A fractional
+// score edge (e.g. 100.0 vs 99.8 from latency-penalty noise) must NOT make one endpoint
+// capture 100% of retry+hedge overflow (winner-take-all). Endpoints scoring within this
+// window of the max are selected among uniformly at random, spreading overflow and blast
+// radius across the genuinely-top tier while still excluding anything meaningfully worse.
+const retryHedgeScoreEpsilon = 2.0
+
+// selectTopRankedEndpoint selects among the highest-reputation endpoints for retry/hedge.
+// It ranks by reputation score, then picks UNIFORMLY AT RANDOM among all endpoints whose
+// score is within retryHedgeScoreEpsilon of the top score. This keeps quality gating
+// (only the top-scoring band is eligible) while avoiding winner-take-all: without it, a
+// sub-point score edge routes every retry and hedge overflow to a single endpoint,
+// dogpiling it and concentrating all blast radius there.
 //
 // Falls back to the first endpoint in the list if reputation service is unavailable.
 func (rc *requestContext) selectTopRankedEndpoint(
@@ -2012,8 +2027,28 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		return endpoints[0]
 	}
 
-	// Return the original endpoint address corresponding to the top-ranked key
-	topKey := rankedKeys[0]
+	// Determine the top-scoring band: rankedKeys is sorted descending, so the eligible band
+	// is the prefix of keys within retryHedgeScoreEpsilon of the max score. Scoring missing
+	// keys as the service's initial score matches RankEndpointsByScore's benefit-of-the-doubt.
+	scores, scoresErr := reputationSvc.GetScores(rc.context, rankedKeys)
+	bandSize := 1
+	if scoresErr == nil {
+		initialScore := reputationSvc.GetInitialScoreForService(rc.serviceID)
+		scoreOf := func(k reputation.EndpointKey) float64 {
+			if s, ok := scores[k]; ok {
+				return s.Value
+			}
+			return initialScore
+		}
+		maxScore := scoreOf(rankedKeys[0])
+		for bandSize < len(rankedKeys) && scoreOf(rankedKeys[bandSize]) >= maxScore-retryHedgeScoreEpsilon {
+			bandSize++
+		}
+	}
+
+	// Pick uniformly at random within the top-scoring band to spread retry/hedge overflow
+	// (and blast radius) instead of always dogpiling the strict #1.
+	topKey := rankedKeys[rand.Intn(bandSize)]
 	originalEndpoint, ok := keyToOriginalEndpoint[topKey.EndpointAddr]
 	if !ok {
 		// Shouldn't happen, but fall back to first endpoint if mapping fails
@@ -2024,10 +2059,11 @@ func (rc *requestContext) selectTopRankedEndpoint(
 	}
 
 	rc.logger.Debug().
-		Str("top_endpoint", string(originalEndpoint)).
+		Str("selected_endpoint", string(originalEndpoint)).
 		Str("reputation_key", string(topKey.EndpointAddr)).
+		Int("band_size", bandSize).
 		Int("num_candidates", len(endpoints)).
-		Msg("🏆 Selected TOP-RANKED endpoint for retry (highest reputation)")
+		Msg("🏆 Selected endpoint from top-scoring band for retry/hedge (spreads overflow)")
 
 	return originalEndpoint
 }

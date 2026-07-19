@@ -189,6 +189,14 @@ type ProtocolRequestContext interface {
 	// about whether they actually work.
 	MarkAsHedge()
 
+	// MarkAsRetry tags this request as a sequential retry to a different endpoint
+	// after a prior attempt failed, so its relay metric is recorded with
+	// request_type="retry" rather than "normal". This keeps retry overflow visible
+	// instead of inflating a single endpoint's apparent primary RPS during upstream
+	// degradation. Reputation signals are unaffected (a retry still gets fair
+	// success/error feedback).
+	MarkAsRetry()
+
 	// GetObservations builds and returns the set of protocol-specific observations using the current context.
 	//
 	// Hypothetical illustrative example.
