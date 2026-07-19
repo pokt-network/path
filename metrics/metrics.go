@@ -607,9 +607,30 @@ func RecordQoSFilterRejection(supplier, serviceID, reason string) {
 var SupplierReputationScore = promauto.NewGaugeVec(
 	prometheus.GaugeOpts{
 		Name: MetricPrefix + "supplier_reputation_score",
-		Help: "Per-supplier reputation score (0-100) by supplier and service_id. Snapshotted every 10s.",
+		Help: "Per-supplier reputation score (0-100) by supplier, service_id, and rpc_type. Snapshotted every 10s. The rpc_type split keeps a supplier's websocket score from colliding with its json_rpc score (they are tracked and acted on separately).",
 	},
-	[]string{LabelSupplier, LabelServiceID},
+	[]string{LabelSupplier, LabelServiceID, LabelRPCType},
+)
+
+// Reasons an endpoint is dropped by the reputation filter, used as the `reason`
+// label on ReputationDisqualifiedTotal.
+const (
+	ReputationDisqualifyReasonBelowThreshold = "below_threshold" // score < per-service MinThreshold
+	ReputationDisqualifyReasonCooldown       = "cooldown"        // in strike cooldown (critical strikes)
+)
+
+// ReputationDisqualifiedTotal counts endpoint exclusions by the reputation filter,
+// split by service_id, rpc_type, and reason. This makes S1-style disqualification
+// (below-threshold or cooldown) visible on a dashboard instead of requiring a Redis
+// read. It counts each drop OCCURRENCE per endpoint-selection pass, not unique
+// endpoints — a high rate on a (service_id, rpc_type=websocket) pair means the filter
+// is actively steering traffic away from proven-bad endpoints for that stream.
+var ReputationDisqualifiedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "reputation_disqualified_total",
+		Help: "Endpoints excluded by the reputation filter, by service_id, rpc_type, and reason (below_threshold/cooldown). Counts each drop occurrence per selection pass, not unique endpoints.",
+	},
+	[]string{LabelServiceID, LabelRPCType, "reason"},
 )
 
 // Severity classes for supplier_signal_total. The reputation layer emits 8
@@ -1040,17 +1061,24 @@ func SetMeanScore(domain, serviceID, rpcType string, score float64) {
 	ReputationMeanScore.WithLabelValues(domain, serviceID, rpcType).Set(score)
 }
 
-// SetSupplierReputationScore sets the per-supplier reputation gauge.
+// SetSupplierReputationScore sets the per-(supplier, service_id, rpc_type) reputation gauge.
 // Skipped silently when supplier is empty (e.g., per-domain reputation key)
 // or when the cardinality guard has tripped for this metric.
-func SetSupplierReputationScore(supplier, serviceID string, score float64) {
+func SetSupplierReputationScore(supplier, serviceID, rpcType string, score float64) {
 	if supplier == "" {
 		return
 	}
 	if !supplierReputationGuard.allow(supplier, serviceID) {
 		return
 	}
-	SupplierReputationScore.WithLabelValues(supplier, serviceID).Set(score)
+	SupplierReputationScore.WithLabelValues(supplier, serviceID, rpcType).Set(score)
+}
+
+// RecordReputationDisqualified increments the reputation-filter disqualification
+// counter for one dropped endpoint. reason is one of the
+// ReputationDisqualifyReason* constants.
+func RecordReputationDisqualified(serviceID, rpcType, reason string) {
+	ReputationDisqualifiedTotal.WithLabelValues(serviceID, rpcType, reason).Inc()
 }
 
 // RecordSupplierSignal increments the per-supplier signal counter, collapsing

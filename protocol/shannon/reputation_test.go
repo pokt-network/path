@@ -10,8 +10,10 @@ import (
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
+	"github.com/pokt-network/path/metrics"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
@@ -491,6 +493,42 @@ func TestReputation_FilterByReputation_Websocket(t *testing.T) {
 	require.Contains(t, filtered, protocol.EndpointAddr("supplier1-https://good.example.com"))
 	require.Contains(t, filtered, protocol.EndpointAddr("supplier3-https://new.example.com"))
 	require.NotContains(t, filtered, protocol.EndpointAddr("supplier2-https://bad.example.com"))
+}
+
+// TestReputation_DisqualifiedMetric verifies #2: dropping a below-threshold endpoint in
+// filterByReputation increments reputation_disqualified_total with reason=below_threshold
+// and the correct rpc_type — the metric that surfaces S1 disqualification without a Redis read.
+// Uses a unique service_id so the shared counter delta is isolated from other tests, and Major
+// errors (not Critical) so the bad endpoint drops below threshold WITHOUT entering cooldown.
+func TestReputation_DisqualifiedMetric(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+	svc, _ := newWSReputationService(t)
+
+	p := &Protocol{logger: logger, reputationService: svc}
+	const serviceID = protocol.ServiceID("disqualify-metric-test")
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"supplier1-https://good.example.com": &mockEndpoint{addr: "supplier1-https://good.example.com"},
+		"supplier2-https://bad.example.com":  &mockEndpoint{addr: "supplier2-https://bad.example.com"},
+	}
+
+	// Bad WS endpoint: 6 Major errors (-10 each) -> 80-60 = 20 < 30 threshold, no cooldown.
+	badKey := reputation.NewEndpointKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_WEBSOCKET)
+	for i := 0; i < 6; i++ {
+		require.NoError(t, svc.RecordSignal(ctx, badKey, reputation.NewMajorErrorSignal("ws_endpoint_stalled", 0)))
+	}
+
+	counter := metrics.ReputationDisqualifiedTotal.WithLabelValues(
+		string(serviceID), "websocket", metrics.ReputationDisqualifyReasonBelowThreshold,
+	)
+	before := testutil.ToFloat64(counter)
+
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, "")
+
+	require.NotContains(t, filtered, protocol.EndpointAddr("supplier2-https://bad.example.com"))
+	require.Equal(t, before+1, testutil.ToFloat64(counter),
+		"below_threshold disqualification of the bad WS endpoint must increment the counter exactly once")
 }
 
 // TestReputation_ScoreRecovery verifies that endpoints can recover
