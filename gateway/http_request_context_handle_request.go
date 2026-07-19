@@ -1953,11 +1953,14 @@ func extractDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 	return domain
 }
 
-// computeDomainFromEndpoint performs the uncached host extraction.
-func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
+// rawURLFromEndpoint splits an endpoint address ("<supplier_address>-<url>", e.g.
+// "pokt1abc-https://rel.example.xyz") into its URL part ("https://rel.example.xyz"). The URL
+// is located by the scheme-prefixed dash ("-http"/"-wss"/"-ws") so a dash inside the supplier
+// address is not mistaken for the separator. Returns ok=false when no URL part is found.
+// Single source of truth for the split convention shared by the domain extractors below.
+func rawURLFromEndpoint(endpoint protocol.EndpointAddr) (string, bool) {
 	endpointStr := string(endpoint)
 
-	// Find the URL part after the supplier address
 	idx := strings.Index(endpointStr, "-http")
 	if idx < 0 {
 		// Try websocket URLs
@@ -1967,10 +1970,17 @@ func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 		}
 	}
 	if idx < 0 {
+		return "", false
+	}
+	return endpointStr[idx+1:], true // skip the dash
+}
+
+// computeDomainFromEndpoint performs the uncached host extraction.
+func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
+	rawURL, ok := rawURLFromEndpoint(endpoint)
+	if !ok {
 		return ""
 	}
-
-	rawURL := endpointStr[idx+1:] // skip the dash
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return ""
@@ -2015,20 +2025,10 @@ func extractRegistrableDomain(endpoint protocol.EndpointAddr) string {
 
 // computeRegistrableDomainFromEndpoint performs the uncached eTLD+1 extraction.
 func computeRegistrableDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
-	endpointStr := string(endpoint)
-
-	idx := strings.Index(endpointStr, "-http")
-	if idx < 0 {
-		idx = strings.Index(endpointStr, "-wss")
-		if idx < 0 {
-			idx = strings.Index(endpointStr, "-ws")
-		}
-	}
-	if idx < 0 {
+	rawURL, ok := rawURLFromEndpoint(endpoint)
+	if !ok {
 		return ""
 	}
-
-	rawURL := endpointStr[idx+1:] // skip the dash
 	if etld1, err := metricshttp.ExtractEffectiveTLDPlusOne(rawURL); err == nil && etld1 != "" {
 		return etld1
 	}

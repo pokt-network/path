@@ -434,6 +434,11 @@ func betterReconnectCandidate(a, b endpoint, scoreOf func(endpoint) float64) boo
 	return a.Addr() < b.Addr()
 }
 
+// zeroReconnectScore scores every endpoint equally, collapsing selectBestReconnectEndpoint's
+// ordering back to (non-fallback, then smallest address) — the behavior used when reputation
+// is unavailable (service nil, empty candidate set, or a batch lookup error).
+func zeroReconnectScore(endpoint) float64 { return 0 }
+
 // websocketReconnectScoreFunc returns a scoring function over the reconnect candidate
 // endpoints keyed by their WEBSOCKET reputation score — the same per-endpoint scores S0
 // populates from stall / dial-failure signals. A tier-2 or stall-escape rebind then prefers
@@ -449,7 +454,7 @@ func (p *Protocol) websocketReconnectScoreFunc(
 	endpoints map[protocol.EndpointAddr]endpoint,
 ) func(endpoint) float64 {
 	if p.reputationService == nil || len(endpoints) == 0 {
-		return func(endpoint) float64 { return 0 }
+		return zeroReconnectScore
 	}
 
 	keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
@@ -463,7 +468,7 @@ func (p *Protocol) websocketReconnectScoreFunc(
 
 	scores, err := p.reputationService.GetScores(ctx, keys)
 	if err != nil {
-		return func(endpoint) float64 { return 0 }
+		return zeroReconnectScore
 	}
 	initialScore := p.reputationService.GetInitialScoreForService(serviceID)
 	return func(ep endpoint) float64 {
