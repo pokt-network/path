@@ -1255,19 +1255,32 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		// - supplier filtering is active (user wants specific suppliers)
 		if filterByReputation && p.reputationService != nil && len(effectiveAllowedSuppliers) == 0 {
 			beforeCount := len(qualifiedEndpoints)
-			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, filterByRPCType, logger, requestedEndpointAddr)
+			filtered := p.filterByReputation(ctx, serviceID, qualifiedEndpoints, filterByRPCType, logger, requestedEndpointAddr)
 
-			if len(qualifiedEndpoints) == 0 {
+			// S1 WebSocket safety net: reputation disqualification must never empty the WS
+			// pool. There are no active WS health checks yet (S3), so a transient score dip
+			// must not sever connectivity — disqualify is best-effort for WS. Keep the
+			// pre-filter set as a last resort (mirrors the session-exhaustion safety net above).
+			if len(filtered) == 0 && filterByRPCType == sharedtypes.RPCType_WEBSOCKET {
 				logger.Warn().Msgf(
-					"All %d endpoints below reputation threshold for service %s, app %s. SKIPPING the app.",
+					"All %d WebSocket endpoints below reputation threshold for service %s, app %s — keeping them as last resort (no WS health checks yet).",
 					beforeCount, serviceID, app.Address,
 				)
-				continue
-			}
+			} else {
+				qualifiedEndpoints = filtered
 
-			if beforeCount != len(qualifiedEndpoints) {
-				logger.Debug().Msgf("app %s has %d endpoints after filtering by reputation (was %d).",
-					app.Address, len(qualifiedEndpoints), beforeCount)
+				if len(qualifiedEndpoints) == 0 {
+					logger.Warn().Msgf(
+						"All %d endpoints below reputation threshold for service %s, app %s. SKIPPING the app.",
+						beforeCount, serviceID, app.Address,
+					)
+					continue
+				}
+
+				if beforeCount != len(qualifiedEndpoints) {
+					logger.Debug().Msgf("app %s has %d endpoints after filtering by reputation (was %d).",
+						app.Address, len(qualifiedEndpoints), beforeCount)
+				}
 			}
 		}
 
@@ -1287,7 +1300,10 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		// Apply tiered selection if enabled - only return endpoints from the highest available tier
 		// SKIP tiered filtering when filterByReputation is false (e.g., for leaderboard metrics gathering)
 		// because tiered selection is based on reputation scores.
-		if filterByReputation && p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
+		// S1: tiered selection (ranking) stays OFF for WebSocket — there are no active WS
+		// health checks yet, so ranking on WS scores is deferred to S2. WS still gets
+		// blacklist + session-exhaustion + reputation threshold/cooldown disqualification above.
+		if filterByReputation && filterByRPCType != sharedtypes.RPCType_WEBSOCKET && p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
 			endpoints = p.filterToHighestTier(ctx, serviceID, endpoints, filterByRPCType, logger, requestedEndpointAddr)
 		}
 

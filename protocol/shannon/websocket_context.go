@@ -276,9 +276,12 @@ func (p *Protocol) getPreSelectedEndpoint(
 	// The final boolean parameter sets whether to filter by reputation.
 	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
 	//
-	// NOTE: WebSocket endpoints currently don't have dedicated health checks, so they may have
-	// low initial scores. We use filterByReputation=false for WebSocket until health checks are implemented.
-	filterByReputation := rpcType != sharedtypes.RPCType_WEBSOCKET
+	// S1 (disqualify-only): reputation filtering now applies to WebSocket too. WS records
+	// reputation signals (connect/handshake/message + stall/dial from S0), so proven-bad
+	// WS endpoints (cooldown / below threshold) are excluded here. Unscored endpoints still
+	// pass (InitialScore), and a WS-only safety net in getSessionsUniqueEndpoints prevents an
+	// empty pool. Tiered *ranking* stays OFF for WS until active WS health checks exist (S2/S3).
+	const filterByReputation = true
 	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, rpcType, allowedSuppliers, selectedEndpointAddr)
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
@@ -347,9 +350,13 @@ func (p *Protocol) getReconnectEndpoint(
 	// within the same allowed set.
 	allowedSuppliers := parseAllowedSuppliersHeader(httpReq)
 
-	// WebSocket endpoints have no health checks yet, so selection is not reputation-filtered
-	// (matches getPreSelectedEndpoint for RPCType_WEBSOCKET).
-	const filterByReputation = false
+	// S1 (disqualify-only): reputation filtering applies on rebind too, so a rollover does
+	// not rebind onto a proven-bad WS endpoint (cooldown / below threshold). The preferred
+	// (original) supplier is still kept if in cooldown via requestedEndpointAddr
+	// race-protection in filterByReputation; the stall watchdog's avoidPreferred path
+	// additionally deletes it below. Tiered ranking stays OFF for WS
+	// (guarded in getSessionsUniqueEndpoints). The WS safety net there prevents an empty pool.
+	const filterByReputation = true
 	endpoints, _, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers, preferredAddr)
 	if err != nil {
 		logger.Error().Err(err).Msg("rebind: failed to build endpoint set for the new session")
@@ -783,6 +790,11 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoid
 	conn, err := websockets.ConnectWebsocketEndpoint(logger, websocketEndpointURL, endpointConnectionHeaders)
 	if err != nil {
 		wrc.lastReconnectReason = metrics.WSRebindFailedDial
+		// S0: the reconnect target failed to dial — feed it into reputation so its
+		// :websocket score reflects the failure. signingEndpoint() == ep here
+		// (wrc.reconnectEndpoint was set above), so the signal attributes to the endpoint
+		// that could not be reached.
+		wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_reconnect_dial_failed", 0))
 		return nil, fmt.Errorf("dial reconnect endpoint: %w", err)
 	}
 
@@ -884,6 +896,13 @@ func (wrc *websocketRequestContext) OnEndpointStallDetected(gaveUp bool) {
 	serviceID := string(wrc.serviceID)
 
 	metrics.RecordWebsocketEndpointStall(domain, serviceID, gaveUp)
+
+	// S0: feed the stall into reputation so the endpoint's :websocket score reflects it.
+	// recordWebsocketSignal attributes to signingEndpoint() — the stalling supplier at
+	// this point, since OnEndpointStallDetected fires BEFORE the rebind swaps in a
+	// replacement. A stalled data feed is a real endpoint fault → Major (same weight as a
+	// connection/handshake failure); consistent stalls accrue toward cooldown.
+	wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_endpoint_stalled", 0))
 
 	// Error level ON PURPOSE for canary visibility. Temporary — downgrade once validated.
 	wrc.logger.Error().
