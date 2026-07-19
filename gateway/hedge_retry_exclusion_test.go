@@ -4,8 +4,10 @@ import (
 	"testing"
 
 	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -94,4 +96,27 @@ func TestSelectHedgeEndpoint_ExcludesOperatorSibling(t *testing.T) {
 	got := hr.selectHedgeEndpoint(protocol.EndpointAddrList{epAlphaPkp, epAlphaNr}, epAlphaPkp)
 
 	c.Empty(got, "hedge must not target a different subdomain of the same operator as the primary")
+}
+
+// TestSelectHedgeEndpoint_RecordsSelfOperatorAvoided verifies the self-avoided counter fires
+// once per skipped sibling: with two operator-siblings alongside the primary, both are skipped
+// and the counter for that service advances by 2 — the live signal for the eTLD+1 fix.
+func TestSelectHedgeEndpoint_RecordsSelfOperatorAvoided(t *testing.T) {
+	c := require.New(t)
+
+	const svc = "test-hedge-avoided"
+	hr := &hedgeRacer{logger: polyzero.NewLogger(), serviceID: svc}
+
+	before := testutil.ToFloat64(metrics.HedgeSelfOperatorAvoidedTotal.WithLabelValues(svc))
+
+	// primary pkp.opalpha.net + two siblings (nr, ws) of the same operator + one distinct operator.
+	got := hr.selectHedgeEndpoint(
+		protocol.EndpointAddrList{epAlphaPkp, epAlphaNr, epAlphaWSS, epBetaRm},
+		epAlphaPkp,
+	)
+
+	c.Equal(epBetaRm, got, "hedge must land on the distinct operator")
+
+	after := testutil.ToFloat64(metrics.HedgeSelfOperatorAvoidedTotal.WithLabelValues(svc))
+	c.Equal(2.0, after-before, "two operator-siblings skipped => counter +2")
 }

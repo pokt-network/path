@@ -633,6 +633,23 @@ var ReputationDisqualifiedTotal = promauto.NewCounterVec(
 	[]string{LabelServiceID, LabelRPCType, "reason"},
 )
 
+// HedgeSelfOperatorAvoidedTotal counts hedge candidates skipped because they
+// share the primary endpoint's registrable domain (eTLD+1) — i.e. a different
+// subdomain of the SAME operator. This is the live, self-measurable signal for
+// the eTLD+1 hedge-exclusion fix: pre-fix these siblings could win the hedge
+// against their own operator (no resilience benefit); post-fix each such skip
+// increments here. A nonzero rate on a service_id means that service has an
+// operator sharding relay miners across subdomains, and the hedge is correctly
+// steering to a genuinely different operator. Counts each skipped sibling
+// endpoint per hedge selection pass, not unique operators.
+var HedgeSelfOperatorAvoidedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "hedge_self_operator_avoided_total",
+		Help: "Hedge candidates skipped for sharing the primary's registrable domain (same operator, different subdomain), by service_id. The live signal for the eTLD+1 hedge-exclusion fix.",
+	},
+	[]string{LabelServiceID},
+)
+
 // Severity classes for supplier_signal_total. The reputation layer emits 8
 // distinct signal-type strings; carrying all 8 as a label multiplies this
 // counter's cardinality 8× on top of the (supplier × service_id) base — the
@@ -1079,6 +1096,13 @@ func SetSupplierReputationScore(supplier, serviceID, rpcType string, score float
 // ReputationDisqualifyReason* constants.
 func RecordReputationDisqualified(serviceID, rpcType, reason string) {
 	ReputationDisqualifiedTotal.WithLabelValues(serviceID, rpcType, reason).Inc()
+}
+
+// RecordHedgeSelfOperatorAvoided increments the counter for one hedge candidate
+// skipped because it shares the primary endpoint's registrable domain (same
+// operator, different subdomain). See HedgeSelfOperatorAvoidedTotal.
+func RecordHedgeSelfOperatorAvoided(serviceID string) {
+	HedgeSelfOperatorAvoidedTotal.WithLabelValues(serviceID).Inc()
 }
 
 // RecordSupplierSignal increments the per-supplier signal counter, collapsing

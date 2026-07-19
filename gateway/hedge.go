@@ -522,6 +522,9 @@ func (hr *hedgeRacer) selectHedgeEndpoint(
 		}
 		if primaryDomain != "" {
 			if domain := extractRegistrableDomain(ep); domain == primaryDomain {
+				// Sibling subdomain of the primary's operator — skip it and record
+				// the avoidance so the eTLD+1 fix is measurable in production.
+				metrics.RecordHedgeSelfOperatorAvoided(hr.serviceID)
 				continue
 			}
 		}
