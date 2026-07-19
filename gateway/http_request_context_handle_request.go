@@ -16,6 +16,7 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/metrics"
+	metricshttp "github.com/pokt-network/path/metrics/http"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/heuristic"
@@ -1884,7 +1885,13 @@ func filterEndpoints(available protocol.EndpointAddrList, tried map[protocol.End
 			continue
 		}
 		if len(triedDomains) > 0 {
-			if domain := extractDomainFromEndpoint(ep); triedDomains[domain] {
+			// triedDomains holds two granularities that must both be honored:
+			//   - retry/hedge tried entries, written by markDomainTried at eTLD+1 (per-operator
+			//     rotation — excludes every subdomain of an operator we already tried), and
+			//   - circuit-breaker broken entries, pre-populated at full hostname (per-instance).
+			// Match either, so an operator's subdomains are excluded once tried while CB stays
+			// per-instance.
+			if triedDomains[extractDomainFromEndpoint(ep)] || triedDomains[extractRegistrableDomain(ep)] {
 				continue
 			}
 		}
@@ -1893,9 +1900,12 @@ func filterEndpoints(available protocol.EndpointAddrList, tried map[protocol.End
 	return filtered
 }
 
-// markDomainTried extracts the domain (host) from an endpoint URL and adds it to the tried set.
+// markDomainTried adds the endpoint's registrable domain (eTLD+1) to the tried set, so a
+// retry/hedge never rotates to a different subdomain of the same operator it just tried.
+// Circuit-breaker exclusion is seeded separately at full-hostname granularity; filterEndpoints
+// matches both.
 func markDomainTried(triedDomains map[string]bool, endpoint protocol.EndpointAddr) {
-	if domain := extractDomainFromEndpoint(endpoint); domain != "" {
+	if domain := extractRegistrableDomain(endpoint); domain != "" {
 		triedDomains[domain] = true
 	}
 }
@@ -1966,6 +1976,64 @@ func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 		return ""
 	}
 	return parsed.Hostname()
+}
+
+// endpointRegistrableDomainCache memoizes extractRegistrableDomain (eTLD+1), mirroring
+// endpointDomainCache. Same bounded key set, same safety cap.
+var (
+	endpointRegistrableDomainCache      sync.Map // map[protocol.EndpointAddr]string
+	endpointRegistrableDomainCacheCount atomic.Int64
+)
+
+// extractRegistrableDomain returns the registrable domain (eTLD+1) of the endpoint's URL —
+// e.g. both "pkp-og.relayminer.example.net" and "nr.relayminer.example.net" collapse to
+// "example.net". It is used ONLY by the retry/hedge exclusion set so that a supplier that
+// shards its relay miners across subdomains cannot self-hedge or self-retry: the diversity
+// guarantee is per-operator, matching the eTLD+1 granularity the parallel selector and the
+// dashboards already use.
+//
+// Circuit-breaking deliberately stays on the full hostname (extractDomainFromEndpoint) —
+// per-instance breaking must not fault a whole operator over one bad relay-miner instance.
+//
+// Results are memoized. Falls back to the full hostname when the registrable domain cannot
+// be derived (IP literal, localhost, unknown TLD), mirroring metrics/http's own fallback, so
+// every endpoint still gets a stable non-empty key.
+func extractRegistrableDomain(endpoint protocol.EndpointAddr) string {
+	if v, ok := endpointRegistrableDomainCache.Load(endpoint); ok {
+		return v.(string)
+	}
+
+	domain := computeRegistrableDomainFromEndpoint(endpoint)
+
+	if endpointRegistrableDomainCacheCount.Load() < maxEndpointDomainCacheEntries {
+		if _, loaded := endpointRegistrableDomainCache.LoadOrStore(endpoint, domain); !loaded {
+			endpointRegistrableDomainCacheCount.Add(1)
+		}
+	}
+	return domain
+}
+
+// computeRegistrableDomainFromEndpoint performs the uncached eTLD+1 extraction.
+func computeRegistrableDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
+	endpointStr := string(endpoint)
+
+	idx := strings.Index(endpointStr, "-http")
+	if idx < 0 {
+		idx = strings.Index(endpointStr, "-wss")
+		if idx < 0 {
+			idx = strings.Index(endpointStr, "-ws")
+		}
+	}
+	if idx < 0 {
+		return ""
+	}
+
+	rawURL := endpointStr[idx+1:] // skip the dash
+	if etld1, err := metricshttp.ExtractEffectiveTLDPlusOne(rawURL); err == nil && etld1 != "" {
+		return etld1
+	}
+	// Registrable domain not derivable (IP/localhost/unknown TLD) — fall back to full host.
+	return computeDomainFromEndpoint(endpoint)
 }
 
 // retryHedgeScoreEpsilon is the reputation-score window (0-100 scale) within which
