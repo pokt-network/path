@@ -375,7 +375,7 @@ func TestReputation_DisabledNoFiltering(t *testing.T) {
 // a just-recorded signal before the test reads it (a test-harness artifact — production sync
 // intervals are seconds). These unit tests exercise the synchronous score path only
 // (RecordSignal writes cache, GetScore/GetScores read cache), which needs no sync loops.
-func newWSReputationService(t *testing.T, _ context.Context) (reputation.ReputationService, reputation.Config) {
+func newWSReputationService(t *testing.T) (reputation.ReputationService, reputation.Config) {
 	t.Helper()
 	config := reputation.Config{
 		Enabled:         true,
@@ -395,7 +395,7 @@ func newWSReputationService(t *testing.T, _ context.Context) (reputation.Reputat
 // endpoint accrues toward cooldown and future selection (S1) can avoid it.
 func TestReputation_WebsocketStallSignal(t *testing.T) {
 	ctx := context.Background()
-	svc, config := newWSReputationService(t, ctx)
+	svc, config := newWSReputationService(t)
 
 	const serviceID = protocol.ServiceID("eth")
 	ep := &mockEndpoint{addr: "supplier1-https://relay.example.com:443/ws"}
@@ -433,7 +433,7 @@ func TestReputation_WebsocketStallSignal(t *testing.T) {
 // on: after a rebind, a failure penalizes the supplier actually serving the connection.
 func TestReputation_WebsocketSignalAttributionAfterRebind(t *testing.T) {
 	ctx := context.Background()
-	svc, config := newWSReputationService(t, ctx)
+	svc, config := newWSReputationService(t)
 
 	const serviceID = protocol.ServiceID("eth")
 	original := &mockEndpoint{addr: "supplierA-https://original.example.com:443/ws"}
@@ -466,7 +466,7 @@ func TestReputation_WebsocketSignalAttributionAfterRebind(t *testing.T) {
 func TestReputation_FilterByReputation_Websocket(t *testing.T) {
 	ctx := context.Background()
 	logger := polyzero.NewLogger()
-	svc, _ := newWSReputationService(t, ctx)
+	svc, _ := newWSReputationService(t)
 
 	p := &Protocol{logger: logger, reputationService: svc}
 	serviceID := protocol.ServiceID("eth")

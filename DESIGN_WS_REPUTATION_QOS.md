@@ -151,13 +151,24 @@ tier/rank yet. No code enum was needed: of the four gates (§4), **only tiering 
 stay off for WS** — blacklist, session-exhaustion, and threshold/cooldown are all
 desirable for WS. So the implementation is surgical:
 
-1. **Flip the two WS entry points on** — `filterByReputation = true` at
-   `websocket_context.go:281` (initial connect) and `:352` (reconnect).
-2. **Guard tiering off for WS at the gate** — add `filterByRPCType !=
+1. **Filter the candidate list at its source** — `AvailableWebsocketEndpoints`
+   (`protocol.go`, the list the gateway's QoS selector picks from) now passes
+   `filterByReputation = true`. This is the load-bearing one for the initial connect:
+   the gateway selects an endpoint from this list *before* `getPreSelectedEndpoint`
+   runs, and `getPreSelectedEndpoint` receives that addr as `requestedEndpointAddr`,
+   which the reputation filter keeps even in cooldown (race-protection). So filtering
+   only inside `getPreSelectedEndpoint` (below) is a no-op on initial connect —
+   the list must be filtered so the selector never sees proven-bad endpoints.
+   *(Found by the S0/S1 independent audit — the original commit filtered only the
+   selection entry points and was silently bypassed on initial connect.)*
+2. **Flip the two selection entry points on** — `filterByReputation = true` at
+   `websocket_context.go:281` (initial connect, defense-in-depth) and `:352`
+   (reconnect, where it IS load-bearing — reconnect builds+selects its own set).
+3. **Guard tiering off for WS at the gate** — add `filterByRPCType !=
    RPCType_WEBSOCKET` to the `tieredSelector` condition (`protocol.go:1290`). This
    is more precise than option (b)'s global-config approach and needs no new flag —
    the gate itself knows the rpc type.
-3. **WS-only safety net** on the reputation filter (`protocol.go:1256`): if the
+4. **WS-only safety net** on the reputation filter (`protocol.go:1256`): if the
    filter would leave the WS pool empty, keep the pre-filter set as last resort
    (mirrors the session-exhaustion net at `:1233`). Disqualify is best-effort for WS
    — a transient score dip must never sever connectivity while active WS health

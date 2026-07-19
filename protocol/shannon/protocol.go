@@ -650,11 +650,15 @@ func (p *Protocol) AvailableWebsocketEndpoints(
 	// The final boolean parameter sets whether to filter by reputation.
 	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
 	//
-	// NOTE: WebSocket endpoints currently don't have dedicated health checks, so they may have
-	// low initial scores. We use filterByReputation=false to allow connections to all WebSocket
-	// endpoints until WebSocket health checks are implemented.
-	// TODO_IMPROVE: Add WebSocket health checks and re-enable reputation filtering.
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers, "")
+	// S1 (disqualify-only): reputation-filter the WebSocket candidate list HERE. This is the
+	// list the gateway's QoS selector picks from before BuildWebsocketRequestContextForEndpoint,
+	// so filtering only inside getPreSelectedEndpoint would be bypassed — that path receives the
+	// already-selected addr as requestedEndpointAddr, which the reputation filter keeps even in
+	// cooldown (race-protection). Filtering the list means the selector never sees proven-bad
+	// endpoints. Unscored endpoints still pass (InitialScore); the WS safety net in
+	// getSessionsUniqueEndpoints prevents an empty pool; tiered ranking stays OFF for WS.
+	// TODO_IMPROVE(S2/S3): rank by :websocket score/head + add active WS health checks.
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers, "")
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -1257,30 +1261,32 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 			beforeCount := len(qualifiedEndpoints)
 			filtered := p.filterByReputation(ctx, serviceID, qualifiedEndpoints, filterByRPCType, logger, requestedEndpointAddr)
 
-			// S1 WebSocket safety net: reputation disqualification must never empty the WS
-			// pool. There are no active WS health checks yet (S3), so a transient score dip
-			// must not sever connectivity — disqualify is best-effort for WS. Keep the
-			// pre-filter set as a last resort (mirrors the session-exhaustion safety net above).
-			if len(filtered) == 0 && filterByRPCType == sharedtypes.RPCType_WEBSOCKET {
-				logger.Warn().Msgf(
-					"All %d WebSocket endpoints below reputation threshold for service %s, app %s — keeping them as last resort (no WS health checks yet).",
-					beforeCount, serviceID, app.Address,
-				)
-			} else {
+			switch {
+			case len(filtered) > 0:
 				qualifiedEndpoints = filtered
-
-				if len(qualifiedEndpoints) == 0 {
-					logger.Warn().Msgf(
-						"All %d endpoints below reputation threshold for service %s, app %s. SKIPPING the app.",
-						beforeCount, serviceID, app.Address,
-					)
-					continue
-				}
-
 				if beforeCount != len(qualifiedEndpoints) {
 					logger.Debug().Msgf("app %s has %d endpoints after filtering by reputation (was %d).",
 						app.Address, len(qualifiedEndpoints), beforeCount)
 				}
+
+			case filterByRPCType == sharedtypes.RPCType_WEBSOCKET:
+				// S1 WebSocket safety net: reputation disqualification must never empty the WS
+				// pool. No active WS health checks yet (S3), so a transient score dip must not
+				// sever connectivity — disqualify is best-effort for WS. Keep the pre-filter set
+				// (qualifiedEndpoints left unchanged) as a last resort, mirroring the
+				// session-exhaustion safety net above.
+				logger.Warn().Msgf(
+					"All %d WebSocket endpoints below reputation threshold for service %s, app %s — keeping them as last resort (no WS health checks yet).",
+					beforeCount, serviceID, app.Address,
+				)
+
+			default:
+				// Non-WebSocket request with every endpoint filtered out → skip the app.
+				logger.Warn().Msgf(
+					"All %d endpoints below reputation threshold for service %s, app %s. SKIPPING the app.",
+					beforeCount, serviceID, app.Address,
+				)
+				continue
 			}
 		}
 

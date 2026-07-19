@@ -898,10 +898,14 @@ func (wrc *websocketRequestContext) OnEndpointStallDetected(gaveUp bool) {
 	metrics.RecordWebsocketEndpointStall(domain, serviceID, gaveUp)
 
 	// S0: feed the stall into reputation so the endpoint's :websocket score reflects it.
-	// recordWebsocketSignal attributes to signingEndpoint() — the stalling supplier at
-	// this point, since OnEndpointStallDetected fires BEFORE the rebind swaps in a
-	// replacement. A stalled data feed is a real endpoint fault → Major (same weight as a
-	// connection/handshake failure); consistent stalls accrue toward cooldown.
+	// recordWebsocketSignal attributes to signingEndpoint(). The bridge invokes this handler
+	// and the subsequent rebind on its single start() goroutine, in order (stall-detect →
+	// OnEndpointStallDetected → handleEndpointDown → ReconnectEndpoint), so signingEndpoint()
+	// still resolves to the stalling supplier here — the rebind has not yet reassigned
+	// reconnectEndpoint. (Even across earlier rebinds, signingEndpoint() is always the CURRENT
+	// serving supplier, which is exactly who should be penalized for stalling.) A stalled data
+	// feed is a real endpoint fault → Major (same weight as a connection/handshake failure);
+	// consistent stalls accrue toward cooldown.
 	wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_endpoint_stalled", 0))
 
 	// Error level ON PURPOSE for canary visibility. Temporary — downgrade once validated.
