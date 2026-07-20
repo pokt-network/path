@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pokt-network/poktroll/pkg/polylog/polyzero"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/stretchr/testify/require"
 
@@ -16,6 +17,7 @@ import (
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
+	reputationstorage "github.com/pokt-network/path/reputation/storage"
 	"github.com/pokt-network/path/websockets"
 )
 
@@ -330,6 +332,7 @@ func intPtr(i int) *int {
 type mockProtocolForRetry struct {
 	unifiedConfigNil bool
 	retryConfig      *ServiceRetryConfig
+	reputationSvc    reputation.ReputationService // nil unless a test injects one
 }
 
 func (m *mockProtocolForRetry) GetUnifiedServicesConfig() *UnifiedServicesConfig {
@@ -411,7 +414,7 @@ func (m *mockProtocolForRetry) UnblacklistSupplier(serviceID protocol.ServiceID,
 }
 
 func (m *mockProtocolForRetry) GetReputationService() reputation.ReputationService {
-	return nil
+	return m.reputationSvc
 }
 
 func (m *mockProtocolForRetry) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]EndpointInfo, error) {
@@ -1174,4 +1177,72 @@ func TestMaxRetryLatencyRealWorldScenarios(t *testing.T) {
 			require.True(t, result, "Fast failures should always be retried (attempt %d)", i+1)
 		}
 	})
+}
+
+// TestSelectTopRankedEndpoint_SpreadsOverflowAcrossBand verifies the retry/hedge overflow
+// fix: selection spreads uniformly across endpoints within retryHedgeScoreEpsilon of the top
+// score (not winner-take-all to the strict #1), while still excluding endpoints scoring
+// meaningfully below the band (quality gating preserved).
+func TestSelectTopRankedEndpoint_SpreadsOverflowAcrossBand(t *testing.T) {
+	ctx := context.Background()
+
+	config := reputation.Config{
+		Enabled:         true,
+		InitialScore:    80,
+		MinThreshold:    30,
+		RecoveryTimeout: 5 * time.Minute,
+		StorageType:     "memory",
+	}
+	config.HydrateDefaults()
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	// Intentionally NOT started: the background sync loops race with the synchronous cache
+	// writes below and can drop just-recorded scores (test-harness artifact). RecordSignal /
+	// GetScores / RankEndpointsByScore all read/write the cache synchronously — all we need.
+
+	const serviceID = protocol.ServiceID("test-service")
+	rpcType := sharedtypes.RPCType_JSON_RPC
+
+	// Four candidates. A/B/C sit within epsilon (2.0) of the top; D is 10 points below.
+	// Scores are InitialScore(80) + one point per success (capped at MaxScore 100).
+	a := protocol.EndpointAddr("supplierA-https://a.example.com")
+	b := protocol.EndpointAddr("supplierB-https://b.example.com")
+	c := protocol.EndpointAddr("supplierC-https://c.example.com")
+	d := protocol.EndpointAddr("supplierD-https://d.example.com")
+
+	kb := svc.KeyBuilderForService(serviceID)
+	record := func(ep protocol.EndpointAddr, successes int) {
+		k := kb.BuildKey(serviceID, ep, rpcType)
+		for i := 0; i < successes; i++ {
+			require.NoError(t, svc.RecordSignal(ctx, k, reputation.NewSuccessSignal(0)))
+		}
+	}
+	record(a, 20) // -> 100 (top)
+	record(b, 19) // ->  99 (within epsilon of 100)
+	record(c, 18) // ->  98 (within epsilon of 100)
+	record(d, 10) // ->  90 (outside the band)
+
+	rc := &requestContext{
+		context:   ctx,
+		serviceID: serviceID,
+		logger:    polyzero.NewLogger(),
+		protocol:  &mockProtocolForRetry{reputationSvc: svc},
+	}
+
+	endpoints := protocol.EndpointAddrList{a, b, c, d}
+	counts := map[protocol.EndpointAddr]int{}
+	const iterations = 600
+	for i := 0; i < iterations; i++ {
+		counts[rc.selectTopRankedEndpoint(endpoints, rpcType)]++
+	}
+
+	// Spread: every in-band endpoint is selected at least once. Under the old strict-#1
+	// behavior, only `a` would ever be returned (winner-take-all).
+	require.Greater(t, counts[a], 0, "top endpoint should be selected")
+	require.Greater(t, counts[b], 0, "within-epsilon endpoint b should share overflow")
+	require.Greater(t, counts[c], 0, "within-epsilon endpoint c should share overflow")
+	// Quality gating: the below-band endpoint is never selected.
+	require.Equal(t, 0, counts[d], "below-band endpoint must not be selected")
+	// Not winner-take-all: no single endpoint captured every selection.
+	require.Less(t, counts[a], iterations, "selection must spread, not dogpile the strict #1")
 }

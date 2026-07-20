@@ -510,15 +510,21 @@ func (hr *hedgeRacer) selectHedgeEndpoint(
 	endpoints protocol.EndpointAddrList,
 	excludePrimary protocol.EndpointAddr,
 ) protocol.EndpointAddr {
-	// Filter out primary endpoint AND any endpoints from the same domain
-	primaryDomain := extractDomainFromEndpoint(excludePrimary)
+	// Filter out the primary endpoint AND any endpoint from the same operator. Uses the
+	// registrable domain (eTLD+1), not the full hostname, so an operator that shards its
+	// relay miners across subdomains cannot win the hedge against itself — the hedge must
+	// reach a genuinely different operator.
+	primaryDomain := extractRegistrableDomain(excludePrimary)
 	filtered := make(protocol.EndpointAddrList, 0, len(endpoints)-1)
 	for _, ep := range endpoints {
 		if ep == excludePrimary {
 			continue
 		}
 		if primaryDomain != "" {
-			if domain := extractDomainFromEndpoint(ep); domain == primaryDomain {
+			if domain := extractRegistrableDomain(ep); domain == primaryDomain {
+				// Sibling subdomain of the primary's operator — skip it and record
+				// the avoidance so the eTLD+1 fix is measurable in production.
+				metrics.RecordHedgeSelfOperatorAvoided(hr.serviceID)
 				continue
 			}
 		}

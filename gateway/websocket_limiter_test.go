@@ -12,7 +12,7 @@ func Test_WebsocketConnectionLimiter_NilIsDisabled(t *testing.T) {
 	c := require.New(t)
 
 	// A max <= 0 yields a nil limiter (limiting disabled).
-	var l *WebsocketConnectionLimiter = NewWebsocketConnectionLimiter(0)
+	l := NewWebsocketConnectionLimiter(0)
 	c.Nil(l)
 	c.Nil(NewWebsocketConnectionLimiter(-5))
 

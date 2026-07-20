@@ -313,13 +313,15 @@ func (p *Protocol) GetMeanScoreData(ctx context.Context) ([]metrics.MeanScoreEnt
 }
 
 // GetSupplierScoreData implements the metrics.LeaderboardDataProvider interface.
-// It returns the mean reputation score per (supplier, service_id) pair, averaging
-// across RPC types and per-endpoint scores when the supplier has multiple endpoints.
+// It returns the mean reputation score per (supplier, service_id, rpc_type) triple,
+// averaging per-endpoint scores when the supplier has multiple endpoints of the same
+// rpc_type.
 //
-// Cardinality note: this metric is bounded by active suppliers × active services.
-// We deliberately omit domain and rpc_type — supplier already implies domain and
-// adding rpc_type would multiply cardinality without operator value (operators
-// running relay miners want one number per service).
+// Cardinality note: bounded by active suppliers × active services × rpc_types (a
+// supplier typically serves 1-3 rpc types). The rpc_type split is deliberate: a
+// supplier's websocket reputation is tracked and disqualified separately from its
+// json_rpc reputation, and averaging the two together hid genuinely-broken websocket
+// endpoints behind a healthy json_rpc score.
 func (p *Protocol) GetSupplierScoreData(ctx context.Context) ([]metrics.SupplierScoreEntry, error) {
 	logger := p.logger.With("method", "GetSupplierScoreData")
 
@@ -336,6 +338,7 @@ func (p *Protocol) GetSupplierScoreData(ctx context.Context) ([]metrics.Supplier
 	type supplierKey struct {
 		Supplier  string
 		ServiceID string
+		RPCType   string
 	}
 	type aggregator struct {
 		Total float64
@@ -372,7 +375,11 @@ func (p *Protocol) GetSupplierScoreData(ctx context.Context) ([]metrics.Supplier
 					score = reputation.Score{Value: p.reputationService.GetInitialScoreForService(serviceID)}
 				}
 
-				aggKey := supplierKey{Supplier: supplier, ServiceID: string(serviceID)}
+				aggKey := supplierKey{
+					Supplier:  supplier,
+					ServiceID: string(serviceID),
+					RPCType:   metrics.NormalizeRPCType(actualRPCType.String()),
+				}
 				if aggregates[aggKey] == nil {
 					aggregates[aggKey] = &aggregator{}
 				}
@@ -390,6 +397,7 @@ func (p *Protocol) GetSupplierScoreData(ctx context.Context) ([]metrics.Supplier
 		entries = append(entries, metrics.SupplierScoreEntry{
 			Supplier:  k.Supplier,
 			ServiceID: k.ServiceID,
+			RPCType:   k.RPCType,
 			Score:     agg.Total / float64(agg.Count),
 		})
 	}

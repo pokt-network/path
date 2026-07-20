@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/metrics"
+	metricshttp "github.com/pokt-network/path/metrics/http"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/heuristic"
@@ -388,8 +390,8 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	var lastErr error
 	var lastStatusCode int
 	var lastEndpointAddr protocol.EndpointAddr
-	var lastCircuitBreakReason string              // reason for circuit breaking the previous endpoint's domain
-	var lastResponseSnippet string                 // truncated response that triggered the break
+	var lastCircuitBreakReason string                 // reason for circuit breaking the previous endpoint's domain
+	var lastResponseSnippet string                    // truncated response that triggered the break
 	var lastHeuristicResult *heuristic.AnalysisResult // heuristic result from the last failed attempt
 
 	// Track endpoints and domains already tried to ensure retry rotation.
@@ -522,6 +524,9 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				break
 			}
 
+			// Tag the rebuilt context as a retry so its relay metric is recorded with
+			// request_type="retry" instead of "normal" — keeps retry overflow visible.
+			newProtocolCtx.MarkAsRetry()
 			currentProtocolCtx = newProtocolCtx
 
 			logger.Debug().
@@ -1880,7 +1885,13 @@ func filterEndpoints(available protocol.EndpointAddrList, tried map[protocol.End
 			continue
 		}
 		if len(triedDomains) > 0 {
-			if domain := extractDomainFromEndpoint(ep); triedDomains[domain] {
+			// triedDomains holds two granularities that must both be honored:
+			//   - retry/hedge tried entries, written by markDomainTried at eTLD+1 (per-operator
+			//     rotation — excludes every subdomain of an operator we already tried), and
+			//   - circuit-breaker broken entries, pre-populated at full hostname (per-instance).
+			// Match either, so an operator's subdomains are excluded once tried while CB stays
+			// per-instance.
+			if triedDomains[extractDomainFromEndpoint(ep)] || triedDomains[extractRegistrableDomain(ep)] {
 				continue
 			}
 		}
@@ -1889,9 +1900,12 @@ func filterEndpoints(available protocol.EndpointAddrList, tried map[protocol.End
 	return filtered
 }
 
-// markDomainTried extracts the domain (host) from an endpoint URL and adds it to the tried set.
+// markDomainTried adds the endpoint's registrable domain (eTLD+1) to the tried set, so a
+// retry/hedge never rotates to a different subdomain of the same operator it just tried.
+// Circuit-breaker exclusion is seeded separately at full-hostname granularity; filterEndpoints
+// matches both.
 func markDomainTried(triedDomains map[string]bool, endpoint protocol.EndpointAddr) {
-	if domain := extractDomainFromEndpoint(endpoint); domain != "" {
+	if domain := extractRegistrableDomain(endpoint); domain != "" {
 		triedDomains[domain] = true
 	}
 }
@@ -1939,11 +1953,14 @@ func extractDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 	return domain
 }
 
-// computeDomainFromEndpoint performs the uncached host extraction.
-func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
+// rawURLFromEndpoint splits an endpoint address ("<supplier_address>-<url>", e.g.
+// "pokt1abc-https://rel.example.xyz") into its URL part ("https://rel.example.xyz"). The URL
+// is located by the scheme-prefixed dash ("-http"/"-wss"/"-ws") so a dash inside the supplier
+// address is not mistaken for the separator. Returns ok=false when no URL part is found.
+// Single source of truth for the split convention shared by the domain extractors below.
+func rawURLFromEndpoint(endpoint protocol.EndpointAddr) (string, bool) {
 	endpointStr := string(endpoint)
 
-	// Find the URL part after the supplier address
 	idx := strings.Index(endpointStr, "-http")
 	if idx < 0 {
 		// Try websocket URLs
@@ -1953,10 +1970,17 @@ func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 		}
 	}
 	if idx < 0 {
+		return "", false
+	}
+	return endpointStr[idx+1:], true // skip the dash
+}
+
+// computeDomainFromEndpoint performs the uncached host extraction.
+func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
+	rawURL, ok := rawURLFromEndpoint(endpoint)
+	if !ok {
 		return ""
 	}
-
-	rawURL := endpointStr[idx+1:] // skip the dash
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return ""
@@ -1964,9 +1988,68 @@ func computeDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
 	return parsed.Hostname()
 }
 
-// selectTopRankedEndpoint selects the highest-reputation endpoint for retry.
-// This maximizes the chance of getting a successful response on retry by
-// prioritizing the best-performing endpoints based on their reputation scores.
+// endpointRegistrableDomainCache memoizes extractRegistrableDomain (eTLD+1), mirroring
+// endpointDomainCache. Same bounded key set, same safety cap.
+var (
+	endpointRegistrableDomainCache      sync.Map // map[protocol.EndpointAddr]string
+	endpointRegistrableDomainCacheCount atomic.Int64
+)
+
+// extractRegistrableDomain returns the registrable domain (eTLD+1) of the endpoint's URL —
+// e.g. both "pkp-og.relayminer.example.net" and "nr.relayminer.example.net" collapse to
+// "example.net". It is used ONLY by the retry/hedge exclusion set so that a supplier that
+// shards its relay miners across subdomains cannot self-hedge or self-retry: the diversity
+// guarantee is per-operator, matching the eTLD+1 granularity the parallel selector and the
+// dashboards already use.
+//
+// Circuit-breaking deliberately stays on the full hostname (extractDomainFromEndpoint) —
+// per-instance breaking must not fault a whole operator over one bad relay-miner instance.
+//
+// Results are memoized. Falls back to the full hostname when the registrable domain cannot
+// be derived (IP literal, localhost, unknown TLD), mirroring metrics/http's own fallback, so
+// every endpoint still gets a stable non-empty key.
+func extractRegistrableDomain(endpoint protocol.EndpointAddr) string {
+	if v, ok := endpointRegistrableDomainCache.Load(endpoint); ok {
+		return v.(string)
+	}
+
+	domain := computeRegistrableDomainFromEndpoint(endpoint)
+
+	if endpointRegistrableDomainCacheCount.Load() < maxEndpointDomainCacheEntries {
+		if _, loaded := endpointRegistrableDomainCache.LoadOrStore(endpoint, domain); !loaded {
+			endpointRegistrableDomainCacheCount.Add(1)
+		}
+	}
+	return domain
+}
+
+// computeRegistrableDomainFromEndpoint performs the uncached eTLD+1 extraction.
+func computeRegistrableDomainFromEndpoint(endpoint protocol.EndpointAddr) string {
+	rawURL, ok := rawURLFromEndpoint(endpoint)
+	if !ok {
+		return ""
+	}
+	if etld1, err := metricshttp.ExtractEffectiveTLDPlusOne(rawURL); err == nil && etld1 != "" {
+		return etld1
+	}
+	// Registrable domain not derivable (IP/localhost/unknown TLD) — fall back to full host.
+	return computeDomainFromEndpoint(endpoint)
+}
+
+// retryHedgeScoreEpsilon is the reputation-score window (0-100 scale) within which
+// endpoints are treated as effectively tied for retry/hedge selection. A fractional
+// score edge (e.g. 100.0 vs 99.8 from latency-penalty noise) must NOT make one endpoint
+// capture 100% of retry+hedge overflow (winner-take-all). Endpoints scoring within this
+// window of the max are selected among uniformly at random, spreading overflow and blast
+// radius across the genuinely-top tier while still excluding anything meaningfully worse.
+const retryHedgeScoreEpsilon = 2.0
+
+// selectTopRankedEndpoint selects among the highest-reputation endpoints for retry/hedge.
+// It ranks by reputation score, then picks UNIFORMLY AT RANDOM among all endpoints whose
+// score is within retryHedgeScoreEpsilon of the top score. This keeps quality gating
+// (only the top-scoring band is eligible) while avoiding winner-take-all: without it, a
+// sub-point score edge routes every retry and hedge overflow to a single endpoint,
+// dogpiling it and concentrating all blast radius there.
 //
 // Falls back to the first endpoint in the list if reputation service is unavailable.
 func (rc *requestContext) selectTopRankedEndpoint(
@@ -2012,8 +2095,28 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		return endpoints[0]
 	}
 
-	// Return the original endpoint address corresponding to the top-ranked key
-	topKey := rankedKeys[0]
+	// Determine the top-scoring band: rankedKeys is sorted descending, so the eligible band
+	// is the prefix of keys within retryHedgeScoreEpsilon of the max score. Scoring missing
+	// keys as the service's initial score matches RankEndpointsByScore's benefit-of-the-doubt.
+	scores, scoresErr := reputationSvc.GetScores(rc.context, rankedKeys)
+	bandSize := 1
+	if scoresErr == nil {
+		initialScore := reputationSvc.GetInitialScoreForService(rc.serviceID)
+		scoreOf := func(k reputation.EndpointKey) float64 {
+			if s, ok := scores[k]; ok {
+				return s.Value
+			}
+			return initialScore
+		}
+		maxScore := scoreOf(rankedKeys[0])
+		for bandSize < len(rankedKeys) && scoreOf(rankedKeys[bandSize]) >= maxScore-retryHedgeScoreEpsilon {
+			bandSize++
+		}
+	}
+
+	// Pick uniformly at random within the top-scoring band to spread retry/hedge overflow
+	// (and blast radius) instead of always dogpiling the strict #1.
+	topKey := rankedKeys[rand.Intn(bandSize)]
 	originalEndpoint, ok := keyToOriginalEndpoint[topKey.EndpointAddr]
 	if !ok {
 		// Shouldn't happen, but fall back to first endpoint if mapping fails
@@ -2024,10 +2127,11 @@ func (rc *requestContext) selectTopRankedEndpoint(
 	}
 
 	rc.logger.Debug().
-		Str("top_endpoint", string(originalEndpoint)).
+		Str("selected_endpoint", string(originalEndpoint)).
 		Str("reputation_key", string(topKey.EndpointAddr)).
+		Int("band_size", bandSize).
 		Int("num_candidates", len(endpoints)).
-		Msg("🏆 Selected TOP-RANKED endpoint for retry (highest reputation)")
+		Msg("🏆 Selected endpoint from top-scoring band for retry/hedge (spreads overflow)")
 
 	return originalEndpoint
 }

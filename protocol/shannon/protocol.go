@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -170,6 +171,13 @@ type Protocol struct {
 	// Used by GetServiceEndpointDetails to query archival status for endpoints.
 	// Set via SetQoSServiceRegistry after initialization.
 	qosServiceRegistry gateway.QoSServiceRegistry
+
+	// websocketSessionRebindEnabled turns on transparent websocket session rebind:
+	// on a Shannon session rollover the endpoint connection is re-established and
+	// subscriptions replayed, instead of closing the client. Experimental. DEFAULT ON
+	// (canary testing); PATH_WEBSOCKET_SESSION_REBIND=false disables. Graduates to YAML
+	// config once canary-validated.
+	websocketSessionRebindEnabled bool
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -299,6 +307,24 @@ func NewProtocol(
 		return nil, fmt.Errorf("failed to create relay signer: %w", err)
 	}
 	protocolInstance.relaySigner = relaySigner
+
+	// Experimental websocket session rebind. When on, a websocket connection survives a
+	// Shannon session rollover by rebinding the endpoint and replaying subscriptions
+	// instead of closing the client.
+	//
+	// DEFAULT ON to make canary testing frictionless; set PATH_WEBSOCKET_SESSION_REBIND=false
+	// to disable (kill switch — takes effect on restart, no rebuild).
+	//
+	// WARNING: the LIVE reconnect path (session re-fetch, dial, handshake acceptance) is
+	// validated only on canary. Do NOT promote an image carrying this default to mainnet
+	// until canary-validated — or pin PATH_WEBSOCKET_SESSION_REBIND=false in the mainnet
+	// manifest. Once validated this graduates to a YAML config field.
+	if os.Getenv("PATH_WEBSOCKET_SESSION_REBIND") == "false" {
+		shannonLogger.Info().Msg("websocket session rebind DISABLED via PATH_WEBSOCKET_SESSION_REBIND=false")
+	} else {
+		protocolInstance.websocketSessionRebindEnabled = true
+		shannonLogger.Warn().Msg("⚠️ EXPERIMENTAL websocket session rebind ENABLED (default-on; set PATH_WEBSOCKET_SESSION_REBIND=false to disable)")
+	}
 
 	// Initialize reputation service if enabled.
 	// Reputation is the primary endpoint quality system - it tracks endpoint scores
@@ -624,11 +650,15 @@ func (p *Protocol) AvailableWebsocketEndpoints(
 	// The final boolean parameter sets whether to filter by reputation.
 	// The final slice parameter optionally restricts endpoints to specific allowed suppliers.
 	//
-	// NOTE: WebSocket endpoints currently don't have dedicated health checks, so they may have
-	// low initial scores. We use filterByReputation=false to allow connections to all WebSocket
-	// endpoints until WebSocket health checks are implemented.
-	// TODO_IMPROVE: Add WebSocket health checks and re-enable reputation filtering.
-	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers, "")
+	// S1 (disqualify-only): reputation-filter the WebSocket candidate list HERE. This is the
+	// list the gateway's QoS selector picks from before BuildWebsocketRequestContextForEndpoint,
+	// so filtering only inside getPreSelectedEndpoint would be bypassed — that path receives the
+	// already-selected addr as requestedEndpointAddr, which the reputation filter keeps even in
+	// cooldown (race-protection). Filtering the list means the selector never sees proven-bad
+	// endpoints. Unscored endpoints still pass (InitialScore); the WS safety net in
+	// getSessionsUniqueEndpoints prevents an empty pool; tiered ranking stays OFF for WS.
+	// TODO_IMPROVE(S2/S3): rank by :websocket score/head + add active WS health checks.
+	endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, true, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers, "")
 	if err != nil {
 		logger.Error().Err(err).Msg(err.Error())
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -1229,19 +1259,34 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		// - supplier filtering is active (user wants specific suppliers)
 		if filterByReputation && p.reputationService != nil && len(effectiveAllowedSuppliers) == 0 {
 			beforeCount := len(qualifiedEndpoints)
-			qualifiedEndpoints = p.filterByReputation(ctx, serviceID, qualifiedEndpoints, filterByRPCType, logger, requestedEndpointAddr)
+			filtered := p.filterByReputation(ctx, serviceID, qualifiedEndpoints, filterByRPCType, logger, requestedEndpointAddr)
 
-			if len(qualifiedEndpoints) == 0 {
+			switch {
+			case len(filtered) > 0:
+				qualifiedEndpoints = filtered
+				if beforeCount != len(qualifiedEndpoints) {
+					logger.Debug().Msgf("app %s has %d endpoints after filtering by reputation (was %d).",
+						app.Address, len(qualifiedEndpoints), beforeCount)
+				}
+
+			case filterByRPCType == sharedtypes.RPCType_WEBSOCKET:
+				// S1 WebSocket safety net: reputation disqualification must never empty the WS
+				// pool. No active WS health checks yet (S3), so a transient score dip must not
+				// sever connectivity — disqualify is best-effort for WS. Keep the pre-filter set
+				// (qualifiedEndpoints left unchanged) as a last resort, mirroring the
+				// session-exhaustion safety net above.
+				logger.Warn().Msgf(
+					"All %d WebSocket endpoints below reputation threshold for service %s, app %s — keeping them as last resort (no WS health checks yet).",
+					beforeCount, serviceID, app.Address,
+				)
+
+			default:
+				// Non-WebSocket request with every endpoint filtered out → skip the app.
 				logger.Warn().Msgf(
 					"All %d endpoints below reputation threshold for service %s, app %s. SKIPPING the app.",
 					beforeCount, serviceID, app.Address,
 				)
 				continue
-			}
-
-			if beforeCount != len(qualifiedEndpoints) {
-				logger.Debug().Msgf("app %s has %d endpoints after filtering by reputation (was %d).",
-					app.Address, len(qualifiedEndpoints), beforeCount)
 			}
 		}
 
@@ -1261,7 +1306,10 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 		// Apply tiered selection if enabled - only return endpoints from the highest available tier
 		// SKIP tiered filtering when filterByReputation is false (e.g., for leaderboard metrics gathering)
 		// because tiered selection is based on reputation scores.
-		if filterByReputation && p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
+		// S1: tiered selection (ranking) stays OFF for WebSocket — there are no active WS
+		// health checks yet, so ranking on WS scores is deferred to S2. WS still gets
+		// blacklist + session-exhaustion + reputation threshold/cooldown disqualification above.
+		if filterByReputation && filterByRPCType != sharedtypes.RPCType_WEBSOCKET && p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
 			endpoints = p.filterToHighestTier(ctx, serviceID, endpoints, filterByRPCType, logger, requestedEndpointAddr)
 		}
 

@@ -63,6 +63,7 @@ func Test_Bridge_StartBridge(t *testing.T) {
 			http.Header{},
 			messageProcessor,
 			observationsChan,
+			nil, // reconnector: rebind disabled in these tests
 		)
 		c.NoError(err)
 		c.NotNil(completionChan, "Should receive completion channel")
@@ -119,6 +120,7 @@ func Test_Bridge_StartBridge_ErrorCases(t *testing.T) {
 		http.Header{},
 		messageProcessor,
 		observationsChan,
+		nil, // reconnector: rebind disabled in these tests
 	)
 	c.Error(err, "Should fail with invalid endpoint URL")
 	c.Nil(completionChan, "Should not receive completion channel on error")
@@ -179,6 +181,7 @@ func Test_Bridge_NoPanicOnProcessingError(t *testing.T) {
 					http.Header{},
 					messageProcessor,
 					observationsChan,
+					nil, // reconnector: rebind disabled in these tests
 				)
 				if err != nil {
 					return
@@ -238,6 +241,7 @@ func Test_Bridge_ClientGetsCloseFrameOnEndpointConnectFailure(t *testing.T) {
 			http.Header{},
 			messageProcessor,
 			observationsChan,
+			nil, // reconnector: rebind disabled in these tests
 		)
 	}))
 	defer clientServer.Close()
@@ -293,6 +297,7 @@ func Test_Bridge_SanitizesReservedCloseCode(t *testing.T) {
 			http.Header{},
 			messageProcessor,
 			observationsChan,
+			nil, // reconnector: rebind disabled in these tests
 		)
 	}))
 	defer clientServer.Close()

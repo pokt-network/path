@@ -156,6 +156,12 @@ type requestContext struct {
 	// about whether they actually work.
 	isHedge bool
 
+	// isRetry marks this request as a sequential retry to a different endpoint after a
+	// prior attempt failed. Set by MarkAsRetry() on the rebuilt retry context. Used at
+	// metric recording time to tag the relay request_type="retry" (not "normal") so retry
+	// overflow is measurable. Does not affect reputation signals.
+	isRetry bool
+
 	// tieredSelector provides access to tier-based selection and probation status.
 	// Used to check if endpoints are in probation when recording success signals.
 	// If non-nil and endpoint is in probation, RecoverySuccessSignal is used instead of SuccessSignal.
@@ -475,6 +481,13 @@ func (rc *requestContext) SetParentContext(ctx context.Context) {
 // for behavior implications (metric request_type, latency penalty skip).
 func (rc *requestContext) MarkAsHedge() {
 	rc.isHedge = true
+}
+
+// MarkAsRetry tags this request as a sequential retry to a different endpoint after a
+// prior attempt failed. Implements gateway.ProtocolRequestContext. See the field doc on
+// `isRetry` (metric request_type only; reputation signals unaffected).
+func (rc *requestContext) MarkAsRetry() {
+	rc.isRetry = true
 }
 
 // getSelectedEndpoint returns the currently selected endpoint in a thread-safe manner.
@@ -1250,10 +1263,14 @@ func (rc *requestContext) handleEndpointError(
 	}
 
 	// Determine relay type - errors are recorded as normal type (probation detection requires success).
-	// Hedge errors are tagged as hedge so they don't pollute the per-domain RPS view.
+	// Hedge/retry errors are tagged so they don't pollute the per-domain RPS view (hedge and
+	// retry are mutually exclusive request kinds).
 	relayType := metrics.RelayTypeNormal
-	if rc.isHedge {
+	switch {
+	case rc.isHedge:
 		relayType = metrics.RelayTypeHedge
+	case rc.isRetry:
+		relayType = metrics.RelayTypeRetry
 	}
 	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
@@ -1388,6 +1405,15 @@ func (rc *requestContext) handleEndpointSuccess(
 		} else {
 			relayType = metrics.RelayTypeNormal
 		}
+	}
+
+	// A sequential retry (rebuilt context after a prior attempt failed) is tagged
+	// request_type="retry" wherever it would otherwise be "normal" — covering both a
+	// successful retry and one that returns 5xx. Hedge and probation keep their own labels
+	// (a retry is neither). This makes retry overflow measurable instead of inflating the
+	// primary "normal" bucket.
+	if rc.isRetry && relayType == metrics.RelayTypeNormal {
+		relayType = metrics.RelayTypeRetry
 	}
 
 	// Record relay metric for successful request

@@ -32,11 +32,13 @@ type MeanScoreEntry struct {
 	MeanScore float64 // Average score across all endpoints for this combination
 }
 
-// SupplierScoreEntry represents the per-(supplier, service_id) reputation score.
-// One value per pair — averaged across RPC types if the supplier serves multiple.
+// SupplierScoreEntry represents the per-(supplier, service_id, rpc_type) reputation score.
+// One value per triple — a supplier serving multiple RPC types (e.g. json_rpc + websocket)
+// gets one entry per type, since reputation is tracked and acted on per rpc_type.
 type SupplierScoreEntry struct {
 	Supplier  string
 	ServiceID string
+	RPCType   string
 	Score     float64
 }
 
@@ -192,7 +194,7 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 
 	if len(supplierScores) > 0 {
 		for _, entry := range supplierScores {
-			SetSupplierReputationScore(entry.Supplier, entry.ServiceID, entry.Score)
+			SetSupplierReputationScore(entry.Supplier, entry.ServiceID, entry.RPCType, entry.Score)
 		}
 		lp.logger.Debug().Int("entries", len(supplierScores)).Msg("Published supplier scores")
 	}

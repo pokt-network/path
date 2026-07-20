@@ -358,6 +358,30 @@ func classifyMalformedPayloadAsSignal(logger polylog.Logger, payloadContent stri
 			reputation.NewSuccessSignal(latency)
 	}
 
+	// Capability-limitation errors (archival/pruned state, "historical state is
+	// not available", "missing trie node", lite fullnode, REST-not-supported) are
+	// NOT supplier faults — the node correctly reports it cannot serve this request
+	// type. The gateway layer already exempts these (recordHeuristicErrorToReputation,
+	// shouldCircuitBreak); mirror it here so the protocol-layer classifier doesn't
+	// penalize the supplier. Without this, the error flattening below routes archival
+	// errors to classifyHeuristicErrorAsSignal's error_indicator_blockchain_error
+	// branch, which applies a MINOR (-3) penalty the gateway explicitly exempts — a
+	// per-request drain on healthy suppliers that just lack historical data. The retry
+	// loop still moves the request to an archival-capable supplier.
+	//
+	// TODO_TECHDEBT: this "is this the supplier's fault?" decision is duplicated across
+	// the gateway and protocol layers and drifts (this leak was one such drift). The
+	// structured AnalysisResult (and its MatchedPattern) is stringified before reaching
+	// here, so we fall back to a substring scan. See DESIGN_UNIFY_ERROR_CLASSIFICATION.md
+	// for the real fix (carry the classification structured; one classifier, one verdict).
+	if heuristic.ErrorContainsArchivalPattern(payloadContent) {
+		logger.Debug().
+			Str("payload_preview", payloadContent[:min(len(payloadContent), 200)]).
+			Msg("Detected capability-limitation (archival) error in payload — skipping reputation penalty")
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED,
+			reputation.NewSuccessSignal(latency)
+	}
+
 	// If this was a heuristic detected error, handle it using the detected reason
 	if idx := strings.LastIndex(payloadContent, ": heuristic detected "); idx != -1 {
 		heuristicReason := payloadContent[idx+len(": heuristic detected "):]

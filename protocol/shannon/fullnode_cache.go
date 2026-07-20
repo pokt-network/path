@@ -72,8 +72,21 @@ const (
 	// - Grace period scale down factor forces the gateway to respect a smaller
 	//   grace period than the one specified onchain to ensure we start using
 	//   the new session as soon as possible.
-	// - It must be between 0 and 1. Default: 0.8
-	gracePeriodScaleDownFactor = 0.8
+	// - It must be between 0 and 1.
+	// - Lowered 0.8 -> 0.2 for the 60->20 block session change (2026-07). On-chain
+	//   grace_period_end_offset_blocks=10, so 0.8 served the previous session for 8
+	//   of a 20-block session's blocks, binding new long-lived WebSocket connections
+	//   to a session the supplier may already reject ("session expired", close 4000).
+	//   0.2 serves the previous session for only 2 blocks, then switches to the
+	//   current session — the rollover grace existed for an era when suppliers were
+	//   slow to materialize the new session; that is now resolved, so we switch as
+	//   soon as possible. See docs/WEBSOCKET_SESSION_REBIND_DESIGN.md.
+	//   NOTE: the floor is supplier NEW-session adoption speed — too small and the
+	//   gateway signs the new session before a lagging supplier has it, which the
+	//   supplier rejects ("session not found/not active"), affecting HTTP too.
+	//   Canary must watch BOTH: WS 4000s should fall AND "session not found"
+	//   boundary failures must not rise.
+	gracePeriodScaleDownFactor = 0.2
 )
 
 // getCacheDelays returns the min/max delays for SturdyC's Early Refresh strategy.
@@ -379,7 +392,8 @@ func getSessionCacheKey(serviceID protocol.ServiceID, appAddr string, height int
 // derive a stable cache key that doesn't change within a session window.
 //
 // Uses Shannon's 1-based session formula (sessions start at block 1, not 0):
-//   sessionStartHeight = currentHeight - ((currentHeight - 1) % numBlocksPerSession)
+//
+//	sessionStartHeight = currentHeight - ((currentHeight - 1) % numBlocksPerSession)
 //
 // For example, with NumBlocksPerSession=60:
 //

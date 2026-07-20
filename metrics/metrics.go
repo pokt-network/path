@@ -607,9 +607,47 @@ func RecordQoSFilterRejection(supplier, serviceID, reason string) {
 var SupplierReputationScore = promauto.NewGaugeVec(
 	prometheus.GaugeOpts{
 		Name: MetricPrefix + "supplier_reputation_score",
-		Help: "Per-supplier reputation score (0-100) by supplier and service_id. Snapshotted every 10s.",
+		Help: "Per-supplier reputation score (0-100) by supplier, service_id, and rpc_type. Snapshotted every 10s. The rpc_type split keeps a supplier's websocket score from colliding with its json_rpc score (they are tracked and acted on separately).",
 	},
-	[]string{LabelSupplier, LabelServiceID},
+	[]string{LabelSupplier, LabelServiceID, LabelRPCType},
+)
+
+// Reasons an endpoint is dropped by the reputation filter, used as the `reason`
+// label on ReputationDisqualifiedTotal.
+const (
+	ReputationDisqualifyReasonBelowThreshold = "below_threshold" // score < per-service MinThreshold
+	ReputationDisqualifyReasonCooldown       = "cooldown"        // in strike cooldown (critical strikes)
+)
+
+// ReputationDisqualifiedTotal counts endpoint exclusions by the reputation filter,
+// split by service_id, rpc_type, and reason. This makes S1-style disqualification
+// (below-threshold or cooldown) visible on a dashboard instead of requiring a Redis
+// read. It counts each drop OCCURRENCE per endpoint-selection pass, not unique
+// endpoints — a high rate on a (service_id, rpc_type=websocket) pair means the filter
+// is actively steering traffic away from proven-bad endpoints for that stream.
+var ReputationDisqualifiedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "reputation_disqualified_total",
+		Help: "Endpoints excluded by the reputation filter, by service_id, rpc_type, and reason (below_threshold/cooldown). Counts each drop occurrence per selection pass, not unique endpoints.",
+	},
+	[]string{LabelServiceID, LabelRPCType, "reason"},
+)
+
+// HedgeSelfOperatorAvoidedTotal counts hedge candidates skipped because they
+// share the primary endpoint's registrable domain (eTLD+1) — i.e. a different
+// subdomain of the SAME operator. This is the live, self-measurable signal for
+// the eTLD+1 hedge-exclusion fix: pre-fix these siblings could win the hedge
+// against their own operator (no resilience benefit); post-fix each such skip
+// increments here. A nonzero rate on a service_id means that service has an
+// operator sharding relay miners across subdomains, and the hedge is correctly
+// steering to a genuinely different operator. Counts each skipped sibling
+// endpoint per hedge selection pass, not unique operators.
+var HedgeSelfOperatorAvoidedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "hedge_self_operator_avoided_total",
+		Help: "Hedge candidates skipped for sharing the primary's registrable domain (same operator, different subdomain), by service_id. The live signal for the eTLD+1 hedge-exclusion fix.",
+	},
+	[]string{LabelServiceID},
 )
 
 // Severity classes for supplier_signal_total. The reputation layer emits 8
@@ -670,6 +708,11 @@ const (
 	// fast endpoints are picked as hedge again and again. Dashboards filter to
 	// request_type="normal" by default to show fair primary-traffic distribution.
 	RelayTypeHedge = "hedge"
+	// RelayTypeRetry tags relays issued as a sequential retry to a different
+	// endpoint after a prior attempt failed. Like hedge, retry overflow otherwise
+	// hides inside "normal" and inflates a single endpoint's apparent RPS during
+	// upstream degradation — its own label makes the overflow measurable.
+	RelayTypeRetry = "retry"
 )
 
 var RelaysTotal = promauto.NewCounterVec(
@@ -706,6 +749,29 @@ const (
 
 	WSDirectionClientToEndpoint = "client_to_endpoint"
 	WSDirectionEndpointToClient = "endpoint_to_client"
+
+	// --- WebSocket session-rebind result labels (experimental; see PATH_WEBSOCKET_SESSION_REBIND)
+	// The `result` dimension of WebsocketRebindTotal. Split by supplier-continuity and
+	// failure stage so canary directly measures how often the original supplier persists
+	// across a Shannon session boundary (persistence rate = same / (same + different)) and
+	// why a rebind fell back to closing the client.
+	//
+	// Successes:
+	WSRebindSuccessSameSupplier      = "success_same_supplier"      // tier-1: original supplier+URL still in the new session (seamless)
+	WSRebindSuccessDifferentSupplier = "success_different_supplier" // tier-2: original supplier rotated out; rebound to best-available endpoint
+	// Failures (bridge gave up → client closed with 1012):
+	WSRebindFailedNoEndpoints  = "failed_no_endpoints"  // new session had zero usable websocket endpoints
+	WSRebindFailedSessionError = "failed_session_error" // could not fetch/build the new session
+	WSRebindFailedDial         = "failed_dial"          // endpoint selected but the websocket dial failed after retries
+	WSRebindFailedReplay       = "failed_replay"        // reconnected, but building/writing subscription replay frames failed
+	WSRebindFailedSelect       = "failed_select"        // generic selection failure with no more specific reason
+
+	// --- WebSocket endpoint-staleness watchdog result labels (experimental)
+	// The `result` dimension of WebsocketEndpointStallTotal. A stall is a silent supplier
+	// (endpoint transport alive, no subscription data past the staleness threshold) that
+	// ping/pong liveness cannot detect.
+	WSStallRebind = "rebind" // watchdog forced a rebind onto a different supplier
+	WSStallGaveUp = "giveup" // endpoint stayed silent across repeated rebinds; client closed (1012)
 )
 
 var WebsocketConnectionsActive = promauto.NewGaugeVec(
@@ -742,6 +808,45 @@ var WebsocketMessagesTotal = promauto.NewCounterVec(
 		Help: "WebSocket messages by domain, service_id, direction (client_to_endpoint/endpoint_to_client), and reputation_signal.",
 	},
 	[]string{LabelDomain, LabelServiceID, "direction", LabelReputationSignal},
+)
+
+// WebsocketRebindTotal counts websocket session-rebind episodes by outcome.
+// EXPERIMENTAL / canary observability for the session-rebind feature
+// (PATH_WEBSOCKET_SESSION_REBIND). result is one of the WSRebind* labels above:
+// success_same_supplier / success_different_supplier on success (client kept open,
+// subscriptions replayed), or failed_* when the bridge gave up and closed the client
+// (1012). The same/different split measures supplier persistence across Shannon session
+// boundaries. Safe to remove once rebind is validated and promoted.
+var WebsocketRebindTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_rebind_total",
+		Help: "WebSocket session-rebind episodes by domain, service_id, and result (success_same_supplier/success_different_supplier/failed_*). EXPERIMENTAL.",
+	},
+	[]string{LabelDomain, LabelServiceID, "result"},
+)
+
+// WebsocketSubscriptionsReplayedTotal counts subscriptions replayed onto a
+// reconnected endpoint during rebind. EXPERIMENTAL / canary observability.
+var WebsocketSubscriptionsReplayedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_subscriptions_replayed_total",
+		Help: "Subscriptions replayed onto a reconnected websocket endpoint during rebind, by domain and service_id. EXPERIMENTAL.",
+	},
+	[]string{LabelDomain, LabelServiceID},
+)
+
+// WebsocketEndpointStallTotal counts endpoint-staleness watchdog firings by outcome.
+// EXPERIMENTAL / canary observability for the silent-supplier-stall detector: a supplier
+// that keeps answering pings but stops delivering subscription data (invisible to
+// ping/pong liveness). result is WSStallRebind (forced a rebind onto a different supplier)
+// or WSStallGaveUp (silent across repeated rebinds → client closed with 1012). The
+// downstream rebind outcome is captured separately in WebsocketRebindTotal.
+var WebsocketEndpointStallTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_endpoint_stall_total",
+		Help: "WebSocket silent-endpoint-stall watchdog firings by domain, service_id, and result (rebind/giveup). EXPERIMENTAL.",
+	},
+	[]string{LabelDomain, LabelServiceID, "result"},
 )
 
 // =============================================================================
@@ -973,17 +1078,31 @@ func SetMeanScore(domain, serviceID, rpcType string, score float64) {
 	ReputationMeanScore.WithLabelValues(domain, serviceID, rpcType).Set(score)
 }
 
-// SetSupplierReputationScore sets the per-supplier reputation gauge.
+// SetSupplierReputationScore sets the per-(supplier, service_id, rpc_type) reputation gauge.
 // Skipped silently when supplier is empty (e.g., per-domain reputation key)
 // or when the cardinality guard has tripped for this metric.
-func SetSupplierReputationScore(supplier, serviceID string, score float64) {
+func SetSupplierReputationScore(supplier, serviceID, rpcType string, score float64) {
 	if supplier == "" {
 		return
 	}
 	if !supplierReputationGuard.allow(supplier, serviceID) {
 		return
 	}
-	SupplierReputationScore.WithLabelValues(supplier, serviceID).Set(score)
+	SupplierReputationScore.WithLabelValues(supplier, serviceID, rpcType).Set(score)
+}
+
+// RecordReputationDisqualified increments the reputation-filter disqualification
+// counter for one dropped endpoint. reason is one of the
+// ReputationDisqualifyReason* constants.
+func RecordReputationDisqualified(serviceID, rpcType, reason string) {
+	ReputationDisqualifiedTotal.WithLabelValues(serviceID, rpcType, reason).Inc()
+}
+
+// RecordHedgeSelfOperatorAvoided increments the counter for one hedge candidate
+// skipped because it shares the primary endpoint's registrable domain (same
+// operator, different subdomain). See HedgeSelfOperatorAvoidedTotal.
+func RecordHedgeSelfOperatorAvoided(serviceID string) {
+	HedgeSelfOperatorAvoidedTotal.WithLabelValues(serviceID).Inc()
 }
 
 // RecordSupplierSignal increments the per-supplier signal counter, collapsing
@@ -1036,6 +1155,26 @@ func RecordWebsocketConnectionFailed(domain, serviceID string) {
 // direction should be WSDirectionClientToEndpoint or WSDirectionEndpointToClient
 func RecordWebsocketMessage(domain, serviceID, direction, reputationSignal string) {
 	WebsocketMessagesTotal.WithLabelValues(domain, serviceID, direction, reputationSignal).Inc()
+}
+
+// RecordWebsocketRebind records a websocket session-rebind episode outcome and, on
+// success, the number of subscriptions replayed. EXPERIMENTAL / canary observability
+// for the session-rebind feature. result should be one of the WSRebind* labels.
+func RecordWebsocketRebind(domain, serviceID, result string, replayedSubscriptions int) {
+	WebsocketRebindTotal.WithLabelValues(domain, serviceID, result).Inc()
+	if replayedSubscriptions > 0 {
+		WebsocketSubscriptionsReplayedTotal.WithLabelValues(domain, serviceID).Add(float64(replayedSubscriptions))
+	}
+}
+
+// RecordWebsocketEndpointStall records a staleness-watchdog firing. gaveUp distinguishes a
+// forced rebind (false) from giving up and closing the client (true).
+func RecordWebsocketEndpointStall(domain, serviceID string, gaveUp bool) {
+	result := WSStallRebind
+	if gaveUp {
+		result = WSStallGaveUp
+	}
+	WebsocketEndpointStallTotal.WithLabelValues(domain, serviceID, result).Inc()
 }
 
 // LatencyThresholds defines thresholds for latency signal categorization.

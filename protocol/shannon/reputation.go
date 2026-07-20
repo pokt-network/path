@@ -6,6 +6,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
 )
@@ -60,8 +61,11 @@ func (p *Protocol) filterByReputation(
 		return endpoints
 	}
 
-	// Hoist out of the loop; the threshold doesn't change per endpoint.
+	// Hoist out of the loop; neither the threshold nor the rpc_type label
+	// changes per endpoint.
 	minThreshold := p.getMinThresholdForService(serviceID)
+	rpcTypeLabel := metrics.NormalizeRPCType(rpcType.String())
+	serviceIDLabel := string(serviceID)
 
 	// Filter endpoints below threshold or in cooldown
 	filtered := make(map[protocol.EndpointAddr]endpoint, len(endpoints))
@@ -94,6 +98,7 @@ func (p *Protocol) filterByReputation(
 				Int("strikes", score.CriticalStrikes).
 				Dur("cooldown_remaining", score.CooldownRemaining()).
 				Msg("Filtering out endpoint in cooldown (strike system)")
+			metrics.RecordReputationDisqualified(serviceIDLabel, rpcTypeLabel, metrics.ReputationDisqualifyReasonCooldown)
 			continue
 		}
 
@@ -113,6 +118,7 @@ func (p *Protocol) filterByReputation(
 				Float64("score", score.Value).
 				Float64("threshold", minThreshold).
 				Msg("Filtering out low-reputation endpoint")
+			metrics.RecordReputationDisqualified(serviceIDLabel, rpcTypeLabel, metrics.ReputationDisqualifyReasonBelowThreshold)
 		}
 	}
 

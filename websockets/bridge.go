@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -71,12 +72,53 @@ type bridge struct {
 	// messageObservationsChan receives message observations from the websocketMessageProcessor.
 	messageObservationsChan chan *observation.RequestResponseObservations
 
+	// reconnector, when non-nil, enables session rebind: a recoverable endpoint
+	// disconnect (Shannon session rollover) re-establishes the endpoint connection and
+	// replays subscriptions instead of tearing down the client. Nil = the endpoint
+	// disconnect cancels the bridge (default, pre-rebind behavior).
+	reconnector EndpointReconnector
+
+	// endpointCtx / endpointCancel scope ONLY the endpoint connection's read/ping
+	// loops (a child of the bridge ctx). On a reconnect they are replaced so the old
+	// endpoint loops stop while the client connection — scoped to the bridge ctx —
+	// stays alive. Set only when reconnector != nil.
+	endpointCtx    context.Context
+	endpointCancel context.CancelFunc
+
+	// endpointGen is the generation of the current endpoint connection, incremented on
+	// each reconnect. A disconnect signal carries the generation it was raised for, so
+	// a late signal from an already-replaced connection is ignored. Mutated only on the
+	// bridge's start() goroutine.
+	endpointGen int
+
+	// endpointDown carries recoverable endpoint disconnects to the start() loop. Nil
+	// (and never selected) when reconnector == nil.
+	endpointDown chan endpointDisconnect
+
+	// lastEndpointDataAt is the time the endpoint last delivered a data frame toward the
+	// client. The staleness watchdog compares it against endpointStalenessThreshold to
+	// detect a silent supplier stall (transport alive, no subscription data). Mutated
+	// only on the start() goroutine (handleEndpointMessage, the watchdog, and a rebind
+	// swap), so it needs no synchronization.
+	lastEndpointDataAt time.Time
+
+	// consecutiveStallRebinds counts staleness-triggered rebinds with no intervening
+	// endpoint data. Reset to 0 by any endpoint data frame; when it reaches
+	// maxConsecutiveStallRebinds the bridge stops rebinding and closes the client.
+	// Mutated only on the start() goroutine.
+	consecutiveStallRebinds int
+
 	// shutdownOnce ensures shutdown() is only called once to prevent panics from double-closing channels
 	shutdownOnce sync.Once
 }
 
 // StartBridge creates a new Bridge instance with connections to both client and endpoint
 // and starts the bridge. Returns a channel that will be closed when the bridge shuts down.
+//
+// reconnector is optional (may be nil): when supplied, a recoverable endpoint
+// disconnect (session rollover) rebinds the endpoint connection and replays
+// subscriptions instead of closing the client. Nil preserves the pre-rebind
+// behavior where an endpoint disconnect cancels the whole bridge.
 func StartBridge(
 	ctx context.Context,
 	logger polylog.Logger,
@@ -86,6 +128,7 @@ func StartBridge(
 	headers http.Header,
 	websocketMessageProcessor WebsocketMessageProcessor,
 	messageObservationsChan chan *observation.RequestResponseObservations,
+	reconnector EndpointReconnector,
 ) (<-chan struct{}, error) {
 	logger = logger.With("component", "websocket_bridge")
 
@@ -138,33 +181,66 @@ func StartBridge(
 		websocketMessageProcessor: websocketMessageProcessor,
 
 		messageObservationsChan: messageObservationsChan,
+		reconnector:             reconnector,
 	}
 	if err := b.validateComponents(); err != nil {
 		cancelCtx() // Clean up context on error
 		return nil, fmt.Errorf("❌ invalid bridge components: %w", err)
 	}
 
-	// Initialize connections with bridge context and cancel function
+	// The client connection's disconnect always cancels the bridge (a departed client
+	// ends the connection).
+	cancelOnDisconnect := func(error) { cancelCtx() }
+
+	// The endpoint connection's disconnect action depends on whether rebind is enabled:
+	//   - rebind on:  signal the start() loop to reconnect the endpoint (client stays up).
+	//                 The endpoint loops run under a dedicated child context so they can
+	//                 be stopped on reconnect without touching the client.
+	//   - rebind off: cancel the bridge, exactly as before.
+	endpointLoopCtx := b.ctx
+	endpointOnDisconnect := cancelOnDisconnect
+	if reconnector != nil {
+		b.endpointDown = make(chan endpointDisconnect, 1)
+		b.endpointCtx, b.endpointCancel = context.WithCancel(b.ctx)
+		endpointLoopCtx = b.endpointCtx
+		endpointOnDisconnect = b.endpointDisconnectFunc(b.endpointGen)
+	}
+
 	b.endpointConn = newConnection(
-		b.ctx,
-		cancelCtx,
+		endpointLoopCtx,
 		logger.With("conn", "endpoint"),
 		endpointConn,
 		messageSourceEndpoint,
 		msgChan,
+		endpointOnDisconnect,
 	)
 	b.clientConn = newConnection(
 		b.ctx,
-		cancelCtx,
 		logger.With("conn", "client"),
 		clientConn,
 		messageSourceClient,
 		msgChan,
+		cancelOnDisconnect,
 	)
 
 	// Start the bridge in a goroutine
 	go func() {
 		defer close(completionChan) // Signal completion when bridge shuts down
+		// Bound any panic in message processing or session-rebind reconnect to THIS
+		// connection: recover, close the client cleanly (1011), and let the bridge shut
+		// down — never let one connection's bug crash the whole process. Runs before the
+		// deferred close(completionChan) above (LIFO), so shutdown's close frames are sent
+		// first. Especially important with experimental session rebind running in this
+		// goroutine.
+		defer func() {
+			if r := recover(); r != nil {
+				b.logger.Error().
+					Str("panic", fmt.Sprintf("%v", r)).
+					Str("stack", string(debug.Stack())).
+					Msg("🔥 websocket bridge panic recovered — closing connection")
+				b.shutdown(fmt.Errorf("%w: bridge panic: %v", ErrBridgeConnectionFailed, r))
+			}
+		}()
 		b.start()
 	}()
 
@@ -213,6 +289,19 @@ func (b *bridge) validateComponents() error {
 func (b *bridge) start() {
 	b.logger.Info().Msg("Websocket bridge operation started successfully")
 
+	// Start the fresh-data clock so the watchdog measures silence from bridge start.
+	b.lastEndpointDataAt = time.Now()
+
+	// The staleness watchdog runs only when rebind is enabled (it needs the reconnect
+	// machinery to escape a stalling supplier). When disabled, stalenessC stays nil and
+	// its select case blocks forever.
+	var stalenessC <-chan time.Time
+	if b.reconnector != nil {
+		ticker := time.NewTicker(stalenessCheckInterval)
+		defer ticker.Stop()
+		stalenessC = ticker.C
+	}
+
 	for {
 		select {
 		case msg := <-b.msgChan:
@@ -224,11 +313,71 @@ func (b *bridge) start() {
 				b.handleEndpointMessage(msg)
 			}
 
+		// Recoverable endpoint disconnect (session rollover). Only ever selected when
+		// rebind is enabled (endpointDown is nil otherwise, so this case blocks
+		// forever). Handled inline on this single goroutine, so no client or endpoint
+		// message is processed concurrently with a reconnect.
+		case down := <-b.endpointDown:
+			b.handleEndpointDown(down)
+
+		// Application-level liveness check: detect a silent supplier stall (endpoint
+		// transport alive but no subscription data) and force a rebind. Runs inline on
+		// this goroutine, serialized with message processing and reconnects.
+		case <-stalenessC:
+			b.checkEndpointStaleness()
+
 		case <-b.ctx.Done():
 			b.shutdown(ErrBridgeContextCanceled)
 			return
 		}
 	}
+}
+
+// checkEndpointStaleness detects a silent supplier stall — the endpoint connection is
+// transport-alive (still answering pings) but has pushed no subscription data past
+// endpointStalenessThreshold — and forces a rebind onto a DIFFERENT supplier. This
+// covers the gap left by ping/pong liveness, which only detects a dead socket.
+//
+// It arms only when the client holds an established subscription (something that should
+// be producing data and that a rebind can replay); a quiet connection with no active
+// subscription is legitimate. After maxConsecutiveStallRebinds with no intervening data
+// — the replacement suppliers are also silent, or the chain is quiet network-wide — it
+// stops rebinding and closes the client (1012), the pre-rebind fallback.
+//
+// Runs on the start() goroutine, so all state access is unsynchronized.
+func (b *bridge) checkEndpointStaleness() {
+	// No reconnector, or nothing that should be flowing → a quiet connection is fine.
+	if b.reconnector == nil || !b.reconnector.HasActiveSubscriptions() {
+		return
+	}
+	if time.Since(b.lastEndpointDataAt) < endpointStalenessThreshold {
+		return
+	}
+
+	if b.consecutiveStallRebinds >= maxConsecutiveStallRebinds {
+		b.logger.Error().
+			Int("consecutive_stall_rebinds", b.consecutiveStallRebinds).
+			Dur("staleness_threshold", endpointStalenessThreshold).
+			Msg("❌ [WS-STALL] endpoint still silent after repeated rebinds — closing client")
+		b.reconnector.OnEndpointStallDetected(true)
+		b.shutdown(fmt.Errorf("%w: endpoint silent after %d stall rebinds", ErrBridgeEndpointUnavailable, b.consecutiveStallRebinds))
+		return
+	}
+
+	b.consecutiveStallRebinds++
+	// Reset the data clock up front so the incoming rebind's new endpoint gets a full
+	// window; a real data frame will also reset it (and the counter) via
+	// handleEndpointMessage.
+	b.lastEndpointDataAt = time.Now()
+	b.logger.Error().
+		Dur("silence_threshold", endpointStalenessThreshold).
+		Int("stall_rebind_attempt", b.consecutiveStallRebinds).
+		Msg("⚠️ [WS-STALL] no subscription data past threshold — forcing rebind to a different supplier")
+	b.reconnector.OnEndpointStallDetected(false)
+
+	// Reuse the standard rebind path; ErrEndpointStalled marks it so the reconnect avoids
+	// the current (stalling) supplier.
+	b.handleEndpointDown(endpointDisconnect{gen: b.endpointGen, err: ErrEndpointStalled})
 }
 
 // shutdown performs immediate and complete bridge cleanup.
@@ -439,6 +588,29 @@ func (b *bridge) handleEndpointMessage(msg message) {
 		b.shutdown(fmt.Errorf("%w: endpoint message processing failed: %w", ErrBridgeMessageProcessingFailed, err))
 		return
 	}
+
+	// A nil payload with no error means the processor intentionally swallowed the
+	// message — e.g. the subscription registry consuming a replay subscribe response
+	// after a reconnect, which the client (already holding its subscription id) must
+	// not see. Nothing to forward.
+	//
+	// A swallowed frame deliberately does NOT reset the staleness clock: a post-reconnect
+	// replay ack only proves the supplier accepted the subscribe, not that its data feed
+	// is alive. Resetting on it would zero the stall-rebind counter after every rebind and
+	// defeat the give-up cap — a supplier that acks but never pushes data would be rotated
+	// to forever. Only client-facing data (below) counts as feed liveness.
+	if processedData == nil {
+		b.logger.Debug().Msg("endpoint message swallowed by processor, not forwarding to client")
+		return
+	}
+
+	// A real, client-facing data frame proves the supplier's subscription feed is alive:
+	// clear the staleness clock and the stall-rebind counter. Control frames (pings/pongs)
+	// never reach here — they are handled in the connection read loop — so a supplier that
+	// only answers pings but stops pushing data does NOT reset this, which is what lets the
+	// watchdog detect a silent stall.
+	b.lastEndpointDataAt = time.Now()
+	b.consecutiveStallRebinds = 0
 
 	// Send the processed message to the client
 	// NOTE: On session rollover, the Endpoint will disconnect the Endpoint connection, which will trigger this

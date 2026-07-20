@@ -10,8 +10,10 @@ import (
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
+	"github.com/pokt-network/path/metrics"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
@@ -365,6 +367,168 @@ func TestReputation_DisabledNoFiltering(t *testing.T) {
 	// Filter should return all endpoints unchanged
 	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
 	require.Equal(t, endpoints, filtered)
+}
+
+// newWSReputationService builds an in-memory reputation service for websocket
+// reputation tests (S0/S1).
+//
+// Deliberately does NOT call Start(): the background refreshLoop periodically reloads the
+// cache from storage, which races with RecordSignal's synchronous cache write and can drop
+// a just-recorded signal before the test reads it (a test-harness artifact — production sync
+// intervals are seconds). These unit tests exercise the synchronous score path only
+// (RecordSignal writes cache, GetScore/GetScores read cache), which needs no sync loops.
+func newWSReputationService(t *testing.T) (reputation.ReputationService, reputation.Config) {
+	t.Helper()
+	config := reputation.Config{
+		Enabled:         true,
+		InitialScore:    80,
+		MinThreshold:    30,
+		RecoveryTimeout: 5 * time.Minute,
+		StorageType:     "memory",
+	}
+	config.HydrateDefaults()
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	return svc, config
+}
+
+// TestReputation_WebsocketStallSignal verifies S0: a detected endpoint stall records a
+// Major error reputation signal against the stalling endpoint's :websocket score, so the
+// endpoint accrues toward cooldown and future selection (S1) can avoid it.
+func TestReputation_WebsocketStallSignal(t *testing.T) {
+	ctx := context.Background()
+	svc, config := newWSReputationService(t)
+
+	const serviceID = protocol.ServiceID("eth")
+	ep := &mockEndpoint{addr: "supplier1-https://relay.example.com:443/ws"}
+
+	wrc := &websocketRequestContext{
+		logger:            polyzero.NewLogger(),
+		context:           ctx,
+		serviceID:         serviceID,
+		selectedEndpoint:  ep,
+		reputationService: svc,
+	}
+
+	// Build the read key via the SAME keyBuilder recordWebsocketSignal uses, so the test is
+	// robust to key granularity config.
+	wsKey := svc.KeyBuilderForService(serviceID).BuildKey(serviceID, ep.Addr(), sharedtypes.RPCType_WEBSOCKET)
+
+	// A stall is a Major error (-10): from InitialScore 80 -> 70.
+	wrc.OnEndpointStallDetected(false)
+
+	after, err := svc.GetScore(ctx, wsKey)
+	require.NoError(t, err)
+	require.Equal(t, config.InitialScore-10, after.Value)
+	require.Equal(t, int64(1), after.ErrorCount)
+
+	// The signal must land on the :websocket key ONLY — the :json_rpc key for the same
+	// endpoint must have no recorded signal (GetScore returns ErrNotFound for unscored keys).
+	jsonKey := reputation.NewEndpointKey(serviceID, ep.Addr(), sharedtypes.RPCType_JSON_RPC)
+	_, err = svc.GetScore(ctx, jsonKey)
+	require.ErrorIs(t, err, reputation.ErrNotFound)
+}
+
+// TestReputation_WebsocketSignalAttributionAfterRebind verifies that recordWebsocketSignal
+// attributes to signingEndpoint() — the CURRENT (rebound) endpoint — not the original
+// selectedEndpoint. This is the property the docs/WEBSOCKET_REPUTATION_QOS_DESIGN metric caveat relies
+// on: after a rebind, a failure penalizes the supplier actually serving the connection.
+func TestReputation_WebsocketSignalAttributionAfterRebind(t *testing.T) {
+	ctx := context.Background()
+	svc, config := newWSReputationService(t)
+
+	const serviceID = protocol.ServiceID("eth")
+	original := &mockEndpoint{addr: "supplierA-https://original.example.com:443/ws"}
+	rebound := &mockEndpoint{addr: "supplierB-https://rebound.example.com:443/ws"}
+
+	wrc := &websocketRequestContext{
+		logger:            polyzero.NewLogger(),
+		context:           ctx,
+		serviceID:         serviceID,
+		selectedEndpoint:  original,
+		reconnectEndpoint: rebound, // signingEndpoint() now returns this
+		reputationService: svc,
+	}
+
+	wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_endpoint_stalled", 0))
+
+	reboundScore, err := svc.GetScore(ctx, reputation.NewEndpointKey(serviceID, rebound.Addr(), sharedtypes.RPCType_WEBSOCKET))
+	require.NoError(t, err)
+	require.Equal(t, config.InitialScore-10, reboundScore.Value, "rebound (current) supplier must be penalized")
+
+	// The original supplier received no signal, so its key must be absent (ErrNotFound) —
+	// proving the penalty did NOT leak to the pre-rebind endpoint.
+	_, err = svc.GetScore(ctx, reputation.NewEndpointKey(serviceID, original.Addr(), sharedtypes.RPCType_WEBSOCKET))
+	require.ErrorIs(t, err, reputation.ErrNotFound, "original supplier must NOT be penalized after rebind")
+}
+
+// TestReputation_FilterByReputation_Websocket verifies S1: reputation filtering applied with
+// RPCType_WEBSOCKET excludes a proven-bad WS endpoint while keeping healthy and unscored ones.
+// (WS scores are keyed :websocket, independent of :json_rpc — see reputation.EndpointKey.)
+func TestReputation_FilterByReputation_Websocket(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+	svc, _ := newWSReputationService(t)
+
+	p := &Protocol{logger: logger, reputationService: svc}
+	serviceID := protocol.ServiceID("eth")
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"supplier1-https://good.example.com": &mockEndpoint{addr: "supplier1-https://good.example.com"},
+		"supplier2-https://bad.example.com":  &mockEndpoint{addr: "supplier2-https://bad.example.com"},
+		"supplier3-https://new.example.com":  &mockEndpoint{addr: "supplier3-https://new.example.com"},
+	}
+
+	// Good WS endpoint: 1 success. Bad WS endpoint: 3 critical errors -> below threshold.
+	goodKey := reputation.NewEndpointKey(serviceID, "supplier1-https://good.example.com", sharedtypes.RPCType_WEBSOCKET)
+	badKey := reputation.NewEndpointKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_WEBSOCKET)
+	require.NoError(t, svc.RecordSignal(ctx, goodKey, reputation.NewSuccessSignal(100*time.Millisecond)))
+	for i := 0; i < 3; i++ {
+		require.NoError(t, svc.RecordSignal(ctx, badKey, reputation.NewCriticalErrorSignal("service_error", 200*time.Millisecond)))
+	}
+
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, "")
+
+	require.Len(t, filtered, 2)
+	require.Contains(t, filtered, protocol.EndpointAddr("supplier1-https://good.example.com"))
+	require.Contains(t, filtered, protocol.EndpointAddr("supplier3-https://new.example.com"))
+	require.NotContains(t, filtered, protocol.EndpointAddr("supplier2-https://bad.example.com"))
+}
+
+// TestReputation_DisqualifiedMetric verifies #2: dropping a below-threshold endpoint in
+// filterByReputation increments reputation_disqualified_total with reason=below_threshold
+// and the correct rpc_type — the metric that surfaces S1 disqualification without a Redis read.
+// Uses a unique service_id so the shared counter delta is isolated from other tests, and Major
+// errors (not Critical) so the bad endpoint drops below threshold WITHOUT entering cooldown.
+func TestReputation_DisqualifiedMetric(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+	svc, _ := newWSReputationService(t)
+
+	p := &Protocol{logger: logger, reputationService: svc}
+	const serviceID = protocol.ServiceID("disqualify-metric-test")
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"supplier1-https://good.example.com": &mockEndpoint{addr: "supplier1-https://good.example.com"},
+		"supplier2-https://bad.example.com":  &mockEndpoint{addr: "supplier2-https://bad.example.com"},
+	}
+
+	// Bad WS endpoint: 6 Major errors (-10 each) -> 80-60 = 20 < 30 threshold, no cooldown.
+	badKey := reputation.NewEndpointKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_WEBSOCKET)
+	for i := 0; i < 6; i++ {
+		require.NoError(t, svc.RecordSignal(ctx, badKey, reputation.NewMajorErrorSignal("ws_endpoint_stalled", 0)))
+	}
+
+	counter := metrics.ReputationDisqualifiedTotal.WithLabelValues(
+		string(serviceID), "websocket", metrics.ReputationDisqualifyReasonBelowThreshold,
+	)
+	before := testutil.ToFloat64(counter)
+
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, "")
+
+	require.NotContains(t, filtered, protocol.EndpointAddr("supplier2-https://bad.example.com"))
+	require.Equal(t, before+1, testutil.ToFloat64(counter),
+		"below_threshold disqualification of the bad WS endpoint must increment the counter exactly once")
 }
 
 // TestReputation_ScoreRecovery verifies that endpoints can recover
