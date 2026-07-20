@@ -2,7 +2,7 @@
 # Pocket Network Health Check Configuration
 # ==========================================
 # Generated for all supported chains at api.pocket.network
-# Last updated: July 13, 2026
+# Last updated: July 20, 2026
 #
 # Service IDs match the subdomain of each endpoint URL
 # Template format: gateway/health_check_config.go
@@ -1417,7 +1417,7 @@
   # Block time: ~2s | Source: fraxscan.com (OP Stack)
   # Formula: 300s / 2s = 150 blocks for 5 minutes
   sync_allowance: 150
-  check_interval: 10s
+  check_interval: 20s
   enabled: true
   checks:
     - name: eth_blockNumber
@@ -1439,6 +1439,43 @@
       # under this service ID (see tron/Base incident). Trailing quote anchors the
       # match so a short id like 0x1 cannot substring-match 0x1388 etc.
       expected_response_contains: '0xfc"'
+      timeout: 5s
+      reputation_signal: critical_error
+
+- service_id: robinhood
+  # Robinhood Chain - Arbitrum Orbit L2, native ETH gas | Source: docs.robinhood.com/chain
+  # Chain ID: 4663 (0x1237)
+  # Block time: ~0.13s (measured ~7.5 blk/s) | Formula: 300s / 0.13s ≈ 2250 blocks
+  # sync_allowance MUST be large: external floor = official node (always at tip);
+  # relay-miner suppliers lag the tip by >50 blocks routinely, so a tight allowance
+  # disqualifies every json_rpc endpoint (all endpoints -> cooldown, "no valid endpoints").
+  # eth_syncing intentionally omitted: robinhood returns -32601 (method not available).
+  # Archival check pending: needs a verified historical balance
+  sync_allowance: 2000
+  # 60s interval: ~20 samples per 20min session — ample for reputation. sync tolerance is
+  # 2000 blocks (~4.5min), so infrequent sampling is fine (no need to catch small drift fast).
+  check_interval: 60s
+  enabled: true
+  checks:
+    - name: eth_blockNumber
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: critical_error
+      sync_check: true
+    - name: eth_chainId
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+      expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x1237"'
       timeout: 5s
       reputation_signal: critical_error
 
