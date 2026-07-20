@@ -431,7 +431,7 @@ func TestReputation_WebsocketStallSignal(t *testing.T) {
 
 // TestReputation_WebsocketSignalAttributionAfterRebind verifies that recordWebsocketSignal
 // attributes to signingEndpoint() — the CURRENT (rebound) endpoint — not the original
-// selectedEndpoint. This is the property the DESIGN_WS_REPUTATION_QOS metric caveat relies
+// selectedEndpoint. This is the property the docs/WEBSOCKET_REPUTATION_QOS_DESIGN metric caveat relies
 // on: after a rebind, a failure penalizes the supplier actually serving the connection.
 func TestReputation_WebsocketSignalAttributionAfterRebind(t *testing.T) {
 	ctx := context.Background()

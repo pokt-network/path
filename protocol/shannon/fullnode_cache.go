@@ -80,7 +80,7 @@ const (
 	//   0.2 serves the previous session for only 2 blocks, then switches to the
 	//   current session — the rollover grace existed for an era when suppliers were
 	//   slow to materialize the new session; that is now resolved, so we switch as
-	//   soon as possible. See DESIGN_WEBSOCKET_SESSION_REBIND.md.
+	//   soon as possible. See docs/WEBSOCKET_SESSION_REBIND_DESIGN.md.
 	//   NOTE: the floor is supplier NEW-session adoption speed — too small and the
 	//   gateway signs the new session before a lagging supplier has it, which the
 	//   supplier rejects ("session not found/not active"), affecting HTTP too.

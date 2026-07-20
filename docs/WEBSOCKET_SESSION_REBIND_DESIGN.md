@@ -1,31 +1,32 @@
 # Design: WebSocket Session Rebind (survive Shannon session rollover)
 
-Status: **Phase 0 (grace tuning) applied + canary-validated (robust view: p50 lifetime
-0.86s→2.29s ≈2.7×, closes/window −4×, HTTP err flat; the point-mean "22.7s/+211%" was
-outlier noise at low canary WS volume — do NOT quote it). Phase 1 (registry) + Phase 2
-(bridge reconnect engine + Shannon provider/registry wiring) ALL BUILT + tested on branch
-`feat/ws-session-rebind`, gated OFF by env `PATH_WEBSOCKET_SESSION_REBIND`. Remaining:
-enable on canary and validate the live reconnect (session re-fetch, dial, handshake).**
-Origin: 2026-07-18 investigation of the Polygon WS teardown (see memory `websocket_session_teardown`).
+Status: **Phase 0 (grace tuning) + Phase 1 (subscription registry) + Phase 2 (bridge
+reconnect engine + Shannon provider/registry wiring) implemented, gated OFF by env
+`PATH_WEBSOCKET_SESSION_REBIND`.** Phase 0 grace tuning measurably lengthened WS
+connection lifetime and reduced boundary closes with no rise in HTTP boundary-error rate.
+Remaining: enable the rebind path and validate the live reconnect (session re-fetch,
+dial, handshake) under real traffic.
 
-## Implementation status (branch `feat/ws-session-rebind`, on top of `fix/ws-error-envelope-and-archival-leak`)
+Origin: investigation of WebSocket teardown at Shannon session boundaries.
 
-- ✅ **Phase 1 — `websockets/subscription_registry.go`** (commit `c65d5176`). Pure JSON-RPC
+## Implementation status
+
+- ✅ **Phase 1 — `websockets/subscription_registry.go`**. Pure JSON-RPC
   subscription tracker: records eth_subscribe for replay, freezes the client-facing
   subscription id, remaps notifications (current→client id), rewrites eth_unsubscribe,
   swallows replay responses. 12 unit tests.
-- ✅ **Phase 2 seam — `websockets/connection.go`** (commit `1442b7bb`). Connection disconnect
+- ✅ **Phase 2 seam — `websockets/connection.go`**. Connection disconnect
   is an injected `onDisconnect(error)` callback (was a hardcoded `cancelCtx()`). Pure
   refactor, behavior identical.
-- ✅ **Phase 2 engine — `websockets/bridge.go` + `bridge_reconnect.go`** (commit `5495eea6`).
+- ✅ **Phase 2 engine — `websockets/bridge.go` + `bridge_reconnect.go`**.
   Optional `EndpointReconnector`: endpoint disconnect → dedicated child-ctx endpoint loops
   → generation-tagged reconnect with bounded retries+backoff → replay subscriptions → client
   stays open. Falls back to 1012 on exhaustion. Bridge also drops a swallowed (nil) endpoint
   message. `reconnector == nil` everywhere in production today, so no behavior change.
   Reconnect / retry-exhaustion / swallow paths race-tested with in-process WS servers.
 
-- ✅ **Phase 2 Shannon wiring — `protocol/shannon/websocket_context.go` + `protocol.go`**
-  (commit `625e41da`). wrc implements `EndpointReconnector` (ReconnectEndpoint via
+- ✅ **Phase 2 Shannon wiring — `protocol/shannon/websocket_context.go` + `protocol.go`**.
+  wrc implements `EndpointReconnector` (ReconnectEndpoint via
   `getPreSelectedEndpoint` for the current session + re-signed handshake dial;
   SubscriptionReplayFrames re-signs the registry's active subscribes). Registry driven in
   `ProcessProtocolClientWebsocketMessage` (track/rewrite before signing) and
@@ -51,7 +52,9 @@ Set `PATH_WEBSOCKET_SESSION_REBIND=true` on canary. Unit tests cover the registr
 bridge reconnect/replay/swallow; what only canary can prove is the LIVE reconnect:
 `getPreSelectedEndpoint` re-fetching a real session, dialing the miner, and the re-signed
 handshake being accepted. Watch `path_websocket_connection_events_total{event}` (fewer
-forced reconnects), messages-per-connection (up), and reconnect-failure fallbacks. Was:
+forced reconnects), messages-per-connection (up), and reconnect-failure fallbacks.
+
+### Wiring detail
 
 The `websocketRequestContext` (wrc) becomes the `EndpointReconnector` and drives the registry:
 
@@ -96,8 +99,8 @@ never rebinds:
 
 One hypothesis is **refuted by evidence**, one is a **real contributor**:
 - **REFUTED — session-math / grid-anchor miscalc.** HTTP and WS share the identical session
-  machinery, and HTTP does ~711M relays/day. If the grid were wrong HTTP would fail too. It
-  doesn't.
+  machinery, and HTTP runs at orders of magnitude higher relay volume. If the grid were wrong
+  HTTP would fail too. It doesn't.
 - **CONTRIBUTOR — the rollover grace (amplified by 60→20).** `extendedSessionEnabled=false`
   (session.go) only disables the `getSession` path; but `getCentralizedGatewayModeActiveSessions`
   (mode_centralized.go:67 — prod is centralized) and `getDelegatedGatewayModeActiveSession`
@@ -133,8 +136,8 @@ is). Tune against the supplier's real grace and CANARY: WS 4000 rate should fall
 boundary-failure rate must not rise. Phase 0 reduces frequency; only the rebind (below) removes
 the teardown.
 
-**Impact.** Teardown is intermittent, not catastrophic: a reconnecting client measured ~0.66
-newHeads/s (healthy Polygon) with ~0.4% downtime. But the 60→20 block session change (Jul 2026)
+**Impact.** Teardown is intermittent, not catastrophic: a reconnecting client still observes a
+healthy newHeads stream with sub-1% downtime. But shortening the session length (60→20 blocks)
 tripled boundary frequency, and near-boundary connects die in seconds. A client that does not
 reconnect promptly loses its stream; the churn is invisible in `path_relays_total` (WS is a
 separate metric family).

@@ -1,8 +1,7 @@
 # Design: WebSocket Reputation / QoS Layer
 
-**Status:** Stage 0 + Stage 1 implemented (branch `feat/ws-reputation-s0-s1`, off `f5b14d65`); Stages 2–3 planned
-**Author:** PATH team
-**Related:** `feat/ws-session-rebind`, `feat/ws-stall-watchdog` (`f5b14d65`), `websocket_relay_instrumentation_gap`
+**Status:** Stage 0 + Stage 1 implemented; Stages 2–3 planned
+**Related:** WebSocket session rebind, WebSocket stall watchdog
 
 ---
 
@@ -24,7 +23,7 @@ Call it **double amnesia**:
 | silent stall (watchdog) | ✅ `path_websocket_endpoint_stall_total` | ❌ none | ❌ |
 | rebind dial-fail | ✅ `path_websocket_rebind_total{result=failed_dial}` | ❌ none | ❌ |
 
-Consequence: the stall watchdog shipped in `f5b14d65` makes the *current*
+Consequence: the stall watchdog makes the *current*
 connection escape a stalling supplier (`avoidCurrentSupplier=true`), but nothing
 persists that judgment. The next fresh WS client for the same service can be
 selected straight back onto the same bad supplier — the system has no memory
@@ -159,8 +158,8 @@ desirable for WS. So the implementation is surgical:
    which the reputation filter keeps even in cooldown (race-protection). So filtering
    only inside `getPreSelectedEndpoint` (below) is a no-op on initial connect —
    the list must be filtered so the selector never sees proven-bad endpoints.
-   *(Found by the S0/S1 independent audit — the original commit filtered only the
-   selection entry points and was silently bypassed on initial connect.)*
+   *(Subtle bypass: filtering only the selection entry points leaves the initial
+   connect unfiltered, because selection happens off this list beforehand.)*
 2. **Flip the two selection entry points on** — `filterByReputation = true` at
    `websocket_context.go:281` (initial connect, defense-in-depth) and `:352`
    (reconnect, where it IS load-bearing — reconnect builds+selects its own set).
