@@ -5,10 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"net/http"
-	"sort"
 	"strconv"
 	"time"
 
@@ -391,7 +389,7 @@ func (p *Protocol) getReconnectEndpoint(
 			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape a stalling supplier", protocol.ErrEndpointUnavailable, serviceID)
 			return nil, false, metrics.WSRebindFailedNoEndpoints, err
 		}
-		ep := selectReconnectEndpointWithCap(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare, preferredAddr)
+		ep := selectReconnectEndpointWithCap(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare)
 		logger.Warn().
 			Str("stalling_endpoint", string(preferredAddr)).
 			Str("replacement_endpoint", string(ep.Addr())).
@@ -406,7 +404,7 @@ func (p *Protocol) getReconnectEndpoint(
 	}
 
 	// Tier 2: original supplier rotated out of the new session → best-available fallback.
-	ep := selectReconnectEndpointWithCap(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare, preferredAddr)
+	ep := selectReconnectEndpointWithCap(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare)
 	logger.Warn().
 		Str("original_endpoint", string(preferredAddr)).
 		Str("fallback_endpoint", string(ep.Addr())).
@@ -447,14 +445,15 @@ const reconnectScoreEpsilon = 1e-9
 // identical to selectBestReconnectEndpoint — the deterministic (non-fallback, highest
 // score, smallest address) pick. With the cap enabled it takes the set of endpoints tied
 // for best (same capability tier + top score — the candidates the deterministic pick
-// would break by address) and spreads them across operators via the shared concentration
-// cap, seeded by seedAddr (the connection's original endpoint, stable for its lifetime) so
-// the choice is reproducible across replays and pods.
+// would otherwise break by address) and spreads them across operators via the shared
+// concentration cap. The spread is a plain random pick: a WebSocket connection re-selects
+// fresh at every session boundary, so there is no value in a per-connection-stable choice
+// — and randomness also lets a reconnect *retry* land on a different endpoint than the one
+// that just failed to dial.
 func selectReconnectEndpointWithCap(
 	endpoints map[protocol.EndpointAddr]endpoint,
 	scoreOf func(endpoint) float64,
 	maxOperatorShare float64,
-	seedAddr protocol.EndpointAddr,
 ) endpoint {
 	if maxOperatorShare <= 0 || maxOperatorShare >= 1 || len(endpoints) <= 1 {
 		return selectBestReconnectEndpoint(endpoints, scoreOf)
@@ -465,12 +464,7 @@ func selectReconnectEndpointWithCap(
 		return selectBestReconnectEndpoint(endpoints, scoreOf)
 	}
 
-	// Stable order so the seeded concentration pick is deterministic (map iteration is not).
-	sort.Slice(band, func(i, j int) bool { return band[i] < band[j] })
-
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(seedAddr))
-	chosen := selector.SelectWithConcentrationCapSeeded(band, maxOperatorShare, int64(h.Sum64()))
+	chosen := selector.SelectWithConcentrationCap(band, maxOperatorShare)
 	if ep, ok := endpoints[chosen]; ok {
 		return ep
 	}

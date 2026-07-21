@@ -162,28 +162,14 @@ func Test_selectReconnectEndpointWithCap_DisabledMatchesDeterministic(t *testing
 
 	want := selectBestReconnectEndpoint(endpoints, noScore).Addr()
 	for _, disabled := range []float64{0, 1.0, -1, 2} {
-		got := selectReconnectEndpointWithCap(endpoints, noScore, disabled, "any-seed")
+		got := selectReconnectEndpointWithCap(endpoints, noScore, disabled)
 		c.Equal(want, got.Addr(), "disabled cap (%v) must match deterministic pick", disabled)
 	}
 }
 
-// Test_selectReconnectEndpointWithCap_Deterministic verifies same-seed reproducibility.
-func Test_selectReconnectEndpointWithCap_Deterministic(t *testing.T) {
-	c := require.New(t)
-	endpoints, _ := buildOperatorEndpoints([]int{10, 1, 1, 1})
-
-	for _, seed := range []protocol.EndpointAddr{"origin-a", "origin-b", "pokt1zzz-https://x.op0.tech"} {
-		first := selectReconnectEndpointWithCap(endpoints, noScore, 0.4, seed).Addr()
-		for i := 0; i < 50; i++ {
-			c.Equal(first, selectReconnectEndpointWithCap(endpoints, noScore, 0.4, seed).Addr(),
-				"same seed must reproduce the same rebind target")
-		}
-	}
-}
-
 // Test_selectReconnectEndpointWithCap_SpreadsAcrossOperators verifies the cap spreads
-// tied-best rebind targets across operators instead of funneling to one address: across
-// many connection origins the 10-key operator's share converges near the 0.4 cap, not 0.77.
+// tied-best rebind targets across operators instead of funneling to one address: over many
+// rebinds the 10-key operator's share converges near the 0.4 cap, not its 0.77 key-share.
 func Test_selectReconnectEndpointWithCap_SpreadsAcrossOperators(t *testing.T) {
 	c := require.New(t)
 	endpoints, ops := buildOperatorEndpoints([]int{10, 1, 1, 1})
@@ -191,8 +177,7 @@ func Test_selectReconnectEndpointWithCap_SpreadsAcrossOperators(t *testing.T) {
 	counts := map[string]int{}
 	const draws = 20_000
 	for i := 0; i < draws; i++ {
-		seed := protocol.EndpointAddr(fmt.Sprintf("origin-%d", i))
-		ep := selectReconnectEndpointWithCap(endpoints, noScore, 0.4, seed)
+		ep := selectReconnectEndpointWithCap(endpoints, noScore, 0.4)
 		counts[opOfAddr(string(ep.Addr()))]++
 	}
 	c.InDelta(0.40, float64(counts[ops[0]])/float64(draws), 0.03,
@@ -215,7 +200,7 @@ func Test_selectReconnectEndpointWithCap_RespectsScoreBand(t *testing.T) {
 	})
 
 	for i := 0; i < 500; i++ {
-		ep := selectReconnectEndpointWithCap(endpoints, scoreOf, 0.6, protocol.EndpointAddr(fmt.Sprintf("o%d", i)))
+		ep := selectReconnectEndpointWithCap(endpoints, scoreOf, 0.6)
 		c.NotEqual(low.Addr(), ep.Addr(), "a below-band (lower-score) endpoint must never be a rebind target")
 	}
 }

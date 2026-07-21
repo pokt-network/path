@@ -86,7 +86,7 @@ func (es *EndpointStore) Select(allAvailableEndpoints protocol.EndpointAddrList)
 	// cap when configured. Disabled (getMaxOperatorShare() <= 0 or >= 1) → byte-for-byte
 	// the prior flat random pick.
 	// TODO_FUTURE: consider ranking filtered endpoints, e.g. based on latency, rather than randomization.
-	return selector.SelectWithConcentrationCap(logger, filteredEndpointsAddr, es.getMaxOperatorShare()), nil
+	return selector.SelectWithConcentrationCap(filteredEndpointsAddr, es.getMaxOperatorShare()), nil
 }
 
 // SelectMultiple returns multiple endpoint addresses from the list of valid endpoints.

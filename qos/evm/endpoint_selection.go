@@ -187,7 +187,6 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 	// selection — both reach here via requestContext.Select. When the cap is disabled
 	// (getMaxOperatorShare() <= 0 or >= 1), this is byte-for-byte the prior flat random pick.
 	selectedEndpointAddr := selector.SelectWithConcentrationCap(
-		logger,
 		filteredEndpointsAddr,
 		ss.serviceQoSConfig.getMaxOperatorShare(),
 	)

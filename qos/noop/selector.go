@@ -82,10 +82,10 @@ func (fs *filteringSelector) Select(endpoints protocol.EndpointAddrList) (protoc
 
 	if len(filtered) == 0 {
 		fs.logger.Warn().Msg("All endpoints failed block height validation, falling back to random selection")
-		return selector.SelectWithConcentrationCap(fs.logger, endpoints, maxOperatorShare), nil
+		return selector.SelectWithConcentrationCap(endpoints, maxOperatorShare), nil
 	}
 
-	return selector.SelectWithConcentrationCap(fs.logger, filtered, maxOperatorShare), nil
+	return selector.SelectWithConcentrationCap(filtered, maxOperatorShare), nil
 }
 
 // SelectMultiple returns multiple endpoints after applying block-height filtering.

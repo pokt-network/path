@@ -3,8 +3,6 @@ package selector
 import (
 	"math/rand"
 
-	"github.com/pokt-network/poktroll/pkg/polylog"
-
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 )
@@ -12,20 +10,6 @@ import (
 // concentrationCapEpsilon guards the water-filling loop against floating-point
 // rounding when comparing an operator's weight to the cap.
 const concentrationCapEpsilon = 1e-9
-
-// randSource abstracts the RNG so the same water-filling logic serves both the
-// global-random initial selection and the deterministically-seeded rebind selection.
-type randSource interface {
-	Intn(int) int
-	Float64() float64
-}
-
-// globalRandSource draws from the package-global math/rand — the source used by the
-// prior flat-random pick, so the disabled path stays byte-for-byte unchanged.
-type globalRandSource struct{}
-
-func (globalRandSource) Intn(n int) int   { return rand.Intn(n) }
-func (globalRandSource) Float64() float64 { return rand.Float64() }
 
 // SelectWithConcentrationCap picks one endpoint from validEndpoints, biased so that
 // no single operator (eTLD+1) exceeds maxOperatorShare of the selection probability.
@@ -41,38 +25,14 @@ func (globalRandSource) Float64() float64 { return rand.Float64() }
 // uniformly within that operator.
 //
 // The cap is DISABLED (byte-for-byte a flat random pick) when:
-//   - maxOperatorShare <= 0 or >= 1 (the canary A/B off-switch), or
+//   - maxOperatorShare <= 0 or >= 1 (the config off-switch), or
 //   - there are 0 or 1 endpoints.
 //
 // Endpoints whose eTLD+1 cannot be resolved are each treated as their own singleton
 // operator (never merged into one bucket — that would fabricate concentration).
 func SelectWithConcentrationCap(
-	logger polylog.Logger,
 	validEndpoints protocol.EndpointAddrList,
 	maxOperatorShare float64,
-) protocol.EndpointAddr {
-	_ = logger
-	return selectWithConcentrationCap(validEndpoints, maxOperatorShare, globalRandSource{})
-}
-
-// SelectWithConcentrationCapSeeded is a deterministic variant of
-// SelectWithConcentrationCap: given the same endpoint slice, cap, and seed it always
-// returns the same endpoint. Used by the WebSocket rebind path, which must spread
-// tied-best endpoints across operators while staying reproducible across replays and
-// pods (seed from a per-connection-stable value). The caller must pass validEndpoints
-// in a stable order (e.g. sorted) so the operator grouping is deterministic.
-func SelectWithConcentrationCapSeeded(
-	validEndpoints protocol.EndpointAddrList,
-	maxOperatorShare float64,
-	seed int64,
-) protocol.EndpointAddr {
-	return selectWithConcentrationCap(validEndpoints, maxOperatorShare, rand.New(rand.NewSource(seed))) //nolint:gosec // not security-sensitive; deterministic spread by design
-}
-
-func selectWithConcentrationCap(
-	validEndpoints protocol.EndpointAddrList,
-	maxOperatorShare float64,
-	r randSource,
 ) protocol.EndpointAddr {
 	n := len(validEndpoints)
 	if n == 0 {
@@ -81,16 +41,18 @@ func selectWithConcentrationCap(
 
 	// Disabled / trivial: preserve the exact prior behavior (flat random pick).
 	if n == 1 || maxOperatorShare <= 0 || maxOperatorShare >= 1 {
-		return validEndpoints[r.Intn(n)]
+		return validEndpoints[rand.Intn(n)]
 	}
 
-	// Group endpoints by operator (eTLD+1). Unresolvable eTLD+1 → singleton operator
-	// keyed by the endpoint address itself, so it can never be merged with another.
-	endpointTLDs := shannonmetrics.GetEndpointTLDs(validEndpoints)
+	// Group endpoints by operator (eTLD+1). The eTLD+1 is extracted inline (rather than via
+	// shannonmetrics.GetEndpointTLDs) to avoid materializing a throwaway map on this hot
+	// path — the map would be built and then read exactly once, in this same loop.
+	// Unresolvable eTLD+1 → singleton operator keyed by the endpoint address itself, so it
+	// can never be merged with another.
 	operatorEndpoints := make(map[string]protocol.EndpointAddrList)
-	operatorOrder := make([]string, 0)
+	operatorOrder := make([]string, 0, n)
 	for _, ep := range validEndpoints {
-		key := endpointTLDs[ep]
+		key := shannonmetrics.ExtractTLDFromEndpointAddr(string(ep))
 		if key == "" {
 			key = string(ep)
 		}
@@ -104,7 +66,7 @@ func selectWithConcentrationCap(
 	// Single operator: the cap has nothing to reshape. A flat random pick is a uniform
 	// pick within that one operator — identical, and cheaper.
 	if m == 1 {
-		return validEndpoints[r.Intn(n)]
+		return validEndpoints[rand.Intn(n)]
 	}
 
 	// Per-operator weights. Start from per-endpoint-uniform (n_i/N): a weighted operator
@@ -125,15 +87,16 @@ func selectWithConcentrationCap(
 	}
 
 	// Weighted pick of an operator, then uniform pick of an endpoint within it.
-	opIdx := weightedPick(weights, r)
+	opIdx := weightedPick(weights)
 	eps := operatorEndpoints[operatorOrder[opIdx]]
-	return eps[r.Intn(len(eps))]
+	return eps[rand.Intn(len(eps))]
 }
 
 // waterFillToCap clamps any weight above cap and redistributes the excess to the
 // under-cap weights, proportionally to their current weight, until no weight exceeds
-// the cap. Feasibility (cap*len(weights) > 1) is guaranteed by the caller, so the loop
-// always terminates with total mass preserved (≈ 1). Operates in place.
+// the cap. The caller only invokes this when the cap is feasible (cap*len(weights) > 1),
+// so total mass is preserved (≈ 1); the underSum guard keeps it safe even if that ever
+// fails to hold. Operates in place.
 func waterFillToCap(weights []float64, maxShare float64) {
 	// At most len(weights) passes: each pass pins at least one new operator to the cap.
 	for pass := 0; pass < len(weights); pass++ {
@@ -151,8 +114,18 @@ func waterFillToCap(weights []float64, maxShare float64) {
 		if !anyOver {
 			return
 		}
+		// No under-cap operator to absorb the excess (only reachable if the caller's
+		// feasibility guarantee is violated). Clamp what we can and stop rather than
+		// dividing by zero.
+		if underSum <= 0 {
+			for i, w := range weights {
+				if w > maxShare+concentrationCapEpsilon {
+					weights[i] = maxShare
+				}
+			}
+			return
+		}
 		// Redistribute excess to the under-cap operators, proportional to their weight.
-		// underSum > 0 is guaranteed by the caller's feasibility check (maxShare*m > 1).
 		for i, w := range weights {
 			if w > maxShare+concentrationCapEpsilon {
 				weights[i] = maxShare
@@ -163,15 +136,15 @@ func waterFillToCap(weights []float64, maxShare float64) {
 	}
 }
 
-// weightedPick returns an index chosen with probability proportional to weights[i],
-// drawing from the supplied RNG. Assumes weights sum to ~1 and are non-negative. Falls
-// back to the last index on floating-point shortfall.
-func weightedPick(weights []float64, r randSource) int {
+// weightedPick returns an index chosen with probability proportional to weights[i].
+// Assumes weights sum to ~1 and are non-negative. Falls back to the last index on
+// floating-point shortfall.
+func weightedPick(weights []float64) int {
 	var total float64
 	for _, w := range weights {
 		total += w
 	}
-	target := r.Float64() * total
+	target := rand.Float64() * total
 	var cum float64
 	for i, w := range weights {
 		cum += w
