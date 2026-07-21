@@ -295,8 +295,21 @@ const (
 const (
 	// KeyGranularityEndpoint scores each endpoint URL separately (the finest granularity).
 	// Key format: serviceID:supplierAddr-endpointURL
-	// This is the default behavior.
+	// Every (supplier, URL) pair is scored independently, so two suppliers that front the
+	// exact same backend URL accumulate — and recover from — reputation separately.
 	KeyGranularityEndpoint = "per-endpoint"
+
+	// KeyGranularityURL scores all suppliers that share the exact same backend URL together,
+	// tracked per RPC type. Key format: serviceID:endpointURL (e.g.,
+	// eth:https://rm-01.eu.nodefleet.net). Identical to per-endpoint for URLs served by a
+	// single supplier; it only differs when multiple staked supplier addresses point at the
+	// same URL (one operator running several suppliers on one backend). Because an exact URL
+	// match means the same physical backend, its failures are shared: one bad backend is
+	// penalized (and cooled) once across every supplier fronting it, instead of each supplier
+	// having to independently prove the shared infrastructure is broken. Unlike per-domain,
+	// it does NOT merge an operator's distinct URLs, so a single bad backend is never diluted
+	// by the operator's healthy ones. This is the default.
+	KeyGranularityURL = "per-url"
 
 	// KeyGranularityDomain scores all endpoints from the same hosting domain together.
 	// Key format: serviceID:domain (e.g., eth:nodefleet.net)
@@ -961,7 +974,7 @@ func DefaultConfig() Config {
 		MinThreshold:    DefaultMinThreshold,
 		RecoveryTimeout: DefaultRecoveryTimeout,
 		StorageType:     "memory",
-		KeyGranularity:  KeyGranularityEndpoint,
+		KeyGranularity:  KeyGranularityURL,
 		SyncConfig:      DefaultSyncConfig(),
 		Latency:         DefaultLatencyConfig(),
 	}
@@ -1007,7 +1020,7 @@ func (c *Config) HydrateDefaults() {
 		c.StorageType = "memory"
 	}
 	if c.KeyGranularity == "" {
-		c.KeyGranularity = KeyGranularityEndpoint
+		c.KeyGranularity = KeyGranularityURL
 	}
 	c.SyncConfig.HydrateDefaults()
 	c.Latency.HydrateDefaults()

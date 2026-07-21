@@ -105,7 +105,7 @@ func TestKeyBuilder_PerSupplier_SameSupplierDifferentURLs(t *testing.T) {
 	require.Equal(t, "eth:pokt1abc123:json_rpc", key1.String())
 }
 
-func TestKeyBuilder_DefaultsToPerEndpoint(t *testing.T) {
+func TestKeyBuilder_DefaultsToPerURL(t *testing.T) {
 	tests := []struct {
 		name        string
 		granularity string
@@ -120,16 +120,81 @@ func TestKeyBuilder_DefaultsToPerEndpoint(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			builder := NewKeyBuilder(tt.granularity)
-			require.IsType(t, &EndpointKeyBuilder{}, builder)
+			require.IsType(t, &URLKeyBuilder{}, builder)
 
-			// Should behave like per-endpoint
+			// Should behave like per-URL: supplier address dropped from the key.
 			serviceID := protocol.ServiceID("eth")
 			endpointAddr := protocol.EndpointAddr("pokt1abc-https://node.com")
 
 			key := builder.BuildKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
-			require.Equal(t, "eth:pokt1abc-https://node.com:json_rpc", key.String())
+			require.Equal(t, "eth:https://node.com:json_rpc", key.String())
 		})
 	}
+}
+
+func TestKeyBuilder_PerURL(t *testing.T) {
+	builder := NewKeyBuilder(KeyGranularityURL)
+	require.IsType(t, &URLKeyBuilder{}, builder)
+
+	serviceID := protocol.ServiceID("eth")
+	endpointAddr := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.nodefleet.net")
+
+	key := builder.BuildKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
+
+	require.Equal(t, serviceID, key.ServiceID)
+	// Supplier stripped; keyed on the URL.
+	require.Equal(t, protocol.EndpointAddr("https://rm-01.eu.nodefleet.net"), key.EndpointAddr)
+	require.Equal(t, "eth:https://rm-01.eu.nodefleet.net:json_rpc", key.String())
+}
+
+// TestKeyBuilder_PerURL_SameURLDifferentSuppliers is the core behavior: two distinct staked
+// supplier addresses fronting the EXACT same backend URL collapse to one reputation key, so
+// the shared backend's failures (and cooldown) are attributed once instead of once per
+// supplier.
+func TestKeyBuilder_PerURL_SameURLDifferentSuppliers(t *testing.T) {
+	builder := NewKeyBuilder(KeyGranularityURL)
+	serviceID := protocol.ServiceID("eth")
+
+	// Same URL, different supplier addresses (one operator, several staked suppliers).
+	ep1 := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.nodefleet.net")
+	ep2 := protocol.EndpointAddr("pokt1xyz789-https://rm-01.eu.nodefleet.net")
+
+	key1 := builder.BuildKey(serviceID, ep1, sharedtypes.RPCType_JSON_RPC)
+	key2 := builder.BuildKey(serviceID, ep2, sharedtypes.RPCType_JSON_RPC)
+
+	require.Equal(t, key1, key2, "same exact URL must produce the same key regardless of supplier")
+	require.Equal(t, "eth:https://rm-01.eu.nodefleet.net:json_rpc", key1.String())
+}
+
+// TestKeyBuilder_PerURL_DistinctURLsStaySeparate verifies per-URL does NOT dilute across an
+// operator's distinct backends (the failure mode of per-domain): two different URLs on the
+// same domain get separate keys, so one bad backend is never masked by the operator's
+// healthy ones.
+func TestKeyBuilder_PerURL_DistinctURLsStaySeparate(t *testing.T) {
+	builder := NewKeyBuilder(KeyGranularityURL)
+	serviceID := protocol.ServiceID("eth")
+
+	// Same supplier/domain, different backend URLs.
+	ep1 := protocol.EndpointAddr("pokt1abc-https://rm-01.eu.nodefleet.net")
+	ep2 := protocol.EndpointAddr("pokt1abc-https://rm-02.eu.nodefleet.net")
+
+	key1 := builder.BuildKey(serviceID, ep1, sharedtypes.RPCType_JSON_RPC)
+	key2 := builder.BuildKey(serviceID, ep2, sharedtypes.RPCType_JSON_RPC)
+
+	require.NotEqual(t, key1, key2, "distinct URLs must stay separate — no per-domain dilution")
+}
+
+// TestKeyBuilder_PerURL_RPCTypeSeparation verifies the same URL is still scored separately
+// per RPC type (json_rpc vs websocket), matching the other builders.
+func TestKeyBuilder_PerURL_RPCTypeSeparation(t *testing.T) {
+	builder := NewKeyBuilder(KeyGranularityURL)
+	serviceID := protocol.ServiceID("eth")
+	ep := protocol.EndpointAddr("pokt1abc-https://node.example.com")
+
+	jsonKey := builder.BuildKey(serviceID, ep, sharedtypes.RPCType_JSON_RPC)
+	wsKey := builder.BuildKey(serviceID, ep, sharedtypes.RPCType_WEBSOCKET)
+
+	require.NotEqual(t, jsonKey, wsKey, "same URL under different RPC types must be scored separately")
 }
 
 // =============================================================================

@@ -109,7 +109,7 @@ func TestConfig_HydrateDefaults(t *testing.T) {
 			expectedInit:        InitialScore,
 			expectedMin:         DefaultMinThreshold,
 			expectedType:        "memory",
-			expectedGranularity: KeyGranularityEndpoint,
+			expectedGranularity: KeyGranularityURL,
 		},
 		{
 			name: "custom values preserved",
@@ -132,7 +132,7 @@ func TestConfig_HydrateDefaults(t *testing.T) {
 			expectedInit:        75,
 			expectedMin:         DefaultMinThreshold,
 			expectedType:        "memory",
-			expectedGranularity: KeyGranularityEndpoint,
+			expectedGranularity: KeyGranularityURL,
 		},
 		{
 			name: "per-domain granularity preserved",
@@ -166,7 +166,7 @@ func TestDefaultConfig(t *testing.T) {
 	require.Equal(t, DefaultMinThreshold, config.MinThreshold)
 	require.Equal(t, DefaultRecoveryTimeout, config.RecoveryTimeout)
 	require.Equal(t, "memory", config.StorageType)
-	require.Equal(t, KeyGranularityEndpoint, config.KeyGranularity)
+	require.Equal(t, KeyGranularityURL, config.KeyGranularity)
 
 	// Verify SyncConfig defaults are included
 	require.Equal(t, DefaultRefreshInterval, config.SyncConfig.RefreshInterval)
@@ -386,14 +386,14 @@ func TestService_KeyBuilderForService(t *testing.T) {
 			expectedBuilderTyp: &DomainKeyBuilder{},
 		},
 		{
-			name:               "empty defaults to per-endpoint",
+			name:               "empty defaults to per-url",
 			keyGranularity:     "",
-			expectedBuilderTyp: &EndpointKeyBuilder{},
+			expectedBuilderTyp: &URLKeyBuilder{},
 		},
 		{
-			name:               "invalid defaults to per-endpoint",
+			name:               "invalid defaults to per-url",
 			keyGranularity:     "invalid-value",
-			expectedBuilderTyp: &EndpointKeyBuilder{},
+			expectedBuilderTyp: &URLKeyBuilder{},
 		},
 	}
 

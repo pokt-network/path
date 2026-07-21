@@ -21,13 +21,18 @@ type KeyBuilder interface {
 // If the granularity is invalid or empty, it defaults to per-endpoint.
 func NewKeyBuilder(granularity string) KeyBuilder {
 	switch granularity {
+	case KeyGranularityURL:
+		return &URLKeyBuilder{}
 	case KeyGranularityDomain:
 		return &DomainKeyBuilder{}
 	case KeyGranularitySupplier:
 		return &SupplierKeyBuilder{}
-	default:
-		// Default to per-endpoint (finest granularity)
+	case KeyGranularityEndpoint:
 		return &EndpointKeyBuilder{}
+	default:
+		// Empty or unrecognized granularity falls back to the shipped default (per-URL):
+		// shared-backend failures are attributed to the URL, not duplicated per supplier.
+		return &URLKeyBuilder{}
 	}
 }
 
@@ -39,6 +44,27 @@ type EndpointKeyBuilder struct{}
 // BuildKey creates a key using the full endpoint address and RPC type.
 func (b *EndpointKeyBuilder) BuildKey(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, rpcType sharedtypes.RPCType) EndpointKey {
 	return NewEndpointKey(serviceID, endpointAddr, rpcType)
+}
+
+// URLKeyBuilder creates keys with per-URL granularity.
+// All suppliers that front the exact same backend URL share a score, tracked per RPC type.
+// Key format: serviceID:endpointURL (e.g., eth:https://rm-01.eu.nodefleet.net)
+// This drops the supplier address from the key so an exact URL match — i.e. the same
+// physical backend behind multiple staked supplier addresses — is scored (and cooled) once
+// rather than once per supplier. It keeps distinct URLs separate (no dilution across an
+// operator's other backends, unlike per-domain).
+type URLKeyBuilder struct{}
+
+// BuildKey creates a key using the URL extracted from the endpoint address and RPC type.
+// If the URL cannot be extracted, it falls back to the full endpoint address (which
+// degrades safely to per-endpoint granularity for that one malformed address).
+func (b *URLKeyBuilder) BuildKey(serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, rpcType sharedtypes.RPCType) EndpointKey {
+	endpointURL, err := endpointAddr.GetURL()
+	if err != nil {
+		// Fallback to full endpoint address if URL extraction fails
+		return NewEndpointKey(serviceID, endpointAddr, rpcType)
+	}
+	return NewEndpointKey(serviceID, protocol.EndpointAddr(endpointURL), rpcType)
 }
 
 // DomainKeyBuilder creates keys with per-domain granularity.
