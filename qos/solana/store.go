@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -34,6 +35,23 @@ type EndpointStore struct {
 
 	endpointsMu sync.RWMutex
 	endpoints   map[protocol.EndpointAddr]endpoint
+
+	// maxOperatorShareBits holds a float64 (via math.Float64bits) for the per-operator
+	// (eTLD+1) concentration cap. 0 (the zero value) disables the cap. Set dynamically
+	// from configuration via QoS.SetMaxOperatorShare.
+	maxOperatorShareBits atomic.Uint64
+}
+
+// getMaxOperatorShare returns the configured per-operator concentration cap (0 = disabled).
+func (es *EndpointStore) getMaxOperatorShare() float64 {
+	return math.Float64frombits(es.maxOperatorShareBits.Load())
+}
+
+// SetMaxOperatorShare dynamically sets the per-operator (eTLD+1) concentration cap used
+// during endpoint selection. A value <= 0 or >= 1 disables the cap (flat random pick).
+// Promoted to the Solana QoS via its embedded *EndpointStore.
+func (es *EndpointStore) SetMaxOperatorShare(maxOperatorShare float64) {
+	es.maxOperatorShareBits.Store(math.Float64bits(maxOperatorShare))
 }
 
 // Select returns a random endpoint address from the list of valid endpoints.
@@ -64,8 +82,11 @@ func (es *EndpointStore) Select(allAvailableEndpoints protocol.EndpointAddrList)
 		return picked[0], nil
 	}
 
+	// Select from the valid candidates, applying the per-operator (eTLD+1) concentration
+	// cap when configured. Disabled (getMaxOperatorShare() <= 0 or >= 1) → byte-for-byte
+	// the prior flat random pick.
 	// TODO_FUTURE: consider ranking filtered endpoints, e.g. based on latency, rather than randomization.
-	return filteredEndpointsAddr[rand.Intn(len(filteredEndpointsAddr))], nil
+	return selector.SelectWithConcentrationCap(logger, filteredEndpointsAddr, es.getMaxOperatorShare()), nil
 }
 
 // SelectMultiple returns multiple endpoint addresses from the list of valid endpoints.

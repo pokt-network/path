@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -49,9 +50,25 @@ type NoOpQoS struct {
 	// perceived block height before being filtered. 0 disables filtering.
 	syncAllowance atomic.Uint64
 
+	// maxOperatorShareBits holds a float64 (via math.Float64bits) for the per-operator
+	// (eTLD+1) concentration cap applied during selection. 0 disables the cap. Set
+	// dynamically from configuration via SetMaxOperatorShare.
+	maxOperatorShareBits atomic.Uint64
+
 	// reputationSvc provides shared perceived block height across replicas via Redis.
 	// Set via SetReputationService; nil when reputation is disabled.
 	reputationSvc reputation.ReputationService
+}
+
+// getMaxOperatorShare returns the configured per-operator concentration cap (0 = disabled).
+func (n *NoOpQoS) getMaxOperatorShare() float64 {
+	return math.Float64frombits(n.maxOperatorShareBits.Load())
+}
+
+// SetMaxOperatorShare dynamically sets the per-operator (eTLD+1) concentration cap used
+// during endpoint selection. A value <= 0 or >= 1 disables the cap (flat random pick).
+func (n *NoOpQoS) SetMaxOperatorShare(maxOperatorShare float64) {
+	n.maxOperatorShareBits.Store(math.Float64bits(maxOperatorShare))
 }
 
 // NewNoOpQoSService creates a new NoOp QoS service instance.

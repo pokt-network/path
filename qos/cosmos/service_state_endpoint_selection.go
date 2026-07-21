@@ -56,8 +56,15 @@ func (ss *serviceState) Select(availableEndpoints protocol.EndpointAddrList) (pr
 
 	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(availableEndpoints))
 
+	// Select from the valid candidates, applying the per-operator (eTLD+1) concentration
+	// cap when configured. Disabled (getMaxOperatorShare() <= 0 or >= 1) → byte-for-byte
+	// the prior flat random pick.
 	// TODO_FUTURE: consider ranking filtered endpoints, e.g. based on latency, rather than randomization.
-	selectedEndpointAddr := filteredEndpointsAddr[rand.Intn(len(filteredEndpointsAddr))]
+	selectedEndpointAddr := selector.SelectWithConcentrationCap(
+		logger,
+		filteredEndpointsAddr,
+		ss.serviceQoSConfig.getMaxOperatorShare(),
+	)
 	return selectedEndpointAddr, nil
 }
 

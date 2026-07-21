@@ -76,12 +76,16 @@ func (fs *filteringSelector) Select(endpoints protocol.EndpointAddrList) (protoc
 
 	filtered := fs.filterValidEndpoints(endpoints)
 
+	// Apply the per-operator (eTLD+1) concentration cap when configured. Disabled
+	// (getMaxOperatorShare() <= 0 or >= 1) → byte-for-byte the prior flat random pick.
+	maxOperatorShare := fs.qos.getMaxOperatorShare()
+
 	if len(filtered) == 0 {
 		fs.logger.Warn().Msg("All endpoints failed block height validation, falling back to random selection")
-		return endpoints[rand.Intn(len(endpoints))], nil
+		return selector.SelectWithConcentrationCap(fs.logger, endpoints, maxOperatorShare), nil
 	}
 
-	return filtered[rand.Intn(len(filtered))], nil
+	return selector.SelectWithConcentrationCap(fs.logger, filtered, maxOperatorShare), nil
 }
 
 // SelectMultiple returns multiple endpoints after applying block-height filtering.

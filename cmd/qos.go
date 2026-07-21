@@ -73,16 +73,6 @@ func getServiceQoSInstances(
 			} else {
 				svcLogger.Info().Msg("⚠️ EVM QoS: sync allowance DISABLED (set sync_allowance > 0 to enable)")
 			}
-			// Per-operator concentration cap: bounds any single operator's share of endpoint
-			// selection (config-driven, shipped ON by default). Covers both HTTP and WebSocket
-			// initial selection via requestContext.Select.
-			if unifiedConfig != nil {
-				maxOperatorShare := unifiedConfig.GetMaxOperatorShareForService(serviceID)
-				evmQoS.SetMaxOperatorShare(maxOperatorShare)
-				if maxOperatorShare > 0 && maxOperatorShare < 1 {
-					svcLogger.Info().Float64("max_operator_share", maxOperatorShare).Msg("✅ EVM QoS: per-operator concentration cap ENABLED")
-				}
-			}
 
 		case gateway.ServiceTypeCosmos:
 			// Convert string RPC types to sharedtypes.RPCType
@@ -118,6 +108,21 @@ func getServiceQoSInstances(
 			svcLogger.Warn().Msg("Unknown service type, using noop QoS")
 			noopQoS := noop.NewNoOpQoSService(qosLogger, serviceID)
 			qosServices[serviceID] = noopQoS
+		}
+
+		// Per-operator concentration cap: bounds any single operator's (eTLD+1) share of
+		// endpoint selection (config-driven, shipped ON by default). Applied uniformly to
+		// every QoS type that supports it — EVM/Cosmos/Solana/NoOp — covering both HTTP and
+		// WebSocket initial selection via requestContext.Select. Disabled (>= 1 or <= 0)
+		// leaves selection as a flat random pick.
+		if unifiedConfig != nil {
+			if setter, ok := qosServices[serviceID].(interface{ SetMaxOperatorShare(float64) }); ok {
+				maxOperatorShare := unifiedConfig.GetMaxOperatorShareForService(serviceID)
+				setter.SetMaxOperatorShare(maxOperatorShare)
+				if maxOperatorShare > 0 && maxOperatorShare < 1 {
+					svcLogger.Info().Float64("max_operator_share", maxOperatorShare).Msg("✅ QoS: per-operator concentration cap ENABLED")
+				}
+			}
 		}
 	}
 

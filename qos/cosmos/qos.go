@@ -2,6 +2,7 @@ package cosmos
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -108,6 +109,9 @@ type simpleCosmosConfig struct {
 	serviceID     protocol.ServiceID
 	syncAllowance atomic.Uint64                    // If 0, uses default. Updated dynamically when external health check rules are loaded.
 	supportedAPIs map[sharedtypes.RPCType]struct{} // Supported RPC types
+	// maxOperatorShareBits holds a float64 (via math.Float64bits) for the per-operator
+	// concentration cap. 0 (the zero value) disables the cap. Updated dynamically.
+	maxOperatorShareBits atomic.Uint64
 }
 
 func (c *simpleCosmosConfig) GetServiceID() protocol.ServiceID { return c.serviceID }
@@ -120,6 +124,9 @@ func (c *simpleCosmosConfig) getSyncAllowance() uint64 {
 	}
 	return defaultCosmosSDKBlockNumberSyncAllowance
 }
+func (c *simpleCosmosConfig) getMaxOperatorShare() float64 {
+	return math.Float64frombits(c.maxOperatorShareBits.Load())
+}
 
 // SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
 // This is called when external health check rules are loaded/refreshed, since those
@@ -127,6 +134,14 @@ func (c *simpleCosmosConfig) getSyncAllowance() uint64 {
 func (qos *QoS) SetSyncAllowance(syncAllowance uint64) {
 	if cfg, ok := qos.serviceQoSConfig.(*simpleCosmosConfig); ok {
 		cfg.syncAllowance.Store(syncAllowance)
+	}
+}
+
+// SetMaxOperatorShare dynamically sets the per-operator (eTLD+1) concentration cap used
+// during endpoint selection. A value <= 0 or >= 1 disables the cap (flat random pick).
+func (qos *QoS) SetMaxOperatorShare(maxOperatorShare float64) {
+	if cfg, ok := qos.serviceQoSConfig.(*simpleCosmosConfig); ok {
+		cfg.maxOperatorShareBits.Store(math.Float64bits(maxOperatorShare))
 	}
 }
 func (c *simpleCosmosConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
