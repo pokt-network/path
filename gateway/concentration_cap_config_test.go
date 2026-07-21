@@ -32,7 +32,7 @@ func TestGetMaxOperatorShareForService(t *testing.T) {
 		{
 			name: "defaults set, no per-service → defaults",
 			cfg: &UnifiedServicesConfig{
-				Defaults: ServiceDefaults{MaxOperatorTrafficShare: f(0.6)},
+				Defaults: ServiceDefaults{MaxOperatorShare: f(0.6)},
 				Services: []ServiceConfig{{ID: "eth"}},
 			},
 			service: "eth",
@@ -41,8 +41,8 @@ func TestGetMaxOperatorShareForService(t *testing.T) {
 		{
 			name: "per-service overrides defaults",
 			cfg: &UnifiedServicesConfig{
-				Defaults: ServiceDefaults{MaxOperatorTrafficShare: f(0.6)},
-				Services: []ServiceConfig{{ID: "eth", MaxOperatorTrafficShare: f(0.5)}},
+				Defaults: ServiceDefaults{MaxOperatorShare: f(0.6)},
+				Services: []ServiceConfig{{ID: "eth", MaxOperatorShare: f(0.5)}},
 			},
 			service: "eth",
 			want:    0.5,
@@ -50,7 +50,7 @@ func TestGetMaxOperatorShareForService(t *testing.T) {
 		{
 			name: "per-service disable (1.0) is honored",
 			cfg: &UnifiedServicesConfig{
-				Services: []ServiceConfig{{ID: "eth", MaxOperatorTrafficShare: f(1.0)}},
+				Services: []ServiceConfig{{ID: "eth", MaxOperatorShare: f(1.0)}},
 			},
 			service: "eth",
 			want:    1.0,
@@ -58,7 +58,7 @@ func TestGetMaxOperatorShareForService(t *testing.T) {
 		{
 			name: "per-service disable (0) is honored",
 			cfg: &UnifiedServicesConfig{
-				Services: []ServiceConfig{{ID: "eth", MaxOperatorTrafficShare: f(0)}},
+				Services: []ServiceConfig{{ID: "eth", MaxOperatorShare: f(0)}},
 			},
 			service: "eth",
 			want:    0,

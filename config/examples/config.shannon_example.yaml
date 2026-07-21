@@ -277,6 +277,13 @@ gateway_config:
       retry_config:
         max_retries: 2
         hedge_delay: 300ms
+      # Per-operator concentration cap (optional). Bounds the fraction of this service's
+      # endpoint selections that any single operator (registrable domain / eTLD+1) may
+      # receive; the excess is spread across the other valid operators. This limits the
+      # blast radius when one operator holds most of the valid pool and then degrades.
+      # Ships ON by default at 0.75 for every service — set a value here to override, or
+      # 1.0 (or 0) to disable it for this service.
+      # max_operator_share: 0.6
       # External block sources for ground-truth validation (optional)
       # Multiple sources provide redundancy — the max height across all is used.
       # If all session endpoints are behind the real chain tip, these correct it.

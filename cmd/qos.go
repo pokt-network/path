@@ -122,6 +122,10 @@ func getServiceQoSInstances(
 				if maxOperatorShare > 0 && maxOperatorShare < 1 {
 					svcLogger.Info().Float64("max_operator_share", maxOperatorShare).Msg("✅ QoS: per-operator concentration cap ENABLED")
 				}
+			} else {
+				// Every current QoS type implements SetMaxOperatorShare; a new type that
+				// forgets it would silently run uncapped despite the shipped-on default.
+				svcLogger.Warn().Msg("⚠️ QoS type does not support the per-operator concentration cap; selection runs uncapped")
 			}
 		}
 	}

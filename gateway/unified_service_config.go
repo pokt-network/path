@@ -237,9 +237,9 @@ type ServiceDefaults struct {
 	ActiveHealthChecks   ServiceHealthCheckOverride   `yaml:"active_health_checks,omitempty"`
 	ExternalBlockSources []ExternalBlockSource        `yaml:"external_block_sources,omitempty"`
 
-	// MaxOperatorTrafficShare is the default per-operator concentration cap applied to any
+	// MaxOperatorShare is the default per-operator concentration cap applied to any
 	// service that does not set its own. nil falls back to DefaultMaxOperatorShare.
-	MaxOperatorTrafficShare *float64 `yaml:"max_operator_traffic_share,omitempty"`
+	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
 }
 
 // ServiceConfig defines configuration for a single service.
@@ -268,13 +268,18 @@ type ServiceConfig struct {
 	// this is a persistent, config-driven blocklist.
 	BlockedSuppliers []string `yaml:"blocked_suppliers,omitempty"`
 
-	// MaxOperatorTrafficShare caps the fraction of this service's endpoint selections that
+	// MaxOperatorShare caps the fraction of this service's endpoint selections that
 	// any single operator (registrable domain / eTLD+1) may receive, bounding the blast
 	// radius of one operator failing when it holds most of the valid endpoint pool. The
 	// excess above the cap is spread across the other valid operators (water-filling).
 	// nil = use the global default (DefaultMaxOperatorShare). A value <= 0 or >= 1 disables
 	// the cap for this service (flat selection ∝ endpoint count).
-	MaxOperatorTrafficShare *float64 `yaml:"max_operator_traffic_share,omitempty"`
+	//
+	// Scope: the cap governs the primary single-endpoint selection (the bulk of traffic,
+	// HTTP and WebSocket, plus the WebSocket rebind target). It does NOT reshape
+	// multi-endpoint selection (parallel fan-out / hedge), which draw from the same
+	// reputation-filtered pool via separate code paths.
+	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
 }
 
 // UnifiedServicesConfig is the top-level configuration for the unified service system.
@@ -856,11 +861,11 @@ const DefaultMaxOperatorShare = 0.75
 // A configured value <= 0 or >= 1 disables the cap for that service.
 func (c *UnifiedServicesConfig) GetMaxOperatorShareForService(serviceID protocol.ServiceID) float64 {
 	svc := c.GetServiceConfig(serviceID)
-	if svc != nil && svc.MaxOperatorTrafficShare != nil {
-		return *svc.MaxOperatorTrafficShare
+	if svc != nil && svc.MaxOperatorShare != nil {
+		return *svc.MaxOperatorShare
 	}
-	if c.Defaults.MaxOperatorTrafficShare != nil {
-		return *c.Defaults.MaxOperatorTrafficShare
+	if c.Defaults.MaxOperatorShare != nil {
+		return *c.Defaults.MaxOperatorShare
 	}
 	return DefaultMaxOperatorShare
 }

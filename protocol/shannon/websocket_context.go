@@ -434,10 +434,6 @@ func selectBestReconnectEndpoint(endpoints map[protocol.EndpointAddr]endpoint, s
 	return best
 }
 
-// reconnectScoreEpsilon is the tolerance within which two reconnect candidates count as
-// tied on reputation score (scores are ~100-scale floats; exact equality is too brittle).
-const reconnectScoreEpsilon = 1e-9
-
 // selectReconnectEndpointWithCap chooses a rebind target, applying the per-operator
 // concentration cap when enabled.
 //
@@ -477,6 +473,12 @@ func selectReconnectEndpointWithCap(
 // reconnectTopBand returns the endpoint addresses tied for best under the
 // (non-fallback preferred, then highest score) ordering — exactly the candidates
 // selectBestReconnectEndpoint would otherwise break by smallest address.
+//
+// "Tied for best" uses exact score equality, matching betterReconnectCandidate (the
+// disabled-path picker), so both paths agree on which endpoints are tied. Reputation
+// scores are shared values (a stored score, or the same InitialScore constant for unscored
+// endpoints), so exact equality is the right test — no float tolerance is needed, and an
+// epsilon band here would disagree with the exact comparison there.
 func reconnectTopBand(endpoints map[protocol.EndpointAddr]endpoint, scoreOf func(endpoint) float64) []protocol.EndpointAddr {
 	hasNonFallback := false
 	for _, ep := range endpoints {
@@ -501,7 +503,7 @@ func reconnectTopBand(endpoints map[protocol.EndpointAddr]endpoint, scoreOf func
 		if hasNonFallback && ep.IsFallback() {
 			continue
 		}
-		if scoreOf(ep) >= maxScore-reconnectScoreEpsilon {
+		if scoreOf(ep) >= maxScore {
 			band = append(band, addr)
 		}
 	}
