@@ -264,7 +264,17 @@ func (n *NoOpQoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan
 						Msg("External block floor skipped — no suppliers have reported yet")
 					continue
 				}
-				if h > n.perceivedBlockHeight {
+				// Guard the external floor the same way the endpoint path is guarded
+				// (see line ~165): an external source must not raise perceived more
+				// than MaxBlockHeightJump above the current value, blocking a
+				// misbehaving/mislabeled external source from poisoning perceived
+				// arbitrarily high and filtering out honest endpoints.
+				if h > n.perceivedBlockHeight && !qos.IsPlausibleBlockHeight(h, n.perceivedBlockHeight) {
+					n.logger.Warn().
+						Uint64("external_block", h).
+						Uint64("perceived_block", n.perceivedBlockHeight).
+						Msg("⚠️ ignoring implausible external block height (possible poisoned external source)")
+				} else if h > n.perceivedBlockHeight {
 					n.logger.Info().
 						Uint64("old_perceived", n.perceivedBlockHeight).
 						Uint64("external_block", h).

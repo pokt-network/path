@@ -12,6 +12,7 @@ import (
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
+	pathqos "github.com/pokt-network/path/qos"
 	"github.com/pokt-network/path/qos/selector"
 	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
@@ -316,7 +317,18 @@ func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan i
 						Msg("External block floor skipped — no suppliers have reported yet")
 					continue
 				}
-				if h > qos.perceivedBlockNumber {
+				// Guard the external floor the same way the endpoint path is guarded
+				// (see service_state.go:101): an external source must not raise
+				// perceived more than MaxBlockHeightJump above the current value,
+				// blocking a misbehaving/mislabeled external source from poisoning
+				// perceived arbitrarily high and filtering out honest endpoints.
+				if h > qos.perceivedBlockNumber && !pathqos.IsPlausibleBlockHeight(h, qos.perceivedBlockNumber) {
+					qos.logger.Warn().
+						Str("service_id", string(serviceID)).
+						Uint64("external_block", h).
+						Uint64("perceived_block", qos.perceivedBlockNumber).
+						Msg("⚠️ ignoring implausible external block height (possible poisoned external source)")
+				} else if h > qos.perceivedBlockNumber {
 					qos.logger.Info().
 						Str("service_id", string(serviceID)).
 						Uint64("old_perceived", qos.perceivedBlockNumber).

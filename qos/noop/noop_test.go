@@ -210,6 +210,41 @@ func TestNoOpQoS_ConsumeExternalBlockHeight(t *testing.T) {
 	require.Equal(t, uint64(200), qos.GetPerceivedBlockNumber())
 }
 
+// TestNoOpQoS_ConsumeExternalBlockHeight_RejectsImplausible reproduces the Solana
+// slot-poisoning incident (2026-07-21): a mislabeled external source returned the
+// SLOT (~434M), which is ~22M above the real block height (~412M). Without a
+// plausibility guard the external-floor path would set perceived to the slot,
+// making every honest endpoint (reporting the real, lower height) look "behind"
+// and get filtered out. The guard must reject an external height that jumps more
+// than MaxBlockHeightJump above the current perceived, while still accepting a
+// normal (small) advance.
+func TestNoOpQoS_ConsumeExternalBlockHeight_RejectsImplausible(t *testing.T) {
+	qos := newTestQoS()
+
+	// Suppliers report the real block height.
+	const realHeight = 412_000_000
+	require.NoError(t, qos.UpdateFromExtractedData("ep1", &qostypes.ExtractedData{BlockHeight: realHeight}))
+
+	heights := make(chan int64, 5)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	qos.ConsumeExternalBlockHeight(ctx, heights, 1*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
+
+	// Implausible external height (the slot, ~22M above the real tip) must be ignored.
+	heights <- 434_000_000
+	time.Sleep(10 * time.Millisecond)
+	require.Equal(t, uint64(realHeight), qos.GetPerceivedBlockNumber(),
+		"an implausible external height (slot magnitude) must not poison perceived")
+
+	// A plausible advance (a few blocks ahead) is still applied — the floor keeps working.
+	heights <- realHeight + 5
+	time.Sleep(10 * time.Millisecond)
+	require.Equal(t, uint64(realHeight+5), qos.GetPerceivedBlockNumber(),
+		"a plausible external advance must still raise perceived")
+}
+
 func TestNoOpQoS_ConsumeExternalBlockHeight_SkipsWhenNoSuppliers(t *testing.T) {
 	qos := newTestQoS()
 	// perceivedBlockHeight is 0 — no suppliers have reported

@@ -12,6 +12,7 @@ import (
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
+	pathqos "github.com/pokt-network/path/qos"
 	"github.com/pokt-network/path/qos/selector"
 	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
@@ -422,12 +423,24 @@ func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan i
 				// could cause other replicas to filter all endpoints.
 				if qos.reputationSvc != nil {
 					currentPerceived := qos.perceivedBlockNumber.Load()
-					if currentPerceived > 0 && h > currentPerceived {
+					// Guard the cross-replica Redis write: an external source must not
+					// raise perceived more than MaxBlockHeightJump above the current
+					// value. Without this, a mislabeled source (e.g. one returning a
+					// slot ~5% above the real block height) would poison perceived for
+					// every replica, filtering out honest endpoints network-wide. This
+					// mirrors the consensus-path guard in block_consensus.go.
+					if currentPerceived > 0 && h > currentPerceived && pathqos.IsPlausibleBlockHeight(h, currentPerceived) {
 						go func(block uint64) {
 							rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 							defer cancel()
 							_ = qos.reputationSvc.SetPerceivedBlockNumber(rCtx, serviceID, block)
 						}(h)
+					} else if currentPerceived > 0 && h > currentPerceived {
+						qos.logger.Warn().
+							Str("service_id", string(serviceID)).
+							Uint64("external_block", h).
+							Uint64("perceived_block", currentPerceived).
+							Msg("⚠️ ignoring implausible external block height for Redis perceived write (possible poisoned external source)")
 					}
 				}
 			}

@@ -157,6 +157,37 @@ func TestExternalBlockFloor_OverridesWhenHigher(t *testing.T) {
 	assert.Equal(t, uint64(100), perceived)
 }
 
+// TestExternalBlockFloor_RejectsImplausible guards against the poisoning class that
+// hit Solana on 2026-07-21: a mislabeled external source reporting a value far above
+// the true chain tip (e.g. a slot ~5% above block height). Applying it as the floor
+// would push perceived above every honest endpoint and filter them all out. The floor
+// must reject an external height more than MaxBlockHeightJump above session consensus,
+// while still accepting a normal advance.
+func TestExternalBlockFloor_RejectsImplausible(t *testing.T) {
+	logger := polyzero.NewLogger()
+	consensus := NewBlockHeightConsensus(logger, 10)
+	consensus.SetExternalBlockGracePeriod(0) // Disable grace period for test
+
+	// Establish consensus at a realistic height.
+	const consensusHeight = 20_000_000
+	consensus.AddObservation("endpoint1", consensusHeight)
+	consensus.AddObservation("endpoint2", consensusHeight)
+	consensus.AddObservation("endpoint3", consensusHeight)
+	assert.Equal(t, uint64(consensusHeight), consensus.GetPerceivedBlock())
+
+	// External height ~20M above consensus (> MaxBlockHeightJump) must be ignored.
+	consensus.SetExternalBlockHeight(40_000_000)
+	perceived := consensus.AddObservation("endpoint4", consensusHeight)
+	assert.Equal(t, uint64(consensusHeight), perceived,
+		"an implausible external height must not override session consensus")
+
+	// A plausible external advance is still applied as a floor.
+	consensus.SetExternalBlockHeight(consensusHeight + 5)
+	perceived = consensus.AddObservation("endpoint5", consensusHeight)
+	assert.Equal(t, uint64(consensusHeight+5), perceived,
+		"a plausible external advance must still act as a floor")
+}
+
 func TestExternalBlockFloor_IgnoredWhenLower(t *testing.T) {
 	logger := polyzero.NewLogger()
 	consensus := NewBlockHeightConsensus(logger, 10)
