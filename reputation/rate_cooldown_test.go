@@ -63,6 +63,36 @@ func TestRateCooldown_VolumeIndependence_TheBug(t *testing.T) {
 		"burst strikes must stay below threshold on alternating C/S — the cooldown here came from the rate detector, not the strike counter")
 }
 
+// TestRateCooldown_HealthCheckSignalsExcluded verifies that a sustained CRITICAL rate made
+// up entirely of health-check probes does NOT trip the rate cooldown — a hard bench must
+// reflect user experience, not a strict/flaky probe (e.g. a Solana getBlockHeight sync check
+// failing an endpoint that serves user reads at 99.8%). The same critical rate from user
+// traffic WOULD trip it (see TestRateCooldown_VolumeIndependence_TheBug), so this isolates
+// the health-check exclusion.
+func TestRateCooldown_HealthCheckSignalsExcluded(t *testing.T) {
+	svc, ctx := newRateTestService(t)
+	key := NewEndpointKey("solana", "probe-fails-users-fine", sharedtypes.RPCType_JSON_RPC)
+
+	// 60 signals at a 50% critical rate — but every one is a health-check probe.
+	for i := 0; i < 60; i++ {
+		var sig Signal
+		if i%2 == 0 {
+			sig = NewCriticalErrorSignal("getBlockHeight sync check", 100*time.Millisecond)
+		} else {
+			sig = NewSuccessSignal(100 * time.Millisecond)
+		}
+		sig.IsHealthCheck = true
+		require.NoError(t, svc.RecordSignal(ctx, key, sig))
+	}
+
+	score, err := svc.GetScore(ctx, key)
+	require.NoError(t, err)
+	require.False(t, score.IsInCooldown(),
+		"health-check-only critical rate must NOT trip the rate cooldown")
+	require.Equal(t, 0.0, score.RecentCriticalRate,
+		"health-check signals must not move the user-traffic critical-rate EWMA")
+}
+
 // TestRateCooldown_HealthyEndpointNeverTrips verifies a high-volume endpoint with only a
 // tiny, well-spaced critical rate (~2.5%) is never cooled — the rate EWMA decays back down
 // between rare failures and stays far below the threshold. This is the false-positive guard:

@@ -802,6 +802,7 @@ func (e *HealthCheckExecutor) recordCheckResult(
 		// than regular SuccessSignal (+1) used by client requests, but requires
 		// sustained good behavior to fully recover from critical errors.
 		signal := reputation.NewRecoverySuccessSignal(latency)
+		signal.IsHealthCheck = true // probe, not user traffic — excluded from the rate-cooldown detector
 		if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
 			e.logger.Warn().
 				Err(err).
@@ -835,6 +836,7 @@ func (e *HealthCheckExecutor) recordCheckResult(
 
 	// Check failed - record error signal based on configured severity
 	signal := e.mapSignalType(check.ReputationSignal, checkErr.Error(), latency)
+	signal.IsHealthCheck = true // probe, not user traffic — excluded from the rate-cooldown detector
 	if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
 		e.logger.Warn().
 			Err(err).

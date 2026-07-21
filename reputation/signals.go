@@ -61,6 +61,14 @@ type Signal struct {
 	// Reason provides additional context for the signal.
 	Reason string
 
+	// IsHealthCheck marks a signal that originated from an active health-check probe rather
+	// than real user traffic. Health checks still move the additive score (soft
+	// deprioritization), but they are excluded from the volume-independent rate-cooldown
+	// detector: a hard bench must reflect what USERS actually experience, not a probe that can
+	// be stricter than user impact (e.g. a Solana getBlockHeight sync check failing an
+	// endpoint that serves reads at 99.8% success). Set by the health-check executor.
+	IsHealthCheck bool
+
 	// Metadata holds additional signal-specific data.
 	Metadata map[string]string
 }

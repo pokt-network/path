@@ -173,53 +173,60 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 	// fast as it spends it and is never cooled — exactly the high-volume "can't be filtered"
 	// case. Track an EWMA of the critical indicator so a sustained critical RATE trips a
 	// cooldown regardless of success volume.
-	criticalIndicator := 0.0
-	if signal.Type == SignalTypeCriticalError || signal.Type == SignalTypeFatalError {
-		criticalIndicator = 1.0
-	}
-	score.RecentCriticalRate = score.RecentCriticalRate*(1-CriticalRateEWMAAlpha) + CriticalRateEWMAAlpha*criticalIndicator
-
-	// Trip only once the sample is meaningful, and only to EXTEND (never shorten) any
-	// cooldown the strike system already set.
-	if score.RecentCriticalRate >= CriticalRateThreshold &&
-		(score.SuccessCount+score.ErrorCount) >= CriticalRateMinObservations {
-		trippedRate := score.RecentCriticalRate
-
-		// Escalating backoff: a repeat trip that lands within DefaultMaxCooldown of the
-		// previous cooldown's end doubles the duration; an endpoint that has since run clean
-		// for longer than that starts fresh at one session. Mirrors the strike system's
-		// exponential backoff so a persistently broken endpoint is benched progressively
-		// longer while a one-off transient spike costs only a single session.
-		prevCooldownUntil := score.CooldownUntil
-		if !prevCooldownUntil.IsZero() && time.Since(prevCooldownUntil) < DefaultMaxCooldown {
-			score.RateCooldownCount++
-		} else {
-			score.RateCooldownCount = 1
+	//
+	// Health-check signals are EXCLUDED from this detector (they still moved the additive
+	// score above). A hard bench must reflect what USERS experience: a strict or flaky probe
+	// (e.g. a Solana getBlockHeight sync check) can fail an endpoint that serves user reads
+	// perfectly, and must not be able to cool it out of rotation on its own.
+	if !signal.IsHealthCheck {
+		criticalIndicator := 0.0
+		if signal.Type == SignalTypeCriticalError || signal.Type == SignalTypeFatalError {
+			criticalIndicator = 1.0
 		}
-		// Linear escalation: 10m, 20m, 30m, 40m, 50m, then capped at DefaultMaxCooldown (1h).
-		// The first offense (10m) is under one Shannon session (~20m) so a transient spike
-		// recovers within the session; only a persistent offender ramps toward a full hour.
-		cooldownDuration := DefaultRateCooldown * time.Duration(score.RateCooldownCount)
-		if cooldownDuration > DefaultMaxCooldown {
-			cooldownDuration = DefaultMaxCooldown
-		}
+		score.RecentCriticalRate = score.RecentCriticalRate*(1-CriticalRateEWMAAlpha) + CriticalRateEWMAAlpha*criticalIndicator
 
-		rateCooldownUntil := time.Now().Add(cooldownDuration)
-		if rateCooldownUntil.After(score.CooldownUntil) {
-			score.CooldownUntil = rateCooldownUntil
-		}
-		// Reset the EWMA so the endpoint starts clean after the cooldown and must
-		// re-accumulate sustained failures to trip again (no immediate re-flap on the first
-		// post-cooldown request).
-		score.RecentCriticalRate = 0
-		metrics.RecordReputationRateCooldown(string(key.ServiceID))
-		if s.logger != nil {
-			s.logger.Warn().
-				Str("endpoint", key.String()).
-				Float64("critical_rate", trippedRate).
-				Int("rate_cooldown_count", score.RateCooldownCount).
-				Dur("cooldown_duration", cooldownDuration).
-				Msg("[RATE_COOLDOWN] Endpoint cooled down due to sustained critical error rate (volume-independent)")
+		// Trip only once the sample is meaningful, and only to EXTEND (never shorten) any
+		// cooldown the strike system already set.
+		if score.RecentCriticalRate >= CriticalRateThreshold &&
+			(score.SuccessCount+score.ErrorCount) >= CriticalRateMinObservations {
+			trippedRate := score.RecentCriticalRate
+
+			// Escalating backoff: a repeat trip that lands within DefaultMaxCooldown of the
+			// previous cooldown's end doubles the duration; an endpoint that has since run clean
+			// for longer than that starts fresh at one session. Mirrors the strike system's
+			// exponential backoff so a persistently broken endpoint is benched progressively
+			// longer while a one-off transient spike costs only a single session.
+			prevCooldownUntil := score.CooldownUntil
+			if !prevCooldownUntil.IsZero() && time.Since(prevCooldownUntil) < DefaultMaxCooldown {
+				score.RateCooldownCount++
+			} else {
+				score.RateCooldownCount = 1
+			}
+			// Linear escalation: 10m, 20m, 30m, 40m, 50m, then capped at DefaultMaxCooldown (1h).
+			// The first offense (10m) is under one Shannon session (~20m) so a transient spike
+			// recovers within the session; only a persistent offender ramps toward a full hour.
+			cooldownDuration := DefaultRateCooldown * time.Duration(score.RateCooldownCount)
+			if cooldownDuration > DefaultMaxCooldown {
+				cooldownDuration = DefaultMaxCooldown
+			}
+
+			rateCooldownUntil := time.Now().Add(cooldownDuration)
+			if rateCooldownUntil.After(score.CooldownUntil) {
+				score.CooldownUntil = rateCooldownUntil
+			}
+			// Reset the EWMA so the endpoint starts clean after the cooldown and must
+			// re-accumulate sustained failures to trip again (no immediate re-flap on the first
+			// post-cooldown request).
+			score.RecentCriticalRate = 0
+			metrics.RecordReputationRateCooldown(string(key.ServiceID))
+			if s.logger != nil {
+				s.logger.Warn().
+					Str("endpoint", key.String()).
+					Float64("critical_rate", trippedRate).
+					Int("rate_cooldown_count", score.RateCooldownCount).
+					Dur("cooldown_duration", cooldownDuration).
+					Msg("[RATE_COOLDOWN] Endpoint cooled down due to sustained critical error rate (volume-independent)")
+			}
 		}
 	}
 
