@@ -162,7 +162,7 @@ func Test_selectReconnectEndpointWithCap_DisabledMatchesDeterministic(t *testing
 
 	want := selectBestReconnectEndpoint(endpoints, noScore).Addr()
 	for _, disabled := range []float64{0, 1.0, -1, 2} {
-		got := selectReconnectEndpointWithCap(endpoints, noScore, disabled)
+		got := selectReconnectEndpointWithCap("test", endpoints, noScore, disabled)
 		c.Equal(want, got.Addr(), "disabled cap (%v) must match deterministic pick", disabled)
 	}
 }
@@ -177,7 +177,7 @@ func Test_selectReconnectEndpointWithCap_SpreadsAcrossOperators(t *testing.T) {
 	counts := map[string]int{}
 	const draws = 20_000
 	for i := 0; i < draws; i++ {
-		ep := selectReconnectEndpointWithCap(endpoints, noScore, 0.4)
+		ep := selectReconnectEndpointWithCap("test", endpoints, noScore, 0.4)
 		counts[opOfAddr(string(ep.Addr()))]++
 	}
 	c.InDelta(0.40, float64(counts[ops[0]])/float64(draws), 0.03,
@@ -200,7 +200,7 @@ func Test_selectReconnectEndpointWithCap_RespectsScoreBand(t *testing.T) {
 	})
 
 	for i := 0; i < 500; i++ {
-		ep := selectReconnectEndpointWithCap(endpoints, scoreOf, 0.6)
+		ep := selectReconnectEndpointWithCap("test", endpoints, scoreOf, 0.6)
 		c.NotEqual(low.Addr(), ep.Addr(), "a below-band (lower-score) endpoint must never be a rebind target")
 	}
 }

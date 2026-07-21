@@ -2,7 +2,6 @@ package evm
 
 import (
 	"context"
-	"math"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/selector"
 	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
 )
@@ -94,9 +94,9 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 type simpleServiceConfig struct {
 	serviceID     protocol.ServiceID
 	syncAllowance atomic.Uint64 // If 0, uses default. Updated dynamically when external health check rules are loaded.
-	// maxOperatorShareBits holds a float64 (via math.Float64bits) for the per-operator
-	// concentration cap. 0 (the zero value) disables the cap. Updated dynamically.
-	maxOperatorShareBits atomic.Uint64
+	// maxOperatorShare is the per-operator concentration cap. 0 (the zero value) disables
+	// the cap. Updated dynamically via SetMaxOperatorShare.
+	maxOperatorShare selector.AtomicFloat64
 }
 
 func (c *simpleServiceConfig) GetServiceID() protocol.ServiceID { return c.serviceID }
@@ -112,7 +112,7 @@ func (c *simpleServiceConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{
 	return map[sharedtypes.RPCType]struct{}{sharedtypes.RPCType_JSON_RPC: {}}
 }
 func (c *simpleServiceConfig) getMaxOperatorShare() float64 {
-	return math.Float64frombits(c.maxOperatorShareBits.Load())
+	return c.maxOperatorShare.Load()
 }
 
 // SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
@@ -129,7 +129,7 @@ func (qos *QoS) SetSyncAllowance(syncAllowance uint64) {
 // pick). Wired from configuration so it can be A/B tested on canary without a redeploy.
 func (qos *QoS) SetMaxOperatorShare(maxOperatorShare float64) {
 	if cfg, ok := qos.serviceQoSConfig.(*simpleServiceConfig); ok {
-		cfg.maxOperatorShareBits.Store(math.Float64bits(maxOperatorShare))
+		cfg.maxOperatorShare.Store(maxOperatorShare)
 	}
 }
 

@@ -650,6 +650,27 @@ var HedgeSelfOperatorAvoidedTotal = promauto.NewCounterVec(
 	[]string{LabelServiceID},
 )
 
+// ConcentrationCapReshapedTotal counts endpoint selections whose distribution the
+// per-operator (eTLD+1) concentration cap actually altered — either an operator's share
+// exceeded the cap and its excess was water-filled to other operators, or the pool was
+// too concentrated to satisfy the cap and selection fell back to uniform-over-operators.
+// Selections where no operator exceeded the cap (the cap is a no-op) are NOT counted, so a
+// nonzero rate on a service_id is the live signal that the cap is bounding a real
+// concentration — the operational proof the shipped-on default is doing something.
+var ConcentrationCapReshapedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "concentration_cap_reshaped_total",
+		Help: "Endpoint selections reshaped by the per-operator (eTLD+1) concentration cap, by service_id. Nonzero = the cap is actively bounding a dominant operator's selection share.",
+	},
+	[]string{LabelServiceID},
+)
+
+// RecordConcentrationCapReshaped increments the concentration-cap reshape counter for a
+// service. Called once per selection whose distribution the cap actually altered.
+func RecordConcentrationCapReshaped(serviceID string) {
+	ConcentrationCapReshapedTotal.WithLabelValues(serviceID).Inc()
+}
+
 // Severity classes for supplier_signal_total. The reputation layer emits 8
 // distinct signal-type strings; carrying all 8 as a label multiplies this
 // counter's cardinality 8× on top of the (supplier × service_id) base — the

@@ -2,7 +2,6 @@ package cosmos
 
 import (
 	"context"
-	"math"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/selector"
 	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
 )
@@ -109,9 +109,9 @@ type simpleCosmosConfig struct {
 	serviceID     protocol.ServiceID
 	syncAllowance atomic.Uint64                    // If 0, uses default. Updated dynamically when external health check rules are loaded.
 	supportedAPIs map[sharedtypes.RPCType]struct{} // Supported RPC types
-	// maxOperatorShareBits holds a float64 (via math.Float64bits) for the per-operator
-	// concentration cap. 0 (the zero value) disables the cap. Updated dynamically.
-	maxOperatorShareBits atomic.Uint64
+	// maxOperatorShare is the per-operator concentration cap. 0 (the zero value) disables
+	// the cap. Updated dynamically via SetMaxOperatorShare.
+	maxOperatorShare selector.AtomicFloat64
 }
 
 func (c *simpleCosmosConfig) GetServiceID() protocol.ServiceID { return c.serviceID }
@@ -125,7 +125,7 @@ func (c *simpleCosmosConfig) getSyncAllowance() uint64 {
 	return defaultCosmosSDKBlockNumberSyncAllowance
 }
 func (c *simpleCosmosConfig) getMaxOperatorShare() float64 {
-	return math.Float64frombits(c.maxOperatorShareBits.Load())
+	return c.maxOperatorShare.Load()
 }
 
 // SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
@@ -141,7 +141,7 @@ func (qos *QoS) SetSyncAllowance(syncAllowance uint64) {
 // during endpoint selection. A value <= 0 or >= 1 disables the cap (flat random pick).
 func (qos *QoS) SetMaxOperatorShare(maxOperatorShare float64) {
 	if cfg, ok := qos.serviceQoSConfig.(*simpleCosmosConfig); ok {
-		cfg.maxOperatorShareBits.Store(math.Float64bits(maxOperatorShare))
+		cfg.maxOperatorShare.Store(maxOperatorShare)
 	}
 }
 func (c *simpleCosmosConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {

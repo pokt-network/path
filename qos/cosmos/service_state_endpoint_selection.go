@@ -61,6 +61,7 @@ func (ss *serviceState) Select(availableEndpoints protocol.EndpointAddrList) (pr
 	// the prior flat random pick.
 	// TODO_FUTURE: consider ranking filtered endpoints, e.g. based on latency, rather than randomization.
 	selectedEndpointAddr := selector.SelectWithConcentrationCap(
+		ss.serviceQoSConfig.GetServiceID(),
 		filteredEndpointsAddr,
 		ss.serviceQoSConfig.getMaxOperatorShare(),
 	)

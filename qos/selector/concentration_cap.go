@@ -3,6 +3,7 @@ package selector
 import (
 	"math/rand"
 
+	"github.com/pokt-network/path/metrics"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 )
@@ -30,7 +31,11 @@ const concentrationCapEpsilon = 1e-9
 //
 // Endpoints whose eTLD+1 cannot be resolved are each treated as their own singleton
 // operator (never merged into one bucket — that would fabricate concentration).
+//
+// serviceID is used only to attribute the reshape metric emitted when the cap actually
+// alters the selection distribution.
 func SelectWithConcentrationCap(
+	serviceID protocol.ServiceID,
 	validEndpoints protocol.EndpointAddrList,
 	maxOperatorShare float64,
 ) protocol.EndpointAddr {
@@ -73,17 +78,25 @@ func SelectWithConcentrationCap(
 	// pick followed by a uniform pick within the operator then reproduces a flat random
 	// pick exactly — until the cap reshapes an over-cap operator's mass.
 	weights := make([]float64, m)
+	reshaped := false
 	if maxOperatorShare*float64(m) <= 1.0 {
 		// Infeasible (or exactly at the 1/M floor): no assignment can hold every operator
 		// under the cap, so the best achievable is uniform-over-operators (max share 1/M).
 		for i := range weights {
 			weights[i] = 1.0 / float64(m)
 		}
+		reshaped = true
 	} else {
 		for i, key := range operatorOrder {
 			weights[i] = float64(len(operatorEndpoints[key])) / float64(n)
 		}
-		waterFillToCap(weights, maxOperatorShare)
+		reshaped = waterFillToCap(weights, maxOperatorShare)
+	}
+
+	// Emit only when the cap actually changed the distribution — no-op selections (no
+	// operator over the cap) stay silent, so a nonzero rate means the cap is biting.
+	if reshaped {
+		metrics.RecordConcentrationCapReshaped(string(serviceID))
 	}
 
 	// Weighted pick of an operator, then uniform pick of an endpoint within it.
@@ -96,8 +109,10 @@ func SelectWithConcentrationCap(
 // under-cap weights, proportionally to their current weight, until no weight exceeds
 // the cap. The caller only invokes this when the cap is feasible (cap*len(weights) > 1),
 // so total mass is preserved (≈ 1); the underSum guard keeps it safe even if that ever
-// fails to hold. Operates in place.
-func waterFillToCap(weights []float64, maxShare float64) {
+// fails to hold. Operates in place. Returns true if it clamped at least one weight (i.e.
+// the cap actually reshaped the distribution).
+func waterFillToCap(weights []float64, maxShare float64) bool {
+	clamped := false
 	// At most len(weights) passes: each pass pins at least one new operator to the cap.
 	for pass := 0; pass < len(weights); pass++ {
 		var excess, underSum float64
@@ -112,8 +127,9 @@ func waterFillToCap(weights []float64, maxShare float64) {
 			}
 		}
 		if !anyOver {
-			return
+			return clamped
 		}
+		clamped = true
 		// No under-cap operator to absorb the excess (only reachable if the caller's
 		// feasibility guarantee is violated). Clamp what we can and stop rather than
 		// dividing by zero.
@@ -123,7 +139,7 @@ func waterFillToCap(weights []float64, maxShare float64) {
 					weights[i] = maxShare
 				}
 			}
-			return
+			return clamped
 		}
 		// Redistribute excess to the under-cap operators, proportional to their weight.
 		for i, w := range weights {
@@ -134,6 +150,7 @@ func waterFillToCap(weights []float64, maxShare float64) {
 			}
 		}
 	}
+	return clamped
 }
 
 // weightedPick returns an index chosen with probability proportional to weights[i].

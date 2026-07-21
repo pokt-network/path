@@ -40,7 +40,7 @@ func operatorShares(
 	t.Helper()
 	counts := map[string]int{}
 	for i := 0; i < draws; i++ {
-		sel := SelectWithConcentrationCap(eps, maxShare)
+		sel := SelectWithConcentrationCap("test", eps, maxShare)
 		require.NotEmpty(t, sel, "selector returned empty endpoint")
 		require.Contains(t, eps, sel, "selector returned an endpoint not in the pool")
 		counts[operatorOf(string(sel))]++
@@ -115,15 +115,15 @@ func TestSelectWithConcentrationCap_FeasibilityFloor(t *testing.T) {
 func TestSelectWithConcentrationCap_SingleAndEmpty(t *testing.T) {
 
 	// Empty input → empty result, no panic.
-	require.Empty(t, SelectWithConcentrationCap(protocol.EndpointAddrList{}, 0.4))
+	require.Empty(t, SelectWithConcentrationCap("test", protocol.EndpointAddrList{}, 0.4))
 
 	// Single endpoint → that endpoint, cap irrelevant.
 	one := protocol.EndpointAddrList{"pokt1solo-https://node.solo.tech"}
-	require.Equal(t, one[0], SelectWithConcentrationCap(one, 0.4))
+	require.Equal(t, one[0], SelectWithConcentrationCap("test", one, 0.4))
 
 	// Single operator with many keys → always returns one of its keys.
 	eps, _ := makeOperatorPool([]int{5})
-	sel := SelectWithConcentrationCap(eps, 0.4)
+	sel := SelectWithConcentrationCap("test", eps, 0.4)
 	require.Contains(t, eps, sel)
 }
 
@@ -134,7 +134,7 @@ func TestSelectWithConcentrationCap_UnresolvableStaySeparate(t *testing.T) {
 	eps := protocol.EndpointAddrList{"garbage-addr-one", "garbage-addr-two"}
 	counts := map[string]int{}
 	for i := 0; i < 50_000; i++ {
-		counts[string(SelectWithConcentrationCap(eps, 0.6))]++
+		counts[string(SelectWithConcentrationCap("test", eps, 0.6))]++
 	}
 	require.InDelta(t, 0.5, float64(counts["garbage-addr-one"])/50_000, 0.03,
 		"unresolvable endpoints must not be merged")

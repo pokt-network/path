@@ -389,7 +389,7 @@ func (p *Protocol) getReconnectEndpoint(
 			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape a stalling supplier", protocol.ErrEndpointUnavailable, serviceID)
 			return nil, false, metrics.WSRebindFailedNoEndpoints, err
 		}
-		ep := selectReconnectEndpointWithCap(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare)
+		ep := selectReconnectEndpointWithCap(serviceID, endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare)
 		logger.Warn().
 			Str("stalling_endpoint", string(preferredAddr)).
 			Str("replacement_endpoint", string(ep.Addr())).
@@ -404,7 +404,7 @@ func (p *Protocol) getReconnectEndpoint(
 	}
 
 	// Tier 2: original supplier rotated out of the new session → best-available fallback.
-	ep := selectReconnectEndpointWithCap(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare)
+	ep := selectReconnectEndpointWithCap(serviceID, endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare)
 	logger.Warn().
 		Str("original_endpoint", string(preferredAddr)).
 		Str("fallback_endpoint", string(ep.Addr())).
@@ -451,6 +451,7 @@ const reconnectScoreEpsilon = 1e-9
 // — and randomness also lets a reconnect *retry* land on a different endpoint than the one
 // that just failed to dial.
 func selectReconnectEndpointWithCap(
+	serviceID protocol.ServiceID,
 	endpoints map[protocol.EndpointAddr]endpoint,
 	scoreOf func(endpoint) float64,
 	maxOperatorShare float64,
@@ -464,7 +465,7 @@ func selectReconnectEndpointWithCap(
 		return selectBestReconnectEndpoint(endpoints, scoreOf)
 	}
 
-	chosen := selector.SelectWithConcentrationCap(band, maxOperatorShare)
+	chosen := selector.SelectWithConcentrationCap(serviceID, band, maxOperatorShare)
 	if ep, ok := endpoints[chosen]; ok {
 		return ep
 	}
