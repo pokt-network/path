@@ -91,11 +91,10 @@ type Score struct {
 	// still be cooled down. See CriticalRateThreshold / CriticalRateEWMAAlpha.
 	RecentCriticalRate float64
 
-	// RateCooldownCount counts consecutive rate-cooldown trips for escalating backoff. Each
-	// trip that lands shortly after a prior cooldown doubles the duration (base
-	// DefaultRateCooldown = 1 session, capped at DefaultMaxCooldown); it resets to a single
-	// fresh session once the endpoint has run clean for longer than DefaultMaxCooldown.
-	// Mirrors the consecutive-strike system's exponential backoff, for the rate detector.
+	// RateCooldownCount counts consecutive rate-cooldown trips for escalating backoff. The Nth
+	// consecutive trip benches for N × DefaultRateCooldown (linear: 10m, 20m, 30m, …), capped
+	// at DefaultMaxCooldown; it resets to 1 once the endpoint has run clean for longer than
+	// DefaultMaxCooldown. Mirrors the strike system's escalation, for the rate detector.
 	RateCooldownCount int
 
 	// IsArchival indicates whether the endpoint has passed archival health checks.
@@ -277,17 +276,12 @@ const (
 	// so a brand-new endpoint is never cooled on a tiny sample.
 	CriticalRateMinObservations = 20
 
-	// DefaultRateCooldown is the BASE cooldown on the first sustained-critical-rate trip:
-	// one Shannon session (~20 min). Repeat trips that land shortly after a prior cooldown
-	// escalate (see Score.RateCooldownCount) — 20m → 40m → … capped at DefaultMaxCooldown
-	// (1h) — so a genuinely broken endpoint is benched progressively longer while a one-off
-	// transient spike costs only a single session.
-	DefaultRateCooldown = 20 * time.Minute
-
-	// DefaultRateCooldownMaxExponent caps the escalation exponent to avoid runaway shifts /
-	// int64 overflow. The duration is clamped to DefaultMaxCooldown well before this bound
-	// (20m << 2 already exceeds 1h), so this is only a safety backstop.
-	DefaultRateCooldownMaxExponent = 4
+	// DefaultRateCooldown is the base (and per-step) cooldown for a sustained-critical-rate
+	// trip. Escalation is LINEAR: the Nth consecutive trip benches for N × this, capped at
+	// DefaultMaxCooldown — i.e. 10m → 20m → 30m → 40m → 50m → 1h. At 10 minutes the first
+	// offense sits under one Shannon session (~20 min), so a transient spike recovers within
+	// the same session; only a persistent offender ramps toward a full hour.
+	DefaultRateCooldown = 10 * time.Minute
 )
 
 // Key granularity options determine how endpoints are grouped for scoring.

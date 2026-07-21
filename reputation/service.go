@@ -196,11 +196,10 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 		} else {
 			score.RateCooldownCount = 1
 		}
-		exponent := score.RateCooldownCount - 1
-		if exponent > DefaultRateCooldownMaxExponent {
-			exponent = DefaultRateCooldownMaxExponent
-		}
-		cooldownDuration := DefaultRateCooldown * time.Duration(1<<exponent)
+		// Linear escalation: 10m, 20m, 30m, 40m, 50m, then capped at DefaultMaxCooldown (1h).
+		// The first offense (10m) is under one Shannon session (~20m) so a transient spike
+		// recovers within the session; only a persistent offender ramps toward a full hour.
+		cooldownDuration := DefaultRateCooldown * time.Duration(score.RateCooldownCount)
 		if cooldownDuration > DefaultMaxCooldown {
 			cooldownDuration = DefaultMaxCooldown
 		}

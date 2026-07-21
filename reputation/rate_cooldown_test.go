@@ -157,12 +157,14 @@ func TestRateCooldown_EscalatesOnRepeatTrips(t *testing.T) {
 	first := feedUntilTrip(1)
 	second := feedUntilTrip(2)
 
-	// First trip ≈ one session (base); second ≈ double. Assert the second is materially
-	// longer (allow slack for the microseconds of elapsed wall-clock in the loop).
+	// Linear escalation: first ≈ base (10m), second ≈ 2× base (20m). Allow slack for the
+	// microseconds of elapsed wall-clock in the loop.
 	require.InDelta(t, DefaultRateCooldown.Minutes(), first.Minutes(), 1.0,
-		"first trip should bench for ~one base session")
-	require.Greater(t, second, first+10*time.Minute,
-		"a repeat offender must be benched materially longer than the first offense")
+		"first trip should bench for ~the base cooldown")
+	require.InDelta(t, (2 * DefaultRateCooldown).Minutes(), second.Minutes(), 1.5,
+		"second consecutive trip should bench for ~2× the base (linear escalation)")
+	require.Greater(t, second, first,
+		"a repeat offender must be benched longer than the first offense")
 }
 
 // TestRateCooldown_ResetsAfterTrip verifies the EWMA is reset when the cooldown fires, so a
