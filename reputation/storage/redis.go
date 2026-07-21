@@ -37,14 +37,16 @@ type RedisStorage struct {
 
 // Redis hash field names
 const (
-	fieldValue           = "value"
-	fieldLastUpdated     = "last_updated"
-	fieldSuccessCount    = "success_count"
-	fieldErrorCount      = "error_count"
-	fieldCriticalStrikes = "critical_strikes"
-	fieldCooldownUntil   = "cooldown_until"
-	fieldIsArchival      = "is_archival"
-	fieldArchivalExpires = "archival_expires_at"
+	fieldValue              = "value"
+	fieldLastUpdated        = "last_updated"
+	fieldSuccessCount       = "success_count"
+	fieldErrorCount         = "error_count"
+	fieldCriticalStrikes    = "critical_strikes"
+	fieldCooldownUntil      = "cooldown_until"
+	fieldIsArchival         = "is_archival"
+	fieldArchivalExpires    = "archival_expires_at"
+	fieldRecentCriticalRate = "recent_critical_rate"
+	fieldRateCooldownCount  = "rate_cooldown_count"
 )
 
 // perceivedBlockTTL bounds how long a perceived block-height entry lives in
@@ -193,14 +195,16 @@ func (r *RedisStorage) Set(ctx context.Context, key reputation.EndpointKey, scor
 	}
 
 	fields := map[string]interface{}{
-		fieldValue:           strconv.FormatFloat(score.Value, 'f', -1, 64),
-		fieldLastUpdated:     strconv.FormatInt(score.LastUpdated.Unix(), 10),
-		fieldSuccessCount:    strconv.FormatInt(score.SuccessCount, 10),
-		fieldErrorCount:      strconv.FormatInt(score.ErrorCount, 10),
-		fieldCriticalStrikes: strconv.Itoa(score.CriticalStrikes),
-		fieldCooldownUntil:   strconv.FormatInt(score.CooldownUntil.Unix(), 10),
-		fieldIsArchival:      isArchivalStr,
-		fieldArchivalExpires: strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
+		fieldValue:              strconv.FormatFloat(score.Value, 'f', -1, 64),
+		fieldLastUpdated:        strconv.FormatInt(score.LastUpdated.Unix(), 10),
+		fieldSuccessCount:       strconv.FormatInt(score.SuccessCount, 10),
+		fieldErrorCount:         strconv.FormatInt(score.ErrorCount, 10),
+		fieldCriticalStrikes:    strconv.Itoa(score.CriticalStrikes),
+		fieldCooldownUntil:      strconv.FormatInt(score.CooldownUntil.Unix(), 10),
+		fieldIsArchival:         isArchivalStr,
+		fieldArchivalExpires:    strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
+		fieldRecentCriticalRate: strconv.FormatFloat(score.RecentCriticalRate, 'f', -1, 64),
+		fieldRateCooldownCount:  strconv.Itoa(score.RateCooldownCount),
 	}
 
 	pipe := r.client.Pipeline()
@@ -236,14 +240,16 @@ func (r *RedisStorage) SetMultiple(ctx context.Context, scores map[reputation.En
 		}
 
 		fields := map[string]interface{}{
-			fieldValue:           strconv.FormatFloat(score.Value, 'f', -1, 64),
-			fieldLastUpdated:     strconv.FormatInt(score.LastUpdated.Unix(), 10),
-			fieldSuccessCount:    strconv.FormatInt(score.SuccessCount, 10),
-			fieldErrorCount:      strconv.FormatInt(score.ErrorCount, 10),
-			fieldCriticalStrikes: strconv.Itoa(score.CriticalStrikes),
-			fieldCooldownUntil:   strconv.FormatInt(score.CooldownUntil.Unix(), 10),
-			fieldIsArchival:      isArchivalStr,
-			fieldArchivalExpires: strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
+			fieldValue:              strconv.FormatFloat(score.Value, 'f', -1, 64),
+			fieldLastUpdated:        strconv.FormatInt(score.LastUpdated.Unix(), 10),
+			fieldSuccessCount:       strconv.FormatInt(score.SuccessCount, 10),
+			fieldErrorCount:         strconv.FormatInt(score.ErrorCount, 10),
+			fieldCriticalStrikes:    strconv.Itoa(score.CriticalStrikes),
+			fieldCooldownUntil:      strconv.FormatInt(score.CooldownUntil.Unix(), 10),
+			fieldIsArchival:         isArchivalStr,
+			fieldArchivalExpires:    strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
+			fieldRecentCriticalRate: strconv.FormatFloat(score.RecentCriticalRate, 'f', -1, 64),
+			fieldRateCooldownCount:  strconv.Itoa(score.RateCooldownCount),
 		}
 
 		pipe.HSet(ctx, redisKey, fields)
@@ -368,6 +374,24 @@ func (r *RedisStorage) parseScore(data map[string]string) (reputation.Score, err
 		if ts > 0 {
 			score.CooldownUntil = time.Unix(ts, 0)
 		}
+	}
+
+	// Parse the rate-based cooldown EWMA (for multi-instance coordination and
+	// restart survival). Absent field (older records) leaves it at 0.0.
+	if v, ok := data[fieldRecentCriticalRate]; ok {
+		rate, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return score, fmt.Errorf("invalid recent_critical_rate: %w", err)
+		}
+		score.RecentCriticalRate = rate
+	}
+
+	if v, ok := data[fieldRateCooldownCount]; ok {
+		count, err := strconv.Atoi(v)
+		if err != nil {
+			return score, fmt.Errorf("invalid rate_cooldown_count: %w", err)
+		}
+		score.RateCooldownCount = count
 	}
 
 	// Parse archival fields (for multi-instance coordination)

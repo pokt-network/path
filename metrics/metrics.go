@@ -671,6 +671,27 @@ func RecordConcentrationCapReshaped(serviceID string) {
 	ConcentrationCapReshapedTotal.WithLabelValues(serviceID).Inc()
 }
 
+// ReputationRateCooldownTotal counts endpoints cooled down by the volume-independent
+// sustained-critical-rate detector (as opposed to the consecutive-strike/burst path).
+// The strike system decays 3 strikes per success and therefore only catches bursts; a
+// high-traffic endpoint bleeding a steady fraction of critical/fatal errors refills its
+// strike budget with successes and is never cooled. A nonzero rate on a service_id is the
+// live signal that the rate detector is filtering a chronically-failing high-volume
+// endpoint the burst-strike system would have missed.
+var ReputationRateCooldownTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "reputation_rate_cooldown_total",
+		Help: "Endpoints cooled down by the sustained-critical-rate detector, by service_id. Nonzero = volume-independent filtering of a chronically-failing endpoint the burst-strike system missed.",
+	},
+	[]string{LabelServiceID},
+)
+
+// RecordReputationRateCooldown increments the rate-cooldown counter for a service.
+// Called once each time an endpoint is cooled down by the sustained-critical-rate detector.
+func RecordReputationRateCooldown(serviceID string) {
+	ReputationRateCooldownTotal.WithLabelValues(serviceID).Inc()
+}
+
 // Severity classes for supplier_signal_total. The reputation layer emits 8
 // distinct signal-type strings; carrying all 8 as a label multiplies this
 // counter's cardinality 8× on top of the (supplier × service_id) base — the

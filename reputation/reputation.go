@@ -78,8 +78,25 @@ type Score struct {
 
 	// CooldownUntil is when the endpoint's cooldown period ends.
 	// Endpoints in cooldown are excluded from selection even if their score is above threshold.
-	// Set when CriticalStrikes exceeds StrikeThreshold.
+	// Set when CriticalStrikes exceeds StrikeThreshold, or when RecentCriticalRate exceeds
+	// CriticalRateThreshold (the volume-independent rate detector).
 	CooldownUntil time.Time
+
+	// RecentCriticalRate is an exponentially-weighted moving average (EWMA) of the
+	// per-request critical/fatal indicator (1.0 on a critical or fatal error, 0.0
+	// otherwise). Unlike CriticalStrikes — which decays 3-per-success and therefore only
+	// fires on a BURST of clustered failures — this tracks the sustained RATE of critical
+	// errors independent of success volume, so a high-traffic endpoint that bleeds a steady
+	// fraction of 5xx/transport errors (and refills its strike budget with successes) can
+	// still be cooled down. See CriticalRateThreshold / CriticalRateEWMAAlpha.
+	RecentCriticalRate float64
+
+	// RateCooldownCount counts consecutive rate-cooldown trips for escalating backoff. Each
+	// trip that lands shortly after a prior cooldown doubles the duration (base
+	// DefaultRateCooldown = 1 session, capped at DefaultMaxCooldown); it resets to a single
+	// fresh session once the endpoint has run clean for longer than DefaultMaxCooldown.
+	// Mirrors the consecutive-strike system's exponential backoff, for the rate detector.
+	RateCooldownCount int
 
 	// IsArchival indicates whether the endpoint has passed archival health checks.
 	// When true, the endpoint can serve historical blockchain data.
@@ -231,6 +248,46 @@ const (
 	// ~25%). Deliberately deceptive suppliers that pass some requests still
 	// can't instantly wipe their strike history with a single success.
 	DefaultStrikeDecayPerSuccess = 3
+)
+
+// Rate-based cooldown constants drive a volume-INDEPENDENT chronic-failure detector.
+//
+// The consecutive-strike system above decays 3 strikes per success, so it only fires on a
+// BURST of clustered criticals. A high-volume endpoint that serves a steady fraction of
+// critical/fatal errors refills its strike budget with successes as fast as it spends it
+// and is never cooled — the "each success helps them, so bad QoS can't be filtered" case.
+// These constants trip a cooldown on the sustained critical RATE (an EWMA of the
+// critical/fatal indicator) regardless of how much successful traffic the endpoint serves.
+const (
+	// CriticalRateEWMAAlpha is the smoothing factor for Score.RecentCriticalRate.
+	// Effective memory ≈ 1/alpha requests, so 0.05 ≈ a 20-request window: long enough that
+	// a brief cluster on an otherwise-healthy endpoint decays away before it can trip, short
+	// enough to react to a genuinely sustained failure rate.
+	CriticalRateEWMAAlpha = 0.05
+
+	// CriticalRateThreshold is the sustained critical/fatal rate (0..1) at or above which an
+	// endpoint is cooled down. 0.30 = 30% of requests failing critically — unambiguously
+	// broken. Deliberately conservative for the first rollout so healthy endpoints are never
+	// penalized; lower it (e.g. 0.20 / 0.15) once canary data shows the false-positive rate
+	// is safe. The consecutive-strike system still catches bursts below this rate.
+	CriticalRateThreshold = 0.30
+
+	// CriticalRateMinObservations is the minimum lifetime observations (successes + errors)
+	// before the rate detector may trip. The EWMA is meaningless on the first few samples,
+	// so a brand-new endpoint is never cooled on a tiny sample.
+	CriticalRateMinObservations = 20
+
+	// DefaultRateCooldown is the BASE cooldown on the first sustained-critical-rate trip:
+	// one Shannon session (~20 min). Repeat trips that land shortly after a prior cooldown
+	// escalate (see Score.RateCooldownCount) — 20m → 40m → … capped at DefaultMaxCooldown
+	// (1h) — so a genuinely broken endpoint is benched progressively longer while a one-off
+	// transient spike costs only a single session.
+	DefaultRateCooldown = 20 * time.Minute
+
+	// DefaultRateCooldownMaxExponent caps the escalation exponent to avoid runaway shifts /
+	// int64 overflow. The duration is clamped to DefaultMaxCooldown well before this bound
+	// (20m << 2 already exceeds 1h), so this is only a safety backstop.
+	DefaultRateCooldownMaxExponent = 4
 )
 
 // Key granularity options determine how endpoints are grouped for scoring.

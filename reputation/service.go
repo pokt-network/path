@@ -165,6 +165,65 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 		}
 	}
 
+	// Rate-based cooldown: a volume-INDEPENDENT chronic-failure detector.
+	//
+	// The consecutive-strike block above decays 3 strikes per success, so it only ever fires
+	// on a BURST of clustered criticals. An endpoint that serves a steady fraction of
+	// critical/fatal errors alongside heavy successful traffic refills its strike budget as
+	// fast as it spends it and is never cooled — exactly the high-volume "can't be filtered"
+	// case. Track an EWMA of the critical indicator so a sustained critical RATE trips a
+	// cooldown regardless of success volume.
+	criticalIndicator := 0.0
+	if signal.Type == SignalTypeCriticalError || signal.Type == SignalTypeFatalError {
+		criticalIndicator = 1.0
+	}
+	score.RecentCriticalRate = score.RecentCriticalRate*(1-CriticalRateEWMAAlpha) + CriticalRateEWMAAlpha*criticalIndicator
+
+	// Trip only once the sample is meaningful, and only to EXTEND (never shorten) any
+	// cooldown the strike system already set.
+	if score.RecentCriticalRate >= CriticalRateThreshold &&
+		(score.SuccessCount+score.ErrorCount) >= CriticalRateMinObservations {
+		trippedRate := score.RecentCriticalRate
+
+		// Escalating backoff: a repeat trip that lands within DefaultMaxCooldown of the
+		// previous cooldown's end doubles the duration; an endpoint that has since run clean
+		// for longer than that starts fresh at one session. Mirrors the strike system's
+		// exponential backoff so a persistently broken endpoint is benched progressively
+		// longer while a one-off transient spike costs only a single session.
+		prevCooldownUntil := score.CooldownUntil
+		if !prevCooldownUntil.IsZero() && time.Since(prevCooldownUntil) < DefaultMaxCooldown {
+			score.RateCooldownCount++
+		} else {
+			score.RateCooldownCount = 1
+		}
+		exponent := score.RateCooldownCount - 1
+		if exponent > DefaultRateCooldownMaxExponent {
+			exponent = DefaultRateCooldownMaxExponent
+		}
+		cooldownDuration := DefaultRateCooldown * time.Duration(1<<exponent)
+		if cooldownDuration > DefaultMaxCooldown {
+			cooldownDuration = DefaultMaxCooldown
+		}
+
+		rateCooldownUntil := time.Now().Add(cooldownDuration)
+		if rateCooldownUntil.After(score.CooldownUntil) {
+			score.CooldownUntil = rateCooldownUntil
+		}
+		// Reset the EWMA so the endpoint starts clean after the cooldown and must
+		// re-accumulate sustained failures to trip again (no immediate re-flap on the first
+		// post-cooldown request).
+		score.RecentCriticalRate = 0
+		metrics.RecordReputationRateCooldown(string(key.ServiceID))
+		if s.logger != nil {
+			s.logger.Warn().
+				Str("endpoint", key.String()).
+				Float64("critical_rate", trippedRate).
+				Int("rate_cooldown_count", score.RateCooldownCount).
+				Dur("cooldown_duration", cooldownDuration).
+				Msg("[RATE_COOLDOWN] Endpoint cooled down due to sustained critical error rate (volume-independent)")
+		}
+	}
+
 	// Update latency metrics if signal includes latency data
 	if signal.Latency > 0 {
 		score.LatencyMetrics.UpdateLatency(signal.Latency)
