@@ -692,6 +692,25 @@ func RecordReputationRateCooldown(serviceID string) {
 	ReputationRateCooldownTotal.WithLabelValues(serviceID).Inc()
 }
 
+// ReputationPoolCollapseGuardTotal counts how often reputation filtering would have removed
+// EVERY endpoint for a service (all in cooldown or below threshold) and the pool-collapse
+// guard instead kept the least-bad tier. A nonzero rate is the signal that a service is
+// fully degraded — every endpoint is failing enough to be filtered — and is being served by
+// its least-bad endpoints rather than a reputation-blind random fallback.
+var ReputationPoolCollapseGuardTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "reputation_pool_collapse_guard_total",
+		Help: "Selections where reputation filtered ALL endpoints and the pool-collapse guard kept the least-bad tier, by service_id and rpc_type. Nonzero = a fully-degraded service being kept reputation-aware instead of falling back to random.",
+	},
+	[]string{LabelServiceID, LabelRPCType},
+)
+
+// RecordReputationPoolCollapseGuard increments the pool-collapse guard counter.
+// Called once each time the guard keeps the least-bad tier because filtering emptied the pool.
+func RecordReputationPoolCollapseGuard(serviceID, rpcType string) {
+	ReputationPoolCollapseGuardTotal.WithLabelValues(serviceID, rpcType).Inc()
+}
+
 // Severity classes for supplier_signal_total. The reputation layer emits 8
 // distinct signal-type strings; carrying all 8 as a label multiplies this
 // counter's cardinality 8× on top of the (supplier × service_id) base — the

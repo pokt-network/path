@@ -349,6 +349,55 @@ func TestReputation_FilterByReputation(t *testing.T) {
 	require.NotContains(t, filtered, protocol.EndpointAddr("supplier2-https://bad.example.com"))
 }
 
+// TestReputation_FilterByReputation_PoolCollapseGuard verifies that when EVERY endpoint is
+// below threshold (the whole pool would be filtered out), filterByReputation does not return
+// empty — it keeps the least-bad tier (the highest-scoring endpoint(s)) so selection stays
+// reputation-aware instead of collapsing to a reputation-blind fallback.
+func TestReputation_FilterByReputation_PoolCollapseGuard(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	config := reputation.Config{
+		Enabled: true, InitialScore: 80, MinThreshold: 30,
+		RecoveryTimeout: 5 * time.Minute, StorageType: "memory",
+	}
+	config.HydrateDefaults()
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	p := &Protocol{logger: logger, reputationService: svc}
+	serviceID := protocol.ServiceID("collapse-test")
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"s1-https://a.example.com": &mockEndpoint{addr: "s1-https://a.example.com"},
+		"s2-https://b.example.com": &mockEndpoint{addr: "s2-https://b.example.com"},
+		"s3-https://c.example.com": &mockEndpoint{addr: "s3-https://c.example.com"},
+	}
+	kb := svc.KeyBuilderForService(serviceID)
+	// Drive ALL three below the threshold with Major errors (-10 each; no cooldown, no rate
+	// detector — this isolates the below-threshold collapse). c is the least-bad.
+	//   a,b: 8 major -> score 0    c: 6 major -> score 20   (all < 30 threshold)
+	cKey := kb.BuildKey(serviceID, "s3-https://c.example.com", sharedtypes.RPCType_JSON_RPC)
+	for _, addr := range []protocol.EndpointAddr{"s1-https://a.example.com", "s2-https://b.example.com"} {
+		k := kb.BuildKey(serviceID, addr, sharedtypes.RPCType_JSON_RPC)
+		for i := 0; i < 8; i++ {
+			require.NoError(t, svc.RecordSignal(ctx, k, reputation.NewMajorErrorSignal("degraded", 0)))
+		}
+	}
+	for i := 0; i < 6; i++ {
+		require.NoError(t, svc.RecordSignal(ctx, cKey, reputation.NewMajorErrorSignal("degraded", 0)))
+	}
+
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
+
+	// Guard must keep the least-bad endpoint (c, score 20), NOT return an empty pool.
+	require.NotEmpty(t, filtered, "pool-collapse guard must keep the least-bad endpoint(s), not return empty")
+	require.Contains(t, filtered, protocol.EndpointAddr("s3-https://c.example.com"), "the highest-scoring (least-bad) endpoint must be kept")
+	require.Len(t, filtered, 1, "only the least-bad tier (c) should be kept, not the strictly-worse a/b")
+}
+
 // TestReputation_DisabledNoFiltering verifies that when reputation
 // is disabled (nil service), no filtering occurs.
 func TestReputation_DisabledNoFiltering(t *testing.T) {
@@ -1310,9 +1359,15 @@ func TestReputationFiltering_RPCTypeAware(t *testing.T) {
 	serviceID := protocol.ServiceID("eth")
 	endpointAddr := protocol.EndpointAddr("supplier1-https://node.example.com")
 
+	// A second, healthy endpoint so the below-threshold WS endpoint is genuinely excluded
+	// (its presence keeps the WS pool non-empty, so the pool-collapse guard does not fire and
+	// re-admit the bad endpoint as "least-bad"). It gets the initial score for both RPC types.
+	healthyAddr := protocol.EndpointAddr("supplier2-https://healthy.example.com")
+
 	// Create test endpoints
 	endpoints := map[protocol.EndpointAddr]endpoint{
 		endpointAddr: &mockEndpoint{addr: endpointAddr},
+		healthyAddr:  &mockEndpoint{addr: healthyAddr},
 	}
 
 	// Setup: Endpoint has high JSON-RPC score, low WebSocket score.
@@ -1345,15 +1400,15 @@ func TestReputationFiltering_RPCTypeAware(t *testing.T) {
 	require.GreaterOrEqual(t, jsonRpcScore.Value, config.MinThreshold, "JSON-RPC should be above threshold")
 	require.Less(t, websocketScore.Value, config.MinThreshold, "WebSocket should be below threshold")
 
-	// Filter for JSON-RPC → endpoint should be included
+	// Filter for JSON-RPC → the endpoint (high JSON score) should be included.
 	filteredJsonRpc := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
-	require.Len(t, filteredJsonRpc, 1, "JSON-RPC filtering should include endpoint (high score)")
-	require.Contains(t, filteredJsonRpc, endpointAddr, "Endpoint should be included for JSON-RPC")
+	require.Contains(t, filteredJsonRpc, endpointAddr, "Endpoint should be included for JSON-RPC (high score)")
 
-	// Filter for WebSocket → endpoint should be excluded
+	// Filter for WebSocket → the endpoint (low WS score) should be excluded, while the healthy
+	// endpoint remains (so the pool is non-empty and the collapse guard does not re-admit it).
 	filteredWebsocket := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, "")
-	require.Len(t, filteredWebsocket, 0, "WebSocket filtering should exclude endpoint (low score)")
-	require.NotContains(t, filteredWebsocket, endpointAddr, "Endpoint should be excluded for WebSocket")
+	require.NotContains(t, filteredWebsocket, endpointAddr, "Endpoint should be excluded for WebSocket (low score)")
+	require.Contains(t, filteredWebsocket, healthyAddr, "Healthy endpoint should remain for WebSocket")
 
 	t.Log("Verified: Filtering respects RPC type - same endpoint included for JSON-RPC, excluded for WebSocket")
 }
