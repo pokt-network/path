@@ -49,54 +49,61 @@ func SelectWithConcentrationCap(
 		return validEndpoints[rand.Intn(n)]
 	}
 
-	// Group endpoints by operator (eTLD+1). The eTLD+1 is extracted inline (rather than via
-	// shannonmetrics.GetEndpointTLDs) to avoid materializing a throwaway map on this hot
-	// path — the map would be built and then read exactly once, in this same loop.
-	// Unresolvable eTLD+1 → singleton operator keyed by the endpoint address itself, so it
-	// can never be merged with another.
-	operatorEndpoints := make(map[string]protocol.EndpointAddrList)
-	operatorOrder := make([]string, 0, n)
-	for _, ep := range validEndpoints {
-		key := shannonmetrics.ExtractTLDFromEndpointAddr(string(ep))
-		if key == "" {
-			key = string(ep)
+	// Phase 1 — cheap pass: resolve each endpoint's operator (eTLD+1) once, count endpoints
+	// per operator into an int map (no per-operator slices), and remember each endpoint's
+	// key so Phase 2 never has to resolve it again. This is enough to decide whether the cap
+	// does anything: the common case — no single operator over the cap — exits here with a
+	// flat random pick, never building the per-operator grouping or the weight vector.
+	// Unresolvable eTLD+1 → singleton operator keyed by the endpoint address (operatorKey).
+	keys := make([]string, n)
+	counts := make(map[string]int)
+	maxCount := 0
+	for i, ep := range validEndpoints {
+		k := operatorKey(ep)
+		keys[i] = k
+		counts[k]++
+		if counts[k] > maxCount {
+			maxCount = counts[k]
 		}
-		if _, seen := operatorEndpoints[key]; !seen {
-			operatorOrder = append(operatorOrder, key)
-		}
-		operatorEndpoints[key] = append(operatorEndpoints[key], ep)
 	}
+	m := len(counts)
 
-	m := len(operatorOrder)
-	// Single operator: the cap has nothing to reshape. A flat random pick is a uniform
-	// pick within that one operator — identical, and cheaper.
-	if m == 1 {
+	// The cap reshapes only when some operator exceeds it (n_i > cap·N) or the pool is too
+	// concentrated for the cap to be satisfiable (cap·m ≤ 1 → uniform-over-operators). A
+	// single operator, or a dominant share already at/under the cap, is a no-op: the capped
+	// weighted pick would reduce exactly to a flat random pick, so take that directly.
+	infeasible := maxOperatorShare*float64(m) <= 1.0
+	if m == 1 || (!infeasible && float64(maxCount) <= maxOperatorShare*float64(n)) {
 		return validEndpoints[rand.Intn(n)]
 	}
 
-	// Per-operator weights. Start from per-endpoint-uniform (n_i/N): a weighted operator
-	// pick followed by a uniform pick within the operator then reproduces a flat random
-	// pick exactly — until the cap reshapes an over-cap operator's mass.
+	// Phase 2 — reshape. Build the per-operator endpoint grouping (reusing the keys resolved
+	// in Phase 1) and the capped weights. The distribution is actually being altered here,
+	// so record it.
+	metrics.RecordConcentrationCapReshaped(string(serviceID))
+	operatorEndpoints := make(map[string]protocol.EndpointAddrList, m)
+	operatorOrder := make([]string, 0, m)
+	for i, ep := range validEndpoints {
+		k := keys[i]
+		if _, seen := operatorEndpoints[k]; !seen {
+			operatorOrder = append(operatorOrder, k)
+		}
+		operatorEndpoints[k] = append(operatorEndpoints[k], ep)
+	}
+
 	weights := make([]float64, m)
-	reshaped := false
-	if maxOperatorShare*float64(m) <= 1.0 {
-		// Infeasible (or exactly at the 1/M floor): no assignment can hold every operator
-		// under the cap, so the best achievable is uniform-over-operators (max share 1/M).
+	if infeasible {
+		// No assignment can hold every operator under the cap → best achievable is
+		// uniform-over-operators (max share 1/m).
 		for i := range weights {
 			weights[i] = 1.0 / float64(m)
 		}
-		reshaped = true
 	} else {
+		// Per-endpoint-uniform (n_i/N) start, then water-fill the over-cap mass down.
 		for i, key := range operatorOrder {
 			weights[i] = float64(len(operatorEndpoints[key])) / float64(n)
 		}
-		reshaped = waterFillToCap(weights, maxOperatorShare)
-	}
-
-	// Emit only when the cap actually changed the distribution — no-op selections (no
-	// operator over the cap) stay silent, so a nonzero rate means the cap is biting.
-	if reshaped {
-		metrics.RecordConcentrationCapReshaped(string(serviceID))
+		waterFillToCap(weights, maxOperatorShare)
 	}
 
 	// Weighted pick of an operator, then uniform pick of an endpoint within it.
@@ -105,14 +112,22 @@ func SelectWithConcentrationCap(
 	return eps[rand.Intn(len(eps))]
 }
 
+// operatorKey returns the operator bucket for an endpoint: its eTLD+1, or the endpoint
+// address itself when the eTLD+1 cannot be resolved (so unresolvable endpoints stay
+// singletons and are never merged, which would fabricate concentration).
+func operatorKey(ep protocol.EndpointAddr) string {
+	if k := shannonmetrics.ExtractTLDFromEndpointAddr(string(ep)); k != "" {
+		return k
+	}
+	return string(ep)
+}
+
 // waterFillToCap clamps any weight above cap and redistributes the excess to the
 // under-cap weights, proportionally to their current weight, until no weight exceeds
-// the cap. The caller only invokes this when the cap is feasible (cap*len(weights) > 1),
-// so total mass is preserved (≈ 1); the underSum guard keeps it safe even if that ever
-// fails to hold. Operates in place. Returns true if it clamped at least one weight (i.e.
-// the cap actually reshaped the distribution).
-func waterFillToCap(weights []float64, maxShare float64) bool {
-	clamped := false
+// the cap. The caller only invokes this when the cap is feasible (cap*len(weights) > 1)
+// and some weight is over the cap, so total mass is preserved (≈ 1); the underSum guard
+// keeps it safe even if that ever fails to hold. Operates in place.
+func waterFillToCap(weights []float64, maxShare float64) {
 	// At most len(weights) passes: each pass pins at least one new operator to the cap.
 	for pass := 0; pass < len(weights); pass++ {
 		var excess, underSum float64
@@ -127,9 +142,8 @@ func waterFillToCap(weights []float64, maxShare float64) bool {
 			}
 		}
 		if !anyOver {
-			return clamped
+			return
 		}
-		clamped = true
 		// No under-cap operator to absorb the excess (only reachable if the caller's
 		// feasibility guarantee is violated). Clamp what we can and stop rather than
 		// dividing by zero.
@@ -139,7 +153,7 @@ func waterFillToCap(weights []float64, maxShare float64) bool {
 					weights[i] = maxShare
 				}
 			}
-			return clamped
+			return
 		}
 		// Redistribute excess to the under-cap operators, proportional to their weight.
 		for i, w := range weights {
@@ -150,7 +164,6 @@ func waterFillToCap(weights []float64, maxShare float64) bool {
 			}
 		}
 	}
-	return clamped
 }
 
 // weightedPick returns an index chosen with probability proportional to weights[i].
