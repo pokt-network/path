@@ -265,6 +265,21 @@ func (m *MemoryStorage) GetPerceivedBlockNumber(ctx context.Context, serviceID p
 	return m.perceivedBlocks[string(serviceID)], nil
 }
 
+// DeletePerceivedBlockNumber removes the perceived block number for a service so it
+// can be rebuilt from fresh endpoint observations (the max-wins Set path cannot lower
+// a stuck value). Used by the chain-state admin reset.
+func (m *MemoryStorage) DeletePerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return reputation.ErrStorageClosed
+	}
+
+	delete(m.perceivedBlocks, string(serviceID))
+	return nil
+}
+
 // SetEndpointBlockHeight stores a single endpoint's block height for a service.
 func (m *MemoryStorage) SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
 	m.mu.Lock()

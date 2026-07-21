@@ -194,6 +194,23 @@ func (q *QoS) GetPerceivedBlockNumber() uint64 {
 	return q.perceivedBlockHeight
 }
 
+// ResetPerceivedBlockHeight clears the perceived block height (in-memory + Redis) so it
+// rebuilds from fresh endpoint observations. Used by the chain-state admin reset to
+// recover from a poisoned/stuck perceived height — the max-based consensus and the
+// external floor only ever RAISE perceived, so a too-high value (e.g. a slot-poisoned
+// height) cannot self-correct. Must be invoked on each pod, since the perceived floor is
+// per-pod in-memory state (mirrors the per-pod circuit-breaker clear).
+func (q *QoS) ResetPerceivedBlockHeight(ctx context.Context) error {
+	q.serviceStateLock.Lock()
+	q.perceivedBlockHeight = 0
+	q.serviceStateLock.Unlock()
+
+	if q.reputationSvc != nil {
+		return q.reputationSvc.DeletePerceivedBlockNumber(ctx, q.ServiceState.serviceID)
+	}
+	return nil
+}
+
 // ConsumeExternalBlockHeight consumes block heights from an external fetcher channel
 // and uses them as a floor for perceivedBlockHeight. This ensures that if all session
 // endpoints are behind the real chain tip, the perceived block is corrected.

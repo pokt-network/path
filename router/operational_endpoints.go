@@ -2,6 +2,7 @@ package router
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -274,5 +275,43 @@ func (r *router) handleCircuitBreakerClear(w http.ResponseWriter, req *http.Requ
 		"service_id":      serviceID,
 		"cleared_domains": count,
 		"message":         "circuit breaker state cleared (in-memory + Redis)",
+	})
+}
+
+// handleChainStateClear handles POST /admin/chain-state/clear/{serviceId}
+// Resets the perceived block height (in-memory + Redis) for the given service so it
+// rebuilds from fresh endpoint observations. This is the only way to recover a
+// stuck/too-high perceived height: the max-based consensus and the external floor only
+// ever RAISE perceived, so a poisoned value cannot self-correct.
+//
+// Like the circuit-breaker clear, this must be called on EACH pod, since the perceived
+// floor is per-pod in-memory state.
+func (r *router) handleChainStateClear(w http.ResponseWriter, req *http.Request) {
+	if r.chainStateAdmin == nil {
+		http.Error(w, `{"error":"chain state admin not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	serviceID := strings.TrimPrefix(req.URL.Path, "/admin/chain-state/clear/")
+	if serviceID == "" {
+		http.Error(w, `{"error":"service ID required: POST /admin/chain-state/clear/{serviceId}"}`, http.StatusBadRequest)
+		return
+	}
+
+	found, err := r.chainStateAdmin.ResetChainState(req.Context(), serviceID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.Error(w, fmt.Sprintf(`{"error":"service %q not found or has no perceived block height to reset"}`, serviceID), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"service_id": serviceID,
+		"message":    "chain state cleared (perceived block height reset, in-memory + Redis)",
 	})
 }

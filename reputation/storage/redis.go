@@ -477,6 +477,17 @@ func (s *RedisStorage) GetPerceivedBlockNumber(ctx context.Context, serviceID pr
 	return blockNumber, nil
 }
 
+// DeletePerceivedBlockNumber removes the perceived block number key for a service.
+// After deletion the value is rebuilt from fresh endpoint observations; the max-wins
+// Set path cannot lower a stuck/poisoned value, so an explicit delete is the only way
+// to recover. Used by the chain-state admin reset.
+func (s *RedisStorage) DeletePerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) error {
+	if err := s.client.Del(ctx, s.perceivedBlockKey(serviceID)).Err(); err != nil {
+		return fmt.Errorf("failed to delete perceived block number: %w", err)
+	}
+	return nil
+}
+
 // endpointBlocksKey returns the Redis key for storing per-endpoint block heights.
 func (s *RedisStorage) endpointBlocksKey(serviceID protocol.ServiceID) string {
 	return fmt.Sprintf("%schain_state:%s:endpoint_blocks", s.keyPrefix, serviceID)

@@ -330,6 +330,11 @@ func main() {
 		QoSLevelReporters:     qosLevelReporters,
 	}
 
+	// Admin handler to reset per-service chain state (perceived block height) via
+	// POST /admin/chain-state/clear/{serviceId}. Recovers a stuck/too-high perceived
+	// height that the max-only consensus and external floor cannot self-correct.
+	chainStateAdmin := gateway.NewChainStateAdmin(qosInstances)
+
 	// Initialize the API router to serve requests to the PATH API.
 	apiRouter := router.NewRouter(
 		logger,
@@ -338,6 +343,7 @@ func main() {
 		healthChecker,
 		config.GetRouterConfig(),
 		gtw.DomainCircuitBreaker,
+		chainStateAdmin,
 	)
 
 	// -------------------- Start PATH API Router --------------------

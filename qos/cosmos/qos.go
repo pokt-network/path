@@ -267,6 +267,21 @@ func (qos *QoS) GetPerceivedBlockNumber() uint64 {
 	return qos.perceivedBlockNumber
 }
 
+// ResetPerceivedBlockHeight clears the perceived block number (in-memory + Redis) so it
+// rebuilds from fresh endpoint observations. Used by the chain-state admin reset to
+// recover from a stuck/too-high perceived height (the max-wins path cannot lower it).
+// Must be invoked on each pod, since the perceived floor is per-pod in-memory state.
+func (qos *QoS) ResetPerceivedBlockHeight(ctx context.Context) error {
+	qos.serviceStateLock.Lock()
+	qos.perceivedBlockNumber = 0
+	qos.serviceStateLock.Unlock()
+
+	if qos.reputationSvc != nil {
+		return qos.reputationSvc.DeletePerceivedBlockNumber(ctx, qos.serviceQoSConfig.GetServiceID())
+	}
+	return nil
+}
+
 // ConsumeExternalBlockHeight consumes block heights from an external fetcher channel
 // and uses them as a floor for perceivedBlockNumber. This ensures that if all session
 // endpoints are behind the real chain tip, the perceived block is corrected.

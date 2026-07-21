@@ -926,6 +926,16 @@ func (s *service) SetPerceivedBlockNumber(ctx context.Context, serviceID protoco
 	return s.storage.SetPerceivedBlockNumber(ctx, serviceID, blockNumber)
 }
 
+// DeletePerceivedBlockNumber removes the shared perceived block number for a service so
+// it can be rebuilt from fresh endpoint observations. Used by the chain-state admin reset.
+func (s *service) DeletePerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) error {
+	if s.storage == nil {
+		return nil // No storage configured, skip
+	}
+
+	return s.storage.DeletePerceivedBlockNumber(ctx, serviceID)
+}
+
 // GetPerceivedBlockNumber retrieves the shared perceived block number for a service.
 // Returns the maximum block number observed across all replicas.
 // Returns 0 if no block number has been stored yet or if storage is unavailable.

@@ -150,6 +150,16 @@ func (m *mockStorage) GetPerceivedBlockNumber(_ context.Context, serviceID proto
 	return m.perceivedBlocks[string(serviceID)], nil
 }
 
+func (m *mockStorage) DeletePerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrStorageClosed
+	}
+	delete(m.perceivedBlocks, string(serviceID))
+	return nil
+}
+
 func (m *mockStorage) SetEndpointBlockHeight(_ context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error {
 	return nil
 }

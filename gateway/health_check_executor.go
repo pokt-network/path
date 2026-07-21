@@ -1854,7 +1854,15 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 				return int64(heightNum), nil
 			}
 		}
-		return 0, fmt.Errorf("unsupported response format: object without sync_info")
+		// Solana getEpochInfo format: {"blockHeight": 412345678, "epoch": ..., "absoluteSlot": ...}
+		// Prefer getEpochInfo over getBlockHeight for a Solana external source: getBlockHeight
+		// returns a bare number that some providers mislabel with the SLOT (~5% higher), whereas
+		// blockHeight is an explicit, unambiguous field. NEVER fall back to absoluteSlot — the
+		// slot poisons the max-based perceived height.
+		if bh, ok := v["blockHeight"].(float64); ok {
+			return int64(bh), nil
+		}
+		return 0, fmt.Errorf("unsupported response format: object without sync_info or blockHeight")
 
 	default:
 		return 0, fmt.Errorf("unsupported result type: %T", v)

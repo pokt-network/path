@@ -418,6 +418,12 @@ type ReputationService interface {
 	// Returns 0 if no block number has been stored yet.
 	GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) uint64
 
+	// DeletePerceivedBlockNumber removes the shared perceived block number for a service
+	// so it can be rebuilt from fresh endpoint observations. Used by the chain-state admin
+	// reset to recover from a poisoned/stuck perceived height — the max-wins Set path
+	// cannot lower a too-high value, so an explicit delete is required.
+	DeletePerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) error
+
 	// SetEndpointBlockHeight stores a single endpoint's block height for cross-replica sync.
 	// Called from UpdateFromExtractedData when a health check reports an endpoint's block height.
 	SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error

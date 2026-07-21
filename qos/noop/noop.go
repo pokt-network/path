@@ -207,6 +207,21 @@ func (n *NoOpQoS) GetPerceivedBlockNumber() uint64 {
 	return n.perceivedBlockHeight
 }
 
+// ResetPerceivedBlockHeight clears the perceived block height (in-memory + Redis) so it
+// rebuilds from fresh endpoint observations. Used by the chain-state admin reset to
+// recover from a stuck/too-high perceived height (the max path cannot lower it). Must be
+// invoked on each pod, since the perceived floor is per-pod in-memory state.
+func (n *NoOpQoS) ResetPerceivedBlockHeight(ctx context.Context) error {
+	n.serviceStateMu.Lock()
+	n.perceivedBlockHeight = 0
+	n.serviceStateMu.Unlock()
+
+	if n.reputationSvc != nil {
+		return n.reputationSvc.DeletePerceivedBlockNumber(ctx, n.serviceID)
+	}
+	return nil
+}
+
 // SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
 // This is called when external health check rules are loaded/refreshed, since those
 // rules may specify a sync_allowance that wasn't available at QoS creation time.

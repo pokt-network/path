@@ -347,10 +347,14 @@ gateway_config:
       latency_profile: "standard"
       timeout_config:
         relay_timeout: 15s
-      # Solana external block source — uses "getBlockHeight" method (numeric result)
+      # Solana external block source — use "getEpochInfo" and read its blockHeight field.
+      # Do NOT use "getBlockHeight": it returns a bare number that some providers mislabel
+      # with the SLOT (~5% higher than block height), which poisons the max-based perceived
+      # height and makes honest endpoints look "behind". getEpochInfo.blockHeight is explicit
+      # and unambiguous. (The external floor is also plausibility-guarded as defense in depth.)
       # external_block_sources:
-      #   - url: "https://api.mainnet-beta.solana.com"
-      #     method: "getBlockHeight"
+      #   - url: "https://solana-rpc.publicnode.com"
+      #     method: "getEpochInfo"
       #     interval: 15s
       #     timeout: 5s
 

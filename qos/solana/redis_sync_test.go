@@ -44,6 +44,13 @@ func (m *mockReputationSvc) SetPerceivedBlockNumber(_ context.Context, serviceID
 	return nil
 }
 
+func (m *mockReputationSvc) DeletePerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.perceivedBlock, serviceID)
+	return nil
+}
+
 func (m *mockReputationSvc) GetPerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -321,4 +328,25 @@ func TestSolana_ConsumeExternalBlockHeight_RejectsImplausible(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, uint64(realHeight+5), qos.GetPerceivedBlockNumber(),
 		"a plausible external advance must still raise perceived")
+}
+
+// TestSolana_ResetPerceivedBlockHeight verifies the chain-state admin reset clears the
+// perceived height both in-memory and in Redis, so a stuck/poisoned value (which the
+// max-only consensus and external floor cannot lower) can be recovered.
+func TestSolana_ResetPerceivedBlockHeight(t *testing.T) {
+	qos := newTestSolanaQoS()
+	mock := newMockReputationSvc()
+	qos.SetReputationService(mock)
+
+	// Seed a stuck/poisoned perceived height in-memory and in the shared store.
+	qos.serviceStateLock.Lock()
+	qos.perceivedBlockHeight = 434_000_000
+	qos.serviceStateLock.Unlock()
+	require.NoError(t, mock.SetPerceivedBlockNumber(context.Background(), testSolanaServiceID, 434_000_000))
+	require.Equal(t, uint64(434_000_000), mock.getBlock(testSolanaServiceID))
+
+	require.NoError(t, qos.ResetPerceivedBlockHeight(context.Background()))
+
+	assert.Equal(t, uint64(0), qos.GetPerceivedBlockNumber(), "in-memory perceived must be cleared")
+	assert.Equal(t, uint64(0), mock.getBlock(testSolanaServiceID), "Redis perceived must be deleted")
 }

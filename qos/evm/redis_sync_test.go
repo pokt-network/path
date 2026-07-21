@@ -42,6 +42,13 @@ func (m *mockRedisSyncRepSvc) SetPerceivedBlockNumber(_ context.Context, service
 	return nil
 }
 
+func (m *mockRedisSyncRepSvc) DeletePerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.perceivedBlock, serviceID)
+	return nil
+}
+
 func (m *mockRedisSyncRepSvc) GetPerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()

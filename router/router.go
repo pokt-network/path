@@ -36,6 +36,7 @@ type (
 		disqualifiedEndpointsReporter disqualifiedEndpointsReporter
 		healthChecker                 *health.Checker
 		circuitBreakerAdmin           CircuitBreakerAdmin
+		chainStateAdmin               ChainStateAdmin
 	}
 	gatewayHandler interface {
 		HandleServiceRequest(context.Context, *http.Request, http.ResponseWriter)
@@ -46,6 +47,12 @@ type (
 	// CircuitBreakerAdmin allows clearing circuit breaker state via admin endpoints.
 	CircuitBreakerAdmin interface {
 		ClearService(ctx context.Context, serviceID string) int
+	}
+	// ChainStateAdmin allows resetting per-service chain state (perceived block height)
+	// via admin endpoints. found=false means unknown service or a QoS type without a
+	// perceived block height; err is non-nil only if the reset itself failed.
+	ChainStateAdmin interface {
+		ResetChainState(ctx context.Context, serviceID string) (found bool, err error)
 	}
 )
 
@@ -59,6 +66,7 @@ func NewRouter(
 	healthChecker *health.Checker,
 	config config.RouterConfig,
 	circuitBreakerAdmin CircuitBreakerAdmin,
+	chainStateAdmin ChainStateAdmin,
 ) *router {
 	r := &router{
 		logger: logger.With("package", "router"),
@@ -70,6 +78,7 @@ func NewRouter(
 		disqualifiedEndpointsReporter: disqualifiedEndpointsReporter,
 		healthChecker:                 healthChecker,
 		circuitBreakerAdmin:           circuitBreakerAdmin,
+		chainStateAdmin:               chainStateAdmin,
 	}
 	r.handleRoutes()
 	return r
@@ -103,6 +112,9 @@ func (r *router) handleRoutes() {
 
 	// POST /admin/circuit-breaker/clear/{serviceId} - clears circuit breaker state (in-memory + Redis)
 	r.mux.HandleFunc("POST /admin/circuit-breaker/clear/", r.handleCircuitBreakerClear)
+
+	// POST /admin/chain-state/clear/{serviceId} - resets perceived block height (in-memory + Redis)
+	r.mux.HandleFunc("POST /admin/chain-state/clear/", r.handleChainStateClear)
 
 	// requestHandlerFn defines the middleware chain for all service requests
 	requestHandlerFn := r.corsMiddleware(r.removeGrovePortalPrefixMiddleware(r.handleServiceRequest))

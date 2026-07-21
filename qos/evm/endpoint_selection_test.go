@@ -95,6 +95,10 @@ func (m *mockReputationService) SetPerceivedBlockNumber(ctx context.Context, ser
 	return nil
 }
 
+func (m *mockReputationService) DeletePerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) error {
+	return nil
+}
+
 func (m *mockReputationService) GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) uint64 {
 	return 0
 }
