@@ -2,6 +2,7 @@ package evm
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -93,6 +94,9 @@ func NewSimpleQoSInstanceWithSyncAllowance(logger polylog.Logger, serviceID prot
 type simpleServiceConfig struct {
 	serviceID     protocol.ServiceID
 	syncAllowance atomic.Uint64 // If 0, uses default. Updated dynamically when external health check rules are loaded.
+	// maxOperatorShareBits holds a float64 (via math.Float64bits) for the per-operator
+	// concentration cap. 0 (the zero value) disables the cap. Updated dynamically.
+	maxOperatorShareBits atomic.Uint64
 }
 
 func (c *simpleServiceConfig) GetServiceID() protocol.ServiceID { return c.serviceID }
@@ -107,6 +111,9 @@ func (c *simpleServiceConfig) getSyncAllowance() uint64 {
 func (c *simpleServiceConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
 	return map[sharedtypes.RPCType]struct{}{sharedtypes.RPCType_JSON_RPC: {}}
 }
+func (c *simpleServiceConfig) getMaxOperatorShare() float64 {
+	return math.Float64frombits(c.maxOperatorShareBits.Load())
+}
 
 // SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
 // This is called when external health check rules are loaded/refreshed, since those
@@ -114,6 +121,15 @@ func (c *simpleServiceConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{
 func (qos *QoS) SetSyncAllowance(syncAllowance uint64) {
 	if cfg, ok := qos.serviceQoSConfig.(*simpleServiceConfig); ok {
 		cfg.syncAllowance.Store(syncAllowance)
+	}
+}
+
+// SetMaxOperatorShare dynamically sets the per-operator (eTLD+1) concentration cap
+// used during endpoint selection. A value <= 0 or >= 1 disables the cap (flat random
+// pick). Wired from configuration so it can be A/B tested on canary without a redeploy.
+func (qos *QoS) SetMaxOperatorShare(maxOperatorShare float64) {
+	if cfg, ok := qos.serviceQoSConfig.(*simpleServiceConfig); ok {
+		cfg.maxOperatorShareBits.Store(math.Float64bits(maxOperatorShare))
 	}
 }
 

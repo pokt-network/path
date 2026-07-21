@@ -11,6 +11,27 @@ import (
 	qostypes "github.com/pokt-network/path/qos/types"
 )
 
+// TestSetMaxOperatorShare_RoundTrip verifies the per-operator concentration cap value
+// round-trips through the atomic float64-bits storage on simpleServiceConfig. Guards the
+// math.Float64bits/Float64frombits plumbing behind SetMaxOperatorShare/getMaxOperatorShare.
+func TestSetMaxOperatorShare_RoundTrip(t *testing.T) {
+	logger := polyzero.NewLogger()
+	qos := NewSimpleQoSInstance(logger, "eth")
+
+	// Default: disabled (0).
+	require.Equal(t, 0.0, qos.serviceQoSConfig.getMaxOperatorShare())
+
+	for _, v := range []float64{0.4, 0.5, 0.85, 0.999} {
+		qos.SetMaxOperatorShare(v)
+		require.Equal(t, v, qos.serviceQoSConfig.getMaxOperatorShare(),
+			"max operator share should round-trip exactly")
+	}
+
+	// Reset to disabled.
+	qos.SetMaxOperatorShare(0)
+	require.Equal(t, 0.0, qos.serviceQoSConfig.getMaxOperatorShare())
+}
+
 // TestUpdateFromExtractedData_ArchivalBidirectional verifies that UpdateFromExtractedData
 // correctly handles both setting (IsArchival=true) and clearing (IsArchival=false) archival status.
 func TestUpdateFromExtractedData_ArchivalBidirectional(t *testing.T) {

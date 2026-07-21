@@ -36,6 +36,9 @@ type EVMServiceQoSConfig interface {
 	getEVMChainID() string
 	getSyncAllowance() uint64
 	getSupportedAPIs() map[sharedtypes.RPCType]struct{}
+	// getMaxOperatorShare returns the per-operator (eTLD+1) concentration cap applied
+	// during endpoint selection. <= 0 or >= 1 disables the cap (flat random pick).
+	getMaxOperatorShare() float64
 }
 
 // NewEVMServiceQoSConfig creates a new EVM service configuration.
@@ -107,4 +110,12 @@ func (c evmServiceQoSConfig) getSyncAllowance() uint64 {
 // Implements the EVMServiceQoSConfig interface.
 func (c evmServiceQoSConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
 	return c.supportedAPIs
+}
+
+// getMaxOperatorShare returns the per-operator concentration cap.
+// This static test/config implementation leaves it disabled (0); the production
+// simpleServiceConfig carries the dynamically-set value.
+// Implements the EVMServiceQoSConfig interface.
+func (evmServiceQoSConfig) getMaxOperatorShare() float64 {
+	return 0
 }
