@@ -162,6 +162,17 @@ type requestContext struct {
 	// overflow is measurable. Does not affect reputation signals.
 	isRetry bool
 
+	// isHealthCheck marks this request as an active health-check relay issued by the
+	// health-check executor (not user traffic). Set by MarkAsHealthCheck() before
+	// HandleServiceRequest. The health-check executor records its own path_relays_total
+	// entry (request_type="health_check", with health-check-specific signals) for every
+	// outcome, so the Shannon layer SKIPS its RecordRelay for these — otherwise the same
+	// relay was ALSO recorded as request_type="normal", leaving every "excludes health
+	// checks" dashboard panel still containing 100% of health-check volume (phantom
+	// "normal" traffic on services with no user requests). Does not affect reputation
+	// signals or observations.
+	isHealthCheck bool
+
 	// tieredSelector provides access to tier-based selection and probation status.
 	// Used to check if endpoints are in probation when recording success signals.
 	// If non-nil and endpoint is in probation, RecoverySuccessSignal is used instead of SuccessSignal.
@@ -488,6 +499,14 @@ func (rc *requestContext) MarkAsHedge() {
 // `isRetry` (metric request_type only; reputation signals unaffected).
 func (rc *requestContext) MarkAsRetry() {
 	rc.isRetry = true
+}
+
+// MarkAsHealthCheck tags this request as an active health-check relay so the Shannon layer
+// skips its path_relays_total recording (the health-check executor is the sole recorder,
+// avoiding a phantom request_type="normal" double-count). Implements
+// gateway.ProtocolRequestContext. See the field doc on `isHealthCheck`.
+func (rc *requestContext) MarkAsHealthCheck() {
+	rc.isHealthCheck = true
 }
 
 // getSelectedEndpoint returns the currently selected endpoint in a thread-safe manner.
@@ -1248,31 +1267,34 @@ func (rc *requestContext) handleEndpointError(
 			Msg("Skipping domain reputation penalty for blacklisted supplier")
 	}
 
-	// Record relay metric for failed request
-	domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
-	if domainErr != nil {
-		domain = shannonmetrics.ErrDomain
-	}
-	rpcTypeStr := metrics.NormalizeRPCType(rc.getCurrentRPCType().String())
-	reputationSignal := mapSignalTypeToMetricSignal(signal.Type)
+	// Record relay metric for failed request — unless this is a health-check relay, which
+	// the health-check executor records itself (skipping here avoids a phantom "normal").
+	if !rc.isHealthCheck {
+		domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
+		if domainErr != nil {
+			domain = shannonmetrics.ErrDomain
+		}
+		rpcTypeStr := metrics.NormalizeRPCType(rc.getCurrentRPCType().String())
+		reputationSignal := mapSignalTypeToMetricSignal(signal.Type)
 
-	// Extract status code from error if possible, otherwise use "error"
-	statusCodeStr := "error"
-	if statusCode, ok := extractHTTPStatusCode(endpointErr); ok {
-		statusCodeStr = metrics.GetStatusCodeCategory(statusCode)
-	}
+		// Extract status code from error if possible, otherwise use "error"
+		statusCodeStr := "error"
+		if statusCode, ok := extractHTTPStatusCode(endpointErr); ok {
+			statusCodeStr = metrics.GetStatusCodeCategory(statusCode)
+		}
 
-	// Determine relay type - errors are recorded as normal type (probation detection requires success).
-	// Hedge/retry errors are tagged so they don't pollute the per-domain RPS view (hedge and
-	// retry are mutually exclusive request kinds).
-	relayType := metrics.RelayTypeNormal
-	switch {
-	case rc.isHedge:
-		relayType = metrics.RelayTypeHedge
-	case rc.isRetry:
-		relayType = metrics.RelayTypeRetry
+		// Determine relay type - errors are recorded as normal type (probation detection requires success).
+		// Hedge/retry errors are tagged so they don't pollute the per-domain RPS view (hedge and
+		// retry are mutually exclusive request kinds).
+		relayType := metrics.RelayTypeNormal
+		switch {
+		case rc.isHedge:
+			relayType = metrics.RelayTypeHedge
+		case rc.isRetry:
+			relayType = metrics.RelayTypeRetry
+		}
+		metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 	}
-	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
 	// Return the original response (preserving any response bytes) with the error.
 	// This allows the gateway to return the actual backend response to the user
@@ -1416,14 +1438,18 @@ func (rc *requestContext) handleEndpointSuccess(
 		relayType = metrics.RelayTypeRetry
 	}
 
-	// Record relay metric for successful request
-	domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
-	if domainErr != nil {
-		domain = shannonmetrics.ErrDomain
+	// Record relay metric for successful request — unless this is a health-check relay,
+	// which the health-check executor records itself (skipping here avoids a phantom
+	// request_type="normal" duplicate).
+	if !rc.isHealthCheck {
+		domain, domainErr := shannonmetrics.ExtractDomainOrHost(string(selectedEndpointAddr))
+		if domainErr != nil {
+			domain = shannonmetrics.ErrDomain
+		}
+		statusCodeStr := metrics.GetStatusCodeCategory(endpointResponse.HTTPStatusCode)
+		rpcTypeStr := metrics.NormalizeRPCType(rc.getCurrentRPCType().String())
+		metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 	}
-	statusCodeStr := metrics.GetStatusCodeCategory(endpointResponse.HTTPStatusCode)
-	rpcTypeStr := metrics.NormalizeRPCType(rc.getCurrentRPCType().String())
-	metrics.RecordRelay(domain, rpcTypeStr, string(rc.serviceID), statusCodeStr, reputationSignal, relayType, latency.Seconds())
 
 	// Return relay response received from endpoint.
 	return nil

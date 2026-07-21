@@ -1009,6 +1009,12 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 		return time.Since(startTime), fmt.Errorf("failed to build protocol context: %w", err)
 	}
 
+	// Tag the relay as a health check so the protocol layer skips its own relays_total
+	// recording. The executor records each outcome below as request_type="health_check";
+	// without this the same relay would ALSO be recorded as request_type="normal",
+	// double-counting it (see requestContext.isHealthCheck).
+	protocolCtx.MarkAsHealthCheck()
+
 	// Execute the relay request through the protocol - this sends the actual relay to the supplier
 	responses, relayErr := protocolCtx.HandleServiceRequest(hcQoSCtx.GetServicePayloads())
 	latency := time.Since(startTime)

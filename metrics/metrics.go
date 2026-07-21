@@ -719,6 +719,13 @@ func supplierSignalSeverity(signalType string) string {
 
 const (
 	// --- Request type labels for relays
+	//
+	// request_type PARTITIONS relays_total: every paid relay PATH sends to a supplier is
+	// recorded under exactly ONE request_type. So "total billable/paid relays" = the sum
+	// across ALL request_type values, NOT just request_type="normal". In particular,
+	// health checks are real paid relays and are counted under request_type="health_check"
+	// — they must NOT be summed on top of "normal" (they are not in it). Filtering to
+	// request_type="normal" gives user-facing primary traffic only.
 
 	RelayTypeNormal      = "normal"
 	RelayTypeHealthCheck = "health_check"
@@ -739,7 +746,7 @@ const (
 var RelaysTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "relays_total",
-		Help: "Total outgoing relays to suppliers by domain, rpc_type, service_id, status_code, reputation_signal, and request_type.",
+		Help: "Total outgoing (paid) relays to suppliers by domain, rpc_type, service_id, status_code, reputation_signal, and request_type. request_type partitions relays: total paid relays = sum over ALL request_type values (health checks are counted under request_type=\"health_check\", not \"normal\").",
 	},
 	[]string{LabelDomain, LabelRPCType, LabelServiceID, LabelStatusCode, LabelReputationSignal, "request_type"},
 )
