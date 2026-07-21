@@ -850,11 +850,15 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 // DefaultMaxOperatorShare is the per-operator concentration cap applied when neither the
 // service nor the global defaults specify one. Shipped ON: no single operator (eTLD+1)
 // receives more than this fraction of a service's endpoint selections when the valid pool
-// spans multiple operators. Tuned from production concentration data — it bounds the
-// clearly-concentrated tail (one operator holding the large majority of a service) while
-// leaving ordinary multi-operator distributions unchanged. Set a per-service or default
-// value of >= 1 (or <= 0) to disable.
-const DefaultMaxOperatorShare = 0.75
+// spans multiple operators. Tuned from production concentration data: a canary survey found
+// the dominant operator held 58–90% of most services' sessions, yet reputation/validation
+// filtering trims its effective valid-pool share enough that a 0.75 cap almost never
+// engaged. 0.65 makes the cap actually bound the concentrated tail (12 of 19 sampled
+// services) at negligible redistribution cost — the excess spreads across a handful of
+// other valid operators — while staying above the uniform-over-operators feasibility floor
+// for services with as few as two operators. Set a per-service or default value of >= 1
+// (or <= 0) to disable.
+const DefaultMaxOperatorShare = 0.65
 
 // GetMaxOperatorShareForService returns the per-operator concentration cap for a service.
 // It checks per-service config first, then global defaults, then DefaultMaxOperatorShare.

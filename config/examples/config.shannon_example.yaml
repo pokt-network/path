@@ -281,7 +281,7 @@ gateway_config:
       # endpoint selections that any single operator (registrable domain / eTLD+1) may
       # receive; the excess is spread across the other valid operators. This limits the
       # blast radius when one operator holds most of the valid pool and then degrades.
-      # Ships ON by default at 0.75 for every service — set a value here to override, or
+      # Ships ON by default at 0.65 for every service — set a value here to override, or
       # 1.0 (or 0) to disable it for this service.
       # max_operator_share: 0.6
       # External block sources for ground-truth validation (optional)

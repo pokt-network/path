@@ -627,7 +627,7 @@ properties:
             health_checks:
               $ref: "#/definitions/service_health_check_override"
             max_operator_share:
-              description: "Per-operator (registrable domain / eTLD+1) concentration cap for endpoint selection. Caps the fraction of this service's selections any single operator may receive; excess is spread across the other valid operators. Bounds the blast radius of one operator failing when it holds most of the valid pool. Range (0, 1); a value <= 0 or >= 1 disables the cap. If unset, the global default (0.75) applies."
+              description: "Per-operator (registrable domain / eTLD+1) concentration cap for endpoint selection. Caps the fraction of this service's selections any single operator may receive; excess is spread across the other valid operators. Bounds the blast radius of one operator failing when it holds most of the valid pool. Range (0, 1); a value <= 0 or >= 1 disables the cap. If unset, the global default (0.65) applies."
               type: number
 
   # Logger Configuration (optional)
