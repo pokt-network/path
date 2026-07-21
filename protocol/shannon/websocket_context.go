@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"hash/fnv"
+	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -22,6 +25,7 @@ import (
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/selector"
 	"github.com/pokt-network/path/reputation"
 	"github.com/pokt-network/path/request"
 	"github.com/pokt-network/path/websockets"
@@ -367,6 +371,17 @@ func (p *Protocol) getReconnectEndpoint(
 		return nil, false, metrics.WSRebindFailedNoEndpoints, err
 	}
 
+	// Per-operator concentration cap for the rebind target (config-driven, shipped ON).
+	// A tier-2/stall rebind otherwise deterministically funnels every connection to the
+	// single smallest-address top-scored endpoint; when scores tie (the common case) this
+	// re-homes an outsized share onto one operator. The cap spreads the tied-best band
+	// across operators, seeded by the connection's original endpoint so the choice stays
+	// reproducible across replays.
+	maxOperatorShare := 0.0
+	if p.unifiedServicesConfig != nil {
+		maxOperatorShare = p.unifiedServicesConfig.GetMaxOperatorShareForService(serviceID)
+	}
+
 	// Staleness rebind: the current supplier is the one stalling, so exclude it and force
 	// a different supplier. If it was the session's only endpoint, there is nothing to
 	// escape to → fail so the bridge closes the client.
@@ -376,7 +391,7 @@ func (p *Protocol) getReconnectEndpoint(
 			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape a stalling supplier", protocol.ErrEndpointUnavailable, serviceID)
 			return nil, false, metrics.WSRebindFailedNoEndpoints, err
 		}
-		ep := selectBestReconnectEndpoint(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints))
+		ep := selectReconnectEndpointWithCap(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare, preferredAddr)
 		logger.Warn().
 			Str("stalling_endpoint", string(preferredAddr)).
 			Str("replacement_endpoint", string(ep.Addr())).
@@ -391,7 +406,7 @@ func (p *Protocol) getReconnectEndpoint(
 	}
 
 	// Tier 2: original supplier rotated out of the new session → best-available fallback.
-	ep := selectBestReconnectEndpoint(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints))
+	ep := selectReconnectEndpointWithCap(endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare, preferredAddr)
 	logger.Warn().
 		Str("original_endpoint", string(preferredAddr)).
 		Str("fallback_endpoint", string(ep.Addr())).
@@ -419,6 +434,83 @@ func selectBestReconnectEndpoint(endpoints map[protocol.EndpointAddr]endpoint, s
 		}
 	}
 	return best
+}
+
+// reconnectScoreEpsilon is the tolerance within which two reconnect candidates count as
+// tied on reputation score (scores are ~100-scale floats; exact equality is too brittle).
+const reconnectScoreEpsilon = 1e-9
+
+// selectReconnectEndpointWithCap chooses a rebind target, applying the per-operator
+// concentration cap when enabled.
+//
+// With the cap disabled (maxOperatorShare <= 0 or >= 1) or nothing to reshape it is
+// identical to selectBestReconnectEndpoint — the deterministic (non-fallback, highest
+// score, smallest address) pick. With the cap enabled it takes the set of endpoints tied
+// for best (same capability tier + top score — the candidates the deterministic pick
+// would break by address) and spreads them across operators via the shared concentration
+// cap, seeded by seedAddr (the connection's original endpoint, stable for its lifetime) so
+// the choice is reproducible across replays and pods.
+func selectReconnectEndpointWithCap(
+	endpoints map[protocol.EndpointAddr]endpoint,
+	scoreOf func(endpoint) float64,
+	maxOperatorShare float64,
+	seedAddr protocol.EndpointAddr,
+) endpoint {
+	if maxOperatorShare <= 0 || maxOperatorShare >= 1 || len(endpoints) <= 1 {
+		return selectBestReconnectEndpoint(endpoints, scoreOf)
+	}
+
+	band := reconnectTopBand(endpoints, scoreOf)
+	if len(band) <= 1 {
+		return selectBestReconnectEndpoint(endpoints, scoreOf)
+	}
+
+	// Stable order so the seeded concentration pick is deterministic (map iteration is not).
+	sort.Slice(band, func(i, j int) bool { return band[i] < band[j] })
+
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(seedAddr))
+	chosen := selector.SelectWithConcentrationCapSeeded(band, maxOperatorShare, int64(h.Sum64()))
+	if ep, ok := endpoints[chosen]; ok {
+		return ep
+	}
+	// Defensive: the helper always returns a member of the band, but fall back rather than
+	// return nil if that ever changes.
+	return selectBestReconnectEndpoint(endpoints, scoreOf)
+}
+
+// reconnectTopBand returns the endpoint addresses tied for best under the
+// (non-fallback preferred, then highest score) ordering — exactly the candidates
+// selectBestReconnectEndpoint would otherwise break by smallest address.
+func reconnectTopBand(endpoints map[protocol.EndpointAddr]endpoint, scoreOf func(endpoint) float64) []protocol.EndpointAddr {
+	hasNonFallback := false
+	for _, ep := range endpoints {
+		if !ep.IsFallback() {
+			hasNonFallback = true
+			break
+		}
+	}
+
+	maxScore := math.Inf(-1)
+	for _, ep := range endpoints {
+		if hasNonFallback && ep.IsFallback() {
+			continue
+		}
+		if s := scoreOf(ep); s > maxScore {
+			maxScore = s
+		}
+	}
+
+	var band []protocol.EndpointAddr
+	for addr, ep := range endpoints {
+		if hasNonFallback && ep.IsFallback() {
+			continue
+		}
+		if scoreOf(ep) >= maxScore-reconnectScoreEpsilon {
+			band = append(band, addr)
+		}
+	}
+	return band
 }
 
 // betterReconnectCandidate reports whether a is a better rebind target than b:

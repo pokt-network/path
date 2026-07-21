@@ -2,6 +2,7 @@ package selector
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os"
 	"strings"
 	"testing"
@@ -143,6 +144,36 @@ func TestSelectWithConcentrationCap_UnresolvableStaySeparate(t *testing.T) {
 	}
 	require.InDelta(t, 0.5, float64(counts["garbage-addr-one"])/50_000, 0.03,
 		"unresolvable endpoints must not be merged")
+}
+
+func TestSelectWithConcentrationCapSeeded_Deterministic(t *testing.T) {
+	eps, _ := makeOperatorPool([]int{10, 1, 1, 1})
+
+	// Same (endpoints, cap, seed) → same endpoint, every time.
+	for _, seed := range []int64{0, 1, 7, 42, 1 << 40} {
+		first := SelectWithConcentrationCapSeeded(eps, 0.4, seed)
+		for i := 0; i < 50; i++ {
+			require.Equal(t, first, SelectWithConcentrationCapSeeded(eps, 0.4, seed),
+				"seeded selection must be deterministic for seed %d", seed)
+		}
+	}
+}
+
+func TestSelectWithConcentrationCapSeeded_SpreadRespectsCap(t *testing.T) {
+	// Across many distinct seeds the seeded variant must obey the same cap as the random
+	// one: the 10-key operator converges near 0.40, not its 0.77 key-share. Seeds are
+	// hashed (mirroring the real per-connection seedAddr) to avoid sequential-seed bias.
+	eps, ops := makeOperatorPool([]int{10, 1, 1, 1})
+	counts := map[string]int{}
+	const draws = 200_000
+	for i := 0; i < draws; i++ {
+		h := fnv.New64a()
+		_, _ = fmt.Fprintf(h, "origin-%d", i)
+		sel := SelectWithConcentrationCapSeeded(eps, 0.4, int64(h.Sum64()))
+		counts[operatorOf(string(sel))]++
+	}
+	require.InDelta(t, 0.40, float64(counts[ops[0]])/float64(draws), 0.02,
+		"seeded spread should cap the dominant operator near 0.40")
 }
 
 func TestWaterFillToCap_PreservesMassAndCaps(t *testing.T) {

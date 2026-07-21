@@ -13,6 +13,20 @@ import (
 // rounding when comparing an operator's weight to the cap.
 const concentrationCapEpsilon = 1e-9
 
+// randSource abstracts the RNG so the same water-filling logic serves both the
+// global-random initial selection and the deterministically-seeded rebind selection.
+type randSource interface {
+	Intn(int) int
+	Float64() float64
+}
+
+// globalRandSource draws from the package-global math/rand — the source used by the
+// prior flat-random pick, so the disabled path stays byte-for-byte unchanged.
+type globalRandSource struct{}
+
+func (globalRandSource) Intn(n int) int   { return rand.Intn(n) }
+func (globalRandSource) Float64() float64 { return rand.Float64() }
+
 // SelectWithConcentrationCap picks one endpoint from validEndpoints, biased so that
 // no single operator (eTLD+1) exceeds maxOperatorShare of the selection probability.
 //
@@ -37,6 +51,29 @@ func SelectWithConcentrationCap(
 	validEndpoints protocol.EndpointAddrList,
 	maxOperatorShare float64,
 ) protocol.EndpointAddr {
+	_ = logger
+	return selectWithConcentrationCap(validEndpoints, maxOperatorShare, globalRandSource{})
+}
+
+// SelectWithConcentrationCapSeeded is a deterministic variant of
+// SelectWithConcentrationCap: given the same endpoint slice, cap, and seed it always
+// returns the same endpoint. Used by the WebSocket rebind path, which must spread
+// tied-best endpoints across operators while staying reproducible across replays and
+// pods (seed from a per-connection-stable value). The caller must pass validEndpoints
+// in a stable order (e.g. sorted) so the operator grouping is deterministic.
+func SelectWithConcentrationCapSeeded(
+	validEndpoints protocol.EndpointAddrList,
+	maxOperatorShare float64,
+	seed int64,
+) protocol.EndpointAddr {
+	return selectWithConcentrationCap(validEndpoints, maxOperatorShare, rand.New(rand.NewSource(seed))) //nolint:gosec // not security-sensitive; deterministic spread by design
+}
+
+func selectWithConcentrationCap(
+	validEndpoints protocol.EndpointAddrList,
+	maxOperatorShare float64,
+	r randSource,
+) protocol.EndpointAddr {
 	n := len(validEndpoints)
 	if n == 0 {
 		return protocol.EndpointAddr("")
@@ -44,7 +81,7 @@ func SelectWithConcentrationCap(
 
 	// Disabled / trivial: preserve the exact prior behavior (flat random pick).
 	if n == 1 || maxOperatorShare <= 0 || maxOperatorShare >= 1 {
-		return validEndpoints[rand.Intn(n)]
+		return validEndpoints[r.Intn(n)]
 	}
 
 	// Group endpoints by operator (eTLD+1). Unresolvable eTLD+1 → singleton operator
@@ -67,7 +104,7 @@ func SelectWithConcentrationCap(
 	// Single operator: the cap has nothing to reshape. A flat random pick is a uniform
 	// pick within that one operator — identical, and cheaper.
 	if m == 1 {
-		return validEndpoints[rand.Intn(n)]
+		return validEndpoints[r.Intn(n)]
 	}
 
 	// Per-operator weights. Start from per-endpoint-uniform (n_i/N): a weighted operator
@@ -88,9 +125,9 @@ func SelectWithConcentrationCap(
 	}
 
 	// Weighted pick of an operator, then uniform pick of an endpoint within it.
-	opIdx := weightedPick(weights)
+	opIdx := weightedPick(weights, r)
 	eps := operatorEndpoints[operatorOrder[opIdx]]
-	return eps[rand.Intn(len(eps))]
+	return eps[r.Intn(len(eps))]
 }
 
 // waterFillToCap clamps any weight above cap and redistributes the excess to the
@@ -126,19 +163,19 @@ func waterFillToCap(weights []float64, maxShare float64) {
 	}
 }
 
-// weightedPick returns an index chosen with probability proportional to weights[i].
-// Assumes weights sum to ~1 and are non-negative. Falls back to the last index on
-// floating-point shortfall.
-func weightedPick(weights []float64) int {
+// weightedPick returns an index chosen with probability proportional to weights[i],
+// drawing from the supplied RNG. Assumes weights sum to ~1 and are non-negative. Falls
+// back to the last index on floating-point shortfall.
+func weightedPick(weights []float64, r randSource) int {
 	var total float64
 	for _, w := range weights {
 		total += w
 	}
-	r := rand.Float64() * total
+	target := r.Float64() * total
 	var cum float64
 	for i, w := range weights {
 		cum += w
-		if r < cum {
+		if target < cum {
 			return i
 		}
 	}

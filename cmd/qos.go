@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"strconv"
 	"strings"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -17,26 +15,6 @@ import (
 	"github.com/pokt-network/path/qos/noop"
 	"github.com/pokt-network/path/qos/solana"
 )
-
-// evmMaxOperatorShareEnvVar gates the per-operator (eTLD+1) concentration cap for EVM
-// endpoint selection. A value in (0, 1) enables the cap at that share; unset, <= 0, or
-// >= 1 disables it (flat random pick). Env-gated so it can be A/B tested on canary
-// without a redeploy, matching the WebSocket-rebind rollout pattern.
-const evmMaxOperatorShareEnvVar = "PATH_EVM_MAX_OPERATOR_SHARE"
-
-// parseMaxOperatorShareEnv reads and validates evmMaxOperatorShareEnvVar. Returns 0
-// (disabled) for an unset, unparseable, or out-of-range value.
-func parseMaxOperatorShareEnv() float64 {
-	raw := os.Getenv(evmMaxOperatorShareEnvVar)
-	if raw == "" {
-		return 0
-	}
-	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil || v <= 0 || v >= 1 {
-		return 0
-	}
-	return v
-}
 
 // getServiceQoSInstances returns all QoS instances to be used by the Gateway and the EndpointHydrator.
 // Service types are determined from the unified YAML configuration (gateway_config.services[]).
@@ -62,9 +40,6 @@ func getServiceQoSInstances(
 	// Get configured service IDs from the protocol instance.
 	gatewayServiceIDs := protocolInstance.ConfiguredServiceIDs()
 	logGatewayServiceIDs(hydratedLogger, gatewayServiceIDs)
-
-	// Per-operator concentration cap for EVM endpoint selection (canary A/B off-switch).
-	maxOperatorShare := parseMaxOperatorShareEnv()
 
 	// Remove any service IDs that are manually disabled by the user.
 	for _, disabledQoSServiceIDForGateway := range gatewayConfig.HydratorConfig.QoSDisabledServiceIDs {
@@ -92,15 +67,21 @@ func getServiceQoSInstances(
 		switch serviceType {
 		case gateway.ServiceTypeEVM:
 			evmQoS := evm.NewSimpleQoSInstanceWithSyncAllowance(qosLogger, serviceID, syncAllowance)
-			evmQoS.SetMaxOperatorShare(maxOperatorShare)
 			qosServices[serviceID] = evmQoS
 			if syncAllowance > 0 {
 				svcLogger.Info().Uint64("sync_allowance", syncAllowance).Msg("✅ EVM QoS: sync allowance ENABLED")
 			} else {
 				svcLogger.Info().Msg("⚠️ EVM QoS: sync allowance DISABLED (set sync_allowance > 0 to enable)")
 			}
-			if maxOperatorShare > 0 {
-				svcLogger.Info().Float64("max_operator_share", maxOperatorShare).Msg("✅ EVM QoS: per-operator concentration cap ENABLED")
+			// Per-operator concentration cap: bounds any single operator's share of endpoint
+			// selection (config-driven, shipped ON by default). Covers both HTTP and WebSocket
+			// initial selection via requestContext.Select.
+			if unifiedConfig != nil {
+				maxOperatorShare := unifiedConfig.GetMaxOperatorShareForService(serviceID)
+				evmQoS.SetMaxOperatorShare(maxOperatorShare)
+				if maxOperatorShare > 0 && maxOperatorShare < 1 {
+					svcLogger.Info().Float64("max_operator_share", maxOperatorShare).Msg("✅ EVM QoS: per-operator concentration cap ENABLED")
+				}
 			}
 
 		case gateway.ServiceTypeCosmos:

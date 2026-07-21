@@ -236,6 +236,10 @@ type ServiceDefaults struct {
 	TimeoutConfig        ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
 	ActiveHealthChecks   ServiceHealthCheckOverride   `yaml:"active_health_checks,omitempty"`
 	ExternalBlockSources []ExternalBlockSource        `yaml:"external_block_sources,omitempty"`
+
+	// MaxOperatorTrafficShare is the default per-operator concentration cap applied to any
+	// service that does not set its own. nil falls back to DefaultMaxOperatorShare.
+	MaxOperatorTrafficShare *float64 `yaml:"max_operator_traffic_share,omitempty"`
 }
 
 // ServiceConfig defines configuration for a single service.
@@ -263,6 +267,14 @@ type ServiceConfig struct {
 	// Unlike the auto-generated supplier blacklist (which is temporary/session-scoped),
 	// this is a persistent, config-driven blocklist.
 	BlockedSuppliers []string `yaml:"blocked_suppliers,omitempty"`
+
+	// MaxOperatorTrafficShare caps the fraction of this service's endpoint selections that
+	// any single operator (registrable domain / eTLD+1) may receive, bounding the blast
+	// radius of one operator failing when it holds most of the valid endpoint pool. The
+	// excess above the cap is spread across the other valid operators (water-filling).
+	// nil = use the global default (DefaultMaxOperatorShare). A value <= 0 or >= 1 disables
+	// the cap for this service (flat selection ∝ endpoint count).
+	MaxOperatorTrafficShare *float64 `yaml:"max_operator_traffic_share,omitempty"`
 }
 
 // UnifiedServicesConfig is the top-level configuration for the unified service system.
@@ -828,6 +840,29 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 	}
 
 	return &merged
+}
+
+// DefaultMaxOperatorShare is the per-operator concentration cap applied when neither the
+// service nor the global defaults specify one. Shipped ON: no single operator (eTLD+1)
+// receives more than this fraction of a service's endpoint selections when the valid pool
+// spans multiple operators. Tuned from production concentration data — it bounds the
+// clearly-concentrated tail (one operator holding the large majority of a service) while
+// leaving ordinary multi-operator distributions unchanged. Set a per-service or default
+// value of >= 1 (or <= 0) to disable.
+const DefaultMaxOperatorShare = 0.75
+
+// GetMaxOperatorShareForService returns the per-operator concentration cap for a service.
+// It checks per-service config first, then global defaults, then DefaultMaxOperatorShare.
+// A configured value <= 0 or >= 1 disables the cap for that service.
+func (c *UnifiedServicesConfig) GetMaxOperatorShareForService(serviceID protocol.ServiceID) float64 {
+	svc := c.GetServiceConfig(serviceID)
+	if svc != nil && svc.MaxOperatorTrafficShare != nil {
+		return *svc.MaxOperatorTrafficShare
+	}
+	if c.Defaults.MaxOperatorTrafficShare != nil {
+		return *c.Defaults.MaxOperatorTrafficShare
+	}
+	return DefaultMaxOperatorShare
 }
 
 // GetSyncAllowanceForService returns the sync allowance for a service.
