@@ -887,6 +887,12 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		metrics.RecordRetryResult(metrics.NormalizeRPCType(rpcType.String()), string(rc.serviceID), strconv.Itoa(maxAttempts-1), metrics.RetryResultFailure, totalLatency)
 	}
 
+	// Record the give-up: this relay exhausted its retries and returns an error (a 500 on the
+	// lastErr path) that path_requests_total does not count. relay_exhausted_total closes that
+	// blind spot; the `capability` category isolates backend-reported unavailable
+	// historical/pruned state — a client asking for data the node does not retain.
+	metrics.RecordRelayExhausted(string(rc.serviceID), metrics.NormalizeRPCType(rpcType.String()), relayExhaustionCategory(lastHeuristicResult, lastErr))
+
 	if lastErr != nil {
 		logger.Error().Err(lastErr).
 			Int("max_attempts", maxAttempts).
@@ -905,6 +911,26 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	// Set the protocol error on QoS context for more informative client error messages
 	rc.qosCtx.SetProtocolError(statusErr)
 	return statusErr
+}
+
+// relayExhaustionCategory classifies why a relay exhausted its retries, for the
+// relay_exhausted_total metric:
+//   - capability: the backend correctly reported unavailable historical/pruned state
+//     (IsCapabilityLimitationError) — a client asking for data the node does not retain.
+//   - heuristic: any other heuristic-detected error payload in a 2xx response.
+//   - transport: a connection/protocol error with no heuristic result.
+//   - status: a non-success HTTP status with neither of the above.
+func relayExhaustionCategory(hr *heuristic.AnalysisResult, err error) string {
+	if hr != nil {
+		if heuristic.IsCapabilityLimitationError(hr.MatchedPattern) {
+			return "capability"
+		}
+		return "heuristic"
+	}
+	if err != nil {
+		return "transport"
+	}
+	return "status"
 }
 
 // batchPayloadResult holds the result of processing a single payload in a batch.

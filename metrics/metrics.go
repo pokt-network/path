@@ -960,6 +960,28 @@ func RecordRetryResult(rpcType, serviceID, retryCount, result string, latencySec
 	RetryResultsLatency.WithLabelValues(rpcType, serviceID, retryCount, result).Observe(latencySeconds)
 }
 
+// RelayExhaustedTotal counts relay requests that exhausted all retry attempts and returned an
+// error (HTTP 500) to the client, by service_id, rpc_type, and category. These 500s are
+// produced on the relay-failure path and are NOT reflected in path_requests_total (which is
+// recorded only for completed relays), so this counter is the visibility into that blind spot
+// — the gap between what the edge proxy sees on the wire and what PATH's own request metric
+// reports. The `capability` category isolates exhaustions where the backend correctly reported
+// unavailable historical/pruned state (a client asking for data the node does not retain),
+// which PATH currently retries as a blockchain error before giving up.
+var RelayExhaustedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "relay_exhausted_total",
+		Help: "Relay requests that exhausted all retries and returned 500 to the client, by service_id, rpc_type, and category (capability/heuristic/transport/status). NOT counted in path_requests_total.",
+	},
+	[]string{LabelServiceID, LabelRPCType, "category"},
+)
+
+// RecordRelayExhausted records a relay that exhausted all retries and returned 500 to the
+// client. category classifies the last failure (capability/heuristic/transport/status).
+func RecordRelayExhausted(serviceID, rpcType, category string) {
+	RelayExhaustedTotal.WithLabelValues(serviceID, rpcType, category).Inc()
+}
+
 // =============================================================================
 // Hedge Request Metrics (Counter + Histogram)
 // Labels: rpc_type, service_id, result
