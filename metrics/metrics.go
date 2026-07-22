@@ -834,6 +834,13 @@ const (
 	WSRebindFailedReplay       = "failed_replay"        // reconnected, but building/writing subscription replay frames failed
 	WSRebindFailedSelect       = "failed_select"        // generic selection failure with no more specific reason
 
+	// --- WebSocket session-rebind trigger labels (experimental)
+	// The `trigger` dimension of WebsocketRebindTotal: what initiated the rebind episode,
+	// so the outcome mix can be read per cause (e.g. whether stalls rotate suppliers more
+	// often than routine rollovers).
+	WSRebindTriggerRollover = "rollover" // routine Shannon session-boundary reconnect
+	WSRebindTriggerStall    = "stall"    // staleness watchdog forced a rebind off a silent supplier
+
 	// --- WebSocket endpoint-staleness watchdog result labels (experimental)
 	// The `result` dimension of WebsocketEndpointStallTotal. A stall is a silent supplier
 	// (endpoint transport alive, no subscription data past the staleness threshold) that
@@ -888,9 +895,9 @@ var WebsocketMessagesTotal = promauto.NewCounterVec(
 var WebsocketRebindTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "websocket_rebind_total",
-		Help: "WebSocket session-rebind episodes by domain, service_id, and result (success_same_supplier/success_different_supplier/failed_*). EXPERIMENTAL.",
+		Help: "WebSocket session-rebind episodes by domain, service_id, result (success_same_supplier/success_different_supplier/failed_*), and trigger (rollover/stall). EXPERIMENTAL.",
 	},
-	[]string{LabelDomain, LabelServiceID, "result"},
+	[]string{LabelDomain, LabelServiceID, "result", "trigger"},
 )
 
 // WebsocketSubscriptionsReplayedTotal counts subscriptions replayed onto a
@@ -1227,9 +1234,10 @@ func RecordWebsocketMessage(domain, serviceID, direction, reputationSignal strin
 
 // RecordWebsocketRebind records a websocket session-rebind episode outcome and, on
 // success, the number of subscriptions replayed. EXPERIMENTAL / canary observability
-// for the session-rebind feature. result should be one of the WSRebind* labels.
-func RecordWebsocketRebind(domain, serviceID, result string, replayedSubscriptions int) {
-	WebsocketRebindTotal.WithLabelValues(domain, serviceID, result).Inc()
+// for the session-rebind feature. result should be one of the WSRebind* labels; trigger
+// one of the WSRebindTrigger* labels (what initiated the rebind).
+func RecordWebsocketRebind(domain, serviceID, result, trigger string, replayedSubscriptions int) {
+	WebsocketRebindTotal.WithLabelValues(domain, serviceID, result, trigger).Inc()
 	if replayedSubscriptions > 0 {
 		WebsocketSubscriptionsReplayedTotal.WithLabelValues(domain, serviceID).Add(float64(replayedSubscriptions))
 	}

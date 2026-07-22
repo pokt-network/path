@@ -33,7 +33,7 @@ func Test_chooseRebindEndpoint_CapDisabled_ReusesOriginal(t *testing.T) {
 
 	for _, disabled := range []float64{0.0, 1.0, -1.0} {
 		ep, different, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, disabled, noScore,
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, disabled, false, noScore,
 		)
 		c.NoError(err)
 		c.Empty(reason)
@@ -52,7 +52,7 @@ func Test_chooseRebindEndpoint_CapDisabled_OriginalRotatedOut(t *testing.T) {
 	ghost := protocol.EndpointAddr("pokt1ghost-https://n.ghost.tech") // not in the session
 
 	ep, different, reason, err := chooseRebindEndpoint(
-		testLogger(), "svc", cloneEndpoints(endpoints), ghost, false, 0.0, noScore,
+		testLogger(), "svc", cloneEndpoints(endpoints), ghost, false, 0.0, false, noScore,
 	)
 	c.NoError(err)
 	c.Empty(reason)
@@ -79,7 +79,7 @@ func Test_chooseRebindEndpoint_CapEngaged_SpreadsAcrossOperators(t *testing.T) {
 	rotatedOff := false
 	for i := 0; i < 400; i++ {
 		ep, different, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, 0.5, noScore,
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, 0.5, false, noScore,
 		)
 		c.NoError(err)
 		c.Empty(reason)
@@ -106,7 +106,7 @@ func Test_chooseRebindEndpoint_CapEngaged_SingleEndpointNeverFails(t *testing.T)
 	endpoints := map[protocol.EndpointAddr]endpoint{solo.Addr(): solo}
 
 	ep, different, reason, err := chooseRebindEndpoint(
-		testLogger(), "svc", cloneEndpoints(endpoints), solo.Addr(), false, 0.5, noScore,
+		testLogger(), "svc", cloneEndpoints(endpoints), solo.Addr(), false, 0.5, false, noScore,
 	)
 	c.NoError(err)
 	c.Empty(reason)
@@ -134,7 +134,7 @@ func Test_chooseRebindEndpoint_CapEngaged_StrictlyBestOriginalWins(t *testing.T)
 
 	for i := 0; i < 50; i++ {
 		ep, different, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), best.Addr(), false, 0.5, scoreOf,
+			testLogger(), "svc", cloneEndpoints(endpoints), best.Addr(), false, 0.5, false, scoreOf,
 		)
 		c.NoError(err)
 		c.Empty(reason)
@@ -152,7 +152,7 @@ func Test_chooseRebindEndpoint_CapEngaged_OriginalRotatedOut(t *testing.T) {
 	ghost := protocol.EndpointAddr("pokt1ghost-https://n.ghost.tech")
 
 	ep, different, reason, err := chooseRebindEndpoint(
-		testLogger(), "svc", cloneEndpoints(endpoints), ghost, false, 0.5, noScore,
+		testLogger(), "svc", cloneEndpoints(endpoints), ghost, false, 0.5, false, noScore,
 	)
 	c.NoError(err)
 	c.Empty(reason)
@@ -172,7 +172,7 @@ func Test_chooseRebindEndpoint_AvoidPreferred_ExcludesOriginal(t *testing.T) {
 
 	for i := 0; i < 100; i++ {
 		ep, different, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), preferred, true, 0.5, noScore,
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, true, 0.5, false, noScore,
 		)
 		c.NoError(err)
 		c.Empty(reason)
@@ -191,10 +191,63 @@ func Test_chooseRebindEndpoint_AvoidPreferred_OnlyOriginal_Errors(t *testing.T) 
 	endpoints := map[protocol.EndpointAddr]endpoint{solo.Addr(): solo}
 
 	ep, different, reason, err := chooseRebindEndpoint(
-		testLogger(), "svc", cloneEndpoints(endpoints), solo.Addr(), true, 0.5, noScore,
+		testLogger(), "svc", cloneEndpoints(endpoints), solo.Addr(), true, 0.5, false, noScore,
 	)
 	c.Error(err)
 	c.Nil(ep)
 	c.False(different)
 	c.Equal(metrics.WSRebindFailedNoEndpoints, reason)
+}
+
+// Test_chooseRebindEndpoint_OperatorUniform_EqualizesOperatorShare verifies the operator-
+// uniform strategy: each operator gets ~equal share regardless of endpoint count. op0 owns
+// 8 of 10 endpoints, yet lands ~1/3 — the opposite of the endpoint-weighted cap, which would
+// concentrate on op0.
+func Test_chooseRebindEndpoint_OperatorUniform_EqualizesOperatorShare(t *testing.T) {
+	c := require.New(t)
+
+	endpoints, ops := buildOperatorEndpoints([]int{8, 1, 1})
+	preferred := anyAddr(endpoints)
+
+	counts := map[string]int{}
+	const N = 3000
+	for i := 0; i < N; i++ {
+		ep, _, reason, err := chooseRebindEndpoint(
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, 0.65, true, noScore,
+		)
+		c.NoError(err)
+		c.Empty(reason)
+		counts[opOfAddr(string(ep.Addr()))]++
+	}
+	for _, op := range ops {
+		share := float64(counts[op]) / float64(N)
+		c.InDelta(1.0/3.0, share, 0.06, "operator %s share %.3f should be ~1/3 under operator-uniform", op, share)
+	}
+}
+
+// Test_chooseRebindEndpoint_OperatorUniform_RotatesWithCapDisabled verifies operator-uniform
+// forces rotation even when the concentration cap is disabled (where the cap path would pin
+// the original). The original stays eligible, so it is sometimes re-picked but never pinned.
+func Test_chooseRebindEndpoint_OperatorUniform_RotatesWithCapDisabled(t *testing.T) {
+	c := require.New(t)
+
+	endpoints, _ := buildOperatorEndpoints([]int{2, 2, 2})
+	preferred := anyAddr(endpoints)
+
+	seenOps := map[string]bool{}
+	rotatedOff := false
+	for i := 0; i < 300; i++ {
+		ep, different, reason, err := chooseRebindEndpoint(
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, 0.0 /* cap off */, true /* operator-uniform */, noScore,
+		)
+		c.NoError(err)
+		c.Empty(reason)
+		c.Equal(ep.Addr() != preferred, different)
+		seenOps[opOfAddr(string(ep.Addr()))] = true
+		if ep.Addr() != preferred {
+			rotatedOff = true
+		}
+	}
+	c.GreaterOrEqual(len(seenOps), 2, "operator-uniform must rotate even with the cap disabled")
+	c.True(rotatedOff, "operator-uniform must sometimes rotate off the original supplier")
 }

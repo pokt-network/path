@@ -91,6 +91,11 @@ type websocketRequestContext struct {
 	// failed selection or dial, consumed by OnReconnectOutcome. Bridge-goroutine only.
 	lastReconnectReason string
 
+	// lastReconnectTrigger holds what initiated the most recent rebind episode
+	// (WSRebindTriggerRollover / WSRebindTriggerStall), consumed by OnReconnectOutcome to
+	// tag the metric. Bridge-goroutine only.
+	lastReconnectTrigger string
+
 	// reputationService tracks endpoint reputation scores.
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
 	reputationService reputation.ReputationService
@@ -381,10 +386,15 @@ func (p *Protocol) getReconnectEndpoint(
 		return nil, false, metrics.WSRebindFailedNoEndpoints, err
 	}
 
-	// Per-operator concentration cap for the rebind target (config-driven, shipped ON).
+	// Rebind selection strategy (config-driven, both shipped ON):
+	//   - operatorUniform: spread the rebind target uniformly across operators.
+	//   - maxOperatorShare: the endpoint-count-weighted concentration cap, used when
+	//     operator-uniform is disabled.
 	maxOperatorShare := 0.0
+	operatorUniform := gateway.DefaultWebsocketRebindOperatorUniform
 	if p.unifiedServicesConfig != nil {
 		maxOperatorShare = p.unifiedServicesConfig.GetMaxOperatorShareForService(serviceID)
+		operatorUniform = p.unifiedServicesConfig.GetWebsocketRebindOperatorUniformForService(serviceID)
 	}
 
 	return chooseRebindEndpoint(
@@ -394,6 +404,7 @@ func (p *Protocol) getReconnectEndpoint(
 		preferredAddr,
 		avoidPreferred,
 		maxOperatorShare,
+		operatorUniform,
 		p.websocketReconnectScoreFunc(ctx, serviceID, endpoints),
 	)
 }
@@ -406,13 +417,17 @@ func (p *Protocol) getReconnectEndpoint(
 //   - avoidPreferred (staleness watchdog): the currently bound supplier is stalling, so
 //     exclude it and force a different supplier. If it was the only endpoint there is nothing
 //     to escape to → error so the bridge closes the client.
-//   - Cap DISABLED (maxOperatorShare <= 0 or >= 1): keep seamless tier-1 reuse — reuse the
-//     original supplier+URL if still present. Load-bearing: with the cap off the capped
-//     selector collapses to a deterministic smallest-address pick that would funnel every
-//     connection onto one endpoint.
-//   - Cap ENGAGED: skip the reuse shortcut and route through the capped selector so the
-//     connection re-spreads across the tied-best operator band. The original endpoint stays a
-//     candidate, so a rebind that lands back on it is still reported as seamless.
+//   - ROTATE (operator-uniform on, or the concentration cap engaged): skip the reuse shortcut
+//     and route through the selected strategy so the connection re-spreads across operators.
+//     The original endpoint stays a candidate, so a rebind that lands back on it is still
+//     reported as seamless.
+//   - PIN (operator-uniform off AND cap disabled): keep seamless tier-1 reuse — reuse the
+//     original supplier+URL if still present. Load-bearing when the cap is the only strategy:
+//     with it off the capped selector collapses to a deterministic smallest-address pick that
+//     would funnel every connection onto one endpoint.
+//
+// operatorUniform selects the rotation strategy: uniform-over-operators (true) vs the
+// endpoint-count-weighted concentration cap (false).
 //
 // Returns (endpoint, differentSupplier, failureReason, error): differentSupplier is true when
 // the rebind re-homed onto a different endpoint than the original.
@@ -423,6 +438,7 @@ func chooseRebindEndpoint(
 	preferredAddr protocol.EndpointAddr,
 	avoidPreferred bool,
 	maxOperatorShare float64,
+	operatorUniform bool,
 	scoreOf func(endpoint) float64,
 ) (endpoint, bool, string, error) {
 	// Staleness rebind: the current supplier is the one stalling, so exclude it and force
@@ -434,7 +450,7 @@ func chooseRebindEndpoint(
 			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape a stalling supplier", protocol.ErrEndpointUnavailable, serviceID)
 			return nil, false, metrics.WSRebindFailedNoEndpoints, err
 		}
-		ep := selectReconnectEndpointWithCap(serviceID, endpoints, scoreOf, maxOperatorShare)
+		ep := selectRebindEndpoint(serviceID, endpoints, scoreOf, maxOperatorShare, operatorUniform)
 		logger.Warn().
 			Str("stalling_endpoint", string(preferredAddr)).
 			Str("replacement_endpoint", string(ep.Addr())).
@@ -443,21 +459,21 @@ func chooseRebindEndpoint(
 		return ep, true, "", nil
 	}
 
-	// Rotation policy hinges on the cap: with it OFF, the capped selector collapses to a
-	// deterministic smallest-address pick that would funnel every connection onto one
-	// endpoint, so keep seamless tier-1 reuse. With it ON, skip the reuse shortcut and let
-	// the capped selector re-spread the connection across the tied-best operator band.
-	capEngaged := maxOperatorShare > 0 && maxOperatorShare < 1
-	if !capEngaged {
-		// Cap disabled: original supplier+URL still present → seamless rebind.
+	// Rotate when a spreading strategy is active (operator-uniform, or the cap engaged).
+	// Otherwise (both off) keep seamless tier-1 reuse: the disabled cap selector collapses to
+	// a deterministic smallest-address pick that would funnel every connection onto one
+	// endpoint, so reusing the original is strictly better than rotating there.
+	rotate := operatorUniform || (maxOperatorShare > 0 && maxOperatorShare < 1)
+	if !rotate {
+		// Pin: original supplier+URL still present → seamless rebind.
 		if ep, ok := endpoints[preferredAddr]; ok {
 			return ep, false, "", nil
 		}
 	}
 
-	// Capped rotation (or original rotated out): pick across the tied-best band. The
+	// Rotation (or original rotated out): pick a target via the selected strategy. The
 	// original endpoint is still in `endpoints` when present, so it remains a candidate.
-	ep := selectReconnectEndpointWithCap(serviceID, endpoints, scoreOf, maxOperatorShare)
+	ep := selectRebindEndpoint(serviceID, endpoints, scoreOf, maxOperatorShare, operatorUniform)
 
 	// A rebind that lands back on the original endpoint is a seamless outcome — same node,
 	// no supplier change to report.
@@ -481,6 +497,50 @@ func chooseRebindEndpoint(
 			Msg("🔀 [WS-REBIND] original supplier rotated out — rebinding to a different supplier for the current session")
 	}
 	return ep, true, "", nil
+}
+
+// selectRebindEndpoint dispatches to the configured rebind selection strategy:
+// operator-uniform spread (operatorUniform=true) or the endpoint-count-weighted
+// concentration cap (false). Both operate over the tied-best band and fall back to the
+// deterministic pick when there is nothing to spread.
+func selectRebindEndpoint(
+	serviceID protocol.ServiceID,
+	endpoints map[protocol.EndpointAddr]endpoint,
+	scoreOf func(endpoint) float64,
+	maxOperatorShare float64,
+	operatorUniform bool,
+) endpoint {
+	if operatorUniform {
+		return selectReconnectEndpointOperatorUniform(serviceID, endpoints, scoreOf)
+	}
+	return selectReconnectEndpointWithCap(serviceID, endpoints, scoreOf, maxOperatorShare)
+}
+
+// selectReconnectEndpointOperatorUniform picks a rebind target so every operator in the
+// tied-best band is equally likely (then an endpoint uniformly within it) — the strongest
+// per-provider spread, giving a thin operator the same share as a large one. Restricting to
+// the tied-best band keeps selection reputation-aware (a degraded endpoint is never a rebind
+// target just because its operator is thin). With a single candidate or a single-endpoint
+// band it reduces to the deterministic pick.
+func selectReconnectEndpointOperatorUniform(
+	serviceID protocol.ServiceID,
+	endpoints map[protocol.EndpointAddr]endpoint,
+	scoreOf func(endpoint) float64,
+) endpoint {
+	if len(endpoints) <= 1 {
+		return selectBestReconnectEndpoint(endpoints, scoreOf)
+	}
+	band := reconnectTopBand(endpoints, scoreOf)
+	if len(band) <= 1 {
+		return selectBestReconnectEndpoint(endpoints, scoreOf)
+	}
+	chosen := selector.SelectOperatorUniform(serviceID, band)
+	if ep, ok := endpoints[chosen]; ok {
+		return ep
+	}
+	// Defensive: SelectOperatorUniform always returns a band member; fall back rather than
+	// return nil if that ever changes.
+	return selectBestReconnectEndpoint(endpoints, scoreOf)
 }
 
 // selectBestReconnectEndpoint chooses an endpoint from the new session for a tier-2 rebind
@@ -959,6 +1019,14 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoid
 		return nil, fmt.Errorf("websocket session rebind not configured")
 	}
 
+	// Record what triggered this rebind so OnReconnectOutcome can tag the metric: the
+	// staleness watchdog sets avoidCurrentSupplier, everything else is a routine rollover.
+	if avoidCurrentSupplier {
+		wrc.lastReconnectTrigger = metrics.WSRebindTriggerStall
+	} else {
+		wrc.lastReconnectTrigger = metrics.WSRebindTriggerRollover
+	}
+
 	// Re-select an endpoint for the current session: the original supplier if it is still
 	// in the new session (seamless), else the best-available endpoint (tier-2). When
 	// avoidCurrentSupplier is set (staleness watchdog), the original supplier is excluded
@@ -1059,7 +1127,11 @@ func (wrc *websocketRequestContext) OnReconnectOutcome(success bool, replayedSub
 	serviceID := string(wrc.serviceID)
 
 	result := wrc.reconnectResultLabel(success, stage)
-	metrics.RecordWebsocketRebind(domain, serviceID, result, replayedSubscriptions)
+	trigger := wrc.lastReconnectTrigger
+	if trigger == "" {
+		trigger = metrics.WSRebindTriggerRollover
+	}
+	metrics.RecordWebsocketRebind(domain, serviceID, result, trigger, replayedSubscriptions)
 
 	// Error level ON PURPOSE for canary visibility. Temporary — downgrade once validated.
 	wrc.logger.Error().
@@ -1067,6 +1139,7 @@ func (wrc *websocketRequestContext) OnReconnectOutcome(success bool, replayedSub
 		Bool("different_supplier", wrc.lastReconnectDifferentSupplier).
 		Int("replayed_subscriptions", replayedSubscriptions).
 		Str("result", result).
+		Str("trigger", trigger).
 		Msg("📈 [WS-REBIND] rebind outcome recorded")
 }
 

@@ -112,6 +112,49 @@ func SelectWithConcentrationCap(
 	return eps[rand.Intn(len(eps))]
 }
 
+// SelectOperatorUniform picks one endpoint so that every operator (eTLD+1) present is equally
+// likely, then an endpoint uniformly within the chosen operator. Unlike
+// SelectWithConcentrationCap — which is endpoint-count-weighted and only trims the mass a
+// dominant operator holds *above* the cap — this gives each operator an identical share
+// regardless of how many endpoints it runs. It is the strongest per-operator spread, used
+// for the WebSocket rebind path where distributing connections across providers matters more
+// than matching endpoint capacity.
+//
+// Trade-off: a thin operator receives the same share as a large one, so a single-endpoint
+// operator absorbs a full 1/m of the load. Callers that cannot tolerate overloading a small
+// provider should use the concentration cap instead.
+//
+// Endpoints whose eTLD+1 cannot be resolved are each their own singleton operator (via
+// operatorKey), never merged. serviceID is currently unused but kept for signature symmetry
+// with SelectWithConcentrationCap and future metric attribution.
+func SelectOperatorUniform(
+	serviceID protocol.ServiceID,
+	validEndpoints protocol.EndpointAddrList,
+) protocol.EndpointAddr {
+	_ = serviceID
+	n := len(validEndpoints)
+	if n == 0 {
+		return protocol.EndpointAddr("")
+	}
+	if n == 1 {
+		return validEndpoints[0]
+	}
+
+	operatorEndpoints := make(map[string]protocol.EndpointAddrList)
+	operatorOrder := make([]string, 0)
+	for _, ep := range validEndpoints {
+		k := operatorKey(ep)
+		if _, seen := operatorEndpoints[k]; !seen {
+			operatorOrder = append(operatorOrder, k)
+		}
+		operatorEndpoints[k] = append(operatorEndpoints[k], ep)
+	}
+
+	// Uniform over operators, then uniform within the chosen operator.
+	eps := operatorEndpoints[operatorOrder[rand.Intn(len(operatorOrder))]]
+	return eps[rand.Intn(len(eps))]
+}
+
 // operatorKey returns the operator bucket for an endpoint: its eTLD+1, or the endpoint
 // address itself when the eTLD+1 cannot be resolved (so unresolvable endpoints stay
 // singletons and are never merged, which would fabricate concentration).

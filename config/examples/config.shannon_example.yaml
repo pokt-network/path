@@ -286,6 +286,13 @@ gateway_config:
       # Ships ON by default at 0.65 for every service — set a value here to override, or
       # 1.0 (or 0) to disable it for this service.
       # max_operator_share: 0.6
+      # WebSocket rebind strategy (optional). When true (the default), a session-rollover
+      # rebind spreads the target uniformly across operators (each provider equally likely),
+      # then picks an endpoint within it — maximizing per-provider spread. When false, the
+      # rebind uses the endpoint-count-weighted max_operator_share cap instead. Note:
+      # operator-uniform gives a single-endpoint operator the same share as a large one, so
+      # disable it per-service if that overloads a small provider.
+      # websocket_rebind_operator_uniform: true
       # External block sources for ground-truth validation (optional)
       # Multiple sources provide redundancy — the max height across all is used.
       # If all session endpoints are behind the real chain tip, these correct it.

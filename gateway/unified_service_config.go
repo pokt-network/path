@@ -277,6 +277,10 @@ type ServiceDefaults struct {
 	// MaxOperatorShare is the default per-operator concentration cap applied to any
 	// service that does not set its own. nil falls back to DefaultMaxOperatorShare.
 	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
+
+	// WebsocketRebindOperatorUniform is the default WebSocket rebind selection strategy.
+	// nil falls back to DefaultWebsocketRebindOperatorUniform (ON).
+	WebsocketRebindOperatorUniform *bool `yaml:"websocket_rebind_operator_uniform,omitempty"`
 }
 
 // ServiceConfig defines configuration for a single service.
@@ -322,6 +326,18 @@ type ServiceConfig struct {
 	// multi-endpoint selection (parallel fan-out / hedge), which draw from the same
 	// reputation-filtered pool via separate code paths.
 	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
+
+	// WebsocketRebindOperatorUniform selects the WebSocket rebind strategy for this service.
+	// When true (the default), a session-rollover rebind picks the target operator uniformly
+	// (every provider equally likely), then an endpoint within it — maximizing per-provider
+	// spread. When false, the rebind uses the endpoint-count-weighted concentration cap
+	// (MaxOperatorShare) instead. nil = use the global default
+	// (ServiceDefaults.WebsocketRebindOperatorUniform, then DefaultWebsocketRebindOperatorUniform).
+	//
+	// Note: operator-uniform gives a thin operator the same share as a large one regardless
+	// of endpoint count, so a single-endpoint operator absorbs a full operator-share of the
+	// WebSocket load. Disable per-service if that overloads a small provider.
+	WebsocketRebindOperatorUniform *bool `yaml:"websocket_rebind_operator_uniform,omitempty"`
 }
 
 // UnifiedServicesConfig is the top-level configuration for the unified service system.
@@ -948,6 +964,27 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 // for services with as few as two operators. Set a per-service or default value of >= 1
 // (or <= 0) to disable.
 const DefaultMaxOperatorShare = 0.65
+
+// DefaultWebsocketRebindOperatorUniform is the WebSocket rebind strategy applied when neither
+// the service nor the global defaults specify one. Shipped ON: a session-rollover rebind
+// spreads uniformly across operators (each provider equally likely) rather than by endpoint
+// count, so no single operator accumulates WebSocket connections in proportion to its
+// (often dominant) endpoint share.
+const DefaultWebsocketRebindOperatorUniform = true
+
+// GetWebsocketRebindOperatorUniformForService returns whether the WebSocket rebind should
+// pick the target operator uniformly (true) or via the endpoint-count-weighted concentration
+// cap (false). It checks per-service config first, then global defaults, then
+// DefaultWebsocketRebindOperatorUniform.
+func (c *UnifiedServicesConfig) GetWebsocketRebindOperatorUniformForService(serviceID protocol.ServiceID) bool {
+	if svc := c.GetServiceConfig(serviceID); svc != nil && svc.WebsocketRebindOperatorUniform != nil {
+		return *svc.WebsocketRebindOperatorUniform
+	}
+	if c.Defaults.WebsocketRebindOperatorUniform != nil {
+		return *c.Defaults.WebsocketRebindOperatorUniform
+	}
+	return DefaultWebsocketRebindOperatorUniform
+}
 
 // GetMaxOperatorShareForService returns the per-operator concentration cap for a service.
 // It checks per-service config first, then global defaults, then DefaultMaxOperatorShare.
