@@ -259,6 +259,8 @@ gateway_config:
   # - fallback: Fallback endpoints (no defaults - must be explicitly configured)
   # - health_checks: Per-service health check rules
   # - external_block_sources: External RPC endpoints for ground-truth block height validation
+  # - static_routes: Fixed responses served by the gateway for a given path, without
+  #   relaying to a backend (e.g. a small service metadata/identity endpoint)
 
   services:
     # -------------------------------------------------------------------------
@@ -295,6 +297,19 @@ gateway_config:
       #   - url: "https://rpc.ankr.com/eth"
       #     interval: 30s
       #     timeout: 5s
+      # Static routes (optional): serve a fixed response for a path directly from the
+      # gateway, bypassing endpoint selection and the relay. Matching is exact on `path`
+      # (evaluated after the /v1 and portal-app-id prefixes are stripped) and, when set,
+      # on the request method. A per-service route overrides a global default on the same
+      # path. `path: "/"` is rejected (it would shadow all relay traffic).
+      # static_routes:
+      #   - path: /identity
+      #     # methods: ["GET"]              # optional; empty = any method
+      #     # status_code: 200              # optional; default 200
+      #     # content_type: text/plain      # optional; default text/plain
+      #     body: "<value-served-at-this-path>"
+      #     # headers:                       # optional extra response headers
+      #     #   Cache-Control: "public, max-age=3600"
 
     - id: poly
       type: "evm"

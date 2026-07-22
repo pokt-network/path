@@ -344,6 +344,7 @@ func main() {
 		config.GetRouterConfig(),
 		gtw.DomainCircuitBreaker,
 		chainStateAdmin,
+		unifiedServicesConfig,
 	)
 
 	// -------------------- Start PATH API Router --------------------

@@ -37,9 +37,18 @@ type (
 		healthChecker                 *health.Checker
 		circuitBreakerAdmin           CircuitBreakerAdmin
 		chainStateAdmin               ChainStateAdmin
+		staticResponses               StaticResponseResolver
 	}
 	gatewayHandler interface {
 		HandleServiceRequest(context.Context, *http.Request, http.ResponseWriter)
+	}
+	// StaticResponseResolver returns a fixed response configured for a service's request
+	// path and method, bypassing the relay pipeline. ok=false means no static route applies
+	// and the request should be relayed normally. The returned headers always include
+	// Content-Type and are safe to write directly onto the response. May be nil, in which
+	// case no static routes are served.
+	StaticResponseResolver interface {
+		ResolveStaticResponse(serviceID, path, method string) (body []byte, statusCode int, headers map[string]string, ok bool)
 	}
 	disqualifiedEndpointsReporter interface {
 		ReportEndpointStatus(protocol.ServiceID, *http.Request) (devtools.DisqualifiedEndpointResponse, error)
@@ -67,6 +76,7 @@ func NewRouter(
 	config config.RouterConfig,
 	circuitBreakerAdmin CircuitBreakerAdmin,
 	chainStateAdmin ChainStateAdmin,
+	staticResponses StaticResponseResolver,
 ) *router {
 	r := &router{
 		logger: logger.With("package", "router"),
@@ -79,6 +89,7 @@ func NewRouter(
 		healthChecker:                 healthChecker,
 		circuitBreakerAdmin:           circuitBreakerAdmin,
 		chainStateAdmin:               chainStateAdmin,
+		staticResponses:               staticResponses,
 	}
 	r.handleRoutes()
 	return r
@@ -116,8 +127,10 @@ func (r *router) handleRoutes() {
 	// POST /admin/chain-state/clear/{serviceId} - resets perceived block height (in-memory + Redis)
 	r.mux.HandleFunc("POST /admin/chain-state/clear/", r.handleChainStateClear)
 
-	// requestHandlerFn defines the middleware chain for all service requests
-	requestHandlerFn := r.corsMiddleware(r.removeGrovePortalPrefixMiddleware(r.handleServiceRequest))
+	// requestHandlerFn defines the middleware chain for all service requests.
+	// staticResponseMiddleware runs after the prefix strip (so it sees the cleaned path)
+	// and before the relay handler, short-circuiting any configured static route.
+	requestHandlerFn := r.corsMiddleware(r.removeGrovePortalPrefixMiddleware(r.staticResponseMiddleware(r.handleServiceRequest)))
 
 	// */v1/ - handles service requests with trailing slash, including REST services with additional path segments
 	r.mux.HandleFunc(gateway.APIVersionPrefix+"/", requestHandlerFn)
@@ -232,6 +245,39 @@ func (r *router) removeGrovePortalPrefixMiddleware(next http.HandlerFunc) http.H
 		}
 
 		next(w, req)
+	}
+}
+
+// staticResponseMiddleware serves a configured fixed response for a service+path+method,
+// short-circuiting the relay pipeline. It runs on the cleaned request path (after the
+// API-version and portal-app-id prefixes are stripped) so a config path like "/identity"
+// matches regardless of the portal prefix. WebSocket upgrades are never intercepted — they
+// connect at the relay root, and a static route matches an exact non-root path only.
+// A nil resolver (not configured, or in tests) is a pass-through.
+func (r *router) staticResponseMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if r.staticResponses == nil || req.Header.Get("Upgrade") != "" {
+			next(w, req)
+			return
+		}
+
+		serviceID := req.Header.Get(request.HTTPHeaderTargetServiceID)
+		body, statusCode, headers, ok := r.staticResponses.ResolveStaticResponse(serviceID, req.URL.Path, req.Method)
+		if !ok {
+			next(w, req)
+			return
+		}
+
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(statusCode)
+		if _, err := w.Write(body); err != nil {
+			r.logger.Warn().Err(err).
+				Str("service_id", serviceID).
+				Str("path", req.URL.Path).
+				Msg("failed to write static response body")
+		}
 	}
 }
 
