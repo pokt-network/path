@@ -167,9 +167,10 @@ func (p *Protocol) BuildWebsocketRequestContextForEndpoint(
 	// Enable websocket session rebind: track subscriptions and give the bridge a way to
 	// re-select an endpoint for the current session on a rollover. When disabled, both
 	// stay nil and the bridge tears the connection down on a rollover (pre-rebind
-	// behavior). getReconnectEndpoint re-fetches the current session and prefers the
-	// original supplier, falling back to the best-available endpoint if that supplier
-	// rotated out of the new session.
+	// behavior). getReconnectEndpoint re-fetches the current session and re-selects an
+	// endpoint per its rotation policy (with the per-operator cap engaged it re-spreads
+	// across operators rather than pinning the original supplier), falling back to the
+	// best-available endpoint if the original supplier rotated out of the new session.
 	if p.websocketSessionRebindEnabled {
 		wrc.registry = websockets.NewSubscriptionRegistry()
 		wrc.reconnectProvider = func(reconnectCtx context.Context, avoidCurrent bool) (endpoint, bool, string, error) {
@@ -313,26 +314,37 @@ func (p *Protocol) getPreSelectedEndpoint(
 }
 
 // getReconnectEndpoint re-selects a websocket endpoint for the CURRENT session on a
-// session rollover. It is the tier-1/tier-2 rebind selector:
+// session rollover. Its selection policy depends on whether the per-operator concentration
+// cap is engaged for the service:
 //
-//   - Tier 1 (seamless): if the ORIGINAL supplier+URL is still in the new session, reuse
-//     it. Same node → no data seam for the client's subscriptions.
-//   - Tier 2 (survive rotation): if that supplier rotated out — the common case for
-//     large-pool services, where the pinned supplier persists only ~NumSuppliersPerSession
-//     / poolSize of the time — fall back to the best-available endpoint in the new session
-//     so the client's connection survives regardless. Shannon supplier rotation is a
-//     protocol detail; the client only wants uninterrupted RPC data.
+//   - Cap ENGAGED (0 < maxOperatorShare < 1): do NOT auto-prefer the original supplier.
+//     Route every rebind through the capped selector so WebSocket connections re-spread
+//     across the tied-best operator band each session boundary instead of pinning to
+//     whichever supplier was selected first. The original endpoint stays eligible (it is
+//     still in the candidate set), so a 1-endpoint pool never fails and a strictly-best
+//     original still wins — only the tied band is reshuffled. Rotating off a still-present
+//     supplier is cheap: the bridge already replays subscriptions on any rebind.
+//   - Cap DISABLED (maxOperatorShare <= 0 or >= 1): keep the seamless tier-1 behavior — if
+//     the ORIGINAL supplier+URL is still in the new session, reuse it (same node → no data
+//     seam). This is load-bearing: with the cap off the capped selector collapses to a
+//     deterministic smallest-address pick, which would funnel ALL connections onto one
+//     endpoint — strictly worse than pinning.
+//
+// In both cases, if the original supplier rotated OUT of the new session, selection falls
+// back to the best-available endpoint so the client's connection survives regardless.
+// Shannon supplier rotation is a protocol detail; the client only wants uninterrupted data.
 //
 // Only when the new session has zero usable endpoints (or session lookup fails) does it
 // error, letting the bridge fall back to closing the client with reconnect guidance.
 //
 // Returns (endpoint, differentSupplier, failureReason, error): differentSupplier is true
-// when tier-2 chose a new supplier; failureReason is a metrics label on error.
+// when the rebind re-homed the connection onto a different endpoint than the original;
+// failureReason is a metrics label on error.
 //
-// avoidPreferred skips tier-1 and excludes preferredAddr from the candidate set: the
-// staleness watchdog sets it because the currently bound supplier is the one stalling, so
-// reselecting it would just stall again. When it is the only endpoint in the new session,
-// selection fails with WSRebindFailedNoEndpoints and the bridge closes the client.
+// avoidPreferred skips reuse entirely and excludes preferredAddr from the candidate set:
+// the staleness watchdog sets it because the currently bound supplier is the one stalling,
+// so reselecting it would just stall again. When it is the only endpoint in the new
+// session, selection fails with WSRebindFailedNoEndpoints and the bridge closes the client.
 func (p *Protocol) getReconnectEndpoint(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
@@ -398,18 +410,43 @@ func (p *Protocol) getReconnectEndpoint(
 		return ep, true, "", nil
 	}
 
-	// Tier 1: original supplier+URL still present → seamless rebind.
-	if ep, ok := endpoints[preferredAddr]; ok {
+	// Rotation policy hinges on the cap: with it OFF, the capped selector collapses to a
+	// deterministic smallest-address pick that would funnel every connection onto one
+	// endpoint, so keep seamless tier-1 reuse. With it ON, skip the reuse shortcut and let
+	// the capped selector re-spread the connection across the tied-best operator band.
+	capEngaged := maxOperatorShare > 0 && maxOperatorShare < 1
+	if !capEngaged {
+		// Cap disabled: original supplier+URL still present → seamless rebind.
+		if ep, ok := endpoints[preferredAddr]; ok {
+			return ep, false, "", nil
+		}
+	}
+
+	// Capped rotation (or original rotated out): pick across the tied-best band. The
+	// original endpoint is still in `endpoints` when present, so it remains a candidate.
+	ep := selectReconnectEndpointWithCap(serviceID, endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare)
+
+	// A rebind that lands back on the original endpoint is a seamless outcome — same node,
+	// no supplier change to report.
+	if ep.Addr() == preferredAddr {
 		return ep, false, "", nil
 	}
 
-	// Tier 2: original supplier rotated out of the new session → best-available fallback.
-	ep := selectReconnectEndpointWithCap(serviceID, endpoints, p.websocketReconnectScoreFunc(ctx, serviceID, endpoints), maxOperatorShare)
-	logger.Warn().
-		Str("original_endpoint", string(preferredAddr)).
-		Str("fallback_endpoint", string(ep.Addr())).
-		Str("fallback_supplier", ep.Supplier()).
-		Msg("🔀 [WS-REBIND] original supplier rotated out — rebinding to a different supplier for the current session")
+	// The connection re-homed onto a different endpoint. Distinguish an intentional rotation
+	// off a still-present supplier from the original having rotated out of the new session.
+	if _, originalStillPresent := endpoints[preferredAddr]; originalStillPresent {
+		logger.Info().
+			Str("original_endpoint", string(preferredAddr)).
+			Str("rebind_endpoint", string(ep.Addr())).
+			Str("rebind_supplier", ep.Supplier()).
+			Msg("🔀 [WS-REBIND-ROTATE] rotating off the still-present original supplier to spread WebSocket load across operators")
+	} else {
+		logger.Warn().
+			Str("original_endpoint", string(preferredAddr)).
+			Str("fallback_endpoint", string(ep.Addr())).
+			Str("fallback_supplier", ep.Supplier()).
+			Msg("🔀 [WS-REBIND] original supplier rotated out — rebinding to a different supplier for the current session")
+	}
 	return ep, true, "", nil
 }
 
