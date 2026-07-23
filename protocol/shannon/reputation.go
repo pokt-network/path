@@ -122,6 +122,40 @@ func (p *Protocol) filterByReputation(
 		}
 	}
 
+	// Pool-collapse guard: if reputation filtered out EVERY endpoint (all in cooldown or
+	// below threshold), do NOT return empty. An empty result drops the caller to a
+	// reputation-BLIND fallback (random / least-stale) that ignores which endpoints are
+	// actually least-bad — observed making a fully-degraded service worse (e.g. poly-zkevm
+	// went 50%→100% error when every endpoint was cooled and selection fell to random). A
+	// hard bench should relatively deprioritize an endpoint, never remove the last ones
+	// standing when there is no better alternative. Keep the least-bad TIER (the endpoints at
+	// the maximum score) so selection stays reputation-aware over the degraded pool.
+	if len(filtered) == 0 && len(cached) > 0 {
+		scoreOf := func(ak addrKey) float64 {
+			if sc, ok := scores[ak.key]; ok {
+				return sc.Value
+			}
+			return reputation.InitialScore
+		}
+		maxScore := scoreOf(cached[0])
+		for _, ak := range cached[1:] {
+			if v := scoreOf(ak); v > maxScore {
+				maxScore = v
+			}
+		}
+		for _, ak := range cached {
+			if scoreOf(ak) >= maxScore-1e-9 {
+				filtered[ak.addr] = ak.ep
+			}
+		}
+		logger.Warn().
+			Int("total_endpoints", len(cached)).
+			Int("kept_least_bad", len(filtered)).
+			Float64("max_score", maxScore).
+			Msg("Reputation filtered ALL endpoints; keeping the least-bad tier to avoid reputation-blind fallback")
+		metrics.RecordReputationPoolCollapseGuard(serviceIDLabel, rpcTypeLabel)
+	}
+
 	return filtered
 }
 

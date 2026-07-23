@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -221,6 +222,38 @@ type ServiceFallbackConfig struct {
 	Endpoints      []map[string]string `yaml:"endpoints,omitempty"`
 }
 
+// StaticRoute defines a fixed response served directly by the gateway for a specific
+// request path, without relaying to a backend endpoint. It lets the gateway expose small,
+// service-scoped metadata endpoints (for example an info/version route) whose body is a
+// constant configured value rather than something fetched from a supplier.
+//
+// A static route short-circuits the relay pipeline: a matching request never reaches
+// RPC-type detection or endpoint selection, so it does not interact with a service's
+// rpc_types (a REST service is unaffected unless it explicitly configures the same path).
+// Matching is exact on Path and, when Methods is set, on the request method.
+type StaticRoute struct {
+	// Path is the exact request path this route serves, matched after the gateway strips
+	// the API-version and portal-app-id prefixes (e.g. "/example"). Must begin with "/"
+	// and must not be the relay root ("/") — that would shadow all of a service's traffic.
+	Path string `yaml:"path"`
+
+	// Methods restricts the route to the listed HTTP methods (case-insensitive). Empty
+	// matches any method.
+	Methods []string `yaml:"methods,omitempty"`
+
+	// StatusCode is the HTTP status returned. Defaults to 200 when unset.
+	StatusCode int `yaml:"status_code,omitempty"`
+
+	// ContentType sets the Content-Type header. Defaults to "text/plain; charset=utf-8".
+	ContentType string `yaml:"content_type,omitempty"`
+
+	// Body is the exact response body returned verbatim.
+	Body string `yaml:"body"`
+
+	// Headers are additional response headers set on the reply.
+	Headers map[string]string `yaml:"headers,omitempty"`
+}
+
 // ServiceDefaults contains default settings inherited by all services.
 type ServiceDefaults struct {
 	Type                 ServiceType                  `yaml:"type,omitempty"`
@@ -236,6 +269,18 @@ type ServiceDefaults struct {
 	TimeoutConfig        ServiceTimeoutConfig         `yaml:"timeout_config,omitempty"`
 	ActiveHealthChecks   ServiceHealthCheckOverride   `yaml:"active_health_checks,omitempty"`
 	ExternalBlockSources []ExternalBlockSource        `yaml:"external_block_sources,omitempty"`
+
+	// StaticRoutes are gateway-served fixed responses applied to every service as a global
+	// default. A per-service StaticRoutes entry with the same Path overrides the global one.
+	StaticRoutes []StaticRoute `yaml:"static_routes,omitempty"`
+
+	// MaxOperatorShare is the default per-operator concentration cap applied to any
+	// service that does not set its own. nil falls back to DefaultMaxOperatorShare.
+	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
+
+	// WebsocketRebindOperatorUniform is the default WebSocket rebind selection strategy.
+	// nil falls back to DefaultWebsocketRebindOperatorUniform (ON).
+	WebsocketRebindOperatorUniform *bool `yaml:"websocket_rebind_operator_uniform,omitempty"`
 }
 
 // ServiceConfig defines configuration for a single service.
@@ -263,6 +308,36 @@ type ServiceConfig struct {
 	// Unlike the auto-generated supplier blacklist (which is temporary/session-scoped),
 	// this is a persistent, config-driven blocklist.
 	BlockedSuppliers []string `yaml:"blocked_suppliers,omitempty"`
+
+	// StaticRoutes are gateway-served fixed responses for this service. A route whose Path
+	// matches a global default (ServiceDefaults.StaticRoutes) overrides that default for this
+	// service; paths present only in the defaults still apply.
+	StaticRoutes []StaticRoute `yaml:"static_routes,omitempty"`
+
+	// MaxOperatorShare caps the fraction of this service's endpoint selections that
+	// any single operator (registrable domain / eTLD+1) may receive, bounding the blast
+	// radius of one operator failing when it holds most of the valid endpoint pool. The
+	// excess above the cap is spread across the other valid operators (water-filling).
+	// nil = use the global default (DefaultMaxOperatorShare). A value <= 0 or >= 1 disables
+	// the cap for this service (flat selection ∝ endpoint count).
+	//
+	// Scope: the cap governs the primary single-endpoint selection (the bulk of traffic,
+	// HTTP and WebSocket, plus the WebSocket rebind target). It does NOT reshape
+	// multi-endpoint selection (parallel fan-out / hedge), which draw from the same
+	// reputation-filtered pool via separate code paths.
+	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
+
+	// WebsocketRebindOperatorUniform selects the WebSocket rebind strategy for this service.
+	// When true (the default), a session-rollover rebind picks the target operator uniformly
+	// (every provider equally likely), then an endpoint within it — maximizing per-provider
+	// spread. When false, the rebind uses the endpoint-count-weighted concentration cap
+	// (MaxOperatorShare) instead. nil = use the global default
+	// (ServiceDefaults.WebsocketRebindOperatorUniform, then DefaultWebsocketRebindOperatorUniform).
+	//
+	// Note: operator-uniform gives a thin operator the same share as a large one regardless
+	// of endpoint count, so a single-endpoint operator absorbs a full operator-share of the
+	// WebSocket load. Disable per-service if that overloads a small provider.
+	WebsocketRebindOperatorUniform *bool `yaml:"websocket_rebind_operator_uniform,omitempty"`
 }
 
 // UnifiedServicesConfig is the top-level configuration for the unified service system.
@@ -332,6 +407,10 @@ func (c *UnifiedServicesConfig) Validate() error {
 				}
 			}
 		}
+
+		if err := validateStaticRoutes(svc.StaticRoutes); err != nil {
+			return fmt.Errorf("services[%d] (%s): %w", i, svc.ID, err)
+		}
 	}
 
 	if c.Defaults.Type != "" {
@@ -348,6 +427,49 @@ func (c *UnifiedServicesConfig) Validate() error {
 		}
 	}
 
+	if err := validateStaticRoutes(c.Defaults.StaticRoutes); err != nil {
+		return fmt.Errorf("defaults: %w", err)
+	}
+
+	return nil
+}
+
+// validateStaticRoutes checks a set of static routes for well-formed paths, unique
+// path+method coverage, and valid status codes. Returns the first problem found.
+func validateStaticRoutes(routes []StaticRoute) error {
+	// Track (path, method) pairs so two routes cannot both claim the same request. A
+	// route with no methods claims all methods for its path, so it conflicts with any
+	// other route on that path.
+	pathAllMethods := make(map[string]struct{})
+	pathMethod := make(map[string]struct{})
+	for i, rt := range routes {
+		if rt.Path == "" || rt.Path[0] != '/' {
+			return fmt.Errorf("static_routes[%d]: path must be non-empty and begin with '/'", i)
+		}
+		if rt.Path == "/" {
+			return fmt.Errorf("static_routes[%d]: path '/' would shadow all relay traffic and is not allowed", i)
+		}
+		if rt.StatusCode != 0 && (rt.StatusCode < 100 || rt.StatusCode > 599) {
+			return fmt.Errorf("static_routes[%d] (%s): status_code %d out of range 100-599", i, rt.Path, rt.StatusCode)
+		}
+		if len(rt.Methods) == 0 {
+			if _, dup := pathAllMethods[rt.Path]; dup {
+				return fmt.Errorf("static_routes[%d]: duplicate path '%s'", i, rt.Path)
+			}
+			pathAllMethods[rt.Path] = struct{}{}
+			continue
+		}
+		if _, dup := pathAllMethods[rt.Path]; dup {
+			return fmt.Errorf("static_routes[%d]: path '%s' conflicts with an all-methods route on the same path", i, rt.Path)
+		}
+		for _, m := range rt.Methods {
+			key := rt.Path + " " + strings.ToUpper(m)
+			if _, dup := pathMethod[key]; dup {
+				return fmt.Errorf("static_routes[%d]: duplicate path+method '%s'", i, key)
+			}
+			pathMethod[key] = struct{}{}
+		}
+	}
 	return nil
 }
 
@@ -828,6 +950,115 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 	}
 
 	return &merged
+}
+
+// DefaultMaxOperatorShare is the per-operator concentration cap applied when neither the
+// service nor the global defaults specify one. Shipped ON: no single operator (eTLD+1)
+// receives more than this fraction of a service's endpoint selections when the valid pool
+// spans multiple operators. Tuned from production concentration data: a canary survey found
+// the dominant operator held 58–90% of most services' sessions, yet reputation/validation
+// filtering trims its effective valid-pool share enough that a 0.75 cap almost never
+// engaged. 0.65 makes the cap actually bound the concentrated tail (12 of 19 sampled
+// services) at negligible redistribution cost — the excess spreads across a handful of
+// other valid operators — while staying above the uniform-over-operators feasibility floor
+// for services with as few as two operators. Set a per-service or default value of >= 1
+// (or <= 0) to disable.
+const DefaultMaxOperatorShare = 0.65
+
+// DefaultWebsocketRebindOperatorUniform is the WebSocket rebind strategy applied when neither
+// the service nor the global defaults specify one. Shipped ON: a session-rollover rebind
+// spreads uniformly across operators (each provider equally likely) rather than by endpoint
+// count, so no single operator accumulates WebSocket connections in proportion to its
+// (often dominant) endpoint share.
+const DefaultWebsocketRebindOperatorUniform = true
+
+// GetWebsocketRebindOperatorUniformForService returns whether the WebSocket rebind should
+// pick the target operator uniformly (true) or via the endpoint-count-weighted concentration
+// cap (false). It checks per-service config first, then global defaults, then
+// DefaultWebsocketRebindOperatorUniform.
+func (c *UnifiedServicesConfig) GetWebsocketRebindOperatorUniformForService(serviceID protocol.ServiceID) bool {
+	if svc := c.GetServiceConfig(serviceID); svc != nil && svc.WebsocketRebindOperatorUniform != nil {
+		return *svc.WebsocketRebindOperatorUniform
+	}
+	if c.Defaults.WebsocketRebindOperatorUniform != nil {
+		return *c.Defaults.WebsocketRebindOperatorUniform
+	}
+	return DefaultWebsocketRebindOperatorUniform
+}
+
+// GetMaxOperatorShareForService returns the per-operator concentration cap for a service.
+// It checks per-service config first, then global defaults, then DefaultMaxOperatorShare.
+// A configured value <= 0 or >= 1 disables the cap for that service.
+func (c *UnifiedServicesConfig) GetMaxOperatorShareForService(serviceID protocol.ServiceID) float64 {
+	svc := c.GetServiceConfig(serviceID)
+	if svc != nil && svc.MaxOperatorShare != nil {
+		return *svc.MaxOperatorShare
+	}
+	if c.Defaults.MaxOperatorShare != nil {
+		return *c.Defaults.MaxOperatorShare
+	}
+	return DefaultMaxOperatorShare
+}
+
+// ResolveStaticResponse returns the configured static response for a service's request path
+// and method, or ok=false if none applies. Per-service routes take precedence over the
+// global defaults on a matching path; the defaults cover paths a service does not override.
+// It implements the router's static-response resolver so a matching request is served
+// directly, bypassing endpoint selection and the relay.
+//
+// The returned headers map always carries Content-Type (defaulting to text/plain) and is a
+// fresh copy safe for the caller to write onto the response.
+func (c *UnifiedServicesConfig) ResolveStaticResponse(
+	serviceID, path, method string,
+) (body []byte, statusCode int, headers map[string]string, ok bool) {
+	if svc := c.GetServiceConfig(protocol.ServiceID(serviceID)); svc != nil {
+		if rt, found := matchStaticRoute(svc.StaticRoutes, path, method); found {
+			return buildStaticResponse(rt)
+		}
+	}
+	// Defaults are set once at load and read-only thereafter, so no lock is needed.
+	if rt, found := matchStaticRoute(c.Defaults.StaticRoutes, path, method); found {
+		return buildStaticResponse(rt)
+	}
+	return nil, 0, nil, false
+}
+
+// matchStaticRoute returns the first route whose path equals the request path and whose
+// method set is empty (any) or contains the request method (case-insensitive).
+func matchStaticRoute(routes []StaticRoute, path, method string) (StaticRoute, bool) {
+	for _, rt := range routes {
+		if rt.Path != path {
+			continue
+		}
+		if len(rt.Methods) == 0 {
+			return rt, true
+		}
+		for _, m := range rt.Methods {
+			if strings.EqualFold(m, method) {
+				return rt, true
+			}
+		}
+	}
+	return StaticRoute{}, false
+}
+
+// buildStaticResponse materializes a route into a response, applying defaults for status
+// code (200) and Content-Type (text/plain).
+func buildStaticResponse(rt StaticRoute) (body []byte, statusCode int, headers map[string]string, ok bool) {
+	statusCode = rt.StatusCode
+	if statusCode == 0 {
+		statusCode = 200
+	}
+	contentType := rt.ContentType
+	if contentType == "" {
+		contentType = "text/plain; charset=utf-8"
+	}
+	headers = make(map[string]string, len(rt.Headers)+1)
+	for k, v := range rt.Headers {
+		headers[k] = v
+	}
+	headers["Content-Type"] = contentType
+	return []byte(rt.Body), statusCode, headers, true
 }
 
 // GetSyncAllowanceForService returns the sync allowance for a service.

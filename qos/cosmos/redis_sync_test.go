@@ -42,6 +42,13 @@ func (m *mockReputationSvc) SetPerceivedBlockNumber(_ context.Context, serviceID
 	return nil
 }
 
+func (m *mockReputationSvc) DeletePerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.perceivedBlock, serviceID)
+	return nil
+}
+
 func (m *mockReputationSvc) GetPerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -269,4 +276,41 @@ func TestCosmos_ConsumeExternalBlockHeight_WritesToRedis(t *testing.T) {
 
 	assert.Equal(t, uint64(300), qos.GetPerceivedBlockNumber())
 	assert.Equal(t, uint64(300), mock.getBlock(serviceID))
+}
+
+// TestCosmos_ConsumeExternalBlockHeight_RejectsImplausible mirrors the Solana
+// slot-poisoning guard for the Cosmos external-floor path: an external source must
+// not raise perceived more than MaxBlockHeightJump above the current value, so a
+// mislabeled/misbehaving source cannot filter out all honest endpoints.
+func TestCosmos_ConsumeExternalBlockHeight_RejectsImplausible(t *testing.T) {
+	qos := newTestCosmosQoS()
+	mock := newMockReputationSvc()
+	qos.SetReputationService(mock)
+	serviceID := qos.serviceQoSConfig.GetServiceID()
+
+	const realHeight = 20_000_000
+	qos.serviceStateLock.Lock()
+	qos.perceivedBlockNumber = realHeight
+	qos.serviceStateLock.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	heights := make(chan int64, 5)
+	qos.ConsumeExternalBlockHeight(ctx, heights, 1*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
+
+	// Implausible jump (~20M above the real tip) must be rejected.
+	heights <- 40_000_000
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, uint64(realHeight), qos.GetPerceivedBlockNumber(),
+		"an implausible external height must not poison perceived")
+	assert.NotEqual(t, uint64(40_000_000), mock.getBlock(serviceID),
+		"an implausible external height must not be written to Redis")
+
+	// A plausible advance is still applied.
+	heights <- realHeight + 5
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, uint64(realHeight+5), qos.GetPerceivedBlockNumber(),
+		"a plausible external advance must still raise perceived")
 }

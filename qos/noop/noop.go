@@ -19,6 +19,7 @@ import (
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos"
+	"github.com/pokt-network/path/qos/selector"
 	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
 )
@@ -49,9 +50,24 @@ type NoOpQoS struct {
 	// perceived block height before being filtered. 0 disables filtering.
 	syncAllowance atomic.Uint64
 
+	// maxOperatorShare is the per-operator (eTLD+1) concentration cap applied during
+	// selection. 0 disables the cap. Set dynamically via SetMaxOperatorShare.
+	maxOperatorShare selector.AtomicFloat64
+
 	// reputationSvc provides shared perceived block height across replicas via Redis.
 	// Set via SetReputationService; nil when reputation is disabled.
 	reputationSvc reputation.ReputationService
+}
+
+// getMaxOperatorShare returns the configured per-operator concentration cap (0 = disabled).
+func (n *NoOpQoS) getMaxOperatorShare() float64 {
+	return n.maxOperatorShare.Load()
+}
+
+// SetMaxOperatorShare dynamically sets the per-operator (eTLD+1) concentration cap used
+// during endpoint selection. A value <= 0 or >= 1 disables the cap (flat random pick).
+func (n *NoOpQoS) SetMaxOperatorShare(maxOperatorShare float64) {
+	n.maxOperatorShare.Store(maxOperatorShare)
 }
 
 // NewNoOpQoSService creates a new NoOp QoS service instance.
@@ -191,6 +207,21 @@ func (n *NoOpQoS) GetPerceivedBlockNumber() uint64 {
 	return n.perceivedBlockHeight
 }
 
+// ResetPerceivedBlockHeight clears the perceived block height (in-memory + Redis) so it
+// rebuilds from fresh endpoint observations. Used by the chain-state admin reset to
+// recover from a stuck/too-high perceived height (the max path cannot lower it). Must be
+// invoked on each pod, since the perceived floor is per-pod in-memory state.
+func (n *NoOpQoS) ResetPerceivedBlockHeight(ctx context.Context) error {
+	n.serviceStateMu.Lock()
+	n.perceivedBlockHeight = 0
+	n.serviceStateMu.Unlock()
+
+	if n.reputationSvc != nil {
+		return n.reputationSvc.DeletePerceivedBlockNumber(ctx, n.serviceID)
+	}
+	return nil
+}
+
 // SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
 // This is called when external health check rules are loaded/refreshed, since those
 // rules may specify a sync_allowance that wasn't available at QoS creation time.
@@ -248,7 +279,17 @@ func (n *NoOpQoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan
 						Msg("External block floor skipped — no suppliers have reported yet")
 					continue
 				}
-				if h > n.perceivedBlockHeight {
+				// Guard the external floor the same way the endpoint path is guarded
+				// (see line ~165): an external source must not raise perceived more
+				// than MaxBlockHeightJump above the current value, blocking a
+				// misbehaving/mislabeled external source from poisoning perceived
+				// arbitrarily high and filtering out honest endpoints.
+				if h > n.perceivedBlockHeight && !qos.IsPlausibleBlockHeight(h, n.perceivedBlockHeight) {
+					n.logger.Warn().
+						Uint64("external_block", h).
+						Uint64("perceived_block", n.perceivedBlockHeight).
+						Msg("⚠️ ignoring implausible external block height (possible poisoned external source)")
+				} else if h > n.perceivedBlockHeight {
 					n.logger.Info().
 						Uint64("old_perceived", n.perceivedBlockHeight).
 						Uint64("external_block", h).

@@ -9,6 +9,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
 	"github.com/pokt-network/path/protocol"
+	pathqos "github.com/pokt-network/path/qos"
 )
 
 const (
@@ -268,7 +269,17 @@ func (c *BlockHeightConsensus) calculatePerceivedLocked() uint64 {
 	// The floor is only applied after the grace period, giving suppliers time
 	// to report their block heights during cold start.
 	if ext := c.externalBlockHeight.Load(); ext > 0 && ext > maxValid {
-		if time.Since(c.createdAt) >= c.externalBlockGracePeriod {
+		if !pathqos.IsPlausibleBlockHeight(ext, maxValid) {
+			// An external source must not raise perceived more than
+			// MaxBlockHeightJump above the session consensus. This blocks a
+			// misbehaving/mislabeled source (e.g. one returning a slot ~5% above
+			// the real block height) from poisoning perceived arbitrarily high
+			// and filtering out honest endpoints.
+			c.logger.Warn().
+				Uint64("consensus_block", maxValid).
+				Uint64("external_block", ext).
+				Msg("⚠️ ignoring implausible external block height (possible poisoned external source)")
+		} else if time.Since(c.createdAt) >= c.externalBlockGracePeriod {
 			c.logger.Warn().
 				Uint64("consensus_block", maxValid).
 				Uint64("external_block", ext).

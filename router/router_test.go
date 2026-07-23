@@ -30,6 +30,8 @@ func newTestRouter(t *testing.T) (*router, *MockgatewayHandler, *httptest.Server
 		&health.Checker{},
 		config.RouterConfig{},
 		nil, // no circuit breaker in tests
+		nil, // no chain state admin in tests
+		nil, // no static responses in tests
 	)
 	ts := httptest.NewServer(r.mux)
 	t.Cleanup(ts.Close)

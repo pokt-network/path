@@ -259,6 +259,8 @@ gateway_config:
   # - fallback: Fallback endpoints (no defaults - must be explicitly configured)
   # - health_checks: Per-service health check rules
   # - external_block_sources: External RPC endpoints for ground-truth block height validation
+  # - static_routes: Fixed responses served by the gateway for a given path, without
+  #   relaying to a backend (e.g. a small service metadata/version endpoint)
 
   services:
     # -------------------------------------------------------------------------
@@ -277,6 +279,20 @@ gateway_config:
       retry_config:
         max_retries: 2
         hedge_delay: 300ms
+      # Per-operator concentration cap (optional). Bounds the fraction of this service's
+      # endpoint selections that any single operator (registrable domain / eTLD+1) may
+      # receive; the excess is spread across the other valid operators. This limits the
+      # blast radius when one operator holds most of the valid pool and then degrades.
+      # Ships ON by default at 0.65 for every service — set a value here to override, or
+      # 1.0 (or 0) to disable it for this service.
+      # max_operator_share: 0.6
+      # WebSocket rebind strategy (optional). When true (the default), a session-rollover
+      # rebind spreads the target uniformly across operators (each provider equally likely),
+      # then picks an endpoint within it — maximizing per-provider spread. When false, the
+      # rebind uses the endpoint-count-weighted max_operator_share cap instead. Note:
+      # operator-uniform gives a single-endpoint operator the same share as a large one, so
+      # disable it per-service if that overloads a small provider.
+      # websocket_rebind_operator_uniform: true
       # External block sources for ground-truth validation (optional)
       # Multiple sources provide redundancy — the max height across all is used.
       # If all session endpoints are behind the real chain tip, these correct it.
@@ -288,6 +304,19 @@ gateway_config:
       #   - url: "https://rpc.ankr.com/eth"
       #     interval: 30s
       #     timeout: 5s
+      # Static routes (optional): serve a fixed response for a path directly from the
+      # gateway, bypassing endpoint selection and the relay. Matching is exact on `path`
+      # (evaluated after the /v1 and portal-app-id prefixes are stripped) and, when set,
+      # on the request method. A per-service route overrides a global default on the same
+      # path. `path: "/"` is rejected (it would shadow all relay traffic).
+      # static_routes:
+      #   - path: /example
+      #     # methods: ["GET"]              # optional; empty = any method
+      #     # status_code: 200              # optional; default 200
+      #     # content_type: text/plain      # optional; default text/plain
+      #     body: "<value-served-at-this-path>"
+      #     # headers:                       # optional extra response headers
+      #     #   Cache-Control: "public, max-age=3600"
 
     - id: poly
       type: "evm"
@@ -340,10 +369,14 @@ gateway_config:
       latency_profile: "standard"
       timeout_config:
         relay_timeout: 15s
-      # Solana external block source — uses "getBlockHeight" method (numeric result)
+      # Solana external block source — use "getEpochInfo" and read its blockHeight field.
+      # Do NOT use "getBlockHeight": it returns a bare number that some providers mislabel
+      # with the SLOT (~5% higher than block height), which poisons the max-based perceived
+      # height and makes honest endpoints look "behind". getEpochInfo.blockHeight is explicit
+      # and unambiguous. (The external floor is also plausibility-guarded as defense in depth.)
       # external_block_sources:
-      #   - url: "https://api.mainnet-beta.solana.com"
-      #     method: "getBlockHeight"
+      #   - url: "https://solana-rpc.publicnode.com"
+      #     method: "getEpochInfo"
       #     interval: 15s
       #     timeout: 5s
 

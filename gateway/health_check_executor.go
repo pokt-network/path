@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alitto/pond/v2"
@@ -93,6 +95,11 @@ type HealthCheckExecutor struct {
 	// unifiedServicesConfig provides per-service health check overrides from unified config.
 	// Health checks defined here are merged with local/external configs.
 	unifiedServicesConfig *UnifiedServicesConfig
+
+	// cycleCounter increments once per health check cycle. Used to rotate which
+	// supplier represents each backend URL under backend-URL dedup, so every
+	// supplier's own relay path is directly validated every N cycles.
+	cycleCounter uint64
 }
 
 // HealthCheckExecutorConfig contains configuration for creating a HealthCheckExecutor.
@@ -802,6 +809,7 @@ func (e *HealthCheckExecutor) recordCheckResult(
 		// than regular SuccessSignal (+1) used by client requests, but requires
 		// sustained good behavior to fully recover from critical errors.
 		signal := reputation.NewRecoverySuccessSignal(latency)
+		signal.IsHealthCheck = true // probe, not user traffic — excluded from the rate-cooldown detector
 		if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
 			e.logger.Warn().
 				Err(err).
@@ -835,6 +843,7 @@ func (e *HealthCheckExecutor) recordCheckResult(
 
 	// Check failed - record error signal based on configured severity
 	signal := e.mapSignalType(check.ReputationSignal, checkErr.Error(), latency)
+	signal.IsHealthCheck = true // probe, not user traffic — excluded from the rate-cooldown detector
 	if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
 		e.logger.Warn().
 			Err(err).
@@ -939,18 +948,47 @@ type EndpointInfo struct {
 	SessionID string
 }
 
+// checkOutcome captures the result of executing one health check relay so that a
+// backend-derived result can be replayed ("fanned") onto sibling suppliers that
+// share the same backend URL, without firing a redundant relay for each of them.
+//
+// Only backend-derived state is fanned (reputation signal, block-height observation,
+// archival verdict). The relay-volume metric and supplier-blacklist recovery stay
+// with the representative that actually made the relay.
+type checkOutcome struct {
+	check   HealthCheckConfig
+	err     error
+	latency time.Duration
+
+	// httpStatus and body are the representative's response, used to replay the
+	// block-height / quality observation for siblings. body is empty when the relay
+	// failed before a response was received (transport error, session rollover).
+	httpStatus int
+	body       []byte
+
+	// archivalResolved is true when this was an archival check that reached a
+	// definitive pass/fail verdict, so siblings can mark/clear archival too.
+	archivalResolved bool
+	archivalPass     bool
+}
+
 // ExecuteCheckViaProtocol executes a health check through the protocol layer.
 // This sends the health check as a synthetic relay request, testing the full path
 // including relay miners, just like regular user requests.
 //
 // This is the preferred method for health checks as it validates the entire request path.
 // syncAllowance is the service-level sync_allowance from health check config (0 = disabled).
+//
+// If capture is non-nil, the representative's response (status, body, archival verdict)
+// is recorded into it so the caller can fan the backend-derived result to sibling
+// suppliers on the same URL. Passing nil disables capture (behavior is otherwise identical).
 func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	endpointAddr protocol.EndpointAddr,
 	check HealthCheckConfig,
 	syncAllowance uint64,
+	capture *checkOutcome,
 ) (time.Duration, error) {
 	if e.protocol == nil {
 		return 0, fmt.Errorf("protocol not configured for health check executor")
@@ -1009,6 +1047,12 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 		return time.Since(startTime), fmt.Errorf("failed to build protocol context: %w", err)
 	}
 
+	// Tag the relay as a health check so the protocol layer skips its own relays_total
+	// recording. The executor records each outcome below as request_type="health_check";
+	// without this the same relay would ALSO be recorded as request_type="normal",
+	// double-counting it (see requestContext.isHealthCheck).
+	protocolCtx.MarkAsHealthCheck()
+
 	// Execute the relay request through the protocol - this sends the actual relay to the supplier
 	responses, relayErr := protocolCtx.HandleServiceRequest(hcQoSCtx.GetServicePayloads())
 	latency := time.Since(startTime)
@@ -1055,6 +1099,13 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Int("response_size", len(response.Bytes)).
 			Dur("latency", latency).
 			Msg("Health check relay response received from supplier")
+	}
+
+	// Capture the backend response so the caller can fan block-height / quality
+	// observations to sibling suppliers sharing this backend URL (backend-URL dedup).
+	if capture != nil {
+		capture.httpStatus = httpStatusCode
+		capture.body = responseBody
 	}
 
 	// Heuristic analysis - detect bad gateway, empty responses, and other error patterns
@@ -1109,6 +1160,10 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 		// clear the archival status. This ensures endpoints that return errors are not marked as archival.
 		if check.Archival {
 			e.clearEndpointArchival(serviceID, endpointAddr, check)
+			if capture != nil {
+				capture.archivalResolved = true
+				capture.archivalPass = false
+			}
 		}
 
 		// Record relay metric for validation failure (relay succeeded but validation failed)
@@ -1189,6 +1244,10 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	// marking endpoints that returned "false success" responses (like "0x0" for archival queries).
 	if check.Archival {
 		e.markEndpointArchival(serviceID, endpointAddr, check)
+		if capture != nil {
+			capture.archivalResolved = true
+			capture.archivalPass = true
+		}
 	}
 
 	e.logger.Debug().
@@ -1534,21 +1593,48 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 		return nil
 	}
 
+	// Run every check type; build the legacy name->error map from the outcomes.
+	outcomes := e.runEndpointChecks(ctx, serviceID, endpointAddr, svcConfig, true, true)
+	results := make(map[string]error, len(outcomes))
+	for i := range outcomes {
+		results[outcomes[i].check.Name] = outcomes[i].err
+	}
+	return results
+}
+
+// runEndpointChecks executes the configured checks for one endpoint, recording each
+// result to the reputation system, and returns the captured outcomes.
+//
+// runHTTP/runWS select which check types to execute. Under backend-URL dedup, the
+// representative runs with both true; siblings run with runHTTP=false (their HTTP
+// outcomes are fanned from the representative) and runWS=true (WebSocket connectivity
+// is genuinely per-endpoint and must be probed directly).
+//
+// Only HTTP/REST outcomes are returned (they are what gets fanned); WebSocket and gRPC
+// checks are recorded here but not included in the returned slice.
+func (e *HealthCheckExecutor) runEndpointChecks(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	endpointAddr protocol.EndpointAddr,
+	svcConfig *ServiceHealthCheckConfig,
+	runHTTP, runWS bool,
+) []checkOutcome {
 	// Get sync_allowance from service config (0 = disabled)
 	var syncAllowance uint64
 	if svcConfig.SyncAllowance != nil && *svcConfig.SyncAllowance > 0 {
 		syncAllowance = uint64(*svcConfig.SyncAllowance)
 	}
 
-	results := make(map[string]error)
+	var httpOutcomes []checkOutcome
 	for _, check := range svcConfig.Checks {
-		var err error
-		var latency time.Duration
-
 		switch check.Type {
 		case HealthCheckTypeWebSocket:
-			// WebSocket checks use the protocol's CheckWebsocketConnection
-			latency, err = e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, endpointAddr, check)
+			if !runWS {
+				continue
+			}
+			// WebSocket checks use the protocol's CheckWebsocketConnection.
+			latency, err := e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, endpointAddr, check)
+			e.recordCheckResult(ctx, serviceID, endpointAddr, check, err, latency)
 		case HealthCheckTypeGRPC:
 			// gRPC checks not yet implemented
 			e.logger.Debug().
@@ -1556,19 +1642,119 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 				Str("endpoint", string(endpointAddr)).
 				Str("check", check.Name).
 				Msg("Skipping gRPC check - not yet implemented")
-			continue
 		default:
-			// HTTP-based checks (jsonrpc, rest)
-			latency, err = e.ExecuteCheckViaProtocol(ctx, serviceID, endpointAddr, check, syncAllowance)
+			if !runHTTP {
+				continue
+			}
+			// HTTP-based checks (jsonrpc, rest). Capture the response so it can be fanned.
+			var outcome checkOutcome
+			latency, err := e.ExecuteCheckViaProtocol(ctx, serviceID, endpointAddr, check, syncAllowance, &outcome)
+			outcome.check = check
+			outcome.err = err
+			outcome.latency = latency
+			e.recordCheckResult(ctx, serviceID, endpointAddr, check, err, latency)
+			httpOutcomes = append(httpOutcomes, outcome)
+		}
+	}
+	return httpOutcomes
+}
+
+// fanOutcomeToSibling replays a representative's HTTP check outcomes onto a sibling
+// supplier that shares the same backend URL, WITHOUT firing a relay. It records the
+// same reputation signal, replays the block-height / quality observation, and fans the
+// archival verdict — the backend-derived state that is identical across suppliers on the
+// same backend. It deliberately does NOT record a relay metric (that would defeat the
+// load reduction) or attempt supplier-blacklist recovery (that needs a real relay).
+func (e *HealthCheckExecutor) fanOutcomeToSibling(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	siblingAddr protocol.EndpointAddr,
+	outcomes []checkOutcome,
+) {
+	for i := range outcomes {
+		o := outcomes[i]
+
+		// Same reputation signal the representative recorded (recovery success or error).
+		e.recordCheckResult(ctx, serviceID, siblingAddr, o.check, o.err, o.latency)
+
+		// Replay the block-height / quality observation so the sibling's stored height
+		// stays fresh and it is not falsely filtered as out-of-sync. Only possible when a
+		// response body was received.
+		if len(o.body) > 0 {
+			payload := e.buildServicePayload(o.check)
+			e.processObservationSync(serviceID, siblingAddr, o.check, payload, time.Now().Add(-o.latency), o.latency, o.httpStatus, o.body)
 		}
 
-		results[check.Name] = err
+		// Fan the archival verdict (same backend => same archival capability).
+		if o.archivalResolved {
+			if o.archivalPass {
+				e.markEndpointArchival(serviceID, siblingAddr, o.check)
+			} else {
+				e.clearEndpointArchival(serviceID, siblingAddr, o.check)
+			}
+		}
 
-		// Record the result to reputation with latency
-		e.recordCheckResult(ctx, serviceID, endpointAddr, check, err, latency)
+		metrics.RecordHealthCheckDeduped(string(serviceID))
+	}
+}
+
+// backendDedupEnabled reports whether backend-URL health check deduplication is on.
+// Defaults to enabled when unset.
+func (e *HealthCheckExecutor) backendDedupEnabled() bool {
+	return e.config == nil || e.config.BackendDedup == nil || *e.config.BackendDedup
+}
+
+// representativeIndex selects which member of a same-URL group fires the real relay
+// this cycle. Rotating by cycle gives every member a directly-probed turn every
+// len(group) cycles, so a supplier's own relay path is validated even when its
+// backend-derived result is otherwise fanned from a sibling.
+func representativeIndex(cycle uint64, groupSize int) int {
+	if groupSize <= 1 {
+		return 0
+	}
+	return int(cycle % uint64(groupSize))
+}
+
+// endpointSessionActive reports whether the endpoint's session is still active, so a
+// stale (rolled-over) endpoint is skipped. Endpoints without a session ID are treated
+// as active (nothing to invalidate against).
+func (e *HealthCheckExecutor) endpointSessionActive(ctx context.Context, serviceID protocol.ServiceID, ep EndpointInfo) bool {
+	if ep.SessionID == "" || e.protocol == nil {
+		return true
+	}
+	return e.protocol.IsSessionActive(ctx, serviceID, ep.SessionID)
+}
+
+// groupEndpointsByURL groups endpoints by their backend HTTP URL. Endpoints sharing a
+// URL front the same backend, so one relay per URL suffices per cycle for backend-derived
+// checks. Groups and their members are returned in a stable (sorted) order so that
+// representative rotation is deterministic across cycles. Endpoints with no HTTP URL
+// (e.g. WebSocket-only) each form their own singleton group and are never deduped.
+func groupEndpointsByURL(endpoints []EndpointInfo) [][]EndpointInfo {
+	byURL := make(map[string][]EndpointInfo)
+	var singletons [][]EndpointInfo
+	for _, ep := range endpoints {
+		if ep.HTTPURL == "" {
+			singletons = append(singletons, []EndpointInfo{ep})
+			continue
+		}
+		byURL[ep.HTTPURL] = append(byURL[ep.HTTPURL], ep)
 	}
 
-	return results
+	urls := make([]string, 0, len(byURL))
+	for u := range byURL {
+		urls = append(urls, u)
+	}
+	sort.Strings(urls)
+
+	groups := make([][]EndpointInfo, 0, len(byURL)+len(singletons))
+	for _, u := range urls {
+		grp := byURL[u]
+		sort.Slice(grp, func(i, j int) bool { return grp[i].Addr < grp[j].Addr })
+		groups = append(groups, grp)
+	}
+	groups = append(groups, singletons...)
+	return groups
 }
 
 // RunAllChecksViaProtocol runs health checks through the protocol layer for all configured services.
@@ -1602,6 +1788,11 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 	group := e.pool.NewGroup()
 	totalJobs := 0
 
+	dedup := e.backendDedupEnabled()
+	// One rotation tick per cycle: every backend-URL group advances its representative
+	// by exactly one, giving each supplier on a URL a directly-probed turn every N cycles.
+	cycle := atomic.AddUint64(&e.cycleCounter, 1)
+
 	// Submit health check jobs to the worker pool
 	for _, svcConfig := range serviceConfigs {
 		if svcConfig.Enabled != nil && !*svcConfig.Enabled {
@@ -1624,28 +1815,77 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			continue
 		}
 
-		// Submit a job for each endpoint
-		for _, endpointInfo := range endpointInfos {
-			// Capture loop variables for closure
-			serviceID := svcConfig.ServiceID
-			endpoint := endpointInfo.Addr
-			sessionID := endpointInfo.SessionID
+		serviceID := svcConfig.ServiceID
+		// Snapshot config per service so closures don't alias the loop variable.
+		cfg := svcConfig
 
+		if !dedup {
+			// Legacy behavior: one relay job per endpoint (no backend-URL dedup).
+			for _, endpointInfo := range endpointInfos {
+				endpoint := endpointInfo.Addr
+				sessionID := endpointInfo.SessionID
+				group.Submit(func() {
+					if ctx.Err() != nil {
+						return
+					}
+					if sessionID != "" && e.protocol != nil && !e.protocol.IsSessionActive(ctx, serviceID, sessionID) {
+						return
+					}
+					e.runEndpointChecks(ctx, serviceID, endpoint, &cfg, true, true)
+				})
+				totalJobs++
+			}
+			continue
+		}
+
+		// Backend-URL dedup: fire ONE relay per unique backend URL (a rotating
+		// representative supplier) and fan the backend-derived result to the other
+		// suppliers on that URL. WebSocket checks are still probed per-endpoint.
+		urlGroups := groupEndpointsByURL(endpointInfos)
+		for _, grp := range urlGroups {
+			grp := grp
+			repIdx := representativeIndex(cycle, len(grp))
 			group.Submit(func() {
-				select {
-				case <-ctx.Done():
+				if ctx.Err() != nil {
 					return
-				default:
-					// Check if session is still active before executing health check
-					// This prevents errors when session has rolled over between collection and execution
-					if sessionID != "" && e.protocol != nil {
-						if !e.protocol.IsSessionActive(ctx, serviceID, sessionID) {
-							// Session no longer active - skip silently
-							// This is expected during session rollover
-							return
+				}
+
+				// Pick the representative: the rotated member, or the next active one
+				// if it rolled over, so a single stale endpoint doesn't skip the group.
+				rep := grp[repIdx]
+				if !e.endpointSessionActive(ctx, serviceID, rep) {
+					for off := 1; off < len(grp); off++ {
+						cand := grp[(repIdx+off)%len(grp)]
+						if e.endpointSessionActive(ctx, serviceID, cand) {
+							rep = cand
+							repIdx = (repIdx + off) % len(grp)
+							break
 						}
 					}
-					e.RunChecksForEndpointViaProtocol(ctx, serviceID, endpoint)
+				}
+
+				var outcomes []checkOutcome
+				if e.endpointSessionActive(ctx, serviceID, rep) {
+					outcomes = e.runEndpointChecks(ctx, serviceID, rep.Addr, &cfg, true, true)
+				}
+
+				// Siblings: fan the representative's HTTP outcomes (no relay), and still
+				// probe each sibling's own WebSocket connectivity (per-endpoint).
+				for i := range grp {
+					if i == repIdx {
+						continue
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					sib := grp[i]
+					if !e.endpointSessionActive(ctx, serviceID, sib) {
+						continue
+					}
+					if len(outcomes) > 0 {
+						e.fanOutcomeToSibling(ctx, serviceID, sib.Addr, outcomes)
+					}
+					e.runEndpointChecks(ctx, serviceID, sib.Addr, &cfg, false, true)
 				}
 			})
 			totalJobs++
@@ -1846,7 +2086,15 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 				return int64(heightNum), nil
 			}
 		}
-		return 0, fmt.Errorf("unsupported response format: object without sync_info")
+		// Solana getEpochInfo format: {"blockHeight": 412345678, "epoch": ..., "absoluteSlot": ...}
+		// Prefer getEpochInfo over getBlockHeight for a Solana external source: getBlockHeight
+		// returns a bare number that some providers mislabel with the SLOT (~5% higher), whereas
+		// blockHeight is an explicit, unambiguous field. NEVER fall back to absoluteSlot — the
+		// slot poisons the max-based perceived height.
+		if bh, ok := v["blockHeight"].(float64); ok {
+			return int64(bh), nil
+		}
+		return 0, fmt.Errorf("unsupported response format: object without sync_info or blockHeight")
 
 	default:
 		return 0, fmt.Errorf("unsupported result type: %T", v)

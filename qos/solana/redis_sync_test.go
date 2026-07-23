@@ -44,6 +44,13 @@ func (m *mockReputationSvc) SetPerceivedBlockNumber(_ context.Context, serviceID
 	return nil
 }
 
+func (m *mockReputationSvc) DeletePerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.perceivedBlock, serviceID)
+	return nil
+}
+
 func (m *mockReputationSvc) GetPerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -280,4 +287,66 @@ func TestSolana_ConsumeExternalBlockHeight_WritesToRedis(t *testing.T) {
 
 	assert.Equal(t, uint64(300), qos.GetPerceivedBlockNumber())
 	assert.Equal(t, uint64(300), mock.getBlock(testSolanaServiceID))
+}
+
+// TestSolana_ConsumeExternalBlockHeight_RejectsImplausible reproduces the actual
+// 2026-07-21 incident: the configured external source (publicnode getBlockHeight)
+// returned the SLOT (~434M), ~22M above the real block height (~412M). The
+// external-floor path had no plausibility guard, so it wrote the slot straight
+// into perceived every poll, tracking the live slot and re-poisoning within
+// seconds of any manual reset. Honest endpoints reporting the real (lower) height
+// then failed the sync check and were filtered/cooled. The guard must reject the
+// implausible jump while still applying a normal advance.
+func TestSolana_ConsumeExternalBlockHeight_RejectsImplausible(t *testing.T) {
+	qos := newTestSolanaQoS()
+	mock := newMockReputationSvc()
+	qos.SetReputationService(mock)
+
+	// Suppliers report the real Solana block height.
+	const realHeight = 412_000_000
+	qos.serviceStateLock.Lock()
+	qos.perceivedBlockHeight = realHeight
+	qos.serviceStateLock.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	heights := make(chan int64, 5)
+	qos.ConsumeExternalBlockHeight(ctx, heights, 1*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
+
+	// The slot (~22M above the real tip) must be rejected — not written locally or to Redis.
+	heights <- 434_000_000
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, uint64(realHeight), qos.GetPerceivedBlockNumber(),
+		"an implausible external height (slot magnitude) must not poison perceived")
+	assert.NotEqual(t, uint64(434_000_000), mock.getBlock(testSolanaServiceID),
+		"an implausible external height must not be written to Redis for other replicas")
+
+	// A plausible advance is still applied.
+	heights <- realHeight + 5
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, uint64(realHeight+5), qos.GetPerceivedBlockNumber(),
+		"a plausible external advance must still raise perceived")
+}
+
+// TestSolana_ResetPerceivedBlockHeight verifies the chain-state admin reset clears the
+// perceived height both in-memory and in Redis, so a stuck/poisoned value (which the
+// max-only consensus and external floor cannot lower) can be recovered.
+func TestSolana_ResetPerceivedBlockHeight(t *testing.T) {
+	qos := newTestSolanaQoS()
+	mock := newMockReputationSvc()
+	qos.SetReputationService(mock)
+
+	// Seed a stuck/poisoned perceived height in-memory and in the shared store.
+	qos.serviceStateLock.Lock()
+	qos.perceivedBlockHeight = 434_000_000
+	qos.serviceStateLock.Unlock()
+	require.NoError(t, mock.SetPerceivedBlockNumber(context.Background(), testSolanaServiceID, 434_000_000))
+	require.Equal(t, uint64(434_000_000), mock.getBlock(testSolanaServiceID))
+
+	require.NoError(t, qos.ResetPerceivedBlockHeight(context.Background()))
+
+	assert.Equal(t, uint64(0), qos.GetPerceivedBlockNumber(), "in-memory perceived must be cleared")
+	assert.Equal(t, uint64(0), mock.getBlock(testSolanaServiceID), "Redis perceived must be deleted")
 }

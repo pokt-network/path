@@ -47,6 +47,20 @@ func TestSolanaDataExtractor_ExtractBlockHeight(t *testing.T) {
 			expectError:   false,
 		},
 		{
+			// Regression guard: a getEpochInfo missing blockHeight must NOT be downgraded to
+			// absoluteSlot (the slot is ~5% higher and poisons the max-based perceived height).
+			name: "absoluteSlot only (no blockHeight) must error, not fall back to slot",
+			response: `{
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": {
+					"absoluteSlot": 434334985,
+					"epoch": 1005
+				}
+			}`,
+			expectError: true,
+		},
+		{
 			name:        "error response",
 			response:    `{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}`,
 			expectError: true,

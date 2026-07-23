@@ -197,6 +197,15 @@ type ProtocolRequestContext interface {
 	// success/error feedback).
 	MarkAsRetry()
 
+	// MarkAsHealthCheck tags this request as an active health-check relay issued by the
+	// health-check executor. The executor records its own relays_total entry
+	// (request_type="health_check") for every outcome, so the protocol layer must SKIP its
+	// own relay metric recording for these — otherwise the same paid relay is also recorded
+	// as request_type="normal", double-counting it and polluting every "excludes health
+	// checks" dashboard. Must be called before HandleServiceRequest. Reputation signals and
+	// observations are unaffected.
+	MarkAsHealthCheck()
+
 	// GetObservations builds and returns the set of protocol-specific observations using the current context.
 	//
 	// Hypothetical illustrative example.

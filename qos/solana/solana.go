@@ -194,6 +194,23 @@ func (q *QoS) GetPerceivedBlockNumber() uint64 {
 	return q.perceivedBlockHeight
 }
 
+// ResetPerceivedBlockHeight clears the perceived block height (in-memory + Redis) so it
+// rebuilds from fresh endpoint observations. Used by the chain-state admin reset to
+// recover from a poisoned/stuck perceived height — the max-based consensus and the
+// external floor only ever RAISE perceived, so a too-high value (e.g. a slot-poisoned
+// height) cannot self-correct. Must be invoked on each pod, since the perceived floor is
+// per-pod in-memory state (mirrors the per-pod circuit-breaker clear).
+func (q *QoS) ResetPerceivedBlockHeight(ctx context.Context) error {
+	q.serviceStateLock.Lock()
+	q.perceivedBlockHeight = 0
+	q.serviceStateLock.Unlock()
+
+	if q.reputationSvc != nil {
+		return q.reputationSvc.DeletePerceivedBlockNumber(ctx, q.ServiceState.serviceID)
+	}
+	return nil
+}
+
 // ConsumeExternalBlockHeight consumes block heights from an external fetcher channel
 // and uses them as a floor for perceivedBlockHeight. This ensures that if all session
 // endpoints are behind the real chain tip, the perceived block is corrected.
@@ -241,7 +258,20 @@ func (q *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan int
 						Msg("External block floor skipped — no suppliers have reported yet")
 					continue
 				}
-				if h > q.perceivedBlockHeight {
+				// Guard the external floor the same way the endpoint path is guarded
+				// (see line ~150): an external source must not raise perceived more
+				// than MaxBlockHeightJump above the current value. This blocks a
+				// misbehaving/mislabeled source (e.g. a Solana provider returning the
+				// SLOT ~5% above the real block height for getBlockHeight) from
+				// poisoning perceived arbitrarily high and filtering out honest
+				// endpoints — the external-floor path has no plausibility check
+				// otherwise, unlike the endpoint observation path.
+				if h > q.perceivedBlockHeight && !qos.IsPlausibleBlockHeight(h, q.perceivedBlockHeight) {
+					q.logger.Warn().
+						Uint64("external_block", h).
+						Uint64("perceived_block", q.perceivedBlockHeight).
+						Msg("⚠️ ignoring implausible external block height (possible poisoned external source)")
+				} else if h > q.perceivedBlockHeight {
 					q.logger.Info().
 						Uint64("old_perceived", q.perceivedBlockHeight).
 						Uint64("external_block", h).

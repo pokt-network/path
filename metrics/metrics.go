@@ -129,6 +129,18 @@ var HealthCheckStatus = promauto.NewCounterVec(
 	[]string{LabelDomain, LabelSupplier, LabelRPCType, LabelServiceID, LabelHealthCheckName, LabelReputationSignal},
 )
 
+// HealthCheckDeduped counts health check relays SKIPPED by backend-URL deduplication.
+// Each increment is one supplier×check whose backend-derived result was fanned from a
+// representative sharing the same URL instead of firing its own relay. Compare against
+// path_relays_total{request_type="health_check"} to see the load reduction.
+var HealthCheckDeduped = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "health_check_deduped_total",
+		Help: "Health check relays skipped via backend-URL dedup (result fanned from a same-URL representative).",
+	},
+	[]string{LabelServiceID},
+)
+
 // =============================================================================
 // Observation Pipeline (Counter)
 // Labels: domain, rpc_type, service_id, network_type, method, reputation_signal
@@ -650,6 +662,67 @@ var HedgeSelfOperatorAvoidedTotal = promauto.NewCounterVec(
 	[]string{LabelServiceID},
 )
 
+// ConcentrationCapReshapedTotal counts endpoint selections whose distribution the
+// per-operator (eTLD+1) concentration cap actually altered — either an operator's share
+// exceeded the cap and its excess was water-filled to other operators, or the pool was
+// too concentrated to satisfy the cap and selection fell back to uniform-over-operators.
+// Selections where no operator exceeded the cap (the cap is a no-op) are NOT counted, so a
+// nonzero rate on a service_id is the live signal that the cap is bounding a real
+// concentration — the operational proof the shipped-on default is doing something.
+var ConcentrationCapReshapedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "concentration_cap_reshaped_total",
+		Help: "Endpoint selections reshaped by the per-operator (eTLD+1) concentration cap, by service_id. Nonzero = the cap is actively bounding a dominant operator's selection share.",
+	},
+	[]string{LabelServiceID},
+)
+
+// RecordConcentrationCapReshaped increments the concentration-cap reshape counter for a
+// service. Called once per selection whose distribution the cap actually altered.
+func RecordConcentrationCapReshaped(serviceID string) {
+	ConcentrationCapReshapedTotal.WithLabelValues(serviceID).Inc()
+}
+
+// ReputationRateCooldownTotal counts endpoints cooled down by the volume-independent
+// sustained-critical-rate detector (as opposed to the consecutive-strike/burst path).
+// The strike system decays 3 strikes per success and therefore only catches bursts; a
+// high-traffic endpoint bleeding a steady fraction of critical/fatal errors refills its
+// strike budget with successes and is never cooled. A nonzero rate on a service_id is the
+// live signal that the rate detector is filtering a chronically-failing high-volume
+// endpoint the burst-strike system would have missed.
+var ReputationRateCooldownTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "reputation_rate_cooldown_total",
+		Help: "Endpoints cooled down by the sustained-critical-rate detector, by service_id. Nonzero = volume-independent filtering of a chronically-failing endpoint the burst-strike system missed.",
+	},
+	[]string{LabelServiceID},
+)
+
+// RecordReputationRateCooldown increments the rate-cooldown counter for a service.
+// Called once each time an endpoint is cooled down by the sustained-critical-rate detector.
+func RecordReputationRateCooldown(serviceID string) {
+	ReputationRateCooldownTotal.WithLabelValues(serviceID).Inc()
+}
+
+// ReputationPoolCollapseGuardTotal counts how often reputation filtering would have removed
+// EVERY endpoint for a service (all in cooldown or below threshold) and the pool-collapse
+// guard instead kept the least-bad tier. A nonzero rate is the signal that a service is
+// fully degraded — every endpoint is failing enough to be filtered — and is being served by
+// its least-bad endpoints rather than a reputation-blind random fallback.
+var ReputationPoolCollapseGuardTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "reputation_pool_collapse_guard_total",
+		Help: "Selections where reputation filtered ALL endpoints and the pool-collapse guard kept the least-bad tier, by service_id and rpc_type. Nonzero = a fully-degraded service being kept reputation-aware instead of falling back to random.",
+	},
+	[]string{LabelServiceID, LabelRPCType},
+)
+
+// RecordReputationPoolCollapseGuard increments the pool-collapse guard counter.
+// Called once each time the guard keeps the least-bad tier because filtering emptied the pool.
+func RecordReputationPoolCollapseGuard(serviceID, rpcType string) {
+	ReputationPoolCollapseGuardTotal.WithLabelValues(serviceID, rpcType).Inc()
+}
+
 // Severity classes for supplier_signal_total. The reputation layer emits 8
 // distinct signal-type strings; carrying all 8 as a label multiplies this
 // counter's cardinality 8× on top of the (supplier × service_id) base — the
@@ -698,6 +771,13 @@ func supplierSignalSeverity(signalType string) string {
 
 const (
 	// --- Request type labels for relays
+	//
+	// request_type PARTITIONS relays_total: every paid relay PATH sends to a supplier is
+	// recorded under exactly ONE request_type. So "total billable/paid relays" = the sum
+	// across ALL request_type values, NOT just request_type="normal". In particular,
+	// health checks are real paid relays and are counted under request_type="health_check"
+	// — they must NOT be summed on top of "normal" (they are not in it). Filtering to
+	// request_type="normal" gives user-facing primary traffic only.
 
 	RelayTypeNormal      = "normal"
 	RelayTypeHealthCheck = "health_check"
@@ -718,7 +798,7 @@ const (
 var RelaysTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "relays_total",
-		Help: "Total outgoing relays to suppliers by domain, rpc_type, service_id, status_code, reputation_signal, and request_type.",
+		Help: "Total outgoing (paid) relays to suppliers by domain, rpc_type, service_id, status_code, reputation_signal, and request_type. request_type partitions relays: total paid relays = sum over ALL request_type values (health checks are counted under request_type=\"health_check\", not \"normal\").",
 	},
 	[]string{LabelDomain, LabelRPCType, LabelServiceID, LabelStatusCode, LabelReputationSignal, "request_type"},
 )
@@ -765,6 +845,13 @@ const (
 	WSRebindFailedDial         = "failed_dial"          // endpoint selected but the websocket dial failed after retries
 	WSRebindFailedReplay       = "failed_replay"        // reconnected, but building/writing subscription replay frames failed
 	WSRebindFailedSelect       = "failed_select"        // generic selection failure with no more specific reason
+
+	// --- WebSocket session-rebind trigger labels (experimental)
+	// The `trigger` dimension of WebsocketRebindTotal: what initiated the rebind episode,
+	// so the outcome mix can be read per cause (e.g. whether stalls rotate suppliers more
+	// often than routine rollovers).
+	WSRebindTriggerRollover = "rollover" // routine Shannon session-boundary reconnect
+	WSRebindTriggerStall    = "stall"    // staleness watchdog forced a rebind off a silent supplier
 
 	// --- WebSocket endpoint-staleness watchdog result labels (experimental)
 	// The `result` dimension of WebsocketEndpointStallTotal. A stall is a silent supplier
@@ -820,9 +907,9 @@ var WebsocketMessagesTotal = promauto.NewCounterVec(
 var WebsocketRebindTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "websocket_rebind_total",
-		Help: "WebSocket session-rebind episodes by domain, service_id, and result (success_same_supplier/success_different_supplier/failed_*). EXPERIMENTAL.",
+		Help: "WebSocket session-rebind episodes by domain, service_id, result (success_same_supplier/success_different_supplier/failed_*), and trigger (rollover/stall). EXPERIMENTAL.",
 	},
-	[]string{LabelDomain, LabelServiceID, "result"},
+	[]string{LabelDomain, LabelServiceID, "result", "trigger"},
 )
 
 // WebsocketSubscriptionsReplayedTotal counts subscriptions replayed onto a
@@ -858,6 +945,11 @@ func RecordHealthCheck(domain, supplier, rpcType, serviceID, healthCheckName, re
 	HealthCheckStatus.WithLabelValues(domain, supplier, rpcType, serviceID, healthCheckName, reputationSignal).Inc()
 }
 
+// RecordHealthCheckDeduped records a health check relay skipped via backend-URL dedup.
+func RecordHealthCheckDeduped(serviceID string) {
+	HealthCheckDeduped.WithLabelValues(serviceID).Inc()
+}
+
 // RecordObservation records an observation pipeline event
 func RecordObservation(domain, rpcType, serviceID, networkType, method, reputationSignal string) {
 	ObservationPipeline.WithLabelValues(domain, rpcType, serviceID, networkType, method, reputationSignal).Inc()
@@ -883,6 +975,28 @@ func RecordRetryDistribution(domain, rpcType, serviceID, reason string) {
 func RecordRetryResult(rpcType, serviceID, retryCount, result string, latencySeconds float64) {
 	RetryResultsTotal.WithLabelValues(rpcType, serviceID, retryCount, result).Inc()
 	RetryResultsLatency.WithLabelValues(rpcType, serviceID, retryCount, result).Observe(latencySeconds)
+}
+
+// RelayExhaustedTotal counts relay requests that exhausted all retry attempts and returned an
+// error (HTTP 500) to the client, by service_id, rpc_type, and category. These 500s are
+// produced on the relay-failure path and are NOT reflected in path_requests_total (which is
+// recorded only for completed relays), so this counter is the visibility into that blind spot
+// — the gap between what the edge proxy sees on the wire and what PATH's own request metric
+// reports. The `capability` category isolates exhaustions where the backend correctly reported
+// unavailable historical/pruned state (a client asking for data the node does not retain),
+// which PATH currently retries as a blockchain error before giving up.
+var RelayExhaustedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "relay_exhausted_total",
+		Help: "Relay requests that exhausted all retries and returned 500 to the client, by service_id, rpc_type, and category (capability/heuristic/transport/status). NOT counted in path_requests_total.",
+	},
+	[]string{LabelServiceID, LabelRPCType, "category"},
+)
+
+// RecordRelayExhausted records a relay that exhausted all retries and returned 500 to the
+// client. category classifies the last failure (capability/heuristic/transport/status).
+func RecordRelayExhausted(serviceID, rpcType, category string) {
+	RelayExhaustedTotal.WithLabelValues(serviceID, rpcType, category).Inc()
 }
 
 // =============================================================================
@@ -1159,9 +1273,10 @@ func RecordWebsocketMessage(domain, serviceID, direction, reputationSignal strin
 
 // RecordWebsocketRebind records a websocket session-rebind episode outcome and, on
 // success, the number of subscriptions replayed. EXPERIMENTAL / canary observability
-// for the session-rebind feature. result should be one of the WSRebind* labels.
-func RecordWebsocketRebind(domain, serviceID, result string, replayedSubscriptions int) {
-	WebsocketRebindTotal.WithLabelValues(domain, serviceID, result).Inc()
+// for the session-rebind feature. result should be one of the WSRebind* labels; trigger
+// one of the WSRebindTrigger* labels (what initiated the rebind).
+func RecordWebsocketRebind(domain, serviceID, result, trigger string, replayedSubscriptions int) {
+	WebsocketRebindTotal.WithLabelValues(domain, serviceID, result, trigger).Inc()
 	if replayedSubscriptions > 0 {
 		WebsocketSubscriptionsReplayedTotal.WithLabelValues(domain, serviceID).Add(float64(replayedSubscriptions))
 	}

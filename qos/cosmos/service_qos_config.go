@@ -29,6 +29,9 @@ type CosmosSDKServiceQoSConfig interface {
 	getEVMChainID() string
 	getSyncAllowance() uint64
 	getSupportedAPIs() map[sharedtypes.RPCType]struct{}
+	// getMaxOperatorShare returns the per-operator (eTLD+1) concentration cap applied
+	// during endpoint selection. <= 0 or >= 1 disables the cap (flat random pick).
+	getMaxOperatorShare() float64
 }
 
 // NewCosmosSDKServiceQoSConfig creates a new CosmosSDK service configuration.
@@ -106,6 +109,14 @@ func (c cosmosSDKServiceQoSConfig) getSyncAllowance() uint64 {
 		c.syncAllowance = defaultCosmosSDKBlockNumberSyncAllowance
 	}
 	return c.syncAllowance
+}
+
+// getMaxOperatorShare returns the per-operator concentration cap. This static
+// test/config implementation leaves it disabled (0); the production simpleCosmosConfig
+// carries the dynamically-set value.
+// Implements the CosmosSDKServiceQoSConfig interface.
+func (cosmosSDKServiceQoSConfig) getMaxOperatorShare() float64 {
+	return 0
 }
 
 // getSupportedAPIs returns the RPC types supported by the service.

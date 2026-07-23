@@ -42,6 +42,13 @@ func (m *mockReputationSvc) SetPerceivedBlockNumber(_ context.Context, serviceID
 	return nil
 }
 
+func (m *mockReputationSvc) DeletePerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.perceivedBlock, serviceID)
+	return nil
+}
+
 func (m *mockReputationSvc) GetPerceivedBlockNumber(_ context.Context, serviceID protocol.ServiceID) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()

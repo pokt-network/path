@@ -312,8 +312,11 @@ func TestReputation_FilterByReputation(t *testing.T) {
 	// - bad endpoint: score 20 (below threshold of 30)
 	// - new endpoint: no score (should be allowed - treated as initial score)
 
-	goodKey := reputation.NewEndpointKey(serviceID, "supplier1-https://good.example.com", sharedtypes.RPCType_JSON_RPC)
-	badKey := reputation.NewEndpointKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_JSON_RPC)
+	// Seed scores via the SAME key builder filterByReputation reads with, so the test is
+	// robust to key granularity config (default is per-URL).
+	kb := svc.KeyBuilderForService(serviceID)
+	goodKey := kb.BuildKey(serviceID, "supplier1-https://good.example.com", sharedtypes.RPCType_JSON_RPC)
+	badKey := kb.BuildKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_JSON_RPC)
 
 	// Record signals to establish scores
 	// Good endpoint: 1 success -> 80 + 1 = 81
@@ -344,6 +347,55 @@ func TestReputation_FilterByReputation(t *testing.T) {
 	require.Contains(t, filtered, protocol.EndpointAddr("supplier1-https://good.example.com"))
 	require.Contains(t, filtered, protocol.EndpointAddr("supplier3-https://new.example.com"))
 	require.NotContains(t, filtered, protocol.EndpointAddr("supplier2-https://bad.example.com"))
+}
+
+// TestReputation_FilterByReputation_PoolCollapseGuard verifies that when EVERY endpoint is
+// below threshold (the whole pool would be filtered out), filterByReputation does not return
+// empty — it keeps the least-bad tier (the highest-scoring endpoint(s)) so selection stays
+// reputation-aware instead of collapsing to a reputation-blind fallback.
+func TestReputation_FilterByReputation_PoolCollapseGuard(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	config := reputation.Config{
+		Enabled: true, InitialScore: 80, MinThreshold: 30,
+		RecoveryTimeout: 5 * time.Minute, StorageType: "memory",
+	}
+	config.HydrateDefaults()
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	p := &Protocol{logger: logger, reputationService: svc}
+	serviceID := protocol.ServiceID("collapse-test")
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"s1-https://a.example.com": &mockEndpoint{addr: "s1-https://a.example.com"},
+		"s2-https://b.example.com": &mockEndpoint{addr: "s2-https://b.example.com"},
+		"s3-https://c.example.com": &mockEndpoint{addr: "s3-https://c.example.com"},
+	}
+	kb := svc.KeyBuilderForService(serviceID)
+	// Drive ALL three below the threshold with Major errors (-10 each; no cooldown, no rate
+	// detector — this isolates the below-threshold collapse). c is the least-bad.
+	//   a,b: 8 major -> score 0    c: 6 major -> score 20   (all < 30 threshold)
+	cKey := kb.BuildKey(serviceID, "s3-https://c.example.com", sharedtypes.RPCType_JSON_RPC)
+	for _, addr := range []protocol.EndpointAddr{"s1-https://a.example.com", "s2-https://b.example.com"} {
+		k := kb.BuildKey(serviceID, addr, sharedtypes.RPCType_JSON_RPC)
+		for i := 0; i < 8; i++ {
+			require.NoError(t, svc.RecordSignal(ctx, k, reputation.NewMajorErrorSignal("degraded", 0)))
+		}
+	}
+	for i := 0; i < 6; i++ {
+		require.NoError(t, svc.RecordSignal(ctx, cKey, reputation.NewMajorErrorSignal("degraded", 0)))
+	}
+
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
+
+	// Guard must keep the least-bad endpoint (c, score 20), NOT return an empty pool.
+	require.NotEmpty(t, filtered, "pool-collapse guard must keep the least-bad endpoint(s), not return empty")
+	require.Contains(t, filtered, protocol.EndpointAddr("s3-https://c.example.com"), "the highest-scoring (least-bad) endpoint must be kept")
+	require.Len(t, filtered, 1, "only the least-bad tier (c) should be kept, not the strictly-worse a/b")
 }
 
 // TestReputation_DisabledNoFiltering verifies that when reputation
@@ -452,13 +504,15 @@ func TestReputation_WebsocketSignalAttributionAfterRebind(t *testing.T) {
 
 	wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_endpoint_stalled", 0))
 
-	reboundScore, err := svc.GetScore(ctx, reputation.NewEndpointKey(serviceID, rebound.Addr(), sharedtypes.RPCType_WEBSOCKET))
+	// Read via the same key builder recordWebsocketSignal uses (robust to granularity).
+	kb := svc.KeyBuilderForService(serviceID)
+	reboundScore, err := svc.GetScore(ctx, kb.BuildKey(serviceID, rebound.Addr(), sharedtypes.RPCType_WEBSOCKET))
 	require.NoError(t, err)
 	require.Equal(t, config.InitialScore-10, reboundScore.Value, "rebound (current) supplier must be penalized")
 
 	// The original supplier received no signal, so its key must be absent (ErrNotFound) —
 	// proving the penalty did NOT leak to the pre-rebind endpoint.
-	_, err = svc.GetScore(ctx, reputation.NewEndpointKey(serviceID, original.Addr(), sharedtypes.RPCType_WEBSOCKET))
+	_, err = svc.GetScore(ctx, kb.BuildKey(serviceID, original.Addr(), sharedtypes.RPCType_WEBSOCKET))
 	require.ErrorIs(t, err, reputation.ErrNotFound, "original supplier must NOT be penalized after rebind")
 }
 
@@ -480,8 +534,10 @@ func TestReputation_FilterByReputation_Websocket(t *testing.T) {
 	}
 
 	// Good WS endpoint: 1 success. Bad WS endpoint: 3 critical errors -> below threshold.
-	goodKey := reputation.NewEndpointKey(serviceID, "supplier1-https://good.example.com", sharedtypes.RPCType_WEBSOCKET)
-	badKey := reputation.NewEndpointKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_WEBSOCKET)
+	// Seed via the service key builder so keys match filterByReputation (default per-URL).
+	kb := svc.KeyBuilderForService(serviceID)
+	goodKey := kb.BuildKey(serviceID, "supplier1-https://good.example.com", sharedtypes.RPCType_WEBSOCKET)
+	badKey := kb.BuildKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_WEBSOCKET)
 	require.NoError(t, svc.RecordSignal(ctx, goodKey, reputation.NewSuccessSignal(100*time.Millisecond)))
 	for i := 0; i < 3; i++ {
 		require.NoError(t, svc.RecordSignal(ctx, badKey, reputation.NewCriticalErrorSignal("service_error", 200*time.Millisecond)))
@@ -514,7 +570,8 @@ func TestReputation_DisqualifiedMetric(t *testing.T) {
 	}
 
 	// Bad WS endpoint: 6 Major errors (-10 each) -> 80-60 = 20 < 30 threshold, no cooldown.
-	badKey := reputation.NewEndpointKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_WEBSOCKET)
+	// Seed via the service key builder so keys match filterByReputation (default per-URL).
+	badKey := svc.KeyBuilderForService(serviceID).BuildKey(serviceID, "supplier2-https://bad.example.com", sharedtypes.RPCType_WEBSOCKET)
 	for i := 0; i < 6; i++ {
 		require.NoError(t, svc.RecordSignal(ctx, badKey, reputation.NewMajorErrorSignal("ws_endpoint_stalled", 0)))
 	}
@@ -1142,10 +1199,10 @@ func TestReputation_KeyGranularityDefault(t *testing.T) {
 		MinThreshold:    30,
 		RecoveryTimeout: 5 * time.Minute,
 		StorageType:     "memory",
-		// KeyGranularity not set - should default to per-endpoint
+		// KeyGranularity not set - should default to per-URL
 	}
 	config.HydrateDefaults()
-	require.Equal(t, reputation.KeyGranularityEndpoint, config.KeyGranularity)
+	require.Equal(t, reputation.KeyGranularityURL, config.KeyGranularity)
 
 	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
 	svc := reputation.NewService(config, store)
@@ -1164,16 +1221,17 @@ func TestReputation_KeyGranularityDefault(t *testing.T) {
 	endpoint1Addr := protocol.EndpointAddr("pokt1supplier1-https://node1.example.com")
 	endpoint2Addr := protocol.EndpointAddr("pokt1supplier1-https://node2.example.com")
 
-	// Get the key builder for the service
+	// Get the key builder for the service (default is now per-URL)
 	keyBuilder := svc.KeyBuilderForService(serviceID)
-	require.IsType(t, &reputation.EndpointKeyBuilder{}, keyBuilder)
+	require.IsType(t, &reputation.URLKeyBuilder{}, keyBuilder)
 
-	// Build keys - each endpoint should have a DIFFERENT key
+	// Build keys - each endpoint has a DIFFERENT backend URL, so per-URL keeps them separate
+	// (distinct URLs are never merged — the no-dilution property vs per-domain).
 	key1 := keyBuilder.BuildKey(serviceID, endpoint1Addr, sharedtypes.RPCType_JSON_RPC)
 	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr, sharedtypes.RPCType_JSON_RPC)
 
-	// Verify keys are different (per-endpoint granularity)
-	require.NotEqual(t, key1, key2, "Each endpoint should have its own key")
+	// Verify keys are different (distinct URLs stay independent)
+	require.NotEqual(t, key1, key2, "Each distinct URL should have its own key")
 
 	// Record critical errors ONLY on endpoint1
 	for i := 0; i < 3; i++ {
@@ -1301,14 +1359,23 @@ func TestReputationFiltering_RPCTypeAware(t *testing.T) {
 	serviceID := protocol.ServiceID("eth")
 	endpointAddr := protocol.EndpointAddr("supplier1-https://node.example.com")
 
+	// A second, healthy endpoint so the below-threshold WS endpoint is genuinely excluded
+	// (its presence keeps the WS pool non-empty, so the pool-collapse guard does not fire and
+	// re-admit the bad endpoint as "least-bad"). It gets the initial score for both RPC types.
+	healthyAddr := protocol.EndpointAddr("supplier2-https://healthy.example.com")
+
 	// Create test endpoints
 	endpoints := map[protocol.EndpointAddr]endpoint{
 		endpointAddr: &mockEndpoint{addr: endpointAddr},
+		healthyAddr:  &mockEndpoint{addr: healthyAddr},
 	}
 
-	// Setup: Endpoint has high JSON-RPC score, low WebSocket score
-	jsonRpcKey := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
-	websocketKey := reputation.NewEndpointKey(serviceID, endpointAddr, sharedtypes.RPCType_WEBSOCKET)
+	// Setup: Endpoint has high JSON-RPC score, low WebSocket score.
+	// Build keys via the service key builder so the recorded scores land under the same
+	// keys filterByReputation reads — correct under any key granularity (default per-URL).
+	kb := svc.KeyBuilderForService(serviceID)
+	jsonRpcKey := kb.BuildKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
+	websocketKey := kb.BuildKey(serviceID, endpointAddr, sharedtypes.RPCType_WEBSOCKET)
 
 	// JSON-RPC: Record success to establish a good score
 	// Initial: 80, after success: 81
@@ -1333,15 +1400,15 @@ func TestReputationFiltering_RPCTypeAware(t *testing.T) {
 	require.GreaterOrEqual(t, jsonRpcScore.Value, config.MinThreshold, "JSON-RPC should be above threshold")
 	require.Less(t, websocketScore.Value, config.MinThreshold, "WebSocket should be below threshold")
 
-	// Filter for JSON-RPC → endpoint should be included
+	// Filter for JSON-RPC → the endpoint (high JSON score) should be included.
 	filteredJsonRpc := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
-	require.Len(t, filteredJsonRpc, 1, "JSON-RPC filtering should include endpoint (high score)")
-	require.Contains(t, filteredJsonRpc, endpointAddr, "Endpoint should be included for JSON-RPC")
+	require.Contains(t, filteredJsonRpc, endpointAddr, "Endpoint should be included for JSON-RPC (high score)")
 
-	// Filter for WebSocket → endpoint should be excluded
+	// Filter for WebSocket → the endpoint (low WS score) should be excluded, while the healthy
+	// endpoint remains (so the pool is non-empty and the collapse guard does not re-admit it).
 	filteredWebsocket := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, "")
-	require.Len(t, filteredWebsocket, 0, "WebSocket filtering should exclude endpoint (low score)")
-	require.NotContains(t, filteredWebsocket, endpointAddr, "Endpoint should be excluded for WebSocket")
+	require.NotContains(t, filteredWebsocket, endpointAddr, "Endpoint should be excluded for WebSocket (low score)")
+	require.Contains(t, filteredWebsocket, healthyAddr, "Healthy endpoint should remain for WebSocket")
 
 	t.Log("Verified: Filtering respects RPC type - same endpoint included for JSON-RPC, excluded for WebSocket")
 }

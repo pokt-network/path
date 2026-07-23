@@ -51,6 +51,12 @@ type Storage interface {
 	// Returns 0 if no block number has been stored yet.
 	GetPerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) (uint64, error)
 
+	// DeletePerceivedBlockNumber removes the stored perceived block number for a
+	// service so it can be rebuilt from fresh endpoint observations. Used by the
+	// chain-state admin reset to recover from a poisoned/stuck perceived height
+	// (the max-wins Set path cannot lower a too-high value).
+	DeletePerceivedBlockNumber(ctx context.Context, serviceID protocol.ServiceID) error
+
 	// SetEndpointBlockHeight stores a single endpoint's block height for a service.
 	// Uses HSET on a Redis hash keyed by service ID, with endpoint address as field.
 	SetEndpointBlockHeight(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, blockHeight uint64) error

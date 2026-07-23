@@ -180,8 +180,17 @@ func (ss *serviceState) SelectWithMetadata(availableEndpoints protocol.EndpointA
 
 	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", validCount, availableCount)
 
-	// Select random endpoint from valid candidates
-	selectedEndpointAddr := filteredEndpointsAddr[rand.Intn(validCount)]
+	// Select from the valid candidates, applying the per-operator (eTLD+1) concentration
+	// cap when configured. The cap bounds any single operator's selection probability so
+	// one supplier that holds most of a service's endpoints can't absorb an outsized share
+	// (and take that whole share down if it degrades). Covers both HTTP and WebSocket
+	// selection — both reach here via requestContext.Select. When the cap is disabled
+	// (getMaxOperatorShare() <= 0 or >= 1), this is byte-for-byte the prior flat random pick.
+	selectedEndpointAddr := selector.SelectWithConcentrationCap(
+		ss.serviceQoSConfig.GetServiceID(),
+		filteredEndpointsAddr,
+		ss.serviceQoSConfig.getMaxOperatorShare(),
+	)
 	return EndpointSelectionResult{
 		SelectedEndpoint: selectedEndpointAddr,
 		Metadata: EndpointSelectionMetadata{

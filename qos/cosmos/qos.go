@@ -12,6 +12,8 @@ import (
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
+	pathqos "github.com/pokt-network/path/qos"
+	"github.com/pokt-network/path/qos/selector"
 	qostypes "github.com/pokt-network/path/qos/types"
 	"github.com/pokt-network/path/reputation"
 )
@@ -108,6 +110,9 @@ type simpleCosmosConfig struct {
 	serviceID     protocol.ServiceID
 	syncAllowance atomic.Uint64                    // If 0, uses default. Updated dynamically when external health check rules are loaded.
 	supportedAPIs map[sharedtypes.RPCType]struct{} // Supported RPC types
+	// maxOperatorShare is the per-operator concentration cap. 0 (the zero value) disables
+	// the cap. Updated dynamically via SetMaxOperatorShare.
+	maxOperatorShare selector.AtomicFloat64
 }
 
 func (c *simpleCosmosConfig) GetServiceID() protocol.ServiceID { return c.serviceID }
@@ -120,6 +125,9 @@ func (c *simpleCosmosConfig) getSyncAllowance() uint64 {
 	}
 	return defaultCosmosSDKBlockNumberSyncAllowance
 }
+func (c *simpleCosmosConfig) getMaxOperatorShare() float64 {
+	return c.maxOperatorShare.Load()
+}
 
 // SetSyncAllowance dynamically updates the sync allowance for this QoS instance.
 // This is called when external health check rules are loaded/refreshed, since those
@@ -127,6 +135,14 @@ func (c *simpleCosmosConfig) getSyncAllowance() uint64 {
 func (qos *QoS) SetSyncAllowance(syncAllowance uint64) {
 	if cfg, ok := qos.serviceQoSConfig.(*simpleCosmosConfig); ok {
 		cfg.syncAllowance.Store(syncAllowance)
+	}
+}
+
+// SetMaxOperatorShare dynamically sets the per-operator (eTLD+1) concentration cap used
+// during endpoint selection. A value <= 0 or >= 1 disables the cap (flat random pick).
+func (qos *QoS) SetMaxOperatorShare(maxOperatorShare float64) {
+	if cfg, ok := qos.serviceQoSConfig.(*simpleCosmosConfig); ok {
+		cfg.maxOperatorShare.Store(maxOperatorShare)
 	}
 }
 func (c *simpleCosmosConfig) getSupportedAPIs() map[sharedtypes.RPCType]struct{} {
@@ -251,6 +267,21 @@ func (qos *QoS) GetPerceivedBlockNumber() uint64 {
 	return qos.perceivedBlockNumber
 }
 
+// ResetPerceivedBlockHeight clears the perceived block number (in-memory + Redis) so it
+// rebuilds from fresh endpoint observations. Used by the chain-state admin reset to
+// recover from a stuck/too-high perceived height (the max-wins path cannot lower it).
+// Must be invoked on each pod, since the perceived floor is per-pod in-memory state.
+func (qos *QoS) ResetPerceivedBlockHeight(ctx context.Context) error {
+	qos.serviceStateLock.Lock()
+	qos.perceivedBlockNumber = 0
+	qos.serviceStateLock.Unlock()
+
+	if qos.reputationSvc != nil {
+		return qos.reputationSvc.DeletePerceivedBlockNumber(ctx, qos.serviceQoSConfig.GetServiceID())
+	}
+	return nil
+}
+
 // ConsumeExternalBlockHeight consumes block heights from an external fetcher channel
 // and uses them as a floor for perceivedBlockNumber. This ensures that if all session
 // endpoints are behind the real chain tip, the perceived block is corrected.
@@ -301,7 +332,18 @@ func (qos *QoS) ConsumeExternalBlockHeight(ctx context.Context, heights <-chan i
 						Msg("External block floor skipped — no suppliers have reported yet")
 					continue
 				}
-				if h > qos.perceivedBlockNumber {
+				// Guard the external floor the same way the endpoint path is guarded
+				// (see service_state.go:101): an external source must not raise
+				// perceived more than MaxBlockHeightJump above the current value,
+				// blocking a misbehaving/mislabeled external source from poisoning
+				// perceived arbitrarily high and filtering out honest endpoints.
+				if h > qos.perceivedBlockNumber && !pathqos.IsPlausibleBlockHeight(h, qos.perceivedBlockNumber) {
+					qos.logger.Warn().
+						Str("service_id", string(serviceID)).
+						Uint64("external_block", h).
+						Uint64("perceived_block", qos.perceivedBlockNumber).
+						Msg("⚠️ ignoring implausible external block height (possible poisoned external source)")
+				} else if h > qos.perceivedBlockNumber {
 					qos.logger.Info().
 						Str("service_id", string(serviceID)).
 						Uint64("old_perceived", qos.perceivedBlockNumber).

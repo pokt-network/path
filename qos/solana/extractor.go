@@ -56,20 +56,22 @@ func (e *SolanaDataExtractor) ExtractBlockHeight(request []byte, response []byte
 		return 0, fmt.Errorf("response missing result field")
 	}
 
-	// Get blockHeight from result
-	// Note: Solana returns blockHeight as a number, or we might also check absoluteSlot
+	// Get blockHeight from result.
+	//
+	// We deliberately do NOT fall back to absoluteSlot. absoluteSlot is the SLOT, which runs
+	// ~5% HIGHER than block height (skipped slots), so substituting it poisons the perceived
+	// block height: Solana consensus is max-based (see state.go — perceived only ever rises),
+	// so a single slot-valued observation lifts perceived above the true chain tip, after
+	// which every endpoint reporting the correct (lower) block height looks "behind", and the
+	// external getBlockHeight floor — which also only raises perceived — cannot pull it back
+	// down. Solana's getEpochInfo always includes blockHeight; a response without a usable
+	// numeric blockHeight is skipped rather than silently downgraded to a slot.
 	blockHeight := gjson.GetBytes(response, "result.blockHeight")
 	if blockHeight.Exists() && blockHeight.Type == gjson.Number {
 		return blockHeight.Int(), nil
 	}
 
-	// Try absoluteSlot as fallback (some responses use this)
-	absoluteSlot := gjson.GetBytes(response, "result.absoluteSlot")
-	if absoluteSlot.Exists() && absoluteSlot.Type == gjson.Number {
-		return absoluteSlot.Int(), nil
-	}
-
-	return 0, fmt.Errorf("could not extract block height from response")
+	return 0, fmt.Errorf("could not extract block height: getEpochInfo result missing numeric blockHeight field")
 }
 
 // ExtractChainID extracts the cluster identifier from a Solana response.

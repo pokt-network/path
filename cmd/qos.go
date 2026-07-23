@@ -109,6 +109,25 @@ func getServiceQoSInstances(
 			noopQoS := noop.NewNoOpQoSService(qosLogger, serviceID)
 			qosServices[serviceID] = noopQoS
 		}
+
+		// Per-operator concentration cap: bounds any single operator's (eTLD+1) share of
+		// endpoint selection (config-driven, shipped ON by default). Applied uniformly to
+		// every QoS type that supports it — EVM/Cosmos/Solana/NoOp — covering both HTTP and
+		// WebSocket initial selection via requestContext.Select. Disabled (>= 1 or <= 0)
+		// leaves selection as a flat random pick.
+		if unifiedConfig != nil {
+			if setter, ok := qosServices[serviceID].(interface{ SetMaxOperatorShare(float64) }); ok {
+				maxOperatorShare := unifiedConfig.GetMaxOperatorShareForService(serviceID)
+				setter.SetMaxOperatorShare(maxOperatorShare)
+				if maxOperatorShare > 0 && maxOperatorShare < 1 {
+					svcLogger.Info().Float64("max_operator_share", maxOperatorShare).Msg("✅ QoS: per-operator concentration cap ENABLED")
+				}
+			} else {
+				// Every current QoS type implements SetMaxOperatorShare; a new type that
+				// forgets it would silently run uncapped despite the shipped-on default.
+				svcLogger.Warn().Msg("⚠️ QoS type does not support the per-operator concentration cap; selection runs uncapped")
+			}
+		}
 	}
 
 	hydratedLogger.Info().Msgf("Initialized %d QoS service instances", len(qosServices))
