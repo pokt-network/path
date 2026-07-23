@@ -129,6 +129,18 @@ var HealthCheckStatus = promauto.NewCounterVec(
 	[]string{LabelDomain, LabelSupplier, LabelRPCType, LabelServiceID, LabelHealthCheckName, LabelReputationSignal},
 )
 
+// HealthCheckDeduped counts health check relays SKIPPED by backend-URL deduplication.
+// Each increment is one supplier×check whose backend-derived result was fanned from a
+// representative sharing the same URL instead of firing its own relay. Compare against
+// path_relays_total{request_type="health_check"} to see the load reduction.
+var HealthCheckDeduped = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "health_check_deduped_total",
+		Help: "Health check relays skipped via backend-URL dedup (result fanned from a same-URL representative).",
+	},
+	[]string{LabelServiceID},
+)
+
 // =============================================================================
 // Observation Pipeline (Counter)
 // Labels: domain, rpc_type, service_id, network_type, method, reputation_signal
@@ -931,6 +943,11 @@ var WebsocketEndpointStallTotal = promauto.NewCounterVec(
 // RecordHealthCheck records a health check result per supplier
 func RecordHealthCheck(domain, supplier, rpcType, serviceID, healthCheckName, reputationSignal string) {
 	HealthCheckStatus.WithLabelValues(domain, supplier, rpcType, serviceID, healthCheckName, reputationSignal).Inc()
+}
+
+// RecordHealthCheckDeduped records a health check relay skipped via backend-URL dedup.
+func RecordHealthCheckDeduped(serviceID string) {
+	HealthCheckDeduped.WithLabelValues(serviceID).Inc()
 }
 
 // RecordObservation records an observation pipeline event

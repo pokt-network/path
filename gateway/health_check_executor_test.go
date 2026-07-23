@@ -669,3 +669,157 @@ func TestRecordCheckResult_SuccessRecordsRecoverySignal(t *testing.T) {
 // but kept here so future tests that need RPCType can copy this file as a
 // template without hunting for the import.
 var _ = sharedtypes.RPCType_JSON_RPC
+
+// ---------------------------------------------------------------------------
+// Backend-URL health check dedup
+// ---------------------------------------------------------------------------
+
+// TestGroupEndpointsByURL pins the grouping used for backend-URL dedup: endpoints
+// that share an identical backend URL are collapsed into one group (one relay per
+// URL), endpoints with no HTTP URL each stay a singleton (never deduped), and both
+// groups and members come back in a stable order so rotation is deterministic.
+func TestGroupEndpointsByURL(t *testing.T) {
+	eps := []EndpointInfo{
+		{Addr: "sB-https://r2.example.com", HTTPURL: "https://r2.example.com"},
+		{Addr: "sA-https://r1.example.com", HTTPURL: "https://r1.example.com"},
+		{Addr: "sC-https://r1.example.com", HTTPURL: "https://r1.example.com"},
+		{Addr: "sD-https://r1.example.com", HTTPURL: "https://r1.example.com"},
+		{Addr: "wsOnly", HTTPURL: "", WebSocketURL: "wss://ws.example.com"},
+	}
+
+	groups := groupEndpointsByURL(eps)
+
+	// r1 (3 members) + r2 (1 member) + ws-only singleton = 3 groups.
+	require.Len(t, groups, 3)
+
+	// First group is r1 (sorted URL order), members sorted by Addr.
+	require.Len(t, groups[0], 3)
+	require.Equal(t, protocol.EndpointAddr("sA-https://r1.example.com"), groups[0][0].Addr)
+	require.Equal(t, protocol.EndpointAddr("sC-https://r1.example.com"), groups[0][1].Addr)
+	require.Equal(t, protocol.EndpointAddr("sD-https://r1.example.com"), groups[0][2].Addr)
+
+	// Second group is r2 (single member).
+	require.Len(t, groups[1], 1)
+	require.Equal(t, protocol.EndpointAddr("sB-https://r2.example.com"), groups[1][0].Addr)
+
+	// Third group is the WS-only singleton — never merged with anything.
+	require.Len(t, groups[2], 1)
+	require.Equal(t, protocol.EndpointAddr("wsOnly"), groups[2][0].Addr)
+}
+
+// TestGroupEndpointsByURL_Stable pins that grouping is deterministic across calls,
+// so representative rotation actually round-robins the same ordering each cycle.
+func TestGroupEndpointsByURL_Stable(t *testing.T) {
+	eps := []EndpointInfo{
+		{Addr: "s3-https://b.example.com", HTTPURL: "https://b.example.com"},
+		{Addr: "s1-https://a.example.com", HTTPURL: "https://a.example.com"},
+		{Addr: "s2-https://a.example.com", HTTPURL: "https://a.example.com"},
+	}
+	first := groupEndpointsByURL(eps)
+	for i := 0; i < 5; i++ {
+		require.Equal(t, first, groupEndpointsByURL(eps))
+	}
+}
+
+// TestRepresentativeIndex_RoundRobin pins that rotation gives every member of a
+// same-URL group a directly-probed turn within len(group) consecutive cycles.
+func TestRepresentativeIndex_RoundRobin(t *testing.T) {
+	require.Equal(t, 0, representativeIndex(7, 1), "singleton group always uses index 0")
+	require.Equal(t, 0, representativeIndex(7, 0), "empty group must not divide-by-zero")
+
+	const size = 4
+	seen := make(map[int]struct{})
+	for cycle := uint64(1); cycle <= size; cycle++ {
+		seen[representativeIndex(cycle, size)] = struct{}{}
+	}
+	require.Len(t, seen, size, "every member must be representative once per %d cycles", size)
+}
+
+// TestBackendDedupEnabled pins the default-on behavior and explicit override.
+func TestBackendDedupEnabled(t *testing.T) {
+	tru, fls := true, false
+	require.True(t, (&HealthCheckExecutor{}).backendDedupEnabled(), "nil config defaults to enabled")
+	require.True(t, (&HealthCheckExecutor{config: &ActiveHealthChecksConfig{}}).backendDedupEnabled(), "nil flag defaults to enabled")
+	require.True(t, (&HealthCheckExecutor{config: &ActiveHealthChecksConfig{BackendDedup: &tru}}).backendDedupEnabled())
+	require.False(t, (&HealthCheckExecutor{config: &ActiveHealthChecksConfig{BackendDedup: &fls}}).backendDedupEnabled())
+}
+
+// TestHydrateDefaults_BackendDedup pins that dedup ships on by default.
+func TestHydrateDefaults_BackendDedup(t *testing.T) {
+	cfg := &ActiveHealthChecksConfig{}
+	cfg.HydrateDefaults(true)
+	require.NotNil(t, cfg.BackendDedup)
+	require.True(t, *cfg.BackendDedup)
+
+	// Explicit false must be preserved, not overwritten by the default.
+	fls := false
+	cfg2 := &ActiveHealthChecksConfig{BackendDedup: &fls}
+	cfg2.HydrateDefaults(true)
+	require.NotNil(t, cfg2.BackendDedup)
+	require.False(t, *cfg2.BackendDedup)
+}
+
+// TestFanOutcomeToSibling_RecordsSignals pins that fanning replays one reputation
+// signal per HTTP outcome onto the sibling — a passing check recovers it, a failing
+// check penalizes it — mirroring what the representative recorded, without a relay.
+func TestFanOutcomeToSibling_RecordsSignals(t *testing.T) {
+	rep := &recordedSignalReputationSvc{}
+	executor := &HealthCheckExecutor{
+		logger:        polyzero.NewLogger(),
+		reputationSvc: rep,
+		// observationQueue nil => processObservationSync is a no-op; archival not resolved
+		// => no SetArchivalStatus call. Isolates the reputation-signal fan.
+	}
+
+	outcomes := []checkOutcome{
+		{
+			check:   HealthCheckConfig{Name: "block-number", Type: "json_rpc"},
+			err:     nil, // pass
+			latency: 40 * time.Millisecond,
+		},
+		{
+			check:   HealthCheckConfig{Name: "chain-id", Type: "json_rpc", ReputationSignal: "critical_error"},
+			err:     fmt.Errorf("wrong chain id"),
+			latency: 60 * time.Millisecond,
+		},
+	}
+
+	executor.fanOutcomeToSibling(
+		context.Background(),
+		protocol.ServiceID("bsc"),
+		protocol.EndpointAddr("pokt1sibling-https://r1.example.com"),
+		outcomes,
+	)
+
+	signals := rep.RecordedSignals()
+	require.Len(t, signals, 2, "one fanned reputation signal per HTTP outcome")
+	require.Equal(t, reputation.SignalTypeRecoverySuccess, signals[0].Type, "passing check recovers the sibling")
+	require.Equal(t, reputation.SignalTypeCriticalError, signals[1].Type, "failing check penalizes the sibling at configured severity")
+}
+
+// TestFanOutcomeToSibling_OverServicedNotPenalized pins that a representative's
+// over-serviced (stake-exhausted) result, when fanned, still skips the sibling
+// penalty — same no-penalty rule as a direct relay.
+func TestFanOutcomeToSibling_OverServicedNotPenalized(t *testing.T) {
+	rep := &recordedSignalReputationSvc{}
+	executor := &HealthCheckExecutor{
+		logger:        polyzero.NewLogger(),
+		reputationSvc: rep,
+	}
+
+	outcomes := []checkOutcome{{
+		check:   HealthCheckConfig{Name: "block-number", Type: "json_rpc", ReputationSignal: "major_error"},
+		err:     fmt.Errorf("relay miner returned error: offchain rate limit hit by relayer proxy"),
+		latency: 20 * time.Millisecond,
+	}}
+
+	executor.fanOutcomeToSibling(
+		context.Background(),
+		protocol.ServiceID("bsc"),
+		protocol.EndpointAddr("pokt1sibling-https://r1.example.com"),
+		outcomes,
+	)
+
+	require.Empty(t, rep.RecordedSignals(),
+		"fanned over-serviced failures must not penalize the sibling")
+}

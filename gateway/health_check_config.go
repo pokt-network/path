@@ -271,6 +271,14 @@ type (
 		// Local defines health checks in the local config.
 		// These override any checks from External with the same service_id + name.
 		Local []ServiceHealthCheckConfig `yaml:"local,omitempty"`
+		// BackendDedup enables backend-URL deduplication of health check relays.
+		// Many staked suppliers front the SAME backend URL (measured: 2-4x redundancy
+		// per service, up to 10 suppliers per URL). When enabled, each cycle fires ONE
+		// relay per unique backend URL (a rotating representative supplier) and fans the
+		// backend-derived result (reputation signal, block height, archival status) to the
+		// other suppliers on that URL — cutting HC relay volume by the redundancy factor.
+		// WebSocket checks are never deduped (connectivity is per-endpoint). Default: true.
+		BackendDedup *bool `yaml:"backend_dedup,omitempty"`
 	}
 
 	// RetryConfig configures automatic retry behavior for failed requests.
@@ -343,6 +351,12 @@ func (hc *ActiveHealthChecksConfig) HydrateDefaults(hasRedis bool) {
 	// Set default sync allowance
 	if hc.SyncAllowance == 0 {
 		hc.SyncAllowance = DefaultSyncAllowance
+	}
+
+	// Backend-URL dedup defaults to enabled.
+	if hc.BackendDedup == nil {
+		enabled := true
+		hc.BackendDedup = &enabled
 	}
 
 	// Hydrate coordination defaults
