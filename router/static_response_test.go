@@ -53,8 +53,8 @@ func Test_staticResponse_ServedOnMatch(t *testing.T) {
 	resolver := stubStaticResolver{
 		fn: func(serviceID, path, method string) ([]byte, int, map[string]string, bool) {
 			c.Equal("solana", serviceID)
-			c.Equal("/identity", path, "middleware must resolve on the cleaned path")
-			return []byte("0xPAYOUT"), http.StatusOK, map[string]string{
+			c.Equal("/example", path, "middleware must resolve on the cleaned path")
+			return []byte("example-body"), http.StatusOK, map[string]string{
 				"Content-Type": "text/plain; charset=utf-8",
 				"X-Test":       "1",
 			}, true
@@ -63,7 +63,7 @@ func Test_staticResponse_ServedOnMatch(t *testing.T) {
 	// No gateway EXPECT: a static hit must never reach the relay handler.
 	_, ts := newStaticTestRouter(t, resolver)
 
-	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/identity", nil)
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/example", nil)
 	c.NoError(err)
 	req.Header.Set(request.HTTPHeaderTargetServiceID, "solana")
 
@@ -74,7 +74,7 @@ func Test_staticResponse_ServedOnMatch(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	c.NoError(err)
 	c.Equal(http.StatusOK, resp.StatusCode)
-	c.Equal("0xPAYOUT", string(body))
+	c.Equal("example-body", string(body))
 	c.Equal("1", resp.Header.Get("X-Test"))
 	c.Equal("text/plain; charset=utf-8", resp.Header.Get("Content-Type"))
 }
@@ -130,7 +130,7 @@ func Test_staticResponse_WebSocketUpgradeBypasses(t *testing.T) {
 		},
 	)
 
-	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/identity", nil)
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/example", nil)
 	c.NoError(err)
 	req.Header.Set(request.HTTPHeaderTargetServiceID, "solana")
 	req.Header.Set("Upgrade", "websocket")

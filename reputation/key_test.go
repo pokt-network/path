@@ -32,23 +32,23 @@ func TestKeyBuilder_PerDomain(t *testing.T) {
 	require.IsType(t, &DomainKeyBuilder{}, builder)
 
 	serviceID := protocol.ServiceID("eth")
-	endpointAddr := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.nodefleet.net")
+	endpointAddr := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.example.com")
 
 	key := builder.BuildKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
 
 	require.Equal(t, serviceID, key.ServiceID)
-	// Should extract domain: nodefleet.net
-	require.Equal(t, protocol.EndpointAddr("nodefleet.net"), key.EndpointAddr)
-	require.Equal(t, "eth:nodefleet.net:json_rpc", key.String())
+	// Should extract domain: example.com
+	require.Equal(t, protocol.EndpointAddr("example.com"), key.EndpointAddr)
+	require.Equal(t, "eth:example.com:json_rpc", key.String())
 }
 
 func TestKeyBuilder_PerDomain_SameDomainDifferentSubdomains(t *testing.T) {
 	builder := NewKeyBuilder(KeyGranularityDomain)
 
 	serviceID := protocol.ServiceID("eth")
-	endpoint1 := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.nodefleet.net")
-	endpoint2 := protocol.EndpointAddr("pokt1xyz789-https://rm-02.us.nodefleet.net")
-	endpoint3 := protocol.EndpointAddr("pokt1def456-https://api.nodefleet.net:8545")
+	endpoint1 := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.example.com")
+	endpoint2 := protocol.EndpointAddr("pokt1xyz789-https://rm-02.us.example.com")
+	endpoint3 := protocol.EndpointAddr("pokt1def456-https://api.example.com:8545")
 
 	key1 := builder.BuildKey(serviceID, endpoint1, sharedtypes.RPCType_JSON_RPC)
 	key2 := builder.BuildKey(serviceID, endpoint2, sharedtypes.RPCType_JSON_RPC)
@@ -57,14 +57,14 @@ func TestKeyBuilder_PerDomain_SameDomainDifferentSubdomains(t *testing.T) {
 	// All should produce the same key (same domain)
 	require.Equal(t, key1, key2, "Same domain should produce same key")
 	require.Equal(t, key1, key3, "Same domain should produce same key")
-	require.Equal(t, "eth:nodefleet.net:json_rpc", key1.String())
+	require.Equal(t, "eth:example.com:json_rpc", key1.String())
 }
 
 func TestKeyBuilder_PerDomain_DifferentDomains(t *testing.T) {
 	builder := NewKeyBuilder(KeyGranularityDomain)
 
 	serviceID := protocol.ServiceID("eth")
-	endpoint1 := protocol.EndpointAddr("pokt1abc-https://node.nodefleet.net")
+	endpoint1 := protocol.EndpointAddr("pokt1abc-https://node.example.com")
 	endpoint2 := protocol.EndpointAddr("pokt1xyz-https://relay.pokt.network")
 
 	key1 := builder.BuildKey(serviceID, endpoint1, sharedtypes.RPCType_JSON_RPC)
@@ -72,7 +72,7 @@ func TestKeyBuilder_PerDomain_DifferentDomains(t *testing.T) {
 
 	// Different domains should produce different keys
 	require.NotEqual(t, key1, key2)
-	require.Equal(t, "eth:nodefleet.net:json_rpc", key1.String())
+	require.Equal(t, "eth:example.com:json_rpc", key1.String())
 	require.Equal(t, "eth:pokt.network:json_rpc", key2.String())
 }
 
@@ -137,14 +137,14 @@ func TestKeyBuilder_PerURL(t *testing.T) {
 	require.IsType(t, &URLKeyBuilder{}, builder)
 
 	serviceID := protocol.ServiceID("eth")
-	endpointAddr := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.nodefleet.net")
+	endpointAddr := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.example.com")
 
 	key := builder.BuildKey(serviceID, endpointAddr, sharedtypes.RPCType_JSON_RPC)
 
 	require.Equal(t, serviceID, key.ServiceID)
 	// Supplier stripped; keyed on the URL.
-	require.Equal(t, protocol.EndpointAddr("https://rm-01.eu.nodefleet.net"), key.EndpointAddr)
-	require.Equal(t, "eth:https://rm-01.eu.nodefleet.net:json_rpc", key.String())
+	require.Equal(t, protocol.EndpointAddr("https://rm-01.eu.example.com"), key.EndpointAddr)
+	require.Equal(t, "eth:https://rm-01.eu.example.com:json_rpc", key.String())
 }
 
 // TestKeyBuilder_PerURL_SameURLDifferentSuppliers is the core behavior: two distinct staked
@@ -156,14 +156,14 @@ func TestKeyBuilder_PerURL_SameURLDifferentSuppliers(t *testing.T) {
 	serviceID := protocol.ServiceID("eth")
 
 	// Same URL, different supplier addresses (one operator, several staked suppliers).
-	ep1 := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.nodefleet.net")
-	ep2 := protocol.EndpointAddr("pokt1xyz789-https://rm-01.eu.nodefleet.net")
+	ep1 := protocol.EndpointAddr("pokt1abc123-https://rm-01.eu.example.com")
+	ep2 := protocol.EndpointAddr("pokt1xyz789-https://rm-01.eu.example.com")
 
 	key1 := builder.BuildKey(serviceID, ep1, sharedtypes.RPCType_JSON_RPC)
 	key2 := builder.BuildKey(serviceID, ep2, sharedtypes.RPCType_JSON_RPC)
 
 	require.Equal(t, key1, key2, "same exact URL must produce the same key regardless of supplier")
-	require.Equal(t, "eth:https://rm-01.eu.nodefleet.net:json_rpc", key1.String())
+	require.Equal(t, "eth:https://rm-01.eu.example.com:json_rpc", key1.String())
 }
 
 // TestKeyBuilder_PerURL_DistinctURLsStaySeparate verifies per-URL does NOT dilute across an
@@ -175,8 +175,8 @@ func TestKeyBuilder_PerURL_DistinctURLsStaySeparate(t *testing.T) {
 	serviceID := protocol.ServiceID("eth")
 
 	// Same supplier/domain, different backend URLs.
-	ep1 := protocol.EndpointAddr("pokt1abc-https://rm-01.eu.nodefleet.net")
-	ep2 := protocol.EndpointAddr("pokt1abc-https://rm-02.eu.nodefleet.net")
+	ep1 := protocol.EndpointAddr("pokt1abc-https://rm-01.eu.example.com")
+	ep2 := protocol.EndpointAddr("pokt1abc-https://rm-02.eu.example.com")
 
 	key1 := builder.BuildKey(serviceID, ep1, sharedtypes.RPCType_JSON_RPC)
 	key2 := builder.BuildKey(serviceID, ep2, sharedtypes.RPCType_JSON_RPC)
@@ -338,10 +338,10 @@ func TestKeyBuilder_EmptyEndpointAddr(t *testing.T) {
 func TestKeyBuilder_GranularityComparison(t *testing.T) {
 	serviceID := protocol.ServiceID("eth")
 	// Two endpoints from same supplier, same domain
-	supplier1Endpoint1 := protocol.EndpointAddr("pokt1supplier1-https://rm-01.nodefleet.net")
-	supplier1Endpoint2 := protocol.EndpointAddr("pokt1supplier1-https://rm-02.nodefleet.net")
+	supplier1Endpoint1 := protocol.EndpointAddr("pokt1supplier1-https://rm-01.example.com")
+	supplier1Endpoint2 := protocol.EndpointAddr("pokt1supplier1-https://rm-02.example.com")
 	// Endpoint from different supplier, same domain
-	supplier2SameDomain := protocol.EndpointAddr("pokt1supplier2-https://rm-03.nodefleet.net")
+	supplier2SameDomain := protocol.EndpointAddr("pokt1supplier2-https://rm-03.example.com")
 	// Endpoint from different supplier, different domain
 	supplier2DiffDomain := protocol.EndpointAddr("pokt1supplier2-https://relay.pokt.network")
 
@@ -510,8 +510,8 @@ func TestKeyBuilder_DomainSameURLDifferentRPCTypes(t *testing.T) {
 	builder := NewKeyBuilder(KeyGranularityDomain)
 
 	// Different suppliers, same domain, different RPC types
-	endpoint1 := protocol.EndpointAddr("pokt1abc-https://rm-01.nodefleet.net")
-	endpoint2 := protocol.EndpointAddr("pokt1xyz-https://rm-02.nodefleet.net")
+	endpoint1 := protocol.EndpointAddr("pokt1abc-https://rm-01.example.com")
+	endpoint2 := protocol.EndpointAddr("pokt1xyz-https://rm-02.example.com")
 
 	// JSON-RPC keys
 	jsonKey1 := builder.BuildKey(serviceID, endpoint1, sharedtypes.RPCType_JSON_RPC)
@@ -529,8 +529,8 @@ func TestKeyBuilder_DomainSameURLDifferentRPCTypes(t *testing.T) {
 	require.NotEqual(t, jsonKey1, wsKey1, "Same domain with different RPC types should produce different keys")
 
 	// Verify key format includes RPC type
-	require.Equal(t, "eth:nodefleet.net:json_rpc", jsonKey1.String())
-	require.Equal(t, "eth:nodefleet.net:websocket", wsKey1.String())
+	require.Equal(t, "eth:example.com:json_rpc", jsonKey1.String())
+	require.Equal(t, "eth:example.com:websocket", wsKey1.String())
 }
 
 func TestKeyBuilder_SupplierSameSupplierDifferentRPCTypes(t *testing.T) {

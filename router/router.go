@@ -250,7 +250,7 @@ func (r *router) removeGrovePortalPrefixMiddleware(next http.HandlerFunc) http.H
 
 // staticResponseMiddleware serves a configured fixed response for a service+path+method,
 // short-circuiting the relay pipeline. It runs on the cleaned request path (after the
-// API-version and portal-app-id prefixes are stripped) so a config path like "/identity"
+// API-version and portal-app-id prefixes are stripped) so a config path like "/example"
 // matches regardless of the portal prefix. WebSocket upgrades are never intercepted — they
 // connect at the relay root, and a static route matches an exact non-root path only.
 // A nil resolver (not configured, or in tests) is a pass-through.

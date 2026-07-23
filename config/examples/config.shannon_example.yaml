@@ -260,7 +260,7 @@ gateway_config:
   # - health_checks: Per-service health check rules
   # - external_block_sources: External RPC endpoints for ground-truth block height validation
   # - static_routes: Fixed responses served by the gateway for a given path, without
-  #   relaying to a backend (e.g. a small service metadata/identity endpoint)
+  #   relaying to a backend (e.g. a small service metadata/version endpoint)
 
   services:
     # -------------------------------------------------------------------------
@@ -310,7 +310,7 @@ gateway_config:
       # on the request method. A per-service route overrides a global default on the same
       # path. `path: "/"` is rejected (it would shadow all relay traffic).
       # static_routes:
-      #   - path: /identity
+      #   - path: /example
       #     # methods: ["GET"]              # optional; empty = any method
       #     # status_code: 200              # optional; default 200
       #     # content_type: text/plain      # optional; default text/plain

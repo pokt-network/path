@@ -224,7 +224,7 @@ type ServiceFallbackConfig struct {
 
 // StaticRoute defines a fixed response served directly by the gateway for a specific
 // request path, without relaying to a backend endpoint. It lets the gateway expose small,
-// service-scoped metadata endpoints (for example an identity/info route) whose body is a
+// service-scoped metadata endpoints (for example an info/version route) whose body is a
 // constant configured value rather than something fetched from a supplier.
 //
 // A static route short-circuits the relay pipeline: a matching request never reaches
@@ -233,7 +233,7 @@ type ServiceFallbackConfig struct {
 // Matching is exact on Path and, when Methods is set, on the request method.
 type StaticRoute struct {
 	// Path is the exact request path this route serves, matched after the gateway strips
-	// the API-version and portal-app-id prefixes (e.g. "/identity"). Must begin with "/"
+	// the API-version and portal-app-id prefixes (e.g. "/example"). Must begin with "/"
 	// and must not be the relay root ("/") — that would shadow all of a service's traffic.
 	Path string `yaml:"path"`
 

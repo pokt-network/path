@@ -10,14 +10,14 @@ func staticTestConfig() *UnifiedServicesConfig {
 	return &UnifiedServicesConfig{
 		Defaults: ServiceDefaults{
 			StaticRoutes: []StaticRoute{
-				{Path: "/identity", Body: "global-body"},
+				{Path: "/example", Body: "global-body"},
 			},
 		},
 		Services: []ServiceConfig{
 			{
 				ID: "solana",
 				StaticRoutes: []StaticRoute{
-					{Path: "/identity", Body: "solana-body"},
+					{Path: "/example", Body: "solana-body"},
 				},
 			},
 			{
@@ -44,17 +44,17 @@ func Test_ResolveStaticResponse_PerServiceOverridesDefault(t *testing.T) {
 	c := require.New(t)
 	cfg := staticTestConfig()
 
-	body, status, headers, ok := cfg.ResolveStaticResponse("solana", "/identity", "GET")
+	body, status, headers, ok := cfg.ResolveStaticResponse("solana", "/example", "GET")
 	c.True(ok)
 	c.Equal("solana-body", string(body), "per-service route overrides the global default")
 	c.Equal(200, status, "status defaults to 200")
 	c.Equal("text/plain; charset=utf-8", headers["Content-Type"], "content-type defaults to text/plain")
 
-	body, _, _, ok = cfg.ResolveStaticResponse("eth", "/identity", "GET")
+	body, _, _, ok = cfg.ResolveStaticResponse("eth", "/example", "GET")
 	c.True(ok)
-	c.Equal("global-body", string(body), "service without its own /identity falls back to the default")
+	c.Equal("global-body", string(body), "service without its own /example falls back to the default")
 
-	body, _, _, ok = cfg.ResolveStaticResponse("unknown-service", "/identity", "GET")
+	body, _, _, ok = cfg.ResolveStaticResponse("unknown-service", "/example", "GET")
 	c.True(ok)
 	c.Equal("global-body", string(body), "unknown service still gets the global default")
 }
@@ -108,7 +108,7 @@ func Test_validateStaticRoutes(t *testing.T) {
 	}{
 		{
 			name:   "valid single route",
-			routes: []StaticRoute{{Path: "/identity", Body: "x"}},
+			routes: []StaticRoute{{Path: "/example", Body: "x"}},
 		},
 		{
 			name:   "valid same path, disjoint methods",
@@ -121,7 +121,7 @@ func Test_validateStaticRoutes(t *testing.T) {
 		},
 		{
 			name:    "path without leading slash",
-			routes:  []StaticRoute{{Path: "identity", Body: "x"}},
+			routes:  []StaticRoute{{Path: "example", Body: "x"}},
 			wantErr: true,
 		},
 		{

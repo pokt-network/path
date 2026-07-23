@@ -295,7 +295,7 @@ const (
 
 	// KeyGranularityURL scores all suppliers that share the exact same backend URL together,
 	// tracked per RPC type. Key format: serviceID:endpointURL (e.g.,
-	// eth:https://rm-01.eu.nodefleet.net). Identical to per-endpoint for URLs served by a
+	// eth:https://rm-01.eu.example.com). Identical to per-endpoint for URLs served by a
 	// single supplier; it only differs when multiple staked supplier addresses point at the
 	// same URL (one operator running several suppliers on one backend). Because an exact URL
 	// match means the same physical backend, its failures are shared: one bad backend is
@@ -306,7 +306,7 @@ const (
 	KeyGranularityURL = "per-url"
 
 	// KeyGranularityDomain scores all endpoints from the same hosting domain together.
-	// Key format: serviceID:domain (e.g., eth:nodefleet.net)
+	// Key format: serviceID:domain (e.g., eth:example.com)
 	// Use when a hosting provider's overall reliability matters.
 	KeyGranularityDomain = "per-domain"
 

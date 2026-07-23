@@ -48,7 +48,7 @@ func (b *EndpointKeyBuilder) BuildKey(serviceID protocol.ServiceID, endpointAddr
 
 // URLKeyBuilder creates keys with per-URL granularity.
 // All suppliers that front the exact same backend URL share a score, tracked per RPC type.
-// Key format: serviceID:endpointURL (e.g., eth:https://rm-01.eu.nodefleet.net)
+// Key format: serviceID:endpointURL (e.g., eth:https://rm-01.eu.example.com)
 // This drops the supplier address from the key so an exact URL match — i.e. the same
 // physical backend behind multiple staked supplier addresses — is scored (and cooled) once
 // rather than once per supplier. It keeps distinct URLs separate (no dilution across an
@@ -69,7 +69,7 @@ func (b *URLKeyBuilder) BuildKey(serviceID protocol.ServiceID, endpointAddr prot
 
 // DomainKeyBuilder creates keys with per-domain granularity.
 // All endpoints from the same hosting domain share a score, tracked per RPC type.
-// Key format: serviceID:domain:rpcType (e.g., eth:nodefleet.net:json_rpc)
+// Key format: serviceID:domain:rpcType (e.g., eth:example.com:json_rpc)
 type DomainKeyBuilder struct{}
 
 // BuildKey creates a key using the domain extracted from the endpoint URL and RPC type.
@@ -83,7 +83,7 @@ func (b *DomainKeyBuilder) BuildKey(serviceID protocol.ServiceID, endpointAddr p
 		return NewEndpointKey(serviceID, endpointAddr, rpcType)
 	}
 
-	// Extract domain from URL (e.g., nodefleet.net from https://rm-01.eu.nodefleet.net)
+	// Extract domain from URL (e.g., example.com from https://rm-01.eu.example.com)
 	domain, err := shannonmetrics.ExtractDomainOrHost(endpointURL)
 	if err != nil {
 		// Fallback to full endpoint address if domain extraction fails
