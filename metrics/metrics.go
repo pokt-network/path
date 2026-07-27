@@ -278,6 +278,18 @@ var BatchItemsTotal = promauto.NewCounterVec(
 	[]string{LabelServiceID},
 )
 
+// HedgeSuppressedLargeBatchTotal counts batch items that skipped hedging because the batch
+// exceeded hedge_max_batch_size. Compare against path_hedge_requests_total to see how much
+// hedge traffic the cap removed, and against path_batch_items_total for the share of batch
+// work now running unhedged.
+var HedgeSuppressedLargeBatchTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "hedge_suppressed_large_batch_total",
+		Help: "Batch items whose hedge was suppressed by hedge_max_batch_size, by service.",
+	},
+	[]string{LabelServiceID},
+)
+
 // =============================================================================
 // Request/Response Sizes (Counters)
 // Labels: rpc_type, service_id
@@ -1120,6 +1132,14 @@ func RecordBatchSize(rpcType, serviceID string, batchCount int, latencySeconds f
 	// Record for average calculation: avg = items_total / requests_total
 	BatchRequestsTotal.WithLabelValues(serviceID).Inc()
 	BatchItemsTotal.WithLabelValues(serviceID).Add(float64(batchCount))
+}
+
+// RecordHedgeSuppressedLargeBatch counts batch items whose hedge was skipped because the
+// batch exceeded hedge_max_batch_size. Counted per ITEM (each item decides independently),
+// so this is directly comparable to the relays it saved: a suppressed item would have cost
+// at most one extra relay.
+func RecordHedgeSuppressedLargeBatch(serviceID string) {
+	HedgeSuppressedLargeBatchTotal.WithLabelValues(serviceID).Inc()
 }
 
 // batchCountBucket maps a raw batch count to one of five fixed bucket labels.

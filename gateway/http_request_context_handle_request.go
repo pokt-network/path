@@ -1002,7 +1002,7 @@ func (rc *requestContext) handleBatchRelayRequest(payloads []protocol.Payload) e
 			if sem != nil {
 				defer func() { <-sem }()
 			}
-			response, err := rc.processSinglePayloadWithRetry(p, index, rpcType, logger)
+			response, err := rc.processSinglePayloadWithRetry(p, index, len(payloads), rpcType, logger)
 			resultChan <- batchPayloadResult{
 				index:    index,
 				response: response,
@@ -1066,11 +1066,32 @@ func (rc *requestContext) handleBatchRelayRequest(payloads []protocol.Payload) e
 	return nil
 }
 
+// shouldSuppressHedgeForBatch reports whether hedging must be skipped for an item belonging
+// to a batch of batchSize items.
+//
+// A batch is fanned out into one independently-retried, independently-hedged relay per item,
+// so hedging an N-item batch costs up to 2N relays. Large batches also run slower than the
+// flat hedge_delay by nature rather than by fault, so a size-blind hedge fires on nearly all
+// of them — doubling relay spend to chase latency the caller already expects.
+//
+// A nil retry config, an unset cap, or a cap <= 0 all mean "no cap": hedge regardless of size.
+func shouldSuppressHedgeForBatch(retryConfig *ServiceRetryConfig, batchSize int) bool {
+	if retryConfig == nil || retryConfig.HedgeMaxBatchSize == nil {
+		return false
+	}
+	maxBatch := *retryConfig.HedgeMaxBatchSize
+	if maxBatch <= 0 {
+		return false
+	}
+	return batchSize > maxBatch
+}
+
 // processSinglePayloadWithRetry handles a single payload with full retry/hedge/heuristic flow.
 // This is the core logic extracted for batch processing.
 func (rc *requestContext) processSinglePayloadWithRetry(
 	payload protocol.Payload,
 	index int,
+	batchSize int,
 	rpcType sharedtypes.RPCType,
 	parentLogger polylog.Logger,
 ) (protocol.Response, error) {
@@ -1100,6 +1121,19 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		} else {
 			connectTimeout = 500 * time.Millisecond
 		}
+	}
+
+	// Suppress hedging on large batches. Every item in the batch reaches this function on
+	// its own goroutine, so hedging a large batch multiplies relays by up to 2x across the
+	// whole batch — and large batches exceed the flat hedge_delay as a matter of course,
+	// not because anything is wrong, so nearly all of them would hedge.
+	if hedgeDelay > 0 && shouldSuppressHedgeForBatch(retryConfig, batchSize) {
+		logger.Debug().
+			Int("batch_size", batchSize).
+			Int("hedge_max_batch_size", *retryConfig.HedgeMaxBatchSize).
+			Msg("hedging suppressed: batch larger than hedge_max_batch_size")
+		hedgeDelay = 0
+		metrics.RecordHedgeSuppressedLargeBatch(string(rc.serviceID))
 	}
 
 	var lastErr error

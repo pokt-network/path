@@ -163,6 +163,16 @@ type ServiceRetryConfig struct {
 	// is sent to a different endpoint. The first response wins.
 	// Default: 500ms. Set to 0 to disable hedging.
 	HedgeDelay *time.Duration `yaml:"hedge_delay,omitempty"`
+
+	// HedgeMaxBatchSize suppresses hedging for JSON-RPC batches larger than this many
+	// items. Each batch item is relayed independently (see buildServicePayloads), so a
+	// hedged N-item batch costs up to 2N relays. Large batches are also inherently slower
+	// than the flat hedge_delay — measured p95 for 51-500 item batches runs 2-2.6x the
+	// single-request p95 — so a size-blind delay hedges most of them on latency that is
+	// expected, not anomalous, burning relays for callers who are not latency-sensitive.
+	// Default: 10 (hedge single requests and small batches only). Set to 0 to disable the
+	// cap and hedge every batch regardless of size.
+	HedgeMaxBatchSize *int `yaml:"hedge_max_batch_size,omitempty"`
 }
 
 // ServiceObservationConfig holds per-service observation pipeline configuration.
@@ -602,6 +612,10 @@ func (c *UnifiedServicesConfig) HydrateDefaults() {
 		hedgeDelay := 500 * time.Millisecond
 		c.Defaults.RetryConfig.HedgeDelay = &hedgeDelay
 	}
+	if c.Defaults.RetryConfig.HedgeMaxBatchSize == nil {
+		hedgeMaxBatchSize := defaultHedgeMaxBatchSize
+		c.Defaults.RetryConfig.HedgeMaxBatchSize = &hedgeMaxBatchSize
+	}
 
 	// Hydrate default observation pipeline
 	if c.Defaults.ObservationPipeline.Enabled == nil {
@@ -876,6 +890,9 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 		if merged.RetryConfig.HedgeDelay == nil {
 			merged.RetryConfig.HedgeDelay = c.Defaults.RetryConfig.HedgeDelay
 		}
+		if merged.RetryConfig.HedgeMaxBatchSize == nil {
+			merged.RetryConfig.HedgeMaxBatchSize = c.Defaults.RetryConfig.HedgeMaxBatchSize
+		}
 	}
 
 	// Merge observation pipeline config
@@ -964,6 +981,24 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 // for services with as few as two operators. Set a per-service or default value of >= 1
 // (or <= 0) to disable.
 const DefaultMaxOperatorShare = 0.65
+
+// defaultHedgeMaxBatchSize is the largest JSON-RPC batch that is still eligible for hedging
+// when neither the service nor the global defaults specify a value.
+//
+// A batch is fanned out into one relay per item (buildServicePayloads), each retried and
+// hedged independently, so hedging an N-item batch costs up to 2N relays. Large batches are
+// also legitimately slower than the flat hedge_delay: measured p95 for 51-500 item batches is
+// 2-2.6x the single-request p95 on the same service, well past a 200ms delay. A size-blind
+// hedge therefore fires on most large batches — paying double the relays to shave latency that
+// the caller was never expecting to be low.
+//
+// Production batch sizes are sharply bimodal — nearly all traffic is either a single request or
+// a 51-500 item batch, with very little between (measured: scroll 26.3/s singles, 2.1/s at 2-10,
+// 0.06/s at 11-50, 64.2/s at 51-500). Any threshold in the single digits therefore captures the
+// entire large-batch bucket where the waste is. 10 rather than 5 keeps hedging for more of the
+// small-batch traffic, which is cheap to hedge (<=10 extra relays) and rarely hedges at all since
+// small batches finish well inside the delay. Set to 0 to disable the cap entirely.
+const defaultHedgeMaxBatchSize = 10
 
 // DefaultWebsocketRebindOperatorUniform is the WebSocket rebind strategy applied when neither
 // the service nor the global defaults specify one. Shipped ON: a session-rollover rebind
