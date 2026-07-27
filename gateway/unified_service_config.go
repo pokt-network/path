@@ -1199,6 +1199,8 @@ type ParentConfigDefaults struct {
 	ConnectTimeout *time.Duration
 	// HedgeDelay from retry_config.hedge_delay
 	HedgeDelay *time.Duration
+	// HedgeMaxBatchSize from retry_config.hedge_max_batch_size
+	HedgeMaxBatchSize *int
 	// ObservationPipelineEnabled from observation_pipeline.enabled
 	ObservationPipelineEnabled bool
 	// SampleRate from observation_pipeline.sample_rate
@@ -1262,6 +1264,16 @@ func (c *UnifiedServicesConfig) SetDefaultsFromParent(parent ParentConfigDefault
 	}
 	if parent.HedgeDelay != nil && *parent.HedgeDelay > 0 {
 		c.Defaults.RetryConfig.HedgeDelay = parent.HedgeDelay
+	}
+	// The default must be applied HERE, not only in HydrateDefaults: NewProtocol receives
+	// GatewayConfig by value and keeps a pointer into that copy, so the instance serving
+	// requests is the one SetDefaultsFromParent runs on — HydrateDefaults runs on a
+	// different instance and never reaches it. A nil here would silently disable the cap.
+	if parent.HedgeMaxBatchSize != nil {
+		c.Defaults.RetryConfig.HedgeMaxBatchSize = parent.HedgeMaxBatchSize
+	} else if c.Defaults.RetryConfig.HedgeMaxBatchSize == nil {
+		hedgeMaxBatchSize := defaultHedgeMaxBatchSize
+		c.Defaults.RetryConfig.HedgeMaxBatchSize = &hedgeMaxBatchSize
 	}
 
 	// Set observation pipeline defaults

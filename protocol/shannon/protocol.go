@@ -226,6 +226,7 @@ func NewProtocol(
 		}(),
 		ConnectTimeout:             config.RetryConfig.ConnectTimeout,
 		HedgeDelay:                 config.RetryConfig.HedgeDelay,
+		HedgeMaxBatchSize:          config.RetryConfig.HedgeMaxBatchSize,
 		ObservationPipelineEnabled: config.ObservationPipelineConfig.Enabled,
 		SampleRate:                 config.ObservationPipelineConfig.SampleRate,
 		HealthChecksEnabled:        config.ActiveHealthChecksConfig.Enabled,
