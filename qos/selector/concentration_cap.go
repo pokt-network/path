@@ -46,7 +46,11 @@ func SelectWithConcentrationCap(
 
 	// Disabled / trivial: preserve the exact prior behavior (flat random pick).
 	if n == 1 || maxOperatorShare <= 0 || maxOperatorShare >= 1 {
-		return validEndpoints[rand.Intn(n)]
+		selected := validEndpoints[rand.Intn(n)]
+		// Instrumented too: "the cap was disabled" is one of the explanations the
+		// selection metrics exist to distinguish, and it is invisible from the outside.
+		recordSelectionPool(serviceID, validEndpoints, selected)
+		return selected
 	}
 
 	// Phase 1 — cheap pass: resolve each endpoint's operator (eTLD+1) once, count endpoints
@@ -74,7 +78,12 @@ func SelectWithConcentrationCap(
 	// weighted pick would reduce exactly to a flat random pick, so take that directly.
 	infeasible := maxOperatorShare*float64(m) <= 1.0
 	if m == 1 || (!infeasible && float64(maxCount) <= maxOperatorShare*float64(n)) {
-		return validEndpoints[rand.Intn(n)]
+		selected := validEndpoints[rand.Intn(n)]
+		// The cap is a no-op here. This is the majority of selections and the case a
+		// reshape-only metric cannot see, so it is exactly where a skew would hide:
+		// m == 1 means the pool reached the selector already collapsed to one operator.
+		metrics.RecordSelectionPool(string(serviceID), counts, n, operatorKey(selected))
+		return selected
 	}
 
 	// Phase 2 — reshape. Build the per-operator endpoint grouping (reusing the keys resolved
@@ -109,7 +118,25 @@ func SelectWithConcentrationCap(
 	// Weighted pick of an operator, then uniform pick of an endpoint within it.
 	opIdx := weightedPick(weights)
 	eps := operatorEndpoints[operatorOrder[opIdx]]
-	return eps[rand.Intn(len(eps))]
+	selected := eps[rand.Intn(len(eps))]
+	metrics.RecordSelectionPool(string(serviceID), counts, n, operatorOrder[opIdx])
+	return selected
+}
+
+// recordSelectionPool resolves the candidate pool's operator composition and records one
+// selection. Used only on the paths that exit before Phase 1 has built the counts map; the
+// others pass their already-computed counts to metrics.RecordSelectionPool directly rather
+// than resolving every operator key a second time.
+func recordSelectionPool(
+	serviceID protocol.ServiceID,
+	validEndpoints protocol.EndpointAddrList,
+	selected protocol.EndpointAddr,
+) {
+	counts := make(map[string]int, len(validEndpoints))
+	for _, ep := range validEndpoints {
+		counts[operatorKey(ep)]++
+	}
+	metrics.RecordSelectionPool(string(serviceID), counts, len(validEndpoints), operatorKey(selected))
 }
 
 // SelectOperatorUniform picks one endpoint so that every operator (eTLD+1) present is equally

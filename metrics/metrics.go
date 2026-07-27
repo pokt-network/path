@@ -695,6 +695,78 @@ func RecordConcentrationCapReshaped(serviceID string) {
 	ConcentrationCapReshapedTotal.WithLabelValues(serviceID).Inc()
 }
 
+// SelectionCandidateTotal counts, per selection, every operator PRESENT in the candidate
+// pool the selector actually saw. SelectionSelectedTotal counts the one it picked.
+//
+// The pair exists to answer a question no other metric can: is a skewed traffic
+// distribution caused by skewed SELECTION, or by a candidate pool that was already skewed
+// before selection ran? path_relays_total shows only the outcome, and /ready shows the
+// session pool — not the post-filter pool the selector receives, which is what matters.
+//
+// Read it as a per-operator selection rate:
+//
+//	selected / candidate  ~= that operator's chance of winning when it is eligible
+//
+// An operator present in most pools and winning ~its endpoint share is normal. One winning
+// far above its share is a selector problem. One rarely appearing as a candidate at all,
+// despite showing healthy in /ready, means the skew happened upstream in filtering.
+//
+// Cardinality is service_id x domain — the same pairing path_relays_total already carries.
+var SelectionCandidateTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "selection_candidate_total",
+		Help: "Operators present in the endpoint-selection candidate pool, counted once per operator per selection, by service_id and domain.",
+	},
+	[]string{LabelServiceID, LabelDomain},
+)
+
+// SelectionSelectedTotal counts selections won, by the selected endpoint's operator.
+// Divide by SelectionCandidateTotal for that operator's per-selection win rate.
+var SelectionSelectedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "selection_selected_total",
+		Help: "Endpoint selections won, by service_id and the selected endpoint's domain.",
+	},
+	[]string{LabelServiceID, LabelDomain},
+)
+
+// SelectionPoolSize reports the size of the candidate pool the selector received, so a pool
+// that is smaller than /ready implies can be seen directly rather than inferred.
+var SelectionPoolSize = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "selection_pool_size",
+		Help:    "Number of endpoints in the endpoint-selection candidate pool, by service_id.",
+		Buckets: []float64{1, 2, 3, 5, 8, 13, 21, 34, 55},
+	},
+	[]string{LabelServiceID},
+)
+
+// SelectionPoolOperators reports how many DISTINCT operators were in the candidate pool.
+// A pool that collapses to 1 makes the concentration cap a no-op by definition, which is
+// indistinguishable from "the cap is broken" without this metric.
+var SelectionPoolOperators = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "selection_pool_operators",
+		Help:    "Number of distinct operators (eTLD+1) in the endpoint-selection candidate pool, by service_id.",
+		Buckets: []float64{1, 2, 3, 4, 5, 6, 8, 10},
+	},
+	[]string{LabelServiceID},
+)
+
+// RecordSelectionPool records the composition of one selection: the pool's size and operator
+// count, every operator that was a candidate, and the operator that won.
+//
+// Called on EVERY selection, including the ones the concentration cap leaves untouched —
+// those are the majority and the ones a reshape-only metric is blind to.
+func RecordSelectionPool(serviceID string, operatorCounts map[string]int, poolSize int, selectedOperator string) {
+	SelectionPoolSize.WithLabelValues(serviceID).Observe(float64(poolSize))
+	SelectionPoolOperators.WithLabelValues(serviceID).Observe(float64(len(operatorCounts)))
+	for op := range operatorCounts {
+		SelectionCandidateTotal.WithLabelValues(serviceID, op).Inc()
+	}
+	SelectionSelectedTotal.WithLabelValues(serviceID, selectedOperator).Inc()
+}
+
 // ReputationRateCooldownTotal counts endpoints cooled down by the volume-independent
 // sustained-critical-rate detector (as opposed to the consecutive-strike/burst path).
 // The strike system decays 3 strikes per success and therefore only catches bursts; a
