@@ -108,7 +108,7 @@ func (fs *filteringSelector) SelectMultipleWithArchival(endpoints protocol.Endpo
 		return selector.RandomSelectMultiple(endpoints, numEndpoints), nil
 	}
 
-	return selector.SelectEndpointsWithDiversity(fs.logger, filtered, numEndpoints), nil
+	return selector.SelectEndpointsWithDiversity(fs.logger, fs.qos.serviceID, filtered, numEndpoints), nil
 }
 
 // filterValidEndpoints returns the subset of endpoints that pass the block height

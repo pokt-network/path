@@ -127,7 +127,7 @@ func (ss *serviceState) SelectMultipleWithArchival(availableEndpoints protocol.E
 		Int("filtered_endpoints", len(filteredEndpointsAddr)).
 		Int("available_endpoints", len(availableEndpoints)).
 		Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(availableEndpoints))
-	return selector.SelectEndpointsWithDiversity(logger, filteredEndpointsAddr, numEndpoints), nil
+	return selector.SelectEndpointsWithDiversity(logger, ss.serviceQoSConfig.GetServiceID(), filteredEndpointsAddr, numEndpoints), nil
 }
 
 // SelectWithMetadata returns endpoint address and selection metadata.

@@ -7,6 +7,7 @@ import (
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 
+	"github.com/pokt-network/path/metrics"
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 )
@@ -52,6 +53,7 @@ func RandomSelectMultiple(
 // being returned to the user.
 func SelectEndpointsWithDiversity(
 	logger polylog.Logger,
+	serviceID protocol.ServiceID,
 	availableEndpoints protocol.EndpointAddrList,
 	numEndpoints uint,
 ) protocol.EndpointAddrList {
@@ -112,6 +114,36 @@ func SelectEndpointsWithDiversity(
 			}
 		}
 		remainingEndpoints = newRemainingEndpoints
+	}
+
+	// Record the candidate pool this selector saw and which operator won the PRIMARY pick.
+	// This is the path every relay takes, so it is the one whose pool composition explains a
+	// skewed traffic distribution. The primary (first) pick is the endpoint that serves the
+	// request; with max_parallel_endpoints=1 it is the only one.
+	if len(selectedEndpoints) > 0 {
+		// Reuse endpointTLDs rather than calling operatorKey per endpoint: both resolve via
+		// ExtractTLDFromEndpointAddr, and that parse is the expensive part. Apply the same
+		// empty-string fallback operatorKey uses so an unresolvable address stays its own
+		// singleton operator here too — merging them would fabricate concentration.
+		counts := make(map[string]int, len(uniqueTLDs)+1)
+		for _, ep := range availableEndpoints {
+			k := endpointTLDs[ep]
+			if k == "" {
+				k = string(ep)
+			}
+			counts[k]++
+		}
+		selectedOp := endpointTLDs[selectedEndpoints[0]]
+		if selectedOp == "" {
+			selectedOp = string(selectedEndpoints[0])
+		}
+		metrics.RecordSelectionPool(
+			string(serviceID),
+			metrics.SelectionPathDiversity,
+			counts,
+			len(availableEndpoints),
+			selectedOp,
+		)
 	}
 
 	// Count fallback selections (endpoints without TLD diversity)

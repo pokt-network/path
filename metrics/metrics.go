@@ -20,6 +20,7 @@ const (
 	LabelDomain             = "domain"
 	LabelRPCType            = "rpc_type"
 	LabelServiceID          = "service_id"
+	LabelSelectionPath      = "path"
 	LabelTierThreshold      = "tier_threshold"
 	LabelSessionStartHeight = "session_start_height"
 	LabelHealthCheckName    = "health_check_name"
@@ -711,13 +712,20 @@ func RecordConcentrationCapReshaped(serviceID string) {
 // far above its share is a selector problem. One rarely appearing as a candidate at all,
 // despite showing healthy in /ready, means the skew happened upstream in filtering.
 //
-// Cardinality is service_id x domain — the same pairing path_relays_total already carries.
+// The `path` label names the selector that ran. There is more than one, and they do NOT
+// carry equal traffic: SelectEndpointsWithDiversity serves effectively all relays, while
+// SelectWithConcentrationCap is reached only via SelectWithMetadata and is close to idle.
+// Splitting by path makes that visible directly instead of being folklore — and would show
+// immediately if the balance ever shifted.
+//
+// Cardinality is service_id x domain x path — the service_id/domain pairing that
+// path_relays_total already carries, doubled by a 2-value label.
 var SelectionCandidateTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "selection_candidate_total",
-		Help: "Operators present in the endpoint-selection candidate pool, counted once per operator per selection, by service_id and domain.",
+		Help: "Operators present in the endpoint-selection candidate pool, counted once per operator per selection, by service_id, domain and selector path.",
 	},
-	[]string{LabelServiceID, LabelDomain},
+	[]string{LabelServiceID, LabelDomain, LabelSelectionPath},
 )
 
 // SelectionSelectedTotal counts selections won, by the selected endpoint's operator.
@@ -725,9 +733,9 @@ var SelectionCandidateTotal = promauto.NewCounterVec(
 var SelectionSelectedTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "selection_selected_total",
-		Help: "Endpoint selections won, by service_id and the selected endpoint's domain.",
+		Help: "Endpoint selections won, by service_id, the selected endpoint's domain, and selector path.",
 	},
-	[]string{LabelServiceID, LabelDomain},
+	[]string{LabelServiceID, LabelDomain, LabelSelectionPath},
 )
 
 // SelectionPoolSize reports the size of the candidate pool the selector received, so a pool
@@ -738,7 +746,7 @@ var SelectionPoolSize = promauto.NewHistogramVec(
 		Help:    "Number of endpoints in the endpoint-selection candidate pool, by service_id.",
 		Buckets: []float64{1, 2, 3, 5, 8, 13, 21, 34, 55},
 	},
-	[]string{LabelServiceID},
+	[]string{LabelServiceID, LabelSelectionPath},
 )
 
 // SelectionPoolOperators reports how many DISTINCT operators were in the candidate pool.
@@ -750,7 +758,7 @@ var SelectionPoolOperators = promauto.NewHistogramVec(
 		Help:    "Number of distinct operators (eTLD+1) in the endpoint-selection candidate pool, by service_id.",
 		Buckets: []float64{1, 2, 3, 4, 5, 6, 8, 10},
 	},
-	[]string{LabelServiceID},
+	[]string{LabelServiceID, LabelSelectionPath},
 )
 
 // RecordSelectionPool records the composition of one selection: the pool's size and operator
@@ -758,14 +766,24 @@ var SelectionPoolOperators = promauto.NewHistogramVec(
 //
 // Called on EVERY selection, including the ones the concentration cap leaves untouched —
 // those are the majority and the ones a reshape-only metric is blind to.
-func RecordSelectionPool(serviceID string, operatorCounts map[string]int, poolSize int, selectedOperator string) {
-	SelectionPoolSize.WithLabelValues(serviceID).Observe(float64(poolSize))
-	SelectionPoolOperators.WithLabelValues(serviceID).Observe(float64(len(operatorCounts)))
+func RecordSelectionPool(serviceID, selectionPath string, operatorCounts map[string]int, poolSize int, selectedOperator string) {
+	SelectionPoolSize.WithLabelValues(serviceID, selectionPath).Observe(float64(poolSize))
+	SelectionPoolOperators.WithLabelValues(serviceID, selectionPath).Observe(float64(len(operatorCounts)))
 	for op := range operatorCounts {
-		SelectionCandidateTotal.WithLabelValues(serviceID, op).Inc()
+		SelectionCandidateTotal.WithLabelValues(serviceID, op, selectionPath).Inc()
 	}
-	SelectionSelectedTotal.WithLabelValues(serviceID, selectedOperator).Inc()
+	SelectionSelectedTotal.WithLabelValues(serviceID, selectedOperator, selectionPath).Inc()
 }
+
+// Selector paths for LabelSelectionPath.
+const (
+	// SelectionPathDiversity is SelectEndpointsWithDiversity, reached from
+	// SelectMultipleWithArchival — the path every HTTP relay actually takes.
+	SelectionPathDiversity = "diversity"
+	// SelectionPathConcentrationCap is SelectWithConcentrationCap, reached only from
+	// SelectWithMetadata.
+	SelectionPathConcentrationCap = "concentration_cap"
+)
 
 // ReputationRateCooldownTotal counts endpoints cooled down by the volume-independent
 // sustained-critical-rate detector (as opposed to the consecutive-strike/burst path).

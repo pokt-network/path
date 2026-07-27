@@ -82,7 +82,7 @@ func SelectWithConcentrationCap(
 		// The cap is a no-op here. This is the majority of selections and the case a
 		// reshape-only metric cannot see, so it is exactly where a skew would hide:
 		// m == 1 means the pool reached the selector already collapsed to one operator.
-		metrics.RecordSelectionPool(string(serviceID), counts, n, operatorKey(selected))
+		metrics.RecordSelectionPool(string(serviceID), metrics.SelectionPathConcentrationCap, counts, n, operatorKey(selected))
 		return selected
 	}
 
@@ -119,7 +119,7 @@ func SelectWithConcentrationCap(
 	opIdx := weightedPick(weights)
 	eps := operatorEndpoints[operatorOrder[opIdx]]
 	selected := eps[rand.Intn(len(eps))]
-	metrics.RecordSelectionPool(string(serviceID), counts, n, operatorOrder[opIdx])
+	metrics.RecordSelectionPool(string(serviceID), metrics.SelectionPathConcentrationCap, counts, n, operatorOrder[opIdx])
 	return selected
 }
 
@@ -136,7 +136,7 @@ func recordSelectionPool(
 	for _, ep := range validEndpoints {
 		counts[operatorKey(ep)]++
 	}
-	metrics.RecordSelectionPool(string(serviceID), counts, len(validEndpoints), operatorKey(selected))
+	metrics.RecordSelectionPool(string(serviceID), metrics.SelectionPathConcentrationCap, counts, len(validEndpoints), operatorKey(selected))
 }
 
 // SelectOperatorUniform picks one endpoint so that every operator (eTLD+1) present is equally

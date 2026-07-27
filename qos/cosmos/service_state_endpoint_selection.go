@@ -100,7 +100,7 @@ func (ss *serviceState) SelectMultipleWithArchival(allAvailableEndpoints protoco
 
 	// Select up to numEndpoints endpoints from filtered list
 	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(allAvailableEndpoints))
-	return selector.SelectEndpointsWithDiversity(logger, filteredEndpointsAddr, numEndpoints), nil
+	return selector.SelectEndpointsWithDiversity(logger, ss.serviceQoSConfig.GetServiceID(), filteredEndpointsAddr, numEndpoints), nil
 }
 
 // filterValidEndpoints returns the subset of available endpoints that are valid

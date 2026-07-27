@@ -132,7 +132,7 @@ func (es *EndpointStore) SelectMultipleWithArchival(
 
 	// Select up to numEndpoints endpoints from filtered list
 	logger.Debug().Msgf("filtered %d endpoints from %d available endpoints", len(filteredEndpointsAddr), len(allAvailableEndpoints))
-	return selector.SelectEndpointsWithDiversity(logger, filteredEndpointsAddr, numEndpoints), nil
+	return selector.SelectEndpointsWithDiversity(logger, es.serviceState.serviceID, filteredEndpointsAddr, numEndpoints), nil
 }
 
 // touchEndpoints updates the lastSeen timestamp for each endpoint address present in the store.
