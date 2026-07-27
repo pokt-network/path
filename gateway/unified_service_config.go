@@ -291,6 +291,10 @@ type ServiceDefaults struct {
 	// WebsocketRebindOperatorUniform is the default WebSocket rebind selection strategy.
 	// nil falls back to DefaultWebsocketRebindOperatorUniform (ON).
 	WebsocketRebindOperatorUniform *bool `yaml:"websocket_rebind_operator_uniform,omitempty"`
+
+	// WebsocketHTTPScoreFloor is the default for gating WebSocket endpoint selection on the
+	// endpoint's json_rpc reputation. nil falls back to DefaultWebsocketHTTPScoreFloor (ON).
+	WebsocketHTTPScoreFloor *bool `yaml:"websocket_http_score_floor,omitempty"`
 }
 
 // ServiceConfig defines configuration for a single service.
@@ -348,6 +352,14 @@ type ServiceConfig struct {
 	// of endpoint count, so a single-endpoint operator absorbs a full operator-share of the
 	// WebSocket load. Disable per-service if that overloads a small provider.
 	WebsocketRebindOperatorUniform *bool `yaml:"websocket_rebind_operator_uniform,omitempty"`
+
+	// WebsocketHTTPScoreFloor gates WebSocket selection for this service on the endpoint's
+	// json_rpc reputation, in addition to its own :websocket score. nil = use the global
+	// default (ServiceDefaults.WebsocketHTTPScoreFloor, then DefaultWebsocketHTTPScoreFloor).
+	//
+	// Disable per-service where HTTP health genuinely does not predict WebSocket health —
+	// e.g. a service whose suppliers front the two protocols with separate infrastructure.
+	WebsocketHTTPScoreFloor *bool `yaml:"websocket_http_score_floor,omitempty"`
 }
 
 // UnifiedServicesConfig is the top-level configuration for the unified service system.
@@ -1006,6 +1018,34 @@ const defaultHedgeMaxBatchSize = 10
 // count, so no single operator accumulates WebSocket connections in proportion to its
 // (often dominant) endpoint share.
 const DefaultWebsocketRebindOperatorUniform = true
+
+// DefaultWebsocketHTTPScoreFloor gates WebSocket endpoint selection on the endpoint's
+// json_rpc reputation in addition to its own :websocket score.
+//
+// Shipped ON because a :websocket score on its own is close to meaningless: reputation is
+// keyed per rpc_type, and the passive WebSocket signals are structurally positive (every
+// delivered frame records an "ok" — measured on bsc at hundreds per second against ~0
+// negatives). Without an active WebSocket probe a :websocket score simply sits at
+// initial_score forever, so filterByReputation had nothing to filter on and an endpoint
+// already proven bad over HTTP stayed freely selectable for WebSocket.
+//
+// The floor is one-directional: bad HTTP disqualifies WebSocket, good HTTP never rescues a
+// WebSocket endpoint its own score has already disqualified. The pool-collapse guard still
+// applies afterwards, so this can never empty the pool.
+const DefaultWebsocketHTTPScoreFloor = true
+
+// GetWebsocketHTTPScoreFloorForService returns whether WebSocket endpoint selection should
+// additionally require a passing json_rpc reputation for the same endpoint. Falls back to
+// the global default, then DefaultWebsocketHTTPScoreFloor.
+func (c *UnifiedServicesConfig) GetWebsocketHTTPScoreFloorForService(serviceID protocol.ServiceID) bool {
+	if svc := c.GetServiceConfig(serviceID); svc != nil && svc.WebsocketHTTPScoreFloor != nil {
+		return *svc.WebsocketHTTPScoreFloor
+	}
+	if c.Defaults.WebsocketHTTPScoreFloor != nil {
+		return *c.Defaults.WebsocketHTTPScoreFloor
+	}
+	return DefaultWebsocketHTTPScoreFloor
+}
 
 // GetWebsocketRebindOperatorUniformForService returns whether the WebSocket rebind should
 // pick the target operator uniformly (true) or via the endpoint-count-weighted concentration

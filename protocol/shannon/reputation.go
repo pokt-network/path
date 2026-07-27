@@ -6,6 +6,7 @@ import (
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
+	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
@@ -61,6 +62,36 @@ func (p *Protocol) filterByReputation(
 		return endpoints
 	}
 
+	// HTTP score floor for WebSocket selection.
+	//
+	// Reputation is keyed per rpc_type, and a :websocket score is close to meaningless on its
+	// own: the passive WebSocket signals are structurally positive (every delivered frame
+	// records an "ok"), so without an active WebSocket probe the score sits at initial_score
+	// forever. That left this filter with nothing to filter on for WebSocket, and an endpoint
+	// already proven bad over HTTP stayed freely selectable.
+	//
+	// So for WebSocket, additionally require the SAME endpoint's json_rpc reputation to pass.
+	// The gate is one-directional: bad HTTP disqualifies WebSocket, but good HTTP never
+	// rescues an endpoint its own :websocket score has already disqualified.
+	//
+	// Only looked up for WebSocket — the HTTP hot path must not pay for a second GetScores.
+	var httpScores map[reputation.EndpointKey]reputation.Score
+	httpKeyOf := make(map[protocol.EndpointAddr]reputation.EndpointKey, 0)
+	if rpcType == sharedtypes.RPCType_WEBSOCKET && p.applyWebsocketHTTPScoreFloor(serviceID) {
+		httpKeys := make([]reputation.EndpointKey, 0, len(cached))
+		for _, ak := range cached {
+			hk := keyBuilder.BuildKey(serviceID, ak.addr, sharedtypes.RPCType_JSON_RPC)
+			httpKeyOf[ak.addr] = hk
+			httpKeys = append(httpKeys, hk)
+		}
+		httpScores, err = p.reputationService.GetScores(ctx, httpKeys)
+		if err != nil {
+			// Fall back to WebSocket-only filtering rather than dropping every endpoint.
+			logger.Warn().Err(err).Msg("Failed to get json_rpc scores for websocket floor, filtering on websocket score only")
+			httpScores = nil
+		}
+	}
+
 	// Hoist out of the loop; neither the threshold nor the rpc_type label
 	// changes per endpoint.
 	minThreshold := p.getMinThresholdForService(serviceID)
@@ -70,6 +101,29 @@ func (p *Protocol) filterByReputation(
 	// Filter endpoints below threshold or in cooldown
 	filtered := make(map[protocol.EndpointAddr]endpoint, len(endpoints))
 	for _, ak := range cached {
+		// HTTP floor (WebSocket only): disqualify on the endpoint's json_rpc reputation before
+		// consulting its :websocket score. requestedEndpointAddr keeps its usual escape hatch so
+		// a pre-selected endpoint is never dropped out from under the caller.
+		if httpScores != nil && ak.addr != requestedEndpointAddr {
+			if hs, ok := httpScores[httpKeyOf[ak.addr]]; ok {
+				httpCooldown := hs.IsInCooldown()
+				if httpCooldown || hs.Value < minThreshold {
+					reason := metrics.ReputationDisqualifyReasonBelowThreshold
+					if httpCooldown {
+						reason = metrics.ReputationDisqualifyReasonCooldown
+					}
+					logger.Debug().
+						Str("endpoint", string(ak.addr)).
+						Float64("http_score", hs.Value).
+						Bool("http_in_cooldown", httpCooldown).
+						Float64("threshold", minThreshold).
+						Msg("Filtering out websocket endpoint on json_rpc score floor")
+					metrics.RecordReputationDisqualified(serviceIDLabel, rpcTypeLabel, reason)
+					continue
+				}
+			}
+		}
+
 		score, exists := scores[ak.key]
 
 		// If score doesn't exist, the endpoint is new and gets initial score (which is above threshold)
@@ -209,6 +263,18 @@ func (p *Protocol) getTieredSelectorForService(serviceID protocol.ServiceID) *re
 
 // getMinThresholdForService returns the minimum reputation threshold for a service.
 // Uses per-service configuration if available, otherwise falls back to global.
+// applyWebsocketHTTPScoreFloor reports whether WebSocket endpoint selection for this service
+// should additionally require a passing json_rpc reputation for the same endpoint.
+//
+// Defaults ON via DefaultWebsocketHTTPScoreFloor when no config is present, so the gate is not
+// silently lost on a config instance that never went through HydrateDefaults.
+func (p *Protocol) applyWebsocketHTTPScoreFloor(serviceID protocol.ServiceID) bool {
+	if p.unifiedServicesConfig == nil {
+		return gateway.DefaultWebsocketHTTPScoreFloor
+	}
+	return p.unifiedServicesConfig.GetWebsocketHTTPScoreFloorForService(serviceID)
+}
+
 func (p *Protocol) getMinThresholdForService(serviceID protocol.ServiceID) float64 {
 	// Check for per-service selector (has its own min threshold)
 	if p.serviceTieredSelectors != nil {
