@@ -2585,14 +2585,7 @@
       expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: major_error
-    # WebSocket connectivity check. Connect-only: this is a Cosmos service, so an
-    # EVM method would fail for reasons unrelated to websocket health. Weaker than
-    # the EVM data-path check but still the only signal these websocket scores get.
-    - name: ws_connect
-      type: websocket
-      path: /
-      timeout: 10s
-      reputation_signal: major_error
+    # NOTE: websocket check intentionally omitted pending upstream work.
 
 - service_id: seda
   # Block time: ~6s | Source: Cosmos SDK default

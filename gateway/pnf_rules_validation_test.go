@@ -48,7 +48,13 @@ func TestPNFRulesFileIsValid(t *testing.T) {
 	if failed > 0 {
 		t.Fatalf("%d service configs failed validation", failed)
 	}
-	if wsCount != 25 {
-		t.Errorf("expected 25 websocket checks, got %d", wsCount)
+	// 24, not 25: one WS-capable service is intentionally excluded pending upstream work.
+	if wsCount != 24 {
+		t.Errorf("expected 24 websocket checks, got %d", wsCount)
+	}
+	for _, svc := range wsSvcs {
+		if svc == "pocket" {
+			t.Error("pocket must not carry a websocket check (intentionally excluded)")
+		}
 	}
 }
