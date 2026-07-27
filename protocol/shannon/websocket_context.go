@@ -269,7 +269,9 @@ func (p *Protocol) getPreSelectedEndpoint(
 ) (endpoint, error) {
 	logger := p.logger.With("method", "getPreSelectedEndpoint")
 
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	// forceCurrentSession: a websocket connection binds a session for its lifetime, so it
+	// must never be bound to the previous session during rollover.
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, true)
 	if err != nil {
 		logger.Error().Err(err).Msgf("Relay request will fail due to error retrieving active sessions for service %s", serviceID)
 		return nil, err
@@ -359,7 +361,10 @@ func (p *Protocol) getReconnectEndpoint(
 ) (endpoint, bool, string, error) {
 	logger := p.logger.With("method", "getReconnectEndpoint", "service_id", serviceID)
 
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	// forceCurrentSession: this rebind fires AT the session boundary, which is exactly the
+	// window where the rollover grace logic would return the session that just ended —
+	// rebinding the connection back onto the session it is trying to escape.
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, true)
 	if err != nil {
 		logger.Error().Err(err).Msg("rebind: failed to retrieve active sessions for the new session")
 		return nil, false, metrics.WSRebindFailedSessionError, err

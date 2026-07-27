@@ -32,25 +32,39 @@ func (p *Protocol) SupportedGatewayModes() []protocol.GatewayMode {
 // The active sessions are retrieved as follows:
 //   - Centralized mode: gateway address and owned apps addresses (specified in configs) are used to retrieve active sessions.
 //   - Delegated mode: gateway address and app address (specified in the HTTP header) are used to retrieve active sessions.
+//
+// forceCurrentSession skips the session-rollover grace logic and always resolves the
+// CURRENT session. Callers on the websocket path must set it: a websocket connection
+// binds a session once and then lives on it, so binding to the previous session during
+// rollover hands the connection a session that has already ended — it survives only as
+// long as the supplier's own grace, then goes silent or is closed ("session expired",
+// 4000). An HTTP request bound to the previous session just fails one relay and retries,
+// which is why the grace logic is still worth keeping there.
+//
+// The worst case is the rollover rebind itself (getReconnectEndpoint): it fires at the
+// session boundary, which is exactly the window where the grace logic returns the session
+// that just ended — so the rebind meant to escape an ending session could land back on it.
 func (p *Protocol) getActiveGatewaySessions(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	httpReq *http.Request,
+	forceCurrentSession bool,
 ) ([]sessiontypes.Session, error) {
 	p.logger.With(
 		"service_id", serviceID,
 		"gateway_mode", p.gatewayMode,
+		"force_current_session", forceCurrentSession,
 	).Debug().Msg("fetching active sessions using the current gateway mode and applicable applications.")
 
 	switch p.gatewayMode {
 
 	// Centralized gateway mode uses the gateway's private key to sign the relay requests.
 	case protocol.GatewayModeCentralized:
-		return p.getCentralizedGatewayModeActiveSessions(ctx, serviceID)
+		return p.getCentralizedGatewayModeActiveSessions(ctx, serviceID, forceCurrentSession)
 
 	// Delegated gateway mode uses the gateway's private key to sign the relay requests.
 	case protocol.GatewayModeDelegated:
-		return p.getDelegatedGatewayModeActiveSession(ctx, serviceID, httpReq)
+		return p.getDelegatedGatewayModeActiveSession(ctx, serviceID, httpReq, forceCurrentSession)
 
 	// TODO_MVP(@adshmh): Uncomment the following code section once support for Permissionless Gateway mode is added to the shannon package.
 	//case protocol.GatewayModePermissionless:

@@ -87,7 +87,7 @@ func TestCentralizedGatewayMode_SessionMerging_NormalOperation(t *testing.T) {
 	p := newTestProtocolForSessionMerging(mockFullNode, protocol.GatewayModeCentralized)
 
 	// Execute
-	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth")
+	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth", false)
 
 	// Verify: Should get exactly 1 session (one per owned app), no extended sessions
 	if err != nil {
@@ -140,7 +140,7 @@ func TestCentralizedGatewayMode_SessionMerging_DuringRollover(t *testing.T) {
 	p := newTestProtocolForSessionMerging(mockFullNode, protocol.GatewayModeCentralized)
 
 	// Execute
-	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth")
+	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth", false)
 
 	// Verify: Should get ONLY 1 session (1 per owned app)
 	// GetSessionWithExtendedValidity chooses which session to use
@@ -192,7 +192,7 @@ func TestCentralizedGatewayMode_SessionMerging_RolloverWithSameSessionID(t *test
 	p := newTestProtocolForSessionMerging(mockFullNode, protocol.GatewayModeCentralized)
 
 	// Execute
-	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth")
+	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth", false)
 
 	// Verify: Should only get 1 session (1 per owned app), extended not added due to same ID
 	if err != nil {
@@ -233,7 +233,7 @@ func TestCentralizedGatewayMode_SessionMerging_ExtendedSessionError(t *testing.T
 	p := newTestProtocolForSessionMerging(mockFullNode, protocol.GatewayModeCentralized)
 
 	// Execute
-	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth")
+	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth", false)
 
 	// Verify: Should succeed with only current session (graceful degradation)
 	if err != nil {
@@ -283,7 +283,7 @@ func TestDelegatedGatewayMode_SessionMerging_NormalOperation(t *testing.T) {
 	}
 
 	// Execute
-	sessions, err := p.getDelegatedGatewayModeActiveSession(context.Background(), "eth", req)
+	sessions, err := p.getDelegatedGatewayModeActiveSession(context.Background(), "eth", req, false)
 
 	// Verify: Should get exactly 1 session
 	if err != nil {
@@ -343,7 +343,7 @@ func TestDelegatedGatewayMode_SessionMerging_DuringRollover(t *testing.T) {
 	}
 
 	// Execute
-	sessions, err := p.getDelegatedGatewayModeActiveSession(context.Background(), "eth", req)
+	sessions, err := p.getDelegatedGatewayModeActiveSession(context.Background(), "eth", req, false)
 
 	// Verify: Should get 2 sessions (current + extended)
 	if err != nil {
@@ -412,7 +412,7 @@ func TestDelegatedGatewayMode_SessionMerging_RolloverWithSameSessionID(t *testin
 	}
 
 	// Execute
-	sessions, err := p.getDelegatedGatewayModeActiveSession(context.Background(), "eth", req)
+	sessions, err := p.getDelegatedGatewayModeActiveSession(context.Background(), "eth", req, false)
 
 	// Verify: Should only get 1 session (extended deduplicated)
 	if err != nil {
@@ -459,7 +459,7 @@ func TestDelegatedGatewayMode_SessionMerging_ExtendedSessionError(t *testing.T) 
 	}
 
 	// Execute
-	sessions, err := p.getDelegatedGatewayModeActiveSession(context.Background(), "eth", req)
+	sessions, err := p.getDelegatedGatewayModeActiveSession(context.Background(), "eth", req, false)
 
 	// Verify: Should succeed with only current session (graceful degradation)
 	if err != nil {
@@ -472,5 +472,155 @@ func TestDelegatedGatewayMode_SessionMerging_ExtendedSessionError(t *testing.T) 
 
 	if sessions[0].SessionId != "session-101" {
 		t.Errorf("Expected current session (session-101), got: %s", sessions[0].SessionId)
+	}
+}
+
+// forceCurrentSession is set by every websocket caller. A websocket connection binds a
+// session once and lives on it, so being handed the previous session during rollover gives
+// the connection a session that has already ended. These tests lock in that the rollover
+// grace logic is bypassed when forceCurrentSession is set, in both gateway modes.
+
+func TestCentralizedGatewayMode_ForceCurrentSession_SkipsRolloverGrace(t *testing.T) {
+	// Setup: in rollover, where the grace logic would otherwise return the previous session.
+	mockFullNode := &mockFullNodeForSessionMerging{
+		isInRollover: true,
+		currentSession: sessiontypes.Session{
+			SessionId: "session-current",
+			Header: &sessiontypes.SessionHeader{
+				SessionStartBlockHeight: 1061,
+				SessionEndBlockHeight:   1080,
+			},
+			Application: &apptypes.Application{
+				Address:                   "pokt1abc123",
+				DelegateeGatewayAddresses: []string{"pokt1gateway"},
+			},
+		},
+		extendedSession: sessiontypes.Session{
+			SessionId: "session-previous",
+			Header: &sessiontypes.SessionHeader{
+				SessionStartBlockHeight: 1041,
+				SessionEndBlockHeight:   1060,
+			},
+			Application: &apptypes.Application{
+				Address:                   "pokt1abc123",
+				DelegateeGatewayAddresses: []string{"pokt1gateway"},
+			},
+		},
+	}
+
+	p := newTestProtocolForSessionMerging(mockFullNode, protocol.GatewayModeCentralized)
+
+	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth", true)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if len(sessions) != 1 {
+		t.Fatalf("Expected 1 session, got %d", len(sessions))
+	}
+
+	if sessions[0].SessionId != "session-current" {
+		t.Errorf("forceCurrentSession must bypass rollover grace: expected session-current, got %s", sessions[0].SessionId)
+	}
+}
+
+func TestCentralizedGatewayMode_WithoutForce_UsesRolloverGrace(t *testing.T) {
+	// Same rollover setup, forceCurrentSession=false: HTTP callers keep the grace behavior.
+	mockFullNode := &mockFullNodeForSessionMerging{
+		isInRollover: true,
+		currentSession: sessiontypes.Session{
+			SessionId: "session-current",
+			Header: &sessiontypes.SessionHeader{
+				SessionStartBlockHeight: 1061,
+				SessionEndBlockHeight:   1080,
+			},
+			Application: &apptypes.Application{
+				Address:                   "pokt1abc123",
+				DelegateeGatewayAddresses: []string{"pokt1gateway"},
+			},
+		},
+		extendedSession: sessiontypes.Session{
+			SessionId: "session-previous",
+			Header: &sessiontypes.SessionHeader{
+				SessionStartBlockHeight: 1041,
+				SessionEndBlockHeight:   1060,
+			},
+			Application: &apptypes.Application{
+				Address:                   "pokt1abc123",
+				DelegateeGatewayAddresses: []string{"pokt1gateway"},
+			},
+		},
+	}
+
+	p := newTestProtocolForSessionMerging(mockFullNode, protocol.GatewayModeCentralized)
+
+	sessions, err := p.getCentralizedGatewayModeActiveSessions(context.Background(), "eth", false)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if len(sessions) != 1 {
+		t.Fatalf("Expected 1 session, got %d", len(sessions))
+	}
+
+	if sessions[0].SessionId != "session-previous" {
+		t.Errorf("Expected the rollover grace path to return session-previous, got %s", sessions[0].SessionId)
+	}
+}
+
+func TestDelegatedGatewayMode_ForceCurrentSession_OmitsPreviousSession(t *testing.T) {
+	// Delegated mode ADDS the previous session to the pool during rollover; a websocket
+	// caller must not see it, or it could be selected and bound for the connection's life.
+	mockFullNode := &mockFullNodeForSessionMerging{
+		isInRollover: true,
+		currentSession: sessiontypes.Session{
+			SessionId: "session-current",
+			Header: &sessiontypes.SessionHeader{
+				SessionStartBlockHeight: 1061,
+				SessionEndBlockHeight:   1080,
+			},
+			Application: &apptypes.Application{
+				Address:                   "pokt1userapp",
+				DelegateeGatewayAddresses: []string{"pokt1gateway"},
+				ServiceConfigs: []*sharedtypes.ApplicationServiceConfig{
+					{ServiceId: "eth"},
+				},
+			},
+		},
+		extendedSession: sessiontypes.Session{
+			SessionId: "session-previous",
+			Header: &sessiontypes.SessionHeader{
+				SessionStartBlockHeight: 1041,
+				SessionEndBlockHeight:   1060,
+			},
+			Application: &apptypes.Application{
+				Address:                   "pokt1userapp",
+				DelegateeGatewayAddresses: []string{"pokt1gateway"},
+				ServiceConfigs: []*sharedtypes.ApplicationServiceConfig{
+					{ServiceId: "eth"},
+				},
+			},
+		},
+	}
+
+	p := newTestProtocolForSessionMerging(mockFullNode, protocol.GatewayModeDelegated)
+
+	req := &http.Request{
+		Header: http.Header{
+			request.HTTPHeaderAppAddress: []string{"pokt1userapp"},
+		},
+	}
+
+	sessions, err := p.getDelegatedGatewayModeActiveSession(context.Background(), "eth", req, true)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if len(sessions) != 1 {
+		t.Fatalf("forceCurrentSession must omit the previous session: expected 1 session, got %d", len(sessions))
+	}
+
+	if sessions[0].SessionId != "session-current" {
+		t.Errorf("Expected session-current, got %s", sessions[0].SessionId)
 	}
 }

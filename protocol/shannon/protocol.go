@@ -554,7 +554,7 @@ func (p *Protocol) AvailableHTTPEndpoints(
 	)
 
 	// TODO_TECHDEBT(@adshmh): validate "serviceID" is a valid onchain Shannon service.
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, false)
 	if err != nil {
 		logger.Error().Err(err).Msg("Relay request will fail: error building the active sessions for service.")
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -628,7 +628,9 @@ func (p *Protocol) AvailableWebsocketEndpoints(
 	)
 
 	// TODO_TECHDEBT(@adshmh): validate "serviceID" is a valid onchain Shannon service.
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	// forceCurrentSession: the pool a websocket connection is selected from must not
+	// contain previous-session endpoints — the connection would live on that session.
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, true)
 	if err != nil {
 		logger.Error().Err(err).Msg("Relay request will fail: error building the active sessions for service.")
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -718,7 +720,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		"filter_by_reputation", filterByReputation,
 	)
 
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, false)
 	if err != nil {
 		logger.Error().Err(err).Msgf("Relay request will fail due to error retrieving active sessions for service %s", serviceID)
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -1344,7 +1346,7 @@ func (p *Protocol) GetTotalServiceEndpointsCount(serviceID protocol.ServiceID, h
 	ctx := context.Background()
 
 	// Get the list of active sessions for the service ID.
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, false)
 	if err != nil {
 		return 0, err
 	}
@@ -1462,7 +1464,7 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 		logger := p.logger.With("method", "GetEndpointsForHealthCheck", "service_id", string(serviceID))
 
 		// Get active sessions for this service (without filtering by reputation)
-		activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
+		activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil, false)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get sessions for service %s: %w", serviceID, err)
 		}
@@ -1784,7 +1786,7 @@ func (p *Protocol) IsSupplierBlacklisted(serviceID protocol.ServiceID, supplierA
 // This is used by health check executor to detect session rollover.
 func (p *Protocol) IsSessionActive(ctx context.Context, serviceID protocol.ServiceID, sessionID string) bool {
 	// Get current active sessions for this service
-	sessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
+	sessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil, false)
 	if err != nil {
 		// If we can't get sessions, assume it's active to avoid false negatives
 		return true

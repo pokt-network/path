@@ -24,7 +24,7 @@ func (p *Protocol) GetServiceReadiness(serviceID protocol.ServiceID) (endpointCo
 	ctx := context.Background()
 
 	// Check if we have sessions for this service
-	sessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
+	sessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil, false)
 	if err != nil {
 		return 0, false, err
 	}
@@ -230,7 +230,7 @@ func (p *Protocol) GetServiceEndpointDetails(serviceID protocol.ServiceID) ([]pr
 	ctx := context.Background()
 
 	// Get active sessions for this service
-	sessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
+	sessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil, false)
 	if err != nil {
 		return nil, err
 	}

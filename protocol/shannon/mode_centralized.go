@@ -31,6 +31,7 @@ import (
 func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
+	forceCurrentSession bool,
 ) ([]sessiontypes.Session, error) {
 	logger := p.logger.With(
 		"method", "getCentralizedGatewayModeActiveSessions",
@@ -51,8 +52,9 @@ func (p *Protocol) getCentralizedGatewayModeActiveSessions(
 		return nil, err
 	}
 
-	// Check if we're in session rollover period
-	inRollover := p.IsInSessionRollover()
+	// Check if we're in session rollover period.
+	// forceCurrentSession (websocket callers) opts out: see getActiveGatewaySessions.
+	inRollover := !forceCurrentSession && p.IsInSessionRollover()
 
 	// Loop over the address of apps owned by the gateway in Centralized gateway mode.
 	// CRITICAL: Each app gets ONLY ONE session to ensure all endpoints reference the same session.
