@@ -117,9 +117,22 @@ func SelectEndpointsWithDiversity(
 	}
 
 	// Record the candidate pool this selector saw and which operator won the PRIMARY pick.
-	// This is the path every relay takes, so it is the one whose pool composition explains a
-	// skewed traffic distribution. The primary (first) pick is the endpoint that serves the
-	// request; with max_parallel_endpoints=1 it is the only one.
+	//
+	// The path label distinguishes the two very different ways this function is called:
+	//
+	//   - numEndpoints < len(availableEndpoints): a real narrowing. The first pick is the
+	//     endpoint that serves the request (with max_parallel_endpoints=1 it is the only one).
+	//   - numEndpoints >= len(availableEndpoints): every endpoint is returned, so the caller
+	//     is using this as a QoS validation filter and DISCARDS the ordering — the batch-item
+	//     and retry paths both do exactly that, then pick via selectTopRankedEndpoint. The
+	//     "winner" here never wins anything.
+	//
+	// Recording both under one label made a discarded pick look like a real decision, which
+	// inverted the apparent traffic attribution on batch-heavy services.
+	selectionPath := metrics.SelectionPathDiversity
+	if int(numEndpoints) >= len(availableEndpoints) {
+		selectionPath = metrics.SelectionPathFilter
+	}
 	if len(selectedEndpoints) > 0 {
 		// Reuse endpointTLDs rather than calling operatorKey per endpoint: both resolve via
 		// ExtractTLDFromEndpointAddr, and that parse is the expensive part. Apply the same
@@ -139,7 +152,7 @@ func SelectEndpointsWithDiversity(
 		}
 		metrics.RecordSelectionPool(
 			string(serviceID),
-			metrics.SelectionPathDiversity,
+			selectionPath,
 			counts,
 			len(availableEndpoints),
 			selectedOp,

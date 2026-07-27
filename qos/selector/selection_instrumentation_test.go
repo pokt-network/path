@@ -204,3 +204,61 @@ func TestSelectionInstrumentation_PathsAreDistinguishable(t *testing.T) {
 		t.Errorf("concentration_cap path = %v, want 3", got)
 	}
 }
+
+// When numEndpoints >= pool size this selector returns EVERY endpoint, so its ordering is a
+// filter result, not a decision — the batch-item and retry paths call it exactly that way and
+// then pick via selectTopRankedEndpoint. Attributing those to "diversity" is what made a
+// discarded pick look like a real one and inverted the apparent traffic attribution.
+func TestSelectionInstrumentation_FilterUsageIsLabelledSeparately(t *testing.T) {
+	const svc = "instr-filter"
+	logger := polyzero.NewLogger()
+	eps := protocol.EndpointAddrList{
+		"s1-https://a.alpha-op.com", "s2-https://b.alpha-op.com",
+		"s3-https://c.beta-op.com",
+	}
+
+	beforeFilter := candidateCountPath(t, svc, "alpha-op.com", metrics.SelectionPathFilter)
+	beforeDiv := candidateCountPath(t, svc, "alpha-op.com", metrics.SelectionPathDiversity)
+
+	// Called the way processBatchItem calls it: numEndpoints == len(pool).
+	const runs = 12
+	for i := 0; i < runs; i++ {
+		got := SelectEndpointsWithDiversity(logger, svc, eps, uint(len(eps)))
+		if len(got) != len(eps) {
+			t.Fatalf("filter usage should return the whole pool: got %d, want %d", len(got), len(eps))
+		}
+	}
+
+	if got := candidateCountPath(t, svc, "alpha-op.com", metrics.SelectionPathFilter) - beforeFilter; got != runs {
+		t.Errorf("filter path = %v, want %d", got, runs)
+	}
+	// The decision-carrying series must stay clean.
+	if got := candidateCountPath(t, svc, "alpha-op.com", metrics.SelectionPathDiversity) - beforeDiv; got != 0 {
+		t.Errorf("filter usage leaked into diversity path: got %v, want 0", got)
+	}
+}
+
+// A genuine narrowing must still be recorded as a decision.
+func TestSelectionInstrumentation_NarrowingStaysOnDiversityPath(t *testing.T) {
+	const svc = "instr-narrowing"
+	logger := polyzero.NewLogger()
+	eps := protocol.EndpointAddrList{
+		"s1-https://a.gamma-op.com", "s2-https://b.gamma-op.com",
+		"s3-https://c.delta-op.com",
+	}
+
+	before := candidateCountPath(t, svc, "gamma-op.com", metrics.SelectionPathDiversity)
+	beforeFilter := candidateCountPath(t, svc, "gamma-op.com", metrics.SelectionPathFilter)
+
+	const runs = 9
+	for i := 0; i < runs; i++ {
+		SelectEndpointsWithDiversity(logger, svc, eps, 2) // 2 < 3 → real narrowing
+	}
+
+	if got := candidateCountPath(t, svc, "gamma-op.com", metrics.SelectionPathDiversity) - before; got != runs {
+		t.Errorf("diversity path = %v, want %d", got, runs)
+	}
+	if got := candidateCountPath(t, svc, "gamma-op.com", metrics.SelectionPathFilter) - beforeFilter; got != 0 {
+		t.Errorf("narrowing leaked into filter path: got %v, want 0", got)
+	}
+}

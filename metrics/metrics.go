@@ -712,11 +712,14 @@ func RecordConcentrationCapReshaped(serviceID string) {
 // far above its share is a selector problem. One rarely appearing as a candidate at all,
 // despite showing healthy in /ready, means the skew happened upstream in filtering.
 //
-// The `path` label names the selector that ran. There is more than one, and they do NOT
-// carry equal traffic: SelectEndpointsWithDiversity serves effectively all relays, while
-// SelectWithConcentrationCap is reached only via SelectWithMetadata and is close to idle.
-// Splitting by path makes that visible directly instead of being folklore — and would show
-// immediately if the balance ever shifted.
+// The `path` label names the DECISION that produced the relay's endpoint. There is more than
+// one, they do NOT carry equal traffic, and — critically — not every selector's output is
+// used: see the SelectionPath* constants. Splitting by path is what makes that visible
+// instead of being folklore, and would show immediately if the balance ever shifted.
+//
+// Only compute a win rate within a single `path`. Mixing them compares a decision that was
+// acted on against one that was discarded, which is how a selector can appear to favor an
+// operator that in fact receives almost no traffic.
 //
 // Cardinality is service_id x domain x path — the service_id/domain pairing that
 // path_relays_total already carries, doubled by a 2-value label.
@@ -777,13 +780,92 @@ func RecordSelectionPool(serviceID, selectionPath string, operatorCounts map[str
 
 // Selector paths for LabelSelectionPath.
 const (
-	// SelectionPathDiversity is SelectEndpointsWithDiversity, reached from
-	// SelectMultipleWithArchival — the path every HTTP relay actually takes.
+	// SelectionPathTopRanked is selectTopRankedEndpoint: uniform random within
+	// retryHedgeScoreEpsilon of the top reputation score. Despite the "retry/hedge" name it
+	// is the PRIMARY selector for batch items and retries, so on batch-heavy services it
+	// decides where nearly every relay goes.
+	SelectionPathTopRanked = "top_ranked"
+	// SelectionPathDiversity is SelectEndpointsWithDiversity when its ordering was actually
+	// used — i.e. it returned fewer endpoints than it was given, so the pick was a decision.
 	SelectionPathDiversity = "diversity"
+	// SelectionPathFilter is SelectEndpointsWithDiversity called with numEndpoints >= pool
+	// size. It returns every endpoint, so the caller is using it purely as a QoS validation
+	// filter and DISCARDS the ordering; the real pick happens afterwards, in
+	// selectTopRankedEndpoint. Recorded separately because attributing these to "diversity"
+	// makes a discarded decision look like a real one.
+	SelectionPathFilter = "filter"
 	// SelectionPathConcentrationCap is SelectWithConcentrationCap, reached only from
 	// SelectWithMetadata.
 	SelectionPathConcentrationCap = "concentration_cap"
 )
+
+// SelectionBandSize reports how many endpoints were inside the top-score band that
+// selectTopRankedEndpoint picks uniformly from. This is the effective choice set: a band of
+// 1 is winner-take-all no matter how large the pool is.
+var SelectionBandSize = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "selection_band_size",
+		Help:    "Endpoints inside the top-reputation-score band eligible for selection, by service_id. 1 means winner-take-all.",
+		Buckets: []float64{1, 2, 3, 4, 5, 6, 8, 10, 15, 25},
+	},
+	[]string{LabelServiceID},
+)
+
+// SelectionBandOperators reports how many DISTINCT operators survived the score band. The
+// band gates on score alone, so a large band drawn from one operator still concentrates all
+// traffic there; only this metric separates "wide choice" from "wide choice of one operator".
+var SelectionBandOperators = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "selection_band_operators",
+		Help:    "Distinct operators (eTLD+1) inside the top-reputation-score band, by service_id.",
+		Buckets: []float64{1, 2, 3, 4, 5, 6, 8, 10},
+	},
+	[]string{LabelServiceID},
+)
+
+// SelectionBandExcludedTotal counts operators that were in the candidate pool but fell
+// outside the top-score band, and so could not be selected at all.
+//
+// This is the metric that explains a healthy-looking operator receiving little traffic: it
+// is present, it passes QoS validation, it is not in cooldown — and it is still ineligible
+// because it sits more than retryHedgeScoreEpsilon below the top score. Without it, that
+// operator simply looks unlucky.
+var SelectionBandExcludedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "selection_band_excluded_total",
+		Help: "Operators present in the candidate pool but excluded by the top-score band, by service_id and domain.",
+	},
+	[]string{LabelServiceID, LabelDomain},
+)
+
+// RecordTopRankedSelection records one selectTopRankedEndpoint decision: the full candidate
+// pool it received, the top-score band it narrowed to, and the operator that won.
+//
+// bandCounts (not poolCounts) feeds SelectionCandidateTotal, so selected/candidate on
+// path="top_ranked" is a true win rate among the endpoints that were actually eligible.
+// Operators in the pool but not the band are counted in SelectionBandExcludedTotal instead —
+// they had a zero chance, and averaging them into the win rate would hide exactly that.
+func RecordTopRankedSelection(
+	serviceID string,
+	poolCounts, bandCounts map[string]int,
+	poolSize, bandSize int,
+	selectedOperator string,
+) {
+	SelectionPoolSize.WithLabelValues(serviceID, SelectionPathTopRanked).Observe(float64(poolSize))
+	SelectionPoolOperators.WithLabelValues(serviceID, SelectionPathTopRanked).Observe(float64(len(poolCounts)))
+	SelectionBandSize.WithLabelValues(serviceID).Observe(float64(bandSize))
+	SelectionBandOperators.WithLabelValues(serviceID).Observe(float64(len(bandCounts)))
+
+	for op := range bandCounts {
+		SelectionCandidateTotal.WithLabelValues(serviceID, op, SelectionPathTopRanked).Inc()
+	}
+	for op := range poolCounts {
+		if _, eligible := bandCounts[op]; !eligible {
+			SelectionBandExcludedTotal.WithLabelValues(serviceID, op).Inc()
+		}
+	}
+	SelectionSelectedTotal.WithLabelValues(serviceID, selectedOperator, SelectionPathTopRanked).Inc()
+}
 
 // ReputationRateCooldownTotal counts endpoints cooled down by the volume-independent
 // sustained-critical-rate detector (as opposed to the consecutive-strike/burst path).

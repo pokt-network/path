@@ -2104,12 +2104,19 @@ func computeRegistrableDomainFromEndpoint(endpoint protocol.EndpointAddr) string
 // radius across the genuinely-top tier while still excluding anything meaningfully worse.
 const retryHedgeScoreEpsilon = 2.0
 
-// selectTopRankedEndpoint selects among the highest-reputation endpoints for retry/hedge.
-// It ranks by reputation score, then picks UNIFORMLY AT RANDOM among all endpoints whose
-// score is within retryHedgeScoreEpsilon of the top score. This keeps quality gating
-// (only the top-scoring band is eligible) while avoiding winner-take-all: without it, a
-// sub-point score edge routes every retry and hedge overflow to a single endpoint,
-// dogpiling it and concentrating all blast radius there.
+// selectTopRankedEndpoint selects among the highest-reputation endpoints. It ranks by
+// reputation score, then picks UNIFORMLY AT RANDOM among all endpoints whose score is within
+// retryHedgeScoreEpsilon of the top score. This keeps quality gating (only the top-scoring
+// band is eligible) while avoiding strict winner-take-all: without it, a sub-point score edge
+// routes every selection to a single endpoint, dogpiling it and concentrating all blast
+// radius there.
+//
+// NOTE ON SCOPE: this was written for retry/hedge overflow, but it is also the PRIMARY
+// selector for batch items (processBatchItem) and retries. On batch-heavy services it decides
+// where nearly every relay goes — the diversity selector's ordering is discarded there,
+// because SelectMultipleWithArchival is called with numEndpoints = len(pool) and used purely
+// as a QoS validation filter. Treat changes here as changes to the main routing path, not to
+// an overflow path. metrics.RecordTopRankedSelection makes that traffic visible.
 //
 // Falls back to the first endpoint in the list if reputation service is unavailable.
 func (rc *requestContext) selectTopRankedEndpoint(
@@ -2120,15 +2127,20 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		return ""
 	}
 
-	// If only one endpoint, return it directly
+	// If only one endpoint, return it directly. Still recorded: a pool that has already
+	// collapsed to one endpoint is a concentration cause in its own right, and is
+	// indistinguishable from a selector that keeps choosing the same operator without it.
 	if len(endpoints) == 1 {
+		rc.recordTopRankedSelection(endpoints, endpoints, endpoints[0])
 		return endpoints[0]
 	}
 
 	// Get reputation service
 	reputationSvc := rc.protocol.GetReputationService()
 	if reputationSvc == nil {
-		// No reputation service - fall back to first endpoint
+		// No reputation service - fall back to first endpoint. Only endpoints[0] could have
+		// been chosen, so the effective band is that single endpoint.
+		rc.recordTopRankedSelection(endpoints, endpoints[:1], endpoints[0])
 		return endpoints[0]
 	}
 
@@ -2151,7 +2163,8 @@ func (rc *requestContext) selectTopRankedEndpoint(
 	// Rank endpoints by score (highest first)
 	rankedKeys, err := reputationSvc.RankEndpointsByScore(rc.context, keys)
 	if err != nil || len(rankedKeys) == 0 {
-		// Error ranking - fall back to first endpoint
+		// Error ranking - fall back to first endpoint (effective band of one).
+		rc.recordTopRankedSelection(endpoints, endpoints[:1], endpoints[0])
 		return endpoints[0]
 	}
 
@@ -2183,8 +2196,20 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		rc.logger.Warn().
 			Str("top_key", string(topKey.EndpointAddr)).
 			Msg("Failed to map top-ranked key back to original endpoint, falling back")
+		rc.recordTopRankedSelection(endpoints, endpoints[:1], endpoints[0])
 		return endpoints[0]
 	}
+
+	// Resolve the band back to endpoints so the metric reports which operators were actually
+	// eligible. Ranking keys are reputation keys (per-supplier/per-domain granularity), not
+	// endpoint addresses, so they must go back through keyToOriginalEndpoint.
+	bandEndpoints := make(protocol.EndpointAddrList, 0, bandSize)
+	for _, k := range rankedKeys[:bandSize] {
+		if ep, mapped := keyToOriginalEndpoint[k.EndpointAddr]; mapped {
+			bandEndpoints = append(bandEndpoints, ep)
+		}
+	}
+	rc.recordTopRankedSelection(endpoints, bandEndpoints, originalEndpoint)
 
 	rc.logger.Debug().
 		Str("selected_endpoint", string(originalEndpoint)).
@@ -2194,6 +2219,50 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		Msg("🏆 Selected endpoint from top-scoring band for retry/hedge (spreads overflow)")
 
 	return originalEndpoint
+}
+
+// recordTopRankedSelection reports one selectTopRankedEndpoint decision to the selection
+// metrics: the candidate pool it received, the top-score band it narrowed to, and the winner,
+// all bucketed by operator (eTLD+1).
+//
+// Operator keys come from extractRegistrableDomain, which is memoized and already used for
+// the retry/hedge exclusion set — so this adds no URL parsing on the hot path beyond the
+// first sighting of each endpoint. Endpoints whose registrable domain cannot be derived fall
+// back to the endpoint address, keeping them singletons rather than merging them into one
+// bucket, which would fabricate concentration.
+func (rc *requestContext) recordTopRankedSelection(
+	pool, band protocol.EndpointAddrList,
+	selected protocol.EndpointAddr,
+) {
+	// selectTopRankedEndpoint returns on a nil receiver for a single-endpoint pool without
+	// ever touching rc, and callers (hedgeRacer.selectHedgeEndpoint) rely on that. Recording
+	// must not be what makes it dereference rc — a metric is never worth a panic.
+	if rc == nil {
+		return
+	}
+
+	operatorOf := func(ep protocol.EndpointAddr) string {
+		if d := extractRegistrableDomain(ep); d != "" {
+			return d
+		}
+		return string(ep)
+	}
+	countByOperator := func(eps protocol.EndpointAddrList) map[string]int {
+		counts := make(map[string]int, len(eps))
+		for _, ep := range eps {
+			counts[operatorOf(ep)]++
+		}
+		return counts
+	}
+
+	metrics.RecordTopRankedSelection(
+		string(rc.serviceID),
+		countByOperator(pool),
+		countByOperator(band),
+		len(pool),
+		len(band),
+		operatorOf(selected),
+	)
 }
 
 // extractSupplierFromEndpoint extracts the supplier address from an endpoint address.
