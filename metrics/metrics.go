@@ -405,6 +405,16 @@ const (
 	LabelCircuitBreakerEvent     = "event"
 	CircuitBreakerEventBroken    = "broken"
 	CircuitBreakerEventRecovered = "recovered"
+	// CircuitBreakerEventSuppressed is a break trigger the failure-rate gate declined to
+	// act on: the domain failed, but not at a rate that justifies removing it from the
+	// pool. Counting these separately is what distinguishes "this domain is healthy" from
+	// "the gate is swallowing real failures" — without it, a mis-tuned gate is invisible.
+	CircuitBreakerEventSuppressed = "suppressed"
+	// CircuitBreakerEventDuplicate is a break trigger arriving while the domain is ALREADY
+	// broken. Batch items fail concurrently on separate goroutines, so one incident
+	// produces many of these. They must not escalate the TTL — one incident is one
+	// episode — but they are counted so the amplification factor stays measurable.
+	CircuitBreakerEventDuplicate = "duplicate"
 )
 
 // CircuitBreakerReasonCategory enumerates the bounded set of reason buckets

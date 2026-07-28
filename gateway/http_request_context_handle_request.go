@@ -751,6 +751,12 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
 		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, requestID, logger)
 		if checkResult.Success {
+			// Denominator for the circuit breaker's failure-rate gate — see RecordSuccess.
+			if rc.circuitBreaker != nil && endpointAddr != "" {
+				if domain := extractDomainFromEndpoint(endpointAddr); domain != "" {
+					rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+				}
+			}
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
 				responseBytes := len(responseBytesForHeuristic)
@@ -1276,6 +1282,15 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		// Check response success with heuristic
 		checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, resp.RequestID, logger)
 		if checkResult.Success {
+			// Feed the circuit breaker's failure-rate gate. This is the denominator: without
+			// it the gate sees only failures, and any failure reads as a 100% failure rate —
+			// which is the first-error behavior that locked out high-volume operators
+			// sustaining >99% success.
+			if rc.circuitBreaker != nil {
+				if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
+					rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+				}
+			}
 			logger.Debug().
 				Str("endpoint", string(resp.EndpointAddr)).
 				Int("status", resp.HTTPStatusCode).
@@ -1630,6 +1645,12 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
 		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, parallelRequestID, logger)
 		if checkResult.Success {
+			// Denominator for the circuit breaker's failure-rate gate — see RecordSuccess.
+			if rc.circuitBreaker != nil && endpointAddr != "" {
+				if domain := extractDomainFromEndpoint(endpointAddr); domain != "" {
+					rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+				}
+			}
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
 				responseBytes := len(responseBytesForHeuristic)
