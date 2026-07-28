@@ -232,7 +232,30 @@ curl -X POST http://localhost:13069/admin/circuit-breaker/clear/near
 # Response: {"service_id":"near","cleared_domains":3,"message":"circuit breaker state cleared (in-memory + Redis)"}
 ```
 
-**When to use:**
+**WebSocket Tumble** (`POST /admin/websocket/tumble/{serviceId}`)
+Forces live WebSocket connections to rebind onto different suppliers. Clients stay connected — the bridge re-dials an endpoint and replays the client's subscriptions, the same machinery a session rollover uses.
+
+A WebSocket connection binds one endpoint for its entire lifetime and only moves at a session rollover or a stall. A long-lived high-volume subscriber therefore pins itself to whichever operator it first landed on, and no change to endpoint selection can move it — selection only governs where *new* connections go. The alternative is restarting the pod, which drops every client and resets unrelated in-memory state.
+
+Must be called on each pod individually (per-pod in-memory registry).
+```bash
+# See the current distribution without moving anything
+curl -X POST "http://localhost:13069/admin/websocket/tumble/bsc?dry_run=true"
+
+# Move every connection currently bound to one operator
+curl -X POST "http://localhost:13069/admin/websocket/tumble/bsc?domain=example.net"
+
+# Move at most 5, most-concentrated operators first
+curl -X POST "http://localhost:13069/admin/websocket/tumble/bsc?max=5"
+```
+
+Query parameters (all optional): `domain=<eTLD+1>` restricts to connections currently bound to that operator; `max=<n>` caps how many move (candidates ordered by descending per-domain concentration); `dry_run=true` reports without moving.
+
+Response includes `connections_by_domain` (the pre-tumble distribution), `tumbled_by_domain`, and `matched`/`tumbled`/`skipped` counts. `skipped` means the connection could not accept a tumble right now — rebind disabled for it, or one already queued.
+
+Rebinds land on `path_websocket_rebind_total{trigger="admin"}`, distinct from `rollover` and `stall`.
+
+**Circuit Breaker — when to use:**
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved
 - Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis

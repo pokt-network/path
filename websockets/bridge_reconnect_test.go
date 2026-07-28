@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -461,4 +462,221 @@ func Test_Bridge_SwallowedEndpointMessageNotForwarded(t *testing.T) {
 	_, msg, err := clientConn.ReadMessage()
 	c.NoError(err)
 	c.Equal("KEEP", string(msg), "swallowed message must not reach the client")
+}
+
+// tumbleAwareReconnector is a mockReconnector that also implements BridgeAttacher and
+// TumbleReporter, so a test can grab the live bridge's controller and assert that a
+// tumble is reported distinctly from a stall.
+type tumbleAwareReconnector struct {
+	*mockReconnector
+
+	mu             sync.Mutex
+	controller     BridgeController
+	detached       bool
+	tumblesRequest int32
+}
+
+func (t *tumbleAwareReconnector) AttachBridge(ctl BridgeController) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if ctl == nil {
+		t.detached = true
+		t.controller = nil
+		return
+	}
+	t.controller = ctl
+}
+
+func (t *tumbleAwareReconnector) OnTumbleRequested() {
+	atomic.AddInt32(&t.tumblesRequest, 1)
+}
+
+func (t *tumbleAwareReconnector) liveController() BridgeController {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.controller
+}
+
+func (t *tumbleAwareReconnector) isDetached() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.detached
+}
+
+// Test_Bridge_TumbleRebindsWithoutDroppingClient is the core guarantee of the admin
+// tumble: an operator can move a live connection onto a different supplier and the client
+// never notices — it stays connected and keeps receiving data from the replacement.
+func Test_Bridge_TumbleRebindsWithoutDroppingClient(t *testing.T) {
+	c := require.New(t)
+
+	// Replacement endpoint: pushes a distinguishable frame so the test can prove the
+	// client is now being served by it.
+	endpoint2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("post-tumble-head"))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer endpoint2.Close()
+
+	// Original endpoint: healthy and quiet. A tumble must move it anyway — unlike the
+	// stall watchdog, a tumble implies nothing about endpoint health.
+	endpoint1 := httptest.NewServer(http.HandlerFunc(upgradeAndStaySilent))
+	defer endpoint1.Close()
+
+	reconnector := &tumbleAwareReconnector{
+		mockReconnector: &mockReconnector{url: wsURL(endpoint2), hasSubs: true},
+	}
+	processor := &mockWebsocketMessageProcessor{}
+	obsChan := make(chan *observation.RequestResponseObservations, 100)
+
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := StartBridge(
+			context.Background(), polyzero.NewLogger(), r, w,
+			wsURL(endpoint1), http.Header{}, processor, obsChan, reconnector,
+		)
+		c.NoError(err)
+	}))
+	defer clientServer.Close()
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL(clientServer), nil)
+	c.NoError(err)
+	defer clientConn.Close()
+
+	// The bridge must have handed its controller to the reconnector on startup —
+	// without that, nothing is tumble-able.
+	var ctl BridgeController
+	require.Eventually(t, func() bool {
+		ctl = reconnector.liveController()
+		return ctl != nil
+	}, 2*time.Second, 10*time.Millisecond, "bridge must register itself for tumbling")
+
+	c.True(ctl.Tumble(), "a live rebind-capable bridge must accept a tumble")
+
+	// The client stays open and is served by the replacement endpoint.
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, msg, err := clientConn.ReadMessage()
+	c.NoError(err, "client must stay connected across an operator tumble")
+	c.Equal("post-tumble-head", string(msg))
+
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&reconnector.avoidCurrentCalls) == 1 &&
+			atomic.LoadInt32(&reconnector.outcomeSuccess) == 1
+	}, 2*time.Second, 10*time.Millisecond, "tumble must reselect a DIFFERENT supplier and succeed")
+
+	// A tumble is reported as a tumble, never as a stall — they are distinct metric
+	// labels and conflating them would make an operator action look like an endpoint
+	// fault.
+	c.Equal(int32(1), atomic.LoadInt32(&reconnector.tumblesRequest))
+	c.Equal(int32(0), atomic.LoadInt32(&reconnector.mockReconnector.stallRebindReported),
+		"an operator tumble must not be reported as a stall")
+	c.Equal(int32(0), atomic.LoadInt32(&reconnector.mockReconnector.stallGiveupReported))
+}
+
+// Test_Bridge_TumbleNeverClosesClientAfterRepeatedUse guards the give-up limit: the stall
+// watchdog closes the client after maxConsecutiveStallRebinds, and a tumble must NOT feed
+// that counter. Otherwise repeatedly redistributing connections would start killing them.
+func Test_Bridge_TumbleNeverClosesClientAfterRepeatedUse(t *testing.T) {
+	origMax := maxConsecutiveStallRebinds
+	maxConsecutiveStallRebinds = 2
+	defer func() { maxConsecutiveStallRebinds = origMax }()
+
+	c := require.New(t)
+
+	// Replacement endpoint that keeps accepting connections and stays quiet, so nothing
+	// but the give-up logic could close the client.
+	endpoint2 := httptest.NewServer(http.HandlerFunc(upgradeAndStaySilent))
+	defer endpoint2.Close()
+	endpoint1 := httptest.NewServer(http.HandlerFunc(upgradeAndStaySilent))
+	defer endpoint1.Close()
+
+	reconnector := &tumbleAwareReconnector{
+		mockReconnector: &mockReconnector{url: wsURL(endpoint2), hasSubs: true},
+	}
+	processor := &mockWebsocketMessageProcessor{}
+	obsChan := make(chan *observation.RequestResponseObservations, 100)
+
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := StartBridge(
+			context.Background(), polyzero.NewLogger(), r, w,
+			wsURL(endpoint1), http.Header{}, processor, obsChan, reconnector,
+		)
+		c.NoError(err)
+	}))
+	defer clientServer.Close()
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL(clientServer), nil)
+	c.NoError(err)
+	defer clientConn.Close()
+
+	var ctl BridgeController
+	require.Eventually(t, func() bool {
+		ctl = reconnector.liveController()
+		return ctl != nil
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Tumble well past the give-up limit, waiting for each to land so they do not
+	// coalesce in the depth-1 channel.
+	const tumbles = 5
+	for i := 0; i < tumbles; i++ {
+		ctl.Tumble()
+		want := int32(i + 1)
+		require.Eventually(t, func() bool {
+			return atomic.LoadInt32(&reconnector.outcomeSuccess) >= want
+		}, 2*time.Second, 5*time.Millisecond, "tumble %d should complete", i+1)
+	}
+
+	c.Equal(int32(0), atomic.LoadInt32(&reconnector.mockReconnector.stallGiveupReported),
+		"tumbling must never trip the stall give-up path")
+
+	// The client is still alive: a ping round-trips.
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	c.NoError(clientConn.WriteMessage(websocket.TextMessage, []byte("still-here")),
+		"client must remain connected after repeated tumbles")
+}
+
+// Test_Bridge_TumbleDeregistersOnShutdown verifies the registry cannot be left holding a
+// handle to a dead bridge.
+func Test_Bridge_TumbleDeregistersOnShutdown(t *testing.T) {
+	c := require.New(t)
+
+	endpoint1 := httptest.NewServer(http.HandlerFunc(upgradeAndStaySilent))
+	defer endpoint1.Close()
+
+	reconnector := &tumbleAwareReconnector{
+		mockReconnector: &mockReconnector{url: wsURL(endpoint1), hasSubs: false},
+	}
+	processor := &mockWebsocketMessageProcessor{}
+	obsChan := make(chan *observation.RequestResponseObservations, 100)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := StartBridge(
+			ctx, polyzero.NewLogger(), r, w,
+			wsURL(endpoint1), http.Header{}, processor, obsChan, reconnector,
+		)
+		c.NoError(err)
+	}))
+	defer clientServer.Close()
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL(clientServer), nil)
+	c.NoError(err)
+	defer clientConn.Close()
+
+	require.Eventually(t, func() bool {
+		return reconnector.liveController() != nil
+	}, 2*time.Second, 10*time.Millisecond)
+
+	cancel() // tear the bridge down
+
+	require.Eventually(t, func() bool {
+		return reconnector.isDetached() && reconnector.liveController() == nil
+	}, 2*time.Second, 10*time.Millisecond, "a shut-down bridge must deregister itself")
 }

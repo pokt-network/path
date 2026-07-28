@@ -92,13 +92,58 @@ type websocketRequestContext struct {
 	lastReconnectReason string
 
 	// lastReconnectTrigger holds what initiated the most recent rebind episode
-	// (WSRebindTriggerRollover / WSRebindTriggerStall), consumed by OnReconnectOutcome to
-	// tag the metric. Bridge-goroutine only.
+	// (WSRebindTriggerRollover / WSRebindTriggerStall / WSRebindTriggerAdmin), consumed
+	// by OnReconnectOutcome to tag the metric. Bridge-goroutine only.
 	lastReconnectTrigger string
+
+	// adminTumbleRequested marks the NEXT rebind as operator-initiated so it is labelled
+	// `admin` instead of `stall` — both arrive with avoidCurrentSupplier set and are
+	// otherwise indistinguishable. Set by OnTumbleRequested and consumed (cleared) by
+	// ReconnectEndpoint; both run on the bridge goroutine, so it needs no
+	// synchronization.
+	adminTumbleRequested bool
+
+	// wsRegistry, when non-nil, holds this pod's live websocket connections so an
+	// operator can force a subset to rebind. Registration is driven by the bridge via
+	// AttachBridge.
+	wsRegistry *websocketConnRegistry
 
 	// reputationService tracks endpoint reputation scores.
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
 	reputationService reputation.ReputationService
+}
+
+// AttachBridge registers (controller != nil) or deregisters (controller == nil) this
+// connection in the pod's tumble registry. Implements websockets.BridgeAttacher; the
+// bridge calls it once when it starts and once when it shuts down, so an entry exists
+// exactly as long as the bridge is alive.
+//
+// A nil wsRegistry (registry not wired, or session rebind disabled — a connection that
+// cannot rebind cannot be tumbled) makes this a no-op.
+func (wrc *websocketRequestContext) AttachBridge(controller websockets.BridgeController) {
+	if wrc.wsRegistry == nil {
+		return
+	}
+
+	if controller == nil {
+		wrc.wsRegistry.deregister(wrc.serviceID, wrc)
+		return
+	}
+
+	// Called on the bridge goroutine before it starts processing, so reading the bound
+	// endpoint here is safe.
+	ep := wrc.signingEndpoint()
+	domain, err := shannonmetrics.ExtractDomainOrHost(ep.PublicURL())
+	if err != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	wrc.wsRegistry.register(wrc.serviceID, wrc, controller, domain, ep.Supplier())
+}
+
+// OnTumbleRequested marks the next rebind as operator-initiated so it is labelled
+// `admin` rather than `stall`. Implements websockets.TumbleReporter.
+func (wrc *websocketRequestContext) OnTumbleRequested() {
+	wrc.adminTumbleRequested = true
 }
 
 // signingEndpoint returns the endpoint whose session must be used to sign/validate
@@ -181,6 +226,9 @@ func (p *Protocol) BuildWebsocketRequestContextForEndpoint(
 		wrc.reconnectProvider = func(reconnectCtx context.Context, avoidCurrent bool) (endpoint, bool, string, error) {
 			return p.getReconnectEndpoint(reconnectCtx, serviceID, selectedEndpointAddr, httpReq, avoidCurrent)
 		}
+		// Only rebind-capable connections can be tumbled, so the tumble registry is
+		// wired on the same condition.
+		wrc.wsRegistry = p.wsConnRegistry
 	}
 
 	// Create observation channel for connection-level observations only
@@ -1024,11 +1072,17 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoid
 		return nil, fmt.Errorf("websocket session rebind not configured")
 	}
 
-	// Record what triggered this rebind so OnReconnectOutcome can tag the metric: the
-	// staleness watchdog sets avoidCurrentSupplier, everything else is a routine rollover.
-	if avoidCurrentSupplier {
+	// Record what triggered this rebind so OnReconnectOutcome can tag the metric. An
+	// operator tumble and the staleness watchdog both arrive with avoidCurrentSupplier
+	// set, so the explicit admin flag has to be checked first; everything else is a
+	// routine rollover.
+	switch {
+	case wrc.adminTumbleRequested:
+		wrc.lastReconnectTrigger = metrics.WSRebindTriggerAdmin
+		wrc.adminTumbleRequested = false
+	case avoidCurrentSupplier:
 		wrc.lastReconnectTrigger = metrics.WSRebindTriggerStall
-	} else {
+	default:
 		wrc.lastReconnectTrigger = metrics.WSRebindTriggerRollover
 	}
 
@@ -1137,6 +1191,14 @@ func (wrc *websocketRequestContext) OnReconnectOutcome(success bool, replayedSub
 		trigger = metrics.WSRebindTriggerRollover
 	}
 	metrics.RecordWebsocketRebind(domain, serviceID, result, trigger, replayedSubscriptions)
+
+	// Re-point the tumble registry at the endpoint this connection is now bound to, so a
+	// later domain-filtered tumble matches where the connection IS rather than where it
+	// started. Only on success — a failed rebind leaves the old binding in place (and the
+	// bridge is closing the client anyway, which deregisters the entry).
+	if success {
+		wrc.wsRegistry.updateBinding(wrc.serviceID, wrc, domain, wrc.signingEndpoint().Supplier())
+	}
 
 	// Error level ON PURPOSE for canary visibility. Temporary — downgrade once validated.
 	wrc.logger.Error().

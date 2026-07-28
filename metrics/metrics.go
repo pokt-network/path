@@ -1046,6 +1046,7 @@ const (
 	// often than routine rollovers).
 	WSRebindTriggerRollover = "rollover" // routine Shannon session-boundary reconnect
 	WSRebindTriggerStall    = "stall"    // staleness watchdog forced a rebind off a silent supplier
+	WSRebindTriggerAdmin    = "admin"    // operator asked to redistribute connections (admin tumble)
 
 	// --- WebSocket endpoint-staleness watchdog result labels (experimental)
 	// The `result` dimension of WebsocketEndpointStallTotal. A stall is a silent supplier

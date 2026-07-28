@@ -57,6 +57,19 @@ type EndpointReconnector interface {
 	OnEndpointStallDetected(gaveUp bool)
 }
 
+// TumbleReporter is an optional interface an EndpointReconnector may implement to learn
+// that the upcoming rebind was requested by an operator (admin tumble) rather than
+// caused by a stall or a session rollover. Both a tumble and a stall reach
+// ReconnectEndpoint with avoidCurrentSupplier=true, so without this signal they are
+// indistinguishable and would share a metric label.
+//
+// Called on the bridge's start() goroutine immediately before the reconnect, i.e. the
+// same goroutine that then calls ReconnectEndpoint, so an implementer may record it in
+// unsynchronized state.
+type TumbleReporter interface {
+	OnTumbleRequested()
+}
+
 // ReconnectFailureStage identifies where in a rebind episode a failure happened, so the
 // reconnector can emit a precise failure-reason metric. The bridge knows only the stage;
 // the reconnector (protocol layer) knows the specific selection/dial reason.
@@ -162,9 +175,22 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 	}
 
 	// A stall-triggered disconnect (raised by the staleness watchdog) means the current
-	// supplier is the problem, so the reconnect must avoid reselecting it. An ordinary
+	// supplier is the problem, so the reconnect must avoid reselecting it. An operator
+	// tumble likewise exists precisely to land somewhere else. An ordinary
 	// session-rollover disconnect prefers supplier continuity (tier-1).
-	avoidCurrentSupplier := errors.Is(down.err, ErrEndpointStalled)
+	tumbled := errors.Is(down.err, ErrEndpointTumbled)
+	avoidCurrentSupplier := tumbled || errors.Is(down.err, ErrEndpointStalled)
+
+	// Tell the reconnector this rebind was operator-initiated so it can label the metric
+	// as such — without this it would be indistinguishable from a stall, since both
+	// arrive with avoidCurrentSupplier set. Called before the reconnect so the
+	// reconnector has it in hand by the time it picks the trigger label. Optional
+	// interface; reconnectors that do not implement it just report stall/rollover.
+	if tumbled {
+		if reporter, ok := b.reconnector.(TumbleReporter); ok {
+			reporter.OnTumbleRequested()
+		}
+	}
 
 	// NOTE: logged at Error level ON PURPOSE so rebind activity is visible on canary
 	// (LOG_LEVEL=error). Downgrade or remove once the feature is validated.

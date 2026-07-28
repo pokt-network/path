@@ -28,4 +28,11 @@ var (
 	// (session-rollover) disconnect via errors.Is so the reconnect avoids reselecting
 	// the stalling supplier.
 	ErrEndpointStalled = errors.New("endpoint stalled: no subscription data past staleness threshold")
+
+	// ErrEndpointTumbled indicates an operator asked the bridge to move this connection
+	// onto a different supplier (admin tumble). Unlike ErrEndpointStalled it implies
+	// nothing about endpoint health — the current endpoint may be perfectly fine and is
+	// being moved for traffic-distribution reasons — but it takes the same reconnect
+	// path, so the rebind avoids reselecting the currently bound supplier.
+	ErrEndpointTumbled = errors.New("endpoint tumbled: operator-requested rebind to a different supplier")
 )

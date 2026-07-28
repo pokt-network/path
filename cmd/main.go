@@ -335,6 +335,12 @@ func main() {
 	// height that the max-only consensus and external floor cannot self-correct.
 	chainStateAdmin := gateway.NewChainStateAdmin(qosInstances)
 
+	// Admin handler to redistribute live websocket connections via
+	// POST /admin/websocket/tumble/{serviceId}. Websocket-capable protocols only; a
+	// protocol that does not implement it leaves the endpoint reporting 503 rather than
+	// failing startup.
+	websocketAdmin, _ := protocol.(router.WebsocketAdmin)
+
 	// Initialize the API router to serve requests to the PATH API.
 	apiRouter := router.NewRouter(
 		logger,
@@ -344,6 +350,7 @@ func main() {
 		config.GetRouterConfig(),
 		gtw.DomainCircuitBreaker,
 		chainStateAdmin,
+		websocketAdmin,
 		unifiedServicesConfig,
 	)
 

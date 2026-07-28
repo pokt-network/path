@@ -178,6 +178,38 @@ type Protocol struct {
 	// (canary testing); PATH_WEBSOCKET_SESSION_REBIND=false disables. Graduates to YAML
 	// config once canary-validated.
 	websocketSessionRebindEnabled bool
+
+	// wsConnRegistry tracks this pod's live websocket connections so an operator can
+	// force a subset to rebind onto different suppliers without a restart. Populated
+	// only for rebind-capable connections. Always non-nil.
+	wsConnRegistry *websocketConnRegistry
+}
+
+// TumbleWebsockets forces live websocket connections for a service to rebind onto
+// different suppliers, keeping clients connected and replaying their subscriptions.
+//
+// Motivation: a websocket connection binds one endpoint for its whole lifetime and only
+// moves at a session rollover or a stall. A long-lived high-volume subscriber therefore
+// pins itself to whichever operator it first landed on, and no selection-side change can
+// move it. This is the supported alternative to restarting a pod to redistribute
+// connections — a restart drops every client and resets unrelated in-memory state.
+//
+// PER-POD: the registry is in-memory, so this must be issued to each pod separately.
+func (p *Protocol) TumbleWebsockets(req protocol.WebsocketTumbleRequest) protocol.WebsocketTumbleResult {
+	result := p.wsConnRegistry.tumble(req)
+
+	p.logger.With("method", "TumbleWebsockets").Warn().
+		Str("service_id", req.ServiceID).
+		Str("domain_filter", req.Domain).
+		Int("max", req.Max).
+		Bool("dry_run", req.DryRun).
+		Int("total", result.Total).
+		Int("matched", result.Matched).
+		Int("tumbled", result.Tumbled).
+		Int("skipped", result.Skipped).
+		Msg("🎲 [WS-TUMBLE] operator-requested websocket redistribution")
+
+	return result
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -261,6 +293,9 @@ func NewProtocol(
 		logger: shannonLogger,
 
 		FullNode: fullNode,
+
+		// Tracks live websocket connections so they can be redistributed on request.
+		wsConnRegistry: newWebsocketConnRegistry(),
 
 		// TODO_MVP(@adshmh): verify the gateway address and private key are valid, by completing the following:
 		// 1. Query onchain data for a gateway with the supplied address.

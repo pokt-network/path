@@ -108,8 +108,74 @@ type bridge struct {
 	// Mutated only on the start() goroutine.
 	consecutiveStallRebinds int
 
+	// tumble carries an operator-initiated forced rebind (admin tumble) to the start()
+	// loop, so the rebind runs on the bridge goroutine like every other one rather than
+	// on the caller's HTTP goroutine. Buffered (cap 1) and written with a non-blocking
+	// send: an admin request never blocks on a busy bridge, and concurrent requests
+	// coalesce into one rebind. Nil (and never selected) when reconnector == nil —
+	// without the reconnect machinery there is nothing to tumble onto.
+	tumble chan struct{}
+
 	// shutdownOnce ensures shutdown() is only called once to prevent panics from double-closing channels
 	shutdownOnce sync.Once
+}
+
+// BridgeController exposes operator-initiated control over one live bridge. A bridge
+// satisfies it; the reconnector receives it through BridgeAttacher so whoever owns the
+// service-level registry can act on individual connections.
+type BridgeController interface {
+	// Tumble asks the bridge to rebind onto a DIFFERENT supplier while keeping the
+	// client connection open and replaying its subscriptions. Safe to call from any
+	// goroutine. Returns false when the bridge cannot tumble (rebind disabled) or a
+	// tumble is already queued for it.
+	Tumble() bool
+}
+
+// BridgeAttacher is an optional interface an EndpointReconnector may implement to
+// receive a handle to its own bridge. StartBridge calls AttachBridge once the bridge is
+// live, and AttachBridge(nil) when it shuts down, so an implementer can register and
+// deregister the connection in a lookup structure. Reconnectors that do not implement it
+// are unaffected.
+type BridgeAttacher interface {
+	AttachBridge(BridgeController)
+}
+
+// Tumble implements BridgeController.
+func (b *bridge) Tumble() bool {
+	if b.tumble == nil {
+		return false
+	}
+	select {
+	case b.tumble <- struct{}{}:
+		return true
+	default:
+		// A tumble is already queued; a second rebind would be redundant.
+		return false
+	}
+}
+
+// handleAdminTumble performs an operator-requested rebind onto a different supplier.
+//
+// It reuses the staleness watchdog's reconnect path — ErrEndpointTumbled makes
+// handleEndpointDown avoid reselecting the currently bound supplier — but a tumble is
+// explicitly NOT a stall: the bound endpoint may be perfectly healthy and is being moved
+// for traffic-distribution reasons. So it deliberately does not touch
+// consecutiveStallRebinds (which gates the give-up-and-close-the-client limit) and does
+// not report a stall for observability. Tumbling must never be able to close a client.
+//
+// Runs on the start() goroutine, so endpointGen and lastEndpointDataAt are read/written
+// without synchronization, same as every other handler here.
+func (b *bridge) handleAdminTumble() {
+	if b.reconnector == nil {
+		return
+	}
+
+	// Give the incoming endpoint a full staleness window rather than inheriting the
+	// outgoing one's clock, which would let the watchdog fire immediately after a tumble.
+	b.lastEndpointDataAt = time.Now()
+
+	b.logger.Info().Msg("🎲 [WS-TUMBLE] operator-requested rebind — moving connection to a different supplier")
+	b.handleEndpointDown(endpointDisconnect{gen: b.endpointGen, err: ErrEndpointTumbled})
 }
 
 // StartBridge creates a new Bridge instance with connections to both client and endpoint
@@ -201,9 +267,18 @@ func StartBridge(
 	endpointOnDisconnect := cancelOnDisconnect
 	if reconnector != nil {
 		b.endpointDown = make(chan endpointDisconnect, 1)
+		b.tumble = make(chan struct{}, 1)
 		b.endpointCtx, b.endpointCancel = context.WithCancel(b.ctx)
 		endpointLoopCtx = b.endpointCtx
 		endpointOnDisconnect = b.endpointDisconnectFunc(b.endpointGen)
+
+		// Hand the reconnector a handle to this bridge so it can register the live
+		// connection for operator-initiated tumbling. Optional: reconnectors that do not
+		// implement BridgeAttacher simply never become tumble-able. Paired with the
+		// AttachBridge(nil) in shutdown().
+		if attacher, ok := reconnector.(BridgeAttacher); ok {
+			attacher.AttachBridge(b)
+		}
 	}
 
 	b.endpointConn = newConnection(
@@ -326,6 +401,13 @@ func (b *bridge) start() {
 		case <-stalenessC:
 			b.checkEndpointStaleness()
 
+		// Operator-requested rebind onto a different supplier. Only ever selected when
+		// rebind is enabled (tumble is nil otherwise, so this case blocks forever).
+		// Handled inline on this goroutine, serialized with message processing and the
+		// other reconnect paths.
+		case <-b.tumble:
+			b.handleAdminTumble()
+
 		case <-b.ctx.Done():
 			b.shutdown(ErrBridgeContextCanceled)
 			return
@@ -401,6 +483,15 @@ func (b *bridge) shutdown(err error) {
 	// Use sync.Once to ensure shutdown is only called once, preventing panics from double-closing channels
 	b.shutdownOnce.Do(func() {
 		b.logger.Warn().Err(err).Msg("🔌👋 Websocket bridge shutting down.")
+
+		// Deregister from the operator-tumble registry before tearing anything down, so
+		// an in-flight admin request cannot hand out a handle to a dying bridge. Tumble()
+		// on an already-shut-down bridge is harmless anyway (the queued signal is never
+		// read), but dropping the reference promptly keeps the registry from pinning
+		// dead connections. Paired with the AttachBridge(b) in StartBridge.
+		if attacher, ok := b.reconnector.(BridgeAttacher); ok {
+			attacher.AttachBridge(nil)
+		}
 
 		// Cancel the context first to signal all goroutines (connLoop, pingLoop, start)
 		// to stop. This must happen before closing connections to prevent connLoop
