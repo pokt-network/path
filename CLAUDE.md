@@ -260,6 +260,24 @@ Rebinds land on `path_websocket_rebind_total{trigger="admin"}`, distinct from `r
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved
 - Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis
 
+## Endpoint Selection — Backend-URL Weighting
+
+Several suppliers can register against the **same backend URL**. Selection weights an operator's share by **distinct backend URL**, not by supplier registration, so stacking registrations behind one machine does not buy that machine more traffic.
+
+Selection is two-stage: pick a backend URL uniformly, then pick a supplier registration uniformly within it. The result is always a concrete supplier — relays are signed against a supplier's session and each supplier carries its own per-session service allowance.
+
+Applies to every real decision path: `SelectWithConcentrationCap`, `SelectEndpointsWithDiversity` (including its first pick, which has no TLD-diversity logic), `selectTopRankedEndpoint` (retry/hedge band), and `SelectOperatorUniform` (WS rebind).
+
+**Off-switch** — restores registration-counted behavior exactly:
+```bash
+PATH_OPERATOR_SHARE_BY_BACKEND_URL=false
+```
+No-op for operators that register one supplier per URL (distinct-URL count == registration count).
+
+**What to watch after enabling:** `path_supplier_exhausted_total` for the **small** operators, not the large one. A solo-registration backend's share rises (on a 50-registration/17-backend service, roughly 3x) while it still has only one supplier's allowance. Exhaustion is self-correcting — an exhausted supplier is filtered out per-supplier and its share redistributes — but a spike there is the expected failure mode.
+
+Related: `path_concentration_cap_reshaped_total` should **fall**, since deduped shares often land under the cap and need no water-filling.
+
 ## Testing Strategy
 
 - **Unit Tests** - Standard Go tests with `-short` flag
