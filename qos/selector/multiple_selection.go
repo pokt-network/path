@@ -84,13 +84,19 @@ func SelectEndpointsWithDiversity(
 		if i > 0 && len(usedTLDs) > 0 {
 			selectedEndpoint, err = selectEndpointWithDifferentTLD(remainingEndpoints, endpointTLDs, usedTLDs)
 			if err != nil {
-				// Fallback to random selection if no different TLD found
-				selectedEndpoint = remainingEndpoints[rand.Intn(len(remainingEndpoints))]
+				// No unused TLD left: fall back to the whole remaining pool, still
+				// backend-uniform rather than registration-uniform.
+				selectedEndpoint = PickBackendUniform(remainingEndpoints)
 				err = nil
 			}
 		} else {
-			// First endpoint: use random selection
-			selectedEndpoint = remainingEndpoints[rand.Intn(len(remainingEndpoints))]
+			// First endpoint. NOTE: no TLD logic applies to this pick — the diverse pass
+			// starts at i > 0 — so with max_parallel_endpoints=1 this IS the serving
+			// endpoint, chosen from the whole pool. Picking uniformly over distinct backend
+			// URLs rather than over supplier registrations stops an operator that stacks
+			// several registrations behind one machine from collecting traffic in
+			// proportion to its registration count.
+			selectedEndpoint = PickBackendUniform(remainingEndpoints)
 		}
 
 		if err != nil {
@@ -206,6 +212,8 @@ func selectEndpointWithDifferentTLD(
 		return "", fmt.Errorf("no endpoints with different TLDs available")
 	}
 
-	// Select a random endpoint from the filtered list
-	return endpointsWithDifferentTLDs[rand.Intn(len(endpointsWithDifferentTLDs))], nil
+	// Select from the filtered list, uniformly over distinct backend URLs. The TLD filter
+	// has already guaranteed operator diversity; this makes the choice WITHIN the surviving
+	// operators track machines rather than supplier registrations.
+	return PickBackendUniform(endpointsWithDifferentTLDs), nil
 }

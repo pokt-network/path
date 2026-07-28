@@ -299,7 +299,11 @@ func TestDomainCircuitBreaker_EscalationMemoryExpires(t *testing.T) {
 	cb.defaultTTL = 10 * time.Millisecond
 	cb.cacheTTL = 1 * time.Millisecond
 	cb.failureWindow = time.Millisecond
-	cb.escalationMemory = 40 * time.Millisecond
+	// Generous memory for the "within memory" leg: the only thing under test there is that
+	// escalation survives a TTL expiry, not any particular duration. A tight bound here
+	// (e.g. 2x the sleep) makes the test fail whenever the sleep overshoots under -race or
+	// load, which says nothing about the code.
+	cb.escalationMemory = 10 * time.Second
 	ctx := context.Background()
 
 	domain := "forgiven.example.com"
@@ -317,8 +321,11 @@ func TestDomainCircuitBreaker_EscalationMemoryExpires(t *testing.T) {
 		t.Fatalf("within escalation memory: hitCount=%d, want 2", state.hitCount)
 	}
 
-	// Beyond memory → forgiven, back to a first offence.
-	time.Sleep(cb.escalationMemory + 30*time.Millisecond)
+	// Beyond memory → forgiven, back to a first offence. Shrink the memory rather than
+	// sleeping it out, so this leg cannot be perturbed by scheduling either: any elapsed
+	// time now exceeds it.
+	cb.escalationMemory = time.Nanosecond
+	time.Sleep(30 * time.Millisecond)
 	cb.GetBrokenDomains(ctx, "eth")
 	breakDomain(cb, ctx, "eth", domain, "test")
 	cb.mu.RLock()

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -13,6 +14,7 @@ import (
 	"github.com/pokt-network/path/qos/cosmos"
 	"github.com/pokt-network/path/qos/evm"
 	"github.com/pokt-network/path/qos/noop"
+	"github.com/pokt-network/path/qos/selector"
 	"github.com/pokt-network/path/qos/solana"
 )
 
@@ -30,6 +32,18 @@ func getServiceQoSInstances(
 	// Create loggers
 	hydratedLogger := logger.With("module", "qos").With("method", "getServiceQoSInstances").With("protocol", protocolInstance.Name())
 	qosLogger := logger.With("module", "qos").With("protocol", protocolInstance.Name())
+
+	// Measure an operator's concentration-cap share in distinct BACKEND URLs rather than in
+	// supplier registrations. Several suppliers can register against the same backend, so
+	// registration-counted shares credit one operator's 6 machines as 25 endpoints — past
+	// the cap, and past what its infrastructure represents. Default ON; a no-op for
+	// operators that register one supplier per URL.
+	if os.Getenv("PATH_OPERATOR_SHARE_BY_BACKEND_URL") == "false" {
+		selector.SetOperatorShareBackendURLDedup(false)
+		hydratedLogger.Warn().Msg("⚠️ operator concentration share counted by SUPPLIER REGISTRATION (backend-URL dedup disabled via PATH_OPERATOR_SHARE_BY_BACKEND_URL=false)")
+	} else {
+		hydratedLogger.Info().Msg("✅ operator concentration share counted by distinct BACKEND URL")
+	}
 
 	// Wait for the protocol to become healthy before configuring QoS instances.
 	err := waitForProtocolHealth(hydratedLogger, protocolInstance, defaultProtocolHealthTimeout)

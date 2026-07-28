@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/url"
 	"strconv"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/heuristic"
+	"github.com/pokt-network/path/qos/selector"
 	"github.com/pokt-network/path/reputation"
 )
 
@@ -2208,34 +2208,43 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		}
 	}
 
-	// Pick uniformly at random within the top-scoring band to spread retry/hedge overflow
-	// (and blast radius) instead of always dogpiling the strict #1.
-	topKey := rankedKeys[rand.Intn(bandSize)]
-	originalEndpoint, ok := keyToOriginalEndpoint[topKey.EndpointAddr]
-	if !ok {
-		// Shouldn't happen, but fall back to first endpoint if mapping fails
-		rc.logger.Warn().
-			Str("top_key", string(topKey.EndpointAddr)).
-			Msg("Failed to map top-ranked key back to original endpoint, falling back")
-		rc.recordTopRankedSelection(endpoints, endpoints[:1], endpoints[0])
-		return endpoints[0]
-	}
-
-	// Resolve the band back to endpoints so the metric reports which operators were actually
-	// eligible. Ranking keys are reputation keys (per-supplier/per-domain granularity), not
-	// endpoint addresses, so they must go back through keyToOriginalEndpoint.
+	// Resolve the band back to endpoints. Needed both for the metric (which operators were
+	// actually eligible) and for the pick itself. Ranking keys are reputation keys
+	// (per-supplier/per-domain granularity), not endpoint addresses, so they must go back
+	// through keyToOriginalEndpoint.
 	bandEndpoints := make(protocol.EndpointAddrList, 0, bandSize)
 	for _, k := range rankedKeys[:bandSize] {
 		if ep, mapped := keyToOriginalEndpoint[k.EndpointAddr]; mapped {
 			bandEndpoints = append(bandEndpoints, ep)
 		}
 	}
+
+	// Pick within the top-scoring band to spread retry/hedge overflow (and blast radius)
+	// instead of always dogpiling the strict #1.
+	//
+	// The pick is uniform over distinct BACKEND URLs, not over band members. Reputation keys
+	// are per-supplier, and several suppliers can register against the same backend, so a
+	// member-uniform pick gave one machine fronted by 7 registrations 7x the traffic of an
+	// equally-scored sibling machine with 1 — the band looked diverse while the traffic was
+	// not. PickBackendUniform still returns a specific supplier registration, so signing and
+	// per-supplier service allowance are unaffected.
+	originalEndpoint := selector.PickBackendUniform(bandEndpoints)
+	if originalEndpoint == "" {
+		// Every band key failed to map back to an endpoint. Shouldn't happen; fall back
+		// rather than return an empty address.
+		rc.logger.Warn().
+			Int("band_size", bandSize).
+			Msg("Failed to map top-ranked band back to endpoints, falling back")
+		rc.recordTopRankedSelection(endpoints, endpoints[:1], endpoints[0])
+		return endpoints[0]
+	}
+
 	rc.recordTopRankedSelection(endpoints, bandEndpoints, originalEndpoint)
 
 	rc.logger.Debug().
 		Str("selected_endpoint", string(originalEndpoint)).
-		Str("reputation_key", string(topKey.EndpointAddr)).
 		Int("band_size", bandSize).
+		Int("distinct_backends_in_band", selector.CountDistinctBackends(bandEndpoints)).
 		Int("num_candidates", len(endpoints)).
 		Msg("🏆 Selected endpoint from top-scoring band for retry/hedge (spreads overflow)")
 
