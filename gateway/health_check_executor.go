@@ -78,6 +78,20 @@ type HealthCheckExecutor struct {
 	// pool is the worker pool for concurrent health check execution.
 	pool pond.Pool
 
+	// wsPool runs websocket checks OFF the main cycle's critical path.
+	//
+	// A cycle ends with group.Wait(), so it cannot finish until every submitted job does.
+	// A websocket check that reads a response blocks until the endpoint answers or the
+	// timeout expires, and an endpoint whose failure mode is silence takes the FULL timeout.
+	// Submitted into the shared group, one such endpoint sets a floor under the whole cycle
+	// and throttles every other check with it. Measured on canary: websocket checks fell to
+	// 3.5/s and json_rpc — which shares the cycle — dropped from ~397/s to ~112/s, with 40%
+	// of websocket reputation series expiring for lack of refreshes.
+	//
+	// Websocket checks therefore get their own pool that the cycle never waits on. Slow ones
+	// delay only each other.
+	wsPool pond.Pool
+
 	// maxWorkers is the configured/calculated worker pool size for logging.
 	maxWorkers int
 
@@ -139,6 +153,21 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 	// Create worker pool for concurrent health check execution
 	pool := pond.NewPool(maxWorkers)
 
+	// Websocket checks are I/O-bound and can each block for their full timeout, so this pool
+	// is sized for concurrency rather than throughput. It is deliberately much smaller than
+	// the main pool: its purpose is isolation, and an unbounded queue of slow checks would
+	// just move the problem.
+	// WithQueueSize BOUNDS the backlog. pond's default queue is effectively unbounded, which
+	// would let TrySubmit accept forever and quietly rebuild the very backlog this pool
+	// exists to prevent — the checks would just stall later instead of sooner. With a bound,
+	// TrySubmit refuses once saturated and the cycle skips that endpoint this round.
+	// WithNonBlocking guarantees a full pool can never block the caller, which is the cycle.
+	wsPool := pond.NewPool(
+		DefaultWebsocketCheckWorkers,
+		pond.WithQueueSize(DefaultWebsocketCheckQueueSize),
+		pond.WithNonBlocking(true),
+	)
+
 	executor := &HealthCheckExecutor{
 		config:          cfg.Config,
 		reputationSvc:   cfg.ReputationSvc,
@@ -146,6 +175,7 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 		protocol:        cfg.Protocol,
 		metricsReporter: cfg.MetricsReporter,
 		pool:            pool,
+		wsPool:          wsPool,
 		maxWorkers:      maxWorkers,
 		// HTTP client for external config fetching only
 		httpClient: &http.Client{
@@ -421,6 +451,9 @@ func (e *HealthCheckExecutor) Stop() {
 	e.stopOnce.Do(func() {
 		if e.stopRefresh != nil {
 			close(e.stopRefresh)
+		}
+		if e.wsPool != nil {
+			e.wsPool.StopAndWait()
 		}
 		if e.pool != nil {
 			e.pool.StopAndWait()
@@ -1677,9 +1710,32 @@ func (e *HealthCheckExecutor) runEndpointChecks(
 			if !runWS {
 				continue
 			}
-			// WebSocket checks use the protocol's CheckWebsocketConnection.
-			latency, err := e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, endpointAddr, check, syncAllowance)
-			e.recordCheckResult(ctx, serviceID, endpointAddr, check, err, latency)
+			// Run OFF the cycle. See wsPool: a websocket check can block for its full
+			// timeout, and the cycle waits on everything it submits, so keeping these
+			// inline lets one silent endpoint throttle every other check in the gateway.
+			//
+			// TrySubmit rather than Submit: when the websocket pool is saturated the
+			// right move is to SKIP this round, not to queue. A skipped check costs a
+			// refresh interval; a growing queue reintroduces the stall it is avoiding.
+			wsCheck := check
+			wsEndpoint := endpointAddr
+			wsAllowance := syncAllowance
+			if e.wsPool != nil {
+				if _, ok := e.wsPool.TrySubmit(func() {
+					if ctx.Err() != nil {
+						return
+					}
+					latency, err := e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, wsEndpoint, wsCheck, wsAllowance)
+					e.recordCheckResult(ctx, serviceID, wsEndpoint, wsCheck, err, latency)
+				}); !ok {
+					e.logger.Debug().
+						Str("service_id", string(serviceID)).
+						Str("endpoint", string(wsEndpoint)).
+						Str("check", wsCheck.Name).
+						Uint64("ws_pool_waiting", e.wsPool.WaitingTasks()).
+						Msg("websocket check skipped this round - check pool saturated")
+				}
+			}
 		case HealthCheckTypeGRPC:
 			// gRPC checks not yet implemented
 			e.logger.Debug().
@@ -2190,3 +2246,20 @@ func parseHexBlockNumber(hexStr string) (int64, error) {
 	}
 	return height, nil
 }
+
+// DefaultWebsocketCheckWorkers bounds concurrent websocket health checks.
+//
+// Sized for isolation, not throughput. Each websocket check can block for its whole
+// configured timeout when an endpoint accepts a connection and then stays silent, so the
+// point of this pool is that such checks delay only each other rather than the shared
+// health-check cycle. Large enough to keep a service's endpoints moving within a refresh
+// interval; small enough that a service-wide outage cannot tie up meaningful resources.
+const DefaultWebsocketCheckWorkers = 64
+
+// DefaultWebsocketCheckQueueSize bounds the websocket check backlog.
+//
+// Load-bearing: pond's queue is effectively unbounded by default, so TrySubmit would accept
+// indefinitely and reconstruct the backlog this pool exists to avoid. Bounded, a saturated
+// pool refuses and the cycle skips that endpoint for one refresh interval — which is the
+// correct trade, since a check that cannot run promptly has no value.
+const DefaultWebsocketCheckQueueSize = 512
