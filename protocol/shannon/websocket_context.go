@@ -1075,7 +1075,21 @@ func (p *Protocol) recordReputationSignalsFromWebsocketObservations(shannonObser
 
 // recordSignalFromWebsocketConnectionObservation records a reputation signal for a websocket connection observation.
 func (p *Protocol) recordSignalFromWebsocketConnectionObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonWebsocketConnectionObservation) {
+	// Reconstruct the FULL endpoint address (<supplier>-<url>).
+	//
+	// Using the bare URL here silently broke every websocket health check: the reputation
+	// key builder runs at per-supplier granularity in production, so a URL with no supplier
+	// hashes to a different key than the one selection reads — and worse, the supplier
+	// extractor splits on the first "-", so a hostname containing one produced a mangled
+	// key. Health check results, pass or fail, were written somewhere nothing ever looked,
+	// which is why every websocket score sat pinned at its initial value.
+	//
+	// Falls back to the URL alone when the observation carries no supplier, which keeps
+	// fallback endpoints (no staked supplier) working as before.
 	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
+	if supplier := obs.GetSupplier(); supplier != "" {
+		endpointAddr = protocol.EndpointAddr(fmt.Sprintf("%s-%s", supplier, obs.GetEndpointUrl()))
+	}
 
 	// Build endpoint key using key builder to respect key_granularity setting
 	rpcType := sharedtypes.RPCType_WEBSOCKET

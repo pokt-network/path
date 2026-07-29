@@ -1441,7 +1441,21 @@ func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations [
 // It maps the observation's error type directly to a reputation signal and records it.
 // Also records probation traffic metrics if the endpoint is in probation.
 func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonEndpointObservation) {
+	// Reconstruct the FULL endpoint address (<supplier>-<url>).
+	//
+	// Using the bare URL here silently broke every websocket health check: the reputation
+	// key builder runs at per-supplier granularity in production, so a URL with no supplier
+	// hashes to a different key than the one selection reads — and worse, the supplier
+	// extractor splits on the first "-", so a hostname containing one produced a mangled
+	// key. Health check results, pass or fail, were written somewhere nothing ever looked,
+	// which is why every websocket score sat pinned at its initial value.
+	//
+	// Falls back to the URL alone when the observation carries no supplier, which keeps
+	// fallback endpoints (no staked supplier) working as before.
 	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
+	if supplier := obs.GetSupplier(); supplier != "" {
+		endpointAddr = protocol.EndpointAddr(fmt.Sprintf("%s-%s", supplier, obs.GetEndpointUrl()))
+	}
 
 	// TODO_FUTURE: Add RPC type to ShannonEndpointObservation proto to support RPC-type-aware reputation.
 	// For now, default to JSON_RPC for HTTP observations since the proto doesn't include RPC type.
