@@ -2,7 +2,7 @@
 # Pocket Network Health Check Configuration
 # ==========================================
 # Generated for all supported chains at api.pocket.network
-# Last updated: July 20, 2026
+# Last updated: July 29, 2026
 #
 # Service IDs match the subdomain of each endpoint URL
 # Template format: gateway/health_check_config.go
@@ -94,6 +94,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -158,6 +159,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -224,6 +226,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -350,6 +353,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -492,6 +496,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -535,6 +540,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -591,6 +597,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -714,6 +721,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -757,6 +765,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -800,6 +809,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -943,6 +953,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1090,6 +1101,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1154,6 +1166,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1197,6 +1210,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1240,6 +1254,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1283,6 +1298,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1453,6 +1469,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1505,6 +1522,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1674,6 +1692,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1758,6 +1777,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1803,6 +1823,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -1987,6 +2008,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
@@ -2034,6 +2056,7 @@
     # websocket cooldowns. Escalate once the false-positive rate is known.
     - name: ws_eth_blockNumber
       type: websocket
+      sync_check: true
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
