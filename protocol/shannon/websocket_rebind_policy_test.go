@@ -33,7 +33,7 @@ func Test_chooseRebindEndpoint_CapDisabled_ReusesOriginal(t *testing.T) {
 
 	for _, disabled := range []float64{0.0, 1.0, -1.0} {
 		ep, different, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, disabled, false, noScore,
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, avoidNothing, disabled, false, noScore,
 		)
 		c.NoError(err)
 		c.Empty(reason)
@@ -52,7 +52,7 @@ func Test_chooseRebindEndpoint_CapDisabled_OriginalRotatedOut(t *testing.T) {
 	ghost := protocol.EndpointAddr("pokt1ghost-https://n.ghost.tech") // not in the session
 
 	ep, different, reason, err := chooseRebindEndpoint(
-		testLogger(), "svc", cloneEndpoints(endpoints), ghost, false, 0.0, false, noScore,
+		testLogger(), "svc", cloneEndpoints(endpoints), ghost, avoidNothing, 0.0, false, noScore,
 	)
 	c.NoError(err)
 	c.Empty(reason)
@@ -79,7 +79,7 @@ func Test_chooseRebindEndpoint_CapEngaged_SpreadsAcrossOperators(t *testing.T) {
 	rotatedOff := false
 	for i := 0; i < 400; i++ {
 		ep, different, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, 0.5, false, noScore,
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, avoidNothing, 0.5, false, noScore,
 		)
 		c.NoError(err)
 		c.Empty(reason)
@@ -106,7 +106,7 @@ func Test_chooseRebindEndpoint_CapEngaged_SingleEndpointNeverFails(t *testing.T)
 	endpoints := map[protocol.EndpointAddr]endpoint{solo.Addr(): solo}
 
 	ep, different, reason, err := chooseRebindEndpoint(
-		testLogger(), "svc", cloneEndpoints(endpoints), solo.Addr(), false, 0.5, false, noScore,
+		testLogger(), "svc", cloneEndpoints(endpoints), solo.Addr(), avoidNothing, 0.5, false, noScore,
 	)
 	c.NoError(err)
 	c.Empty(reason)
@@ -134,7 +134,7 @@ func Test_chooseRebindEndpoint_CapEngaged_StrictlyBestOriginalWins(t *testing.T)
 
 	for i := 0; i < 50; i++ {
 		ep, different, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), best.Addr(), false, 0.5, false, scoreOf,
+			testLogger(), "svc", cloneEndpoints(endpoints), best.Addr(), avoidNothing, 0.5, false, scoreOf,
 		)
 		c.NoError(err)
 		c.Empty(reason)
@@ -152,7 +152,7 @@ func Test_chooseRebindEndpoint_CapEngaged_OriginalRotatedOut(t *testing.T) {
 	ghost := protocol.EndpointAddr("pokt1ghost-https://n.ghost.tech")
 
 	ep, different, reason, err := chooseRebindEndpoint(
-		testLogger(), "svc", cloneEndpoints(endpoints), ghost, false, 0.5, false, noScore,
+		testLogger(), "svc", cloneEndpoints(endpoints), ghost, avoidNothing, 0.5, false, noScore,
 	)
 	c.NoError(err)
 	c.Empty(reason)
@@ -172,7 +172,7 @@ func Test_chooseRebindEndpoint_AvoidPreferred_ExcludesOriginal(t *testing.T) {
 
 	for i := 0; i < 100; i++ {
 		ep, different, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), preferred, true, 0.5, false, noScore,
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, avoidBoundEndpoint, 0.5, false, noScore,
 		)
 		c.NoError(err)
 		c.Empty(reason)
@@ -191,7 +191,7 @@ func Test_chooseRebindEndpoint_AvoidPreferred_OnlyOriginal_Errors(t *testing.T) 
 	endpoints := map[protocol.EndpointAddr]endpoint{solo.Addr(): solo}
 
 	ep, different, reason, err := chooseRebindEndpoint(
-		testLogger(), "svc", cloneEndpoints(endpoints), solo.Addr(), true, 0.5, false, noScore,
+		testLogger(), "svc", cloneEndpoints(endpoints), solo.Addr(), avoidBoundEndpoint, 0.5, false, noScore,
 	)
 	c.Error(err)
 	c.Nil(ep)
@@ -213,7 +213,7 @@ func Test_chooseRebindEndpoint_OperatorUniform_EqualizesOperatorShare(t *testing
 	const N = 3000
 	for i := 0; i < N; i++ {
 		ep, _, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, 0.65, true, noScore,
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, avoidNothing, 0.65, true, noScore,
 		)
 		c.NoError(err)
 		c.Empty(reason)
@@ -238,7 +238,7 @@ func Test_chooseRebindEndpoint_OperatorUniform_RotatesWithCapDisabled(t *testing
 	rotatedOff := false
 	for i := 0; i < 300; i++ {
 		ep, different, reason, err := chooseRebindEndpoint(
-			testLogger(), "svc", cloneEndpoints(endpoints), preferred, false, 0.0 /* cap off */, true /* operator-uniform */, noScore,
+			testLogger(), "svc", cloneEndpoints(endpoints), preferred, avoidNothing, 0.0 /* cap off */, true /* operator-uniform */, noScore,
 		)
 		c.NoError(err)
 		c.Empty(reason)

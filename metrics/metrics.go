@@ -1107,6 +1107,29 @@ var WebsocketRebindTotal = promauto.NewCounterVec(
 	[]string{LabelDomain, LabelServiceID, "result", "trigger"},
 )
 
+// WebsocketRebindAvoidNarrowedTotal counts forced rebinds (stall escape, admin tumble) whose
+// avoid-set had to be narrowed because the session held nothing outside the failure domain the
+// rebind was told to escape. Incremented ONLY on a shortfall, so the series stays near-empty
+// on healthy services; the denominator is WebsocketRebindTotal for the matching trigger.
+//
+// This is the signal that a rebind did not actually escape: `requested=backend applied=endpoint`
+// means a stall escape could only drop the one supplier registration and may have landed on a
+// sibling registration fronting the SAME machine — the connection will stall again.
+// `requested=operator applied=backend|endpoint` means a tumble could not leave the operator.
+var WebsocketRebindAvoidNarrowedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_rebind_avoid_narrowed_total",
+		Help: "Forced websocket rebinds whose avoid-set was narrowed for lack of candidates, by service_id, requested scope (backend/operator) and applied scope (backend/endpoint). A nonzero rate means rebinds are not escaping what they were told to escape.",
+	},
+	[]string{LabelServiceID, "requested", "applied"},
+)
+
+// RecordWebsocketRebindAvoidNarrowed records a forced rebind that could not honor its
+// requested avoid scope. See WebsocketRebindAvoidNarrowedTotal.
+func RecordWebsocketRebindAvoidNarrowed(serviceID, requested, applied string) {
+	WebsocketRebindAvoidNarrowedTotal.WithLabelValues(serviceID, requested, applied).Inc()
+}
+
 // WebsocketSubscriptionsReplayedTotal counts subscriptions replayed onto a
 // reconnected endpoint during rebind. EXPERIMENTAL / canary observability.
 var WebsocketSubscriptionsReplayedTotal = promauto.NewCounterVec(

@@ -72,15 +72,15 @@ type websocketRequestContext struct {
 	registry *websockets.SubscriptionRegistry
 
 	// reconnectProvider re-selects an endpoint for the CURRENT session on a rollover. It
-	// prefers the original supplier+URL (seamless) and, if that supplier rotated out of
-	// the new session, falls back to the best-available endpoint (tier-2) so the client's
-	// connection survives regardless of Shannon supplier rotation. avoidCurrent forces a
-	// different supplier than the one currently bound (used by the staleness watchdog,
-	// where the current supplier is the one stalling). Returns the endpoint, whether a
-	// different supplier was chosen, and (on failure) a metrics reason label. Non-nil only
+	// prefers the CURRENTLY BOUND supplier+URL (seamless) and, if that supplier rotated out
+	// of the new session, falls back to the best-available endpoint (tier-2) so the client's
+	// connection survives regardless of Shannon supplier rotation. avoidScope forces the
+	// rebind out of the currently bound endpoint's failure domain — its backend URL for a
+	// staleness rebind, its whole operator for an admin tumble. Returns the endpoint, whether
+	// a different supplier was chosen, and (on failure) a metrics reason label. Non-nil only
 	// when session rebind is enabled; its presence is what makes this context act as an
 	// EndpointReconnector.
-	reconnectProvider func(ctx context.Context, avoidCurrent bool) (ep endpoint, differentSupplier bool, failureReason string, err error)
+	reconnectProvider func(ctx context.Context, avoidScope rebindAvoidScope) (ep endpoint, differentSupplier bool, failureReason string, err error)
 
 	// lastReconnectDifferentSupplier records whether the most recent successful reconnect
 	// fell back to a different supplier (tier-2). Read by OnReconnectOutcome to tag the
@@ -223,8 +223,16 @@ func (p *Protocol) BuildWebsocketRequestContextForEndpoint(
 	// best-available endpoint if the original supplier rotated out of the new session.
 	if p.websocketSessionRebindEnabled {
 		wrc.registry = websockets.NewSubscriptionRegistry()
-		wrc.reconnectProvider = func(reconnectCtx context.Context, avoidCurrent bool) (endpoint, bool, string, error) {
-			return p.getReconnectEndpoint(reconnectCtx, serviceID, selectedEndpointAddr, httpReq, avoidCurrent)
+		wrc.reconnectProvider = func(reconnectCtx context.Context, avoidScope rebindAvoidScope) (endpoint, bool, string, error) {
+			// Anchor the decision on the endpoint the connection is CURRENTLY bound to, not
+			// the one it started on. After an earlier rebind these differ, and using the
+			// original gets both cases wrong: a rollover would pull the connection back off
+			// the endpoint it had settled on, and — far worse — a stall escape would exclude
+			// an endpoint the connection already left while leaving the one actually stalling
+			// in the candidate set, free to be reselected. signingEndpoint() is the live
+			// binding and is read here on the bridge goroutine, the same goroutine that
+			// writes it in ReconnectEndpoint.
+			return p.getReconnectEndpoint(reconnectCtx, serviceID, wrc.signingEndpoint().Addr(), httpReq, avoidScope)
 		}
 		// Only rebind-capable connections can be tumbled, so the tumble registry is
 		// wired on the same condition.
@@ -369,23 +377,29 @@ func (p *Protocol) getPreSelectedEndpoint(
 }
 
 // getReconnectEndpoint re-selects a websocket endpoint for the CURRENT session on a
-// session rollover. Its selection policy depends on whether the per-operator concentration
-// cap is engaged for the service:
+// session rollover.
 //
-//   - Cap ENGAGED (0 < maxOperatorShare < 1): do NOT auto-prefer the original supplier.
+// preferredAddr is the endpoint the connection is CURRENTLY bound to, which after an earlier
+// rebind is not the one it started on. Seamlessness means staying where the connection
+// actually is, and a forced rebind must escape what it is actually on — anchoring on the
+// setup-time endpoint would get both wrong.
+//
+// The selection policy depends on whether the per-operator concentration cap is engaged:
+//
+//   - Cap ENGAGED (0 < maxOperatorShare < 1): do NOT auto-prefer the bound supplier.
 //     Route every rebind through the capped selector so WebSocket connections re-spread
 //     across the tied-best operator band each session boundary instead of pinning to
-//     whichever supplier was selected first. The original endpoint stays eligible (it is
+//     whichever supplier was selected first. The bound endpoint stays eligible (it is
 //     still in the candidate set), so a 1-endpoint pool never fails and a strictly-best
-//     original still wins — only the tied band is reshuffled. Rotating off a still-present
-//     supplier is cheap: the bridge already replays subscriptions on any rebind.
+//     bound endpoint still wins — only the tied band is reshuffled. Rotating off a
+//     still-present supplier is cheap: the bridge replays subscriptions on any rebind.
 //   - Cap DISABLED (maxOperatorShare <= 0 or >= 1): keep the seamless tier-1 behavior — if
-//     the ORIGINAL supplier+URL is still in the new session, reuse it (same node → no data
+//     the BOUND supplier+URL is still in the new session, reuse it (same node → no data
 //     seam). This is load-bearing: with the cap off the capped selector collapses to a
 //     deterministic smallest-address pick, which would funnel ALL connections onto one
 //     endpoint — strictly worse than pinning.
 //
-// In both cases, if the original supplier rotated OUT of the new session, selection falls
+// In both cases, if the bound supplier rotated OUT of the new session, selection falls
 // back to the best-available endpoint so the client's connection survives regardless.
 // Shannon supplier rotation is a protocol detail; the client only wants uninterrupted data.
 //
@@ -396,16 +410,18 @@ func (p *Protocol) getPreSelectedEndpoint(
 // when the rebind re-homed the connection onto a different endpoint than the original;
 // failureReason is a metrics label on error.
 //
-// avoidPreferred skips reuse entirely and excludes preferredAddr from the candidate set:
-// the staleness watchdog sets it because the currently bound supplier is the one stalling,
-// so reselecting it would just stall again. When it is the only endpoint in the new
-// session, selection fails with WSRebindFailedNoEndpoints and the bridge closes the client.
+// avoidScope skips reuse entirely and excludes the bound endpoint's failure domain from the
+// candidate set — its backend URL for a staleness rebind (the machine went silent, so every
+// registration fronting it would stall again) or its whole operator for an admin tumble (the
+// point is redistributing off that operator). It narrows automatically when the session has
+// nothing outside that domain; only when even the bound endpoint alone cannot be excluded does
+// selection fail with WSRebindFailedNoEndpoints and the bridge close the client.
 func (p *Protocol) getReconnectEndpoint(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	preferredAddr protocol.EndpointAddr,
 	httpReq *http.Request,
-	avoidPreferred bool,
+	avoidScope rebindAvoidScope,
 ) (endpoint, bool, string, error) {
 	logger := p.logger.With("method", "getReconnectEndpoint", "service_id", serviceID)
 
@@ -425,8 +441,8 @@ func (p *Protocol) getReconnectEndpoint(
 	// S1 (disqualify-only): reputation filtering applies on rebind too, so a rollover does
 	// not rebind onto a proven-bad WS endpoint (cooldown / below threshold). The preferred
 	// (original) supplier is still kept if in cooldown via requestedEndpointAddr
-	// race-protection in filterByReputation; the stall watchdog's avoidPreferred path
-	// additionally deletes it below. Tiered ranking stays OFF for WS
+	// race-protection in filterByReputation; a forced rebind's avoidScope additionally
+	// deletes it (and its backend/operator siblings) below. Tiered ranking stays OFF for WS
 	// (guarded in getSessionsUniqueEndpoints). The WS safety net there prevents an empty pool.
 	const filterByReputation = true
 	endpoints, _, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers, preferredAddr)
@@ -455,11 +471,101 @@ func (p *Protocol) getReconnectEndpoint(
 		serviceID,
 		endpoints,
 		preferredAddr,
-		avoidPreferred,
+		avoidScope,
 		maxOperatorShare,
 		operatorUniform,
 		p.websocketReconnectScoreFunc(ctx, serviceID, endpoints),
 	)
+}
+
+// rebindAvoidScope describes how much of the currently bound endpoint a rebind must move away
+// from. Excluding only the bound endpoint address is too narrow for both non-rollover
+// triggers, because one machine can carry several supplier registrations and one operator can
+// carry several machines:
+//
+//   - a STALL means that backend went silent. A sibling registration at the same URL is the
+//     same machine, so rebinding onto it escapes nothing and the connection stalls again.
+//   - an ADMIN TUMBLE exists to redistribute away from an operator. Hopping to another
+//     registration at that same operator leaves the concentration exactly where it was.
+//
+// The scopes are strictly nested (operator ⊇ backend ⊇ endpoint), which lets selection request
+// the widest scope and narrow only when honoring it would strand the client.
+type rebindAvoidScope int
+
+const (
+	// avoidNothing: routine session rollover — the bound endpoint stays a candidate.
+	avoidNothing rebindAvoidScope = iota
+	// avoidBoundEndpoint: exclude exactly the bound supplier+URL. The narrowest useful
+	// exclusion and the last rung before giving up.
+	avoidBoundEndpoint
+	// avoidBoundBackend: exclude every supplier registration sharing the bound backend URL.
+	// What a stall escape requires.
+	avoidBoundBackend
+	// avoidBoundOperator: exclude every endpoint at the bound operator (eTLD+1). What an
+	// admin tumble requires.
+	avoidBoundOperator
+)
+
+func (s rebindAvoidScope) String() string {
+	switch s {
+	case avoidBoundEndpoint:
+		return "endpoint"
+	case avoidBoundBackend:
+		return "backend"
+	case avoidBoundOperator:
+		return "operator"
+	default:
+		return "none"
+	}
+}
+
+// excludedByScope reports whether addr is ruled out for a rebind that must move away from
+// preferredAddr at the given scope.
+func excludedByScope(addr, preferredAddr protocol.EndpointAddr, scope rebindAvoidScope) bool {
+	switch scope {
+	case avoidBoundOperator:
+		return selector.OperatorKey(addr) == selector.OperatorKey(preferredAddr)
+	case avoidBoundBackend:
+		return selector.BackendKey(addr) == selector.BackendKey(preferredAddr)
+	case avoidBoundEndpoint:
+		return addr == preferredAddr
+	default:
+		return false
+	}
+}
+
+// applyAvoidScope removes from endpoints everything ruled out by `want`, falling back one rung
+// at a time whenever the wider exclusion would empty the pool. It returns the scope actually
+// applied, which is avoidNothing only when even excluding the single bound endpoint leaves
+// nothing — the caller treats that as "nowhere to escape to".
+//
+// Narrowing rather than failing is deliberate: a service whose session holds one operator (or
+// one machine) must still be able to escape a stalling supplier onto a sibling registration.
+// Refusing would close a client that today survives. The returned scope tells the caller how
+// much of the request was actually honored so the shortfall is reported rather than hidden.
+func applyAvoidScope(
+	endpoints map[protocol.EndpointAddr]endpoint,
+	preferredAddr protocol.EndpointAddr,
+	want rebindAvoidScope,
+) rebindAvoidScope {
+	for scope := want; scope > avoidNothing; scope-- {
+		survivors := 0
+		for addr := range endpoints {
+			if !excludedByScope(addr, preferredAddr, scope) {
+				survivors++
+			}
+		}
+		if survivors == 0 {
+			continue
+		}
+		for addr := range endpoints {
+			if excludedByScope(addr, preferredAddr, scope) {
+				delete(endpoints, addr)
+			}
+		}
+		return scope
+	}
+	return avoidNothing
 }
 
 // chooseRebindEndpoint applies the rebind selection policy to a non-empty candidate set. It
@@ -467,9 +573,10 @@ func (p *Protocol) getReconnectEndpoint(
 // or reputation service — getReconnectEndpoint builds `endpoints`, `maxOperatorShare`, and
 // `scoreOf`, and this decides which one to rebind onto.
 //
-//   - avoidPreferred (staleness watchdog): the currently bound supplier is stalling, so
-//     exclude it and force a different supplier. If it was the only endpoint there is nothing
-//     to escape to → error so the bridge closes the client.
+//   - avoidScope > avoidNothing (staleness watchdog or admin tumble): exclude the bound
+//     endpoint's backend or operator per the scope and force a different one. If not even the
+//     bound endpoint alone can be excluded, there is nothing to escape to → error so the
+//     bridge closes the client.
 //   - ROTATE (operator-uniform on, or the concentration cap engaged): skip the reuse shortcut
 //     and route through the selected strategy so the connection re-spreads across operators.
 //     The original endpoint stays a candidate, so a rebind that lands back on it is still
@@ -489,26 +596,37 @@ func chooseRebindEndpoint(
 	serviceID protocol.ServiceID,
 	endpoints map[protocol.EndpointAddr]endpoint,
 	preferredAddr protocol.EndpointAddr,
-	avoidPreferred bool,
+	avoidScope rebindAvoidScope,
 	maxOperatorShare float64,
 	operatorUniform bool,
 	scoreOf func(endpoint) float64,
 ) (endpoint, bool, string, error) {
-	// Staleness rebind: the current supplier is the one stalling, so exclude it and force
-	// a different supplier. If it was the session's only endpoint, there is nothing to
-	// escape to → fail so the bridge closes the client.
-	if avoidPreferred {
-		delete(endpoints, preferredAddr)
-		if len(endpoints) == 0 {
-			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape a stalling supplier", protocol.ErrEndpointUnavailable, serviceID)
+	// Forced rebind (stall escape or admin tumble): exclude the bound endpoint's backend or
+	// operator and pick something outside it. If not even the bound endpoint alone can be
+	// excluded, there is nothing to escape to → fail so the bridge closes the client.
+	if avoidScope > avoidNothing {
+		applied := applyAvoidScope(endpoints, preferredAddr, avoidScope)
+		if applied == avoidNothing {
+			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape the bound supplier", protocol.ErrEndpointUnavailable, serviceID)
 			return nil, false, metrics.WSRebindFailedNoEndpoints, err
 		}
+
+		// The requested scope could not be honored in full: the session had nothing outside
+		// the bound backend/operator. The rebind still moves, but it lands closer to what it
+		// was told to escape than intended — a stall escape narrowed to `endpoint` can land
+		// on the same machine, which is exactly the case worth counting.
+		if applied < avoidScope {
+			metrics.RecordWebsocketRebindAvoidNarrowed(string(serviceID), avoidScope.String(), applied.String())
+		}
+
 		ep := selectRebindEndpoint(serviceID, endpoints, scoreOf, maxOperatorShare, operatorUniform)
 		logger.Warn().
-			Str("stalling_endpoint", string(preferredAddr)).
+			Str("previous_endpoint", string(preferredAddr)).
 			Str("replacement_endpoint", string(ep.Addr())).
 			Str("replacement_supplier", ep.Supplier()).
-			Msg("🔀 [WS-STALL] excluding stalling supplier — rebinding to a different supplier for the current session")
+			Str("avoid_scope_requested", avoidScope.String()).
+			Str("avoid_scope_applied", applied.String()).
+			Msg("🔀 [WS-REBIND-AVOID] excluding the bound endpoint's failure domain — rebinding for the current session")
 		return ep, true, "", nil
 	}
 
@@ -1076,23 +1194,33 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoid
 	// operator tumble and the staleness watchdog both arrive with avoidCurrentSupplier
 	// set, so the explicit admin flag has to be checked first; everything else is a
 	// routine rollover.
+	//
+	// The trigger also fixes how much of the current binding the rebind must move away from.
+	// A stall condemns the BACKEND (the machine went silent, so every supplier registration
+	// fronting that URL would stall again); an operator tumble condemns the OPERATOR (moving
+	// to another registration at the same operator would redistribute nothing). A rollover
+	// condemns nothing — it may reuse the current endpoint.
+	var avoidScope rebindAvoidScope
 	switch {
 	case wrc.adminTumbleRequested:
 		wrc.lastReconnectTrigger = metrics.WSRebindTriggerAdmin
 		wrc.adminTumbleRequested = false
+		avoidScope = avoidBoundOperator
 	case avoidCurrentSupplier:
 		wrc.lastReconnectTrigger = metrics.WSRebindTriggerStall
+		avoidScope = avoidBoundBackend
 	default:
 		wrc.lastReconnectTrigger = metrics.WSRebindTriggerRollover
+		avoidScope = avoidNothing
 	}
 
-	// Re-select an endpoint for the current session: the original supplier if it is still
-	// in the new session (seamless), else the best-available endpoint (tier-2). When
-	// avoidCurrentSupplier is set (staleness watchdog), the original supplier is excluded
-	// so the rebind escapes it. Only a session lookup failure or a session with no usable
+	// Re-select an endpoint for the current session: the currently bound supplier if it is
+	// still in the new session (seamless), else the best-available endpoint (tier-2). When
+	// avoidScope is set, the bound endpoint's backend or operator is excluded so the rebind
+	// escapes it. Only a session lookup failure or a session with no usable
 	// endpoints errors here — the bridge then falls back to closing the client with
 	// reconnect guidance.
-	ep, differentSupplier, failureReason, err := wrc.reconnectProvider(ctx, avoidCurrentSupplier)
+	ep, differentSupplier, failureReason, err := wrc.reconnectProvider(ctx, avoidScope)
 	if err != nil {
 		wrc.lastReconnectReason = failureReason
 		return nil, fmt.Errorf("re-select endpoint for current session: %w", err)

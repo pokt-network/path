@@ -282,6 +282,17 @@ func backendKey(ep protocol.EndpointAddr) string {
 	return url
 }
 
+// BackendKey exposes the backend-URL identity of an endpoint to other packages. Callers that
+// need to reason about the shared failure domain — every supplier registration fronting one
+// machine — must use this rather than comparing endpoint addresses, which treats sibling
+// registrations at the same URL as unrelated.
+func BackendKey(ep protocol.EndpointAddr) string { return backendKey(ep) }
+
+// OperatorKey exposes the operator (eTLD+1) bucket of an endpoint to other packages, so
+// operator-scoped decisions outside this package use the same bucketing the concentration cap
+// and the operator-uniform selector use.
+func OperatorKey(ep protocol.EndpointAddr) string { return operatorKey(ep) }
+
 // recordSelectionPool resolves the candidate pool's operator composition and records one
 // selection. Used only on the paths that exit before Phase 1 has built the counts map; the
 // others pass their already-computed counts to metrics.RecordSelectionPool directly rather

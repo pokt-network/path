@@ -575,9 +575,9 @@ func Test_Bridge_TumbleRebindsWithoutDroppingClient(t *testing.T) {
 	// labels and conflating them would make an operator action look like an endpoint
 	// fault.
 	c.Equal(int32(1), atomic.LoadInt32(&reconnector.tumblesRequest))
-	c.Equal(int32(0), atomic.LoadInt32(&reconnector.mockReconnector.stallRebindReported),
+	c.Equal(int32(0), atomic.LoadInt32(&reconnector.stallRebindReported),
 		"an operator tumble must not be reported as a stall")
-	c.Equal(int32(0), atomic.LoadInt32(&reconnector.mockReconnector.stallGiveupReported))
+	c.Equal(int32(0), atomic.LoadInt32(&reconnector.stallGiveupReported))
 }
 
 // Test_Bridge_TumbleNeverClosesClientAfterRepeatedUse guards the give-up limit: the stall
@@ -633,7 +633,7 @@ func Test_Bridge_TumbleNeverClosesClientAfterRepeatedUse(t *testing.T) {
 		}, 2*time.Second, 5*time.Millisecond, "tumble %d should complete", i+1)
 	}
 
-	c.Equal(int32(0), atomic.LoadInt32(&reconnector.mockReconnector.stallGiveupReported),
+	c.Equal(int32(0), atomic.LoadInt32(&reconnector.stallGiveupReported),
 		"tumbling must never trip the stall give-up path")
 
 	// The client is still alive: a ping round-trips.
