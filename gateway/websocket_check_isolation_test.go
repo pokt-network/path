@@ -106,6 +106,16 @@ func Test_websocketCheckPool_SaturationSkipsRatherThanQueues(t *testing.T) {
 func Test_websocketCheckWorkers_IsBounded(t *testing.T) {
 	c := require.New(t)
 	c.Positive(DefaultWebsocketCheckWorkers, "the websocket check pool must be bounded")
-	c.LessOrEqual(DefaultWebsocketCheckWorkers, 256,
+	c.LessOrEqual(DefaultWebsocketCheckWorkers, 512,
 		"sized for isolation, not throughput - a websocket check can block for its whole timeout")
+
+	// The pool must be able to absorb a large operator going dark. One operator alone had ~29
+	// silent websocket endpoints on a single service, and each silent endpoint holds a worker
+	// for a full tick, so a pool near that number degrades into skipping everyone's checks.
+	c.GreaterOrEqual(DefaultWebsocketCheckWorkers, 128,
+		"too small a pool turns one operator's outage into fleet-wide skipped checks")
+
+	// Queue bounded to roughly one sweep of the fleet; a deeper queue reports stale results.
+	c.Positive(DefaultWebsocketCheckQueueSize)
+	c.LessOrEqual(DefaultWebsocketCheckQueueSize, 4096)
 }

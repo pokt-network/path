@@ -2249,17 +2249,31 @@ func parseHexBlockNumber(hexStr string) (int64, error) {
 
 // DefaultWebsocketCheckWorkers bounds concurrent websocket health checks.
 //
-// Sized for isolation, not throughput. Each websocket check can block for its whole
-// configured timeout when an endpoint accepts a connection and then stays silent, so the
-// point of this pool is that such checks delay only each other rather than the shared
-// health-check cycle. Large enough to keep a service's endpoints moving within a refresh
-// interval; small enough that a service-wide outage cannot tie up meaningful resources.
-const DefaultWebsocketCheckWorkers = 64
+// Sizing arithmetic, worth re-deriving if the fleet changes — measured 1054 websocket-capable
+// endpoints across 55 services, on a 10s tick with a 10s check timeout:
+//
+//   - A HEALTHY endpoint answers in ~0.25s, so a full sweep costs ~260 worker-seconds and
+//     any pool above ~30 workers clears it well inside one tick. Healthy load is not the
+//     constraint.
+//   - A SILENT endpoint — accepts the connection, never replies — holds a worker for the
+//     entire timeout, i.e. one whole tick. So the pool size is really a budget for how many
+//     silent endpoints can be in flight before coverage starts being skipped.
+//
+// 64 was the first guess and is too tight: one operator alone had ~29 silent websocket
+// endpoints on a single service. 256 absorbs a large operator going dark across several
+// services without dropping checks for everyone else, and 256 concurrent in-flight dials is
+// modest for I/O-bound work.
+//
+// Beyond this the pool refuses rather than queueing without limit — see
+// DefaultWebsocketCheckQueueSize.
+const DefaultWebsocketCheckWorkers = 256
 
 // DefaultWebsocketCheckQueueSize bounds the websocket check backlog.
 //
-// Load-bearing: pond's queue is effectively unbounded by default, so TrySubmit would accept
-// indefinitely and reconstruct the backlog this pool exists to avoid. Bounded, a saturated
-// pool refuses and the cycle skips that endpoint for one refresh interval — which is the
-// correct trade, since a check that cannot run promptly has no value.
-const DefaultWebsocketCheckQueueSize = 512
+// Load-bearing: pond's DefaultQueueSize is Unbounded, so TrySubmit would accept indefinitely
+// and reconstruct the backlog this pool exists to avoid — stalling later instead of sooner.
+//
+// Sized at roughly one sweep of the fleet (~1054 endpoints). Deliberately not larger: a check
+// that sits queued for several ticks reports staleness that has since changed, so beyond about
+// one sweep the right answer is to skip and re-check next tick rather than to buffer.
+const DefaultWebsocketCheckQueueSize = 1024
