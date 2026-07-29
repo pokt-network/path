@@ -157,6 +157,27 @@ func (wrc *websocketRequestContext) signingEndpoint() endpoint {
 	return wrc.selectedEndpoint
 }
 
+// currentDomain returns the metrics domain of the endpoint CURRENTLY serving this
+// connection.
+//
+// Every per-domain websocket metric must resolve its label through here rather than through
+// selectedEndpoint. A long-lived connection rebinds across operators over its lifetime — every
+// session rollover, every stall escape, every admin tumble — and labelling its frames with
+// wherever it first landed makes the per-operator websocket metrics describe FIRST bind rather
+// than CURRENT bind. That reads as an operator serving heavy traffic while it holds no
+// connections at all, and hides the traffic actually flowing to whoever it moved to.
+func (wrc *websocketRequestContext) currentDomain() string {
+	ep := wrc.signingEndpoint()
+	if ep == nil {
+		return shannonmetrics.ErrDomain
+	}
+	domain, err := shannonmetrics.ExtractDomainOrHost(ep.PublicURL())
+	if err != nil {
+		return shannonmetrics.ErrDomain
+	}
+	return domain
+}
+
 // ---------- Websocket Request Context Setup  ----------
 
 // BuildWebsocketRequestContextForEndpoint creates a new Websocket protocol request context for a specified service and endpoint.
@@ -1059,8 +1080,14 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		// Wait for the bridge to complete (blocks until Websocket connection terminates)
 		<-bridgeCompletionChan
 		// Send closure observation, stamping the actual close time.
+		//
+		// Attributed to the endpoint the connection was serving WHEN IT CLOSED, not the one
+		// it opened on — that is the operator holding the active-connection credit by then,
+		// so this is the Dec that cancels it. Reading signingEndpoint() here is race-free:
+		// the bridge goroutine that writes it is the same one whose deferred
+		// close(completionChan) released the receive above, so its writes are visible.
 		wrc.logger.Debug().Msg("Websocket connection closed, sending closure observation")
-		connectionObservationChan <- getWebsocketConnectionClosedObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, establishedAt, time.Now())
+		connectionObservationChan <- getWebsocketConnectionClosedObservation(wrc.logger, wrc.serviceID, wrc.signingEndpoint(), establishedAt, time.Now())
 	}()
 
 	return nil
@@ -1229,8 +1256,17 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoid
 	// Update the signing endpoint FIRST so the URL/headers/handshake below (and all
 	// subsequent message signing) use the new session. Record whether this is a
 	// different-supplier (tier-2) rebind so OnReconnectOutcome can tag the metric.
+	prevDomain := wrc.currentDomain()
 	wrc.reconnectEndpoint = ep
 	wrc.lastReconnectDifferentSupplier = differentSupplier
+
+	// Hand this connection's active-connection credit to the operator now serving it. Done
+	// immediately after the binding moves — NOT after the dial below succeeds — so the gauge
+	// stays in lockstep with signingEndpoint() on every path, including a failed dial. The
+	// close observation decrements currentDomain(), so keeping the two in lockstep is what
+	// guarantees the Dec cancels the outstanding Inc instead of leaking a phantom connection
+	// onto the operator the client started on.
+	metrics.MoveWebsocketConnection(prevDomain, wrc.currentDomain(), string(wrc.serviceID))
 
 	websocketEndpointURL, err := getWebsocketEndpointURL(logger, ep)
 	if err != nil {
@@ -1404,11 +1440,8 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 
 	logger.Debug().Msgf("received message from client: %s", string(msgData))
 
-	// Extract domain for message metrics
-	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
-	if domainErr != nil {
-		domain = shannonmetrics.ErrDomain
-	}
+	// Domain of the endpoint currently serving the connection — see currentDomain().
+	domain := wrc.currentDomain()
 	serviceID := string(wrc.serviceID)
 
 	// Session rebind: record an eth_subscribe for later replay, and rewrite an
@@ -1420,10 +1453,16 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 		msgData = wrc.registry.TrackClientMessage(msgData)
 	}
 
-	// If the selected endpoint is a fallback endpoint, skip signing the message.
+	// If the endpoint currently serving this connection is a fallback endpoint, skip signing.
 	// Fallback endpoints bypass the protocol so the raw message is sent to the endpoint.
+	//
+	// This MUST test the live endpoint, not the setup-time one: a rebind can cross the
+	// fallback boundary in either direction, and branching on the original would either send
+	// unsigned frames to a protocol endpoint (the miner rejects them) or sign frames for a
+	// fallback endpoint that expects raw ones. signClientWebsocketMessage below already signs
+	// against signingEndpoint(), so only this branch was left behind.
 	// TODO_IMPROVE(@commoddity,@adshmh): Cleanly separate fallback endpoint handling from the protocol package.
-	if wrc.selectedEndpoint.IsFallback() {
+	if wrc.signingEndpoint().IsFallback() {
 		// Record message metric for client→endpoint direction (fallback = always success)
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionClientToEndpoint, metrics.SignalOK)
 		return msgData, nil
@@ -1488,22 +1527,22 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 
 	logger.Debug().Msgf("received message from endpoint: %s", string(msgData))
 
-	// Extract domain for message metrics
-	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
-	if domainErr != nil {
-		domain = shannonmetrics.ErrDomain
-	}
+	// Domain of the endpoint currently serving the connection — see currentDomain().
+	domain := wrc.currentDomain()
 	serviceID := string(wrc.serviceID)
 
-	// If the selected endpoint is a fallback endpoint, skip validation.
-	// Fallback endpoints bypass the protocol so the raw message is sent to the endpoint.
+	// If the endpoint currently serving this connection is a fallback endpoint, skip
+	// validation. Fallback endpoints bypass the protocol so the raw message is forwarded.
+	// Must test the live endpoint for the same reason as the client-side branch above: a
+	// rebind can cross the fallback boundary, and validateEndpointWebsocketMessage already
+	// works against the live session.
 	// TODO_IMPROVE(@commoddity,@adshmh): Cleanly separate fallback endpoint handling from the protocol package.
-	if wrc.selectedEndpoint.IsFallback() {
+	if wrc.signingEndpoint().IsFallback() {
 		// Record success signal for fallback endpoint messages
 		wrc.recordWebsocketSignal(reputation.NewSuccessSignal(time.Since(startTime)))
 		// Record message metric for endpoint→client direction
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalOK)
-		return msgData, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+		return msgData, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData), nil
 	}
 
 	// If the selected endpoint is a protocol endpoint, we need to validate the message.
@@ -1514,7 +1553,7 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 		wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_message_validation_failed", time.Since(startTime)))
 		// Record message metric for endpoint→client direction with error
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMajorError)
-		return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, err), err
+		return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData, err), err
 	}
 
 	// A non-2xx status carried in a POKTHTTPResponse envelope (e.g. "session
@@ -1543,7 +1582,7 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 			// Error level for canary visibility (LOG_LEVEL=error). Temporary.
 			logger.Error().Msg("🤫 [WS-REBIND] swallowing session-expiry (410) advisory — rebind will reconnect transparently")
 			metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMinorError)
-			return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, fmt.Errorf("session expired (rebind pending)")), nil
+			return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData, fmt.Errorf("session expired (rebind pending)")), nil
 		}
 
 		logger.Warn().
@@ -1552,7 +1591,7 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 			Msg("⚠️ endpoint returned a non-2xx response over websocket — forwarding decoded body, no reputation change")
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMinorError)
 		return endpointMessageBz,
-			getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, fmt.Errorf("endpoint returned HTTP %d over websocket", statusCode)),
+			getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData, fmt.Errorf("endpoint returned HTTP %d over websocket", statusCode)),
 			nil
 	}
 
@@ -1572,9 +1611,9 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 	// A swallowed replay response is a valid, successful endpoint reply (recorded above)
 	// that must not reach the client — return a nil body so the bridge drops it.
 	if !forward {
-		return nil, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+		return nil, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData), nil
 	}
-	return endpointMessageBz, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+	return endpointMessageBz, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData), nil
 }
 
 // validateEndpointWebsocketMessage validates a message from the endpoint using the

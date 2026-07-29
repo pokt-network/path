@@ -1486,6 +1486,22 @@ func RecordWebsocketConnectionClosed(domain, serviceID string, durationSeconds f
 	WebsocketConnectionDuration.WithLabelValues(domain, serviceID).Observe(durationSeconds)
 }
 
+// MoveWebsocketConnection hands one connection's active-connection credit from the operator
+// it was bound to onto the one it just rebound to, so the gauge reports where connections
+// ACTUALLY are rather than where they first landed.
+//
+// Pairing: the Inc happens once at establishment and the Dec once at close, both via the
+// connection observation. This moves the outstanding credit in between, and the close path
+// decrements the CURRENT domain, so the Dec always cancels whichever Inc is outstanding no
+// matter how many times the connection moved.
+func MoveWebsocketConnection(oldDomain, newDomain, serviceID string) {
+	if oldDomain == newDomain {
+		return
+	}
+	WebsocketConnectionsActive.WithLabelValues(oldDomain, serviceID).Dec()
+	WebsocketConnectionsActive.WithLabelValues(newDomain, serviceID).Inc()
+}
+
 // RecordWebsocketConnectionFailed records a WebSocket connection failure
 func RecordWebsocketConnectionFailed(domain, serviceID string) {
 	WebsocketConnectionEventsTotal.WithLabelValues(domain, serviceID, WSEventFailed).Inc()
