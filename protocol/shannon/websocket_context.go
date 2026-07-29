@@ -319,7 +319,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	serviceID protocol.ServiceID,
 	selectedEndpointAddr protocol.EndpointAddr,
 	probe protocol.WebsocketProbe,
-) *protocolobservations.Observations {
+) ([]byte, *protocolobservations.Observations) {
 	logger := p.logger.With("method", "CheckWebsocketConnection")
 
 	// Get the pre-selected endpoint.
@@ -327,7 +327,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	if err != nil {
 		err = fmt.Errorf("⁉️ SHOULD NEVER HAPPEN: failed to get pre-selected endpoint: %s", err.Error())
 		// Will not lead to reputation penalty as this does not indicate a problem with the endpoint, nor should it ever happen.
-		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
 
 	// Get the websocket-specific URL from the selected endpoint.
@@ -335,7 +335,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	if err != nil {
 		err = fmt.Errorf("%w: selected endpoint does not support websocket RPC type: %s", errCreatingWebSocketConnection, err.Error())
 		logger.Debug().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
-		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
 	logger = logger.With("websocket_url", websocketEndpointURL)
 
@@ -344,7 +344,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	if err != nil {
 		err = fmt.Errorf("%w: failed to get websocket connection headers: %s", errCreatingWebSocketConnection, err.Error())
 		logger.Debug().Err(err).Msg("❌ Failed to get websocket connection headers")
-		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
 
 	// Test the websocket connection to the endpoint.
@@ -356,7 +356,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	if err != nil {
 		err = fmt.Errorf("%w: failed to connect to websocket endpoint: %s", errCreatingWebSocketConnection, err.Error())
 		logger.Debug().Err(err).Msg("❌ Failed to connect to websocket endpoint")
-		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
 	defer conn.Close()
 
@@ -366,28 +366,40 @@ func (p *Protocol) CheckWebsocketConnection(
 	// like a healthy one — see protocol.WebsocketProbe for the measurement — so a service
 	// whose rules only reach here cannot have a websocket score that means anything.
 	if probe.IsHandshakeOnly() {
-		return nil
+		return nil, nil
 	}
 
-	if err := p.runWebsocketProbe(ctx, logger, serviceID, selectedEndpoint, conn, probe); err != nil {
+	body, err := p.runWebsocketProbe(ctx, logger, serviceID, selectedEndpoint, conn, probe)
+	if err != nil {
 		logger.Debug().Err(err).Msg("❌ websocket probe failed")
-		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
 
-	// A nil observation means no error occurred.
-	return nil
+	// The response goes back so the executor can judge its CONTENT. A connection that opens
+	// and answers is not evidence of a working endpoint: the one that motivated this replied
+	// correctly with a block height a full day stale.
+	return body, nil
 }
 
-// runWebsocketProbe sends the probe payload over an established endpoint connection and,
-// when the probe demands it, waits for a subscription notification.
+// runWebsocketProbe sends the probe payload over an established endpoint connection and
+// returns the endpoint's decoded response, so the caller can judge its CONTENT.
 //
-// Frames must be signed and responses validated exactly as the live bridge does them —
-// otherwise the relay miner rejects the payload and every endpoint fails identically, which
-// would be worse than the handshake-only check it replaces. Both are reused here through a
-// minimal request context rather than reimplemented.
+// It deliberately does ONE round-trip and returns. An earlier version waited for a
+// subscription notification to prove data actually flows. That detects a dead feed, but it
+// makes every check against a non-delivering endpoint occupy a slot in the shared,
+// concurrency-bounded health-check loop for its full timeout. On a service where one
+// operator holds most of the websocket endpoints, those blocked checks starve everything
+// behind them: measured on canary, websocket check throughput across ALL services fell from
+// 55.66/s to 0.06/s within minutes of enabling it — and because the checks never completed,
+// no failure was ever recorded and nothing was demoted, so it defeated its own purpose.
 //
-// The deadline comes from ctx, which the health-check executor derives from the rule's
-// configured timeout.
+// Returning the response instead lets the executor apply the SAME staleness comparison the
+// json_rpc sync checks already use. That catches the case the notification wait was built
+// for — the endpoint that motivated it answered correctly with a head 31,470 blocks stale
+// while its HTTP side tracked the chain — in one round-trip, with no blocking.
+//
+// Frames are signed and responses validated exactly as the live bridge does them, otherwise
+// the relay miner rejects the payload and every endpoint fails identically.
 func (p *Protocol) runWebsocketProbe(
 	ctx context.Context,
 	logger polylog.Logger,
@@ -395,10 +407,10 @@ func (p *Protocol) runWebsocketProbe(
 	selectedEndpoint endpoint,
 	conn *gorillaws.Conn,
 	probe protocol.WebsocketProbe,
-) error {
+) ([]byte, error) {
 	signer, err := p.getGatewayModePermittedRelaySigner(p.gatewayMode)
 	if err != nil {
-		return fmt.Errorf("%w: websocket probe signer setup: %s", errRequestContextSetupErrSignerSetup, err.Error())
+		return nil, fmt.Errorf("%w: websocket probe signer setup: %s", errRequestContextSetupErrSignerSetup, err.Error())
 	}
 
 	// Minimal context carrying just what signing and validation need. It never starts a
@@ -416,9 +428,9 @@ func (p *Protocol) runWebsocketProbe(
 	if !selectedEndpoint.IsFallback() {
 		signed, signErr := probeCtx.signClientWebsocketMessage(payload)
 		if signErr != nil {
-			// A signing failure is OUR fault, not the endpoint's. Surfacing it as an
-			// endpoint error would penalise every endpoint for a gateway problem.
-			return fmt.Errorf("websocket probe: sign payload: %w", signErr)
+			// A signing failure is OURS, not the endpoint's. Surfacing it as an endpoint
+			// error would penalise every endpoint for a gateway problem.
+			return nil, fmt.Errorf("websocket probe: sign payload: %w", signErr)
 		}
 		payload = signed
 	}
@@ -428,54 +440,38 @@ func (p *Protocol) runWebsocketProbe(
 		deadline = time.Now().Add(DefaultWebsocketProbeTimeout)
 	}
 	if err := conn.SetWriteDeadline(deadline); err != nil {
-		return fmt.Errorf("websocket probe: set write deadline: %w", err)
+		return nil, fmt.Errorf("websocket probe: set write deadline: %w", err)
 	}
 	if err := conn.WriteMessage(gorillaws.TextMessage, payload); err != nil {
-		return fmt.Errorf("%w: websocket probe: send payload: %s", errCreatingWebSocketConnection, err.Error())
+		return nil, fmt.Errorf("%w: websocket probe: send payload: %s", errCreatingWebSocketConnection, err.Error())
 	}
 
-	// Read until the deadline. The FIRST decodable frame is the acknowledgement (for a
-	// subscribe, the subscription id); any FURTHER frame is a notification, which is the
-	// only evidence that data actually flows.
-	acked := false
-	for {
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			return fmt.Errorf("websocket probe: set read deadline: %w", err)
-		}
-		_, raw, readErr := conn.ReadMessage()
-		if readErr != nil {
-			switch {
-			case !acked:
-				return fmt.Errorf("%w: websocket probe: no response to payload: %s", errCreatingWebSocketConnection, readErr.Error())
-			case probe.RequireNotification:
-				// The case this check exists for: subscription acknowledged, then silence.
-				// The endpoint looks healthy to every other signal — it connected, it
-				// answered — but it delivers nothing to a real subscriber.
-				return fmt.Errorf("%w: websocket probe: subscription acknowledged but no notification delivered before timeout", errCreatingWebSocketConnection)
-			default:
-				return nil
-			}
-		}
-
-		body, statusCode, validateErr := probeCtx.validateEndpointWebsocketMessage(raw)
-		if validateErr != nil {
-			return fmt.Errorf("%w: websocket probe: invalid response: %s", errCreatingWebSocketConnection, validateErr.Error())
-		}
-		if statusCode < 200 || statusCode >= 300 {
-			return fmt.Errorf("%w: websocket probe: endpoint returned HTTP %d: %s", errCreatingWebSocketConnection, statusCode, string(body))
-		}
-
-		if !acked {
-			acked = true
-			if !probe.RequireNotification {
-				return nil
-			}
-			continue
-		}
-
-		// A second decodable frame arrived: the subscription is genuinely delivering.
-		return nil
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("websocket probe: set read deadline: %w", err)
 	}
+	_, raw, err := conn.ReadMessage()
+	if err != nil {
+		return nil, fmt.Errorf("%w: websocket probe: no response to payload: %s", errCreatingWebSocketConnection, err.Error())
+	}
+
+	body, statusCode, err := probeCtx.validateEndpointWebsocketMessage(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: websocket probe: invalid response: %s", errCreatingWebSocketConnection, err.Error())
+	}
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("%w: websocket probe: endpoint returned HTTP %d: %s", errCreatingWebSocketConnection, statusCode, string(body))
+	}
+
+	// Judge the CONTENT. A well-formed answer carrying a stale block height fails here,
+	// which is the whole point: the endpoint this was built for answered correctly and was
+	// a full day behind.
+	if probe.ValidateResponse != nil {
+		if err := probe.ValidateResponse(body); err != nil {
+			return nil, fmt.Errorf("%w: websocket probe: %s", errCreatingWebSocketConnection, err.Error())
+		}
+	}
+
+	return body, nil
 }
 
 func (p *Protocol) getPreSelectedEndpoint(

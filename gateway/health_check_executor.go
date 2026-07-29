@@ -1512,6 +1512,7 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 	serviceID protocol.ServiceID,
 	endpointAddr protocol.EndpointAddr,
 	check HealthCheckConfig,
+	syncAllowance uint64,
 ) (time.Duration, error) {
 	if e.protocol == nil {
 		return 0, fmt.Errorf("protocol not configured for health check executor")
@@ -1539,19 +1540,37 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Depth of the probe follows the rule's own payload.
+	// Send the rule's payload, if it has one, and judge the response's CONTENT — not merely
+	// that one arrived.
 	//
-	// A payload that SUBSCRIBES is asking for a stream, so the probe waits for an actual
-	// notification — acknowledging a subscription and then delivering nothing is a real,
-	// measured failure mode that a handshake or a request/response probe both pass.
-	// A plain request/response payload is satisfied by its response. No payload leaves the
-	// original handshake-only behaviour untouched.
-	probe := protocol.WebsocketProbe{
-		Payload:             check.Body,
-		RequireNotification: websocketPayloadSubscribes(check.Body),
+	// This is what lets a websocket check fail an endpoint that is perfectly reachable. The
+	// endpoint that motivated it accepted connections, answered eth_blockNumber correctly,
+	// and reported a head 31,470 blocks stale — while the same operator's HTTP side tracked
+	// the chain, so every json_rpc sync check passed and nothing ever looked at the
+	// websocket side's answer.
+	//
+	// The comparison is the SAME one the json_rpc checks use, supplied as a closure so it
+	// stays here where perceived height and sync_allowance already live.
+	probe := protocol.WebsocketProbe{Payload: check.Body}
+	if check.SyncCheck && syncAllowance > 0 {
+		probe.ValidateResponse = func(responseBody []byte) error {
+			syncErr := e.validateSyncCheck(serviceID, responseBody, syncAllowance)
+			// Not applicable means the rule points at a response shape we cannot read a
+			// height from. That is our bug, it fails identically on every endpoint of the
+			// service, and it must never cost a supplier reputation.
+			if errors.Is(syncErr, errSyncCheckNotApplicable) {
+				e.logger.Warn().
+					Err(syncErr).
+					Str("service_id", string(serviceID)).
+					Str("check", check.Name).
+					Msg("WebSocket sync check skipped - cannot read a block height from this response shape; check the rule, not the endpoint")
+				return nil
+			}
+			return syncErr
+		}
 	}
 
-	protocolObs := e.protocol.CheckWebsocketConnection(checkCtx, serviceID, endpointAddr, probe)
+	_, protocolObs := e.protocol.CheckWebsocketConnection(checkCtx, serviceID, endpointAddr, probe)
 
 	// Apply observations to protocol (this updates reputation via observations)
 	if protocolObs != nil {
@@ -1659,7 +1678,7 @@ func (e *HealthCheckExecutor) runEndpointChecks(
 				continue
 			}
 			// WebSocket checks use the protocol's CheckWebsocketConnection.
-			latency, err := e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, endpointAddr, check)
+			latency, err := e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, endpointAddr, check, syncAllowance)
 			e.recordCheckResult(ctx, serviceID, endpointAddr, check, err, latency)
 		case HealthCheckTypeGRPC:
 			// gRPC checks not yet implemented
@@ -2170,14 +2189,4 @@ func parseHexBlockNumber(hexStr string) (int64, error) {
 		return 0, fmt.Errorf("invalid hex block number: %w", err)
 	}
 	return height, nil
-}
-
-// websocketPayloadSubscribes reports whether a websocket health-check payload asks the
-// endpoint to open a subscription, in which case the probe must wait for a notification
-// rather than being satisfied by the acknowledgement.
-//
-// Matching on the method name keeps this working across chains without a per-service list:
-// EVM uses eth_subscribe, and other JSON-RPC chains follow the same `*_subscribe` shape.
-func websocketPayloadSubscribes(payload string) bool {
-	return strings.Contains(payload, "_subscribe")
 }

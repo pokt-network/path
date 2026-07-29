@@ -19,14 +19,16 @@ type WebsocketProbe struct {
 	// the original behaviour.
 	Payload string
 
-	// RequireNotification makes the probe wait, after Payload is acknowledged, for at least
-	// one further frame — a subscription notification — before the deadline. An endpoint
-	// that acks and then goes silent FAILS.
+	// ValidateResponse, when set, judges the endpoint's decoded response. Returning an error
+	// fails the probe exactly as a transport failure would, so the caller can reject an
+	// endpoint on the CONTENT of a perfectly well-formed answer — a stale block height being
+	// the case this exists for.
 	//
-	// Only meaningful when Payload subscribes to something. A plain request/response
-	// payload is acknowledged and nothing further ever arrives, so this would fail every
-	// endpoint.
-	RequireNotification bool
+	// Supplied by the health-check executor so the staleness comparison stays where the
+	// perceived chain head and sync_allowance already live, rather than being duplicated in
+	// the protocol layer. Must return nil for conditions that are the gateway's fault rather
+	// than the endpoint's, or a config error becomes a service-wide reputation storm.
+	ValidateResponse func(responseBody []byte) error
 }
 
 // IsHandshakeOnly reports whether the probe does no more than open the connection.
