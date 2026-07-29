@@ -92,12 +92,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 40s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: poly
@@ -156,10 +156,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -222,10 +222,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -348,10 +348,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -490,12 +490,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 20s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: moonriver
@@ -533,12 +533,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 20s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: gnosis
@@ -589,12 +589,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 15s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: celo
@@ -712,10 +712,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -755,12 +755,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 15s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: iotex
@@ -798,12 +798,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 15s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: oasys
@@ -941,12 +941,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 15s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: hyperliquid
@@ -1088,10 +1088,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -1152,10 +1152,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -1195,10 +1195,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -1238,10 +1238,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -1281,10 +1281,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -1451,10 +1451,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -1503,10 +1503,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -1672,10 +1672,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -1756,10 +1756,10 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
       timeout: 10s
       reputation_signal: major_error
@@ -1801,12 +1801,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 40s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: eth-holesky-testnet
@@ -1985,12 +1985,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 15s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: giwa-sepolia-testnet
@@ -2032,12 +2032,12 @@
     # signal at all, so this is the first thing that can move them. Starting at
     # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
     # websocket cooldowns. Escalate once the false-positive rate is known.
-    - name: ws_newHeads_subscription
+    - name: ws_eth_blockNumber
       type: websocket
       path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}'
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
       expected_response_contains: '"result"'
-      timeout: 40s
+      timeout: 10s
       reputation_signal: major_error
 
 - service_id: solana
