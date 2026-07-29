@@ -35,4 +35,22 @@ var (
 	// being moved for traffic-distribution reasons — but it takes the same reconnect
 	// path, so the rebind avoids reselecting the currently bound supplier.
 	ErrEndpointTumbled = errors.New("endpoint tumbled: operator-requested rebind to a different supplier")
+
+	// ErrEndpointSessionExpired indicates the session the endpoint connection is bound to
+	// has ended, and the supplier never closed the socket to tell us.
+	//
+	// Every other rebind trigger is REACTIVE — the endpoint hangs up (relay miner close
+	// 4000 at session expiry), or the staleness watchdog notices silence. Neither fires
+	// when a supplier keeps streaming past its own session: endpoint→client frames carry
+	// no signature and need no session, so data flows exactly as before and the watchdog
+	// stays quiet because the feed is alive. The connection is then stranded on a supplier
+	// outside the current session — invisible to reputation and unreachable by endpoint
+	// selection — until the client itself disconnects. Worse for the client, every
+	// client→endpoint frame is signed against the dead session, so it can no longer add a
+	// subscription while its existing stream keeps running.
+	//
+	// This is the proactive trigger for that case. It takes the ordinary rollover path
+	// (supplier continuity is fine if the supplier is still in the new session), unlike
+	// ErrEndpointStalled/ErrEndpointTumbled which must land elsewhere.
+	ErrEndpointSessionExpired = errors.New("endpoint session expired: bound session ended without the supplier disconnecting")
 )

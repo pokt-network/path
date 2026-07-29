@@ -70,6 +70,34 @@ type TumbleReporter interface {
 	OnTumbleRequested()
 }
 
+// SessionExpiryChecker is an optional interface an EndpointReconnector may implement so the
+// bridge can detect, without waiting for the supplier to hang up, that the session its
+// endpoint connection is bound to has ended. See ErrEndpointSessionExpired for why no other
+// trigger catches this.
+//
+// Optional so existing reconnectors (and test doubles) keep compiling; a reconnector that
+// does not implement it simply never gets the proactive check.
+//
+// Called on the bridge's start() goroutine, serialized with message processing and the other
+// rebind paths, so an implementer may read unsynchronized connection state.
+type SessionExpiryChecker interface {
+	// BoundSessionExpired reports whether the session the currently bound endpoint belongs
+	// to has ended, beyond any rollover grace. Implementations must be cheap (this runs per
+	// connection on a timer) and must return false when the answer is unknown — a rebind is
+	// disruptive, so an unavailable block height must never be read as "expired".
+	BoundSessionExpired() bool
+}
+
+// SessionExpiryReporter is an optional interface letting the reconnector learn that the
+// upcoming rebind was triggered by the bound session having expired, so it can label the
+// metric distinctly. Without it such a rebind is indistinguishable from an ordinary
+// supplier-initiated rollover, which is exactly the thing we want to measure separately.
+//
+// Called on the bridge's start() goroutine immediately before the rebind.
+type SessionExpiryReporter interface {
+	OnSessionExpiryRebindRequested()
+}
+
 // ReconnectFailureStage identifies where in a rebind episode a failure happened, so the
 // reconnector can emit a precise failure-reason metric. The bridge knows only the stage;
 // the reconnector (protocol layer) knows the specific selection/dial reason.
@@ -132,6 +160,24 @@ var (
 	// quiet network-wide); the bridge then closes the client (1012) rather than churn
 	// forever. Reset to 0 by any endpoint data frame.
 	maxConsecutiveStallRebinds = 3
+)
+
+// Bound-session expiry watchdog bounds. Package-level vars (not consts) so tests can shrink
+// them; production never mutates them.
+var (
+	// sessionExpiryCheckInterval is how often a connection checks whether the session it is
+	// bound to has ended. Sessions run ~20 minutes, so this only needs to be small relative
+	// to that; the check itself is cheap (a cached block height compared against a height
+	// already held on the endpoint), but it runs per connection, so there is no reason to
+	// make it aggressive.
+	sessionExpiryCheckInterval = 30 * time.Second
+	// maxConsecutiveSessionRebinds caps rebinds triggered by session expiry with no
+	// intervening healthy check. A successful rebind lands on the current session and the
+	// next check passes, resetting this to 0; if it somehow does not, this stops the bridge
+	// from rebinding on every tick forever. Reaching it stops the proactive checking for
+	// that connection rather than closing the client — an out-of-session connection is
+	// still delivering data, so dropping it would be a worse outcome than leaving it.
+	maxConsecutiveSessionRebinds = 3
 )
 
 // endpointDisconnectFunc returns the onDisconnect callback for an endpoint connection

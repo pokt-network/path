@@ -1047,6 +1047,12 @@ const (
 	WSRebindTriggerRollover = "rollover" // routine Shannon session-boundary reconnect
 	WSRebindTriggerStall    = "stall"    // staleness watchdog forced a rebind off a silent supplier
 	WSRebindTriggerAdmin    = "admin"    // operator asked to redistribute connections (admin tumble)
+	// WSRebindTriggerSessionExpired: PATH itself noticed the bound session had ended while
+	// the supplier kept streaming (it never sent the close 4000 that drives `rollover`).
+	// Distinct from `rollover` on purpose: rollover is supplier-initiated and healthy,
+	// this one counts connections that would otherwise have been stranded outside the
+	// session indefinitely — invisible to reputation and to endpoint selection.
+	WSRebindTriggerSessionExpired = "session_expired"
 
 	// --- WebSocket endpoint-staleness watchdog result labels (experimental)
 	// The `result` dimension of WebsocketEndpointStallTotal. A stall is a silent supplier

@@ -38,6 +38,15 @@ var _ gateway.ProtocolRequestContextWebsocket = &websocketRequestContext{}
 // endpoint connection across a Shannon session rollover (when session rebind is enabled).
 var _ websockets.EndpointReconnector = &websocketRequestContext{}
 
+// The rebind extras are OPTIONAL interfaces the bridge discovers by type assertion, so a
+// drifting signature would silently disable the behaviour rather than fail to compile.
+// Assert them explicitly.
+var (
+	_ websockets.TumbleReporter        = &websocketRequestContext{}
+	_ websockets.SessionExpiryChecker  = &websocketRequestContext{}
+	_ websockets.SessionExpiryReporter = &websocketRequestContext{}
+)
+
 type websocketRequestContext struct {
 	logger polylog.Logger
 
@@ -95,6 +104,13 @@ type websocketRequestContext struct {
 	// (WSRebindTriggerRollover / WSRebindTriggerStall / WSRebindTriggerAdmin), consumed
 	// by OnReconnectOutcome to tag the metric. Bridge-goroutine only.
 	lastReconnectTrigger string
+
+	// sessionExpiryRebindRequested marks the NEXT rebind as one PATH initiated because the
+	// bound session had ended while the supplier kept streaming. Without it the rebind is
+	// indistinguishable from a supplier-initiated rollover, which is exactly the comparison
+	// worth measuring. Set by OnSessionExpiryRebindRequested and consumed (cleared) by
+	// ReconnectEndpoint; both run on the bridge goroutine, so no synchronization is needed.
+	sessionExpiryRebindRequested bool
 
 	// adminTumbleRequested marks the NEXT rebind as operator-initiated so it is labelled
 	// `admin` instead of `stall` — both arrive with avoidCurrentSupplier set and are
@@ -1236,6 +1252,13 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoid
 	case avoidCurrentSupplier:
 		wrc.lastReconnectTrigger = metrics.WSRebindTriggerStall
 		avoidScope = avoidBoundBackend
+	case wrc.sessionExpiryRebindRequested:
+		// PATH-initiated because the bound session ended and the supplier never hung up.
+		// Condemns nothing: if that supplier is in the new session, reusing it is the
+		// seamless outcome — the connection just needs a live session, not a new operator.
+		wrc.lastReconnectTrigger = metrics.WSRebindTriggerSessionExpired
+		wrc.sessionExpiryRebindRequested = false
+		avoidScope = avoidNothing
 	default:
 		wrc.lastReconnectTrigger = metrics.WSRebindTriggerRollover
 		avoidScope = avoidNothing
@@ -1391,6 +1414,62 @@ func (wrc *websocketRequestContext) reconnectResultLabel(success bool, stage web
 		}
 		return metrics.WSRebindFailedSelect
 	}
+}
+
+// boundSessionGraceBlocks is how far past its end height a bound session is tolerated before
+// the connection is considered stranded. Matched to the rollover grace the session logic
+// itself applies (sessionRolloverBlocks), so the proactive check never fires inside the window
+// where the ending session is still legitimately serving and a supplier-initiated rollover may
+// still arrive on its own.
+const boundSessionGraceBlocks = 10
+
+// BoundSessionExpired reports whether the session this connection's endpoint belongs to has
+// ended, beyond the rollover grace. Implements websockets.SessionExpiryChecker.
+//
+// Needed because nothing else notices. The relay miner normally closes the socket at session
+// expiry, which drives the ordinary rollover rebind; a supplier that keeps streaming instead
+// leaves the connection bound to a dead session, and because endpoint→client frames are
+// unsigned the data keeps flowing, so the staleness watchdog never fires either.
+//
+// Compares the end height already carried on the bound endpoint's session header against the
+// current block height, which the full node caches — no session fetch, no chain round-trip on
+// the common path.
+//
+// Returns FALSE whenever the answer is not known (no session header, no end height, block
+// height unavailable). A rebind costs the client a gap in its subscription stream, so an
+// unknown height must never be read as "expired".
+//
+// Runs on the bridge goroutine, the same one that writes reconnectEndpoint, so
+// signingEndpoint() is read without synchronization.
+func (wrc *websocketRequestContext) BoundSessionExpired() bool {
+	ep := wrc.signingEndpoint()
+	if ep == nil || wrc.fullNode == nil {
+		return false
+	}
+
+	session := ep.Session()
+	if session == nil || session.Header == nil {
+		return false
+	}
+	endHeight := session.Header.SessionEndBlockHeight
+	if endHeight <= 0 {
+		return false
+	}
+
+	currentHeight, err := wrc.fullNode.GetCurrentBlockHeight(wrc.context)
+	if err != nil || currentHeight <= 0 {
+		// Unknown height — say nothing rather than disrupt a working connection.
+		return false
+	}
+
+	return currentHeight > endHeight+boundSessionGraceBlocks
+}
+
+// OnSessionExpiryRebindRequested marks the next rebind as PATH-initiated due to bound-session
+// expiry, so it is labelled `session_expired` rather than `rollover`. Implements
+// websockets.SessionExpiryReporter.
+func (wrc *websocketRequestContext) OnSessionExpiryRebindRequested() {
+	wrc.sessionExpiryRebindRequested = true
 }
 
 // HasActiveSubscriptions reports whether the client holds at least one established
