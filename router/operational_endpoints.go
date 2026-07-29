@@ -364,10 +364,25 @@ func (r *router) handleWebsocketTumble(w http.ResponseWriter, req *http.Request)
 		maxConns = parsed
 	}
 
+	// order_by controls how a capped tumble ranks candidates. Defaults to throughput —
+	// socket count is a poor proxy for load, so ordering by it spends the cap moving
+	// connections that were not the problem. Rejected rather than silently defaulted, so a
+	// typo does not quietly give the operator the ordering they were trying to avoid.
+	orderBy := protocol.TumbleOrderThroughput
+	switch raw := query.Get("order_by"); raw {
+	case "", string(protocol.TumbleOrderThroughput):
+	case string(protocol.TumbleOrderConnections):
+		orderBy = protocol.TumbleOrderConnections
+	default:
+		http.Error(w, `{"error":"order_by must be one of: throughput, connections"}`, http.StatusBadRequest)
+		return
+	}
+
 	result := r.websocketAdmin.TumbleWebsockets(protocol.WebsocketTumbleRequest{
 		ServiceID: serviceID,
 		Domain:    query.Get("domain"),
 		Max:       maxConns,
+		OrderBy:   orderBy,
 		DryRun:    query.Get("dry_run") == "true",
 	})
 

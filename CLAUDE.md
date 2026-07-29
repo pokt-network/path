@@ -249,11 +249,20 @@ curl -X POST "http://localhost:13069/admin/websocket/tumble/bsc?domain=example.n
 curl -X POST "http://localhost:13069/admin/websocket/tumble/bsc?max=5"
 ```
 
-Query parameters (all optional): `domain=<eTLD+1>` restricts to connections currently bound to that operator; `max=<n>` caps how many move (candidates ordered by descending per-domain concentration); `dry_run=true` reports without moving.
+Query parameters (all optional): `domain=<eTLD+1>` restricts to connections currently bound to that operator; `max=<n>` caps how many move; `order_by=throughput|connections` picks how a capped tumble ranks candidates (default `throughput`); `dry_run=true` reports without moving.
 
-Response includes `connections_by_domain` (the pre-tumble distribution), `tumbled_by_domain`, and `matched`/`tumbled`/`skipped` counts. `skipped` means the connection could not accept a tumble right now — rebind disabled for it, or one already queued.
+**`max` is spent by traffic, not by socket count.** Connection count is a poor proxy for load — a single firehose subscriber routinely carries more than a dozen idle sockets on another operator (measured on live bsc: 232 frames/s on one connection vs 2.2 frames/s on another). Ordering by throughput moves the operator actually carrying the service, and within it that operator's busiest connections first. `order_by=connections` restores the old socket-count ordering for when the goal is evening out socket counts irrespective of how busy they are.
 
-Rebinds land on `path_websocket_rebind_total{trigger="admin"}`, distinct from `rollover` and `stall`.
+Response includes `connections_by_domain` and `throughput_by_domain_msgs_per_sec` (the pre-tumble distributions), `tumbled_by_domain` and `tumbled_throughput_by_domain_msgs_per_sec` (what moved), `order_by`, and `matched`/`tumbled`/`skipped` counts. `skipped` means the connection could not accept a tumble right now — rebind disabled for it, or one already queued.
+
+A `dry_run=true` call is the cheapest way to answer **"who is actually carrying this service"** — the throughput distribution routinely contradicts the connection distribution.
+
+Rebinds land on `path_websocket_rebind_total{trigger="admin"}`, distinct from `rollover`, `stall`, and `session_expired`.
+
+**Automatic rebind triggers** (no admin action needed):
+- `rollover` — the supplier closed the socket at session expiry (close 4000). The healthy path.
+- `stall` — the staleness watchdog saw no subscription data past the threshold; escapes the bound **backend URL**.
+- `session_expired` — PATH noticed the bound session had ended while the supplier kept streaming. Without this a connection is stranded outside the session indefinitely: unsigned endpoint→client frames need no session so data keeps flowing, and the staleness watchdog stays quiet *because* it is flowing. Measured at 21% of live connections before the fix. Watch for `Endpoints = 0` with a blank Mean Score but nonzero WS msg/s on the supplier-quality panel — that combination is the tell.
 
 **Circuit Breaker — when to use:**
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts

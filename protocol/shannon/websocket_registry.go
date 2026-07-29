@@ -1,8 +1,10 @@
 package shannon
 
 import (
+	"context"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/websockets"
@@ -51,11 +53,113 @@ type websocketConnEntry struct {
 	// supplier is the operator address of the currently bound endpoint, kept for the
 	// response body so an operator can see exactly what moved.
 	supplier string
+
+	// frames reports the connection's cumulative delivered-frame count. A closure rather
+	// than a direct read of the request context so the sampler below is testable without
+	// standing up a live connection.
+	frames func() uint64
+
+	// Rate sampling state, all guarded by the registry mutex.
+	//
+	// rate is an EWMA of delivered frames per second. It exists because a capped tumble
+	// must be spent on the connections carrying LOAD, and socket count does not tell you
+	// that: on live traffic a single firehose has been measured at 232 frames/s against
+	// 2.2 frames/s for another connection on the same service — a 100x spread that
+	// counting sockets renders invisible.
+	//
+	// Seeded so the first sample yields the connection's lifetime average (lastSample is
+	// set to its registration time), which means a connection has a usable rate after one
+	// tick rather than two.
+	rate       float64
+	lastFrames uint64
+	lastSample time.Time
 }
+
+// sample folds one observation into the entry's frames-per-second EWMA. Caller holds the
+// registry write lock.
+func (e *websocketConnEntry) sample(now time.Time) {
+	if e.frames == nil {
+		return
+	}
+	current := e.frames()
+	elapsed := now.Sub(e.lastSample).Seconds()
+	if elapsed <= 0 {
+		return
+	}
+
+	// The counter only ever grows; guard anyway so a replaced closure can never produce a
+	// negative rate via unsigned wraparound.
+	var delta uint64
+	if current > e.lastFrames {
+		delta = current - e.lastFrames
+	}
+	instant := float64(delta) / elapsed
+
+	if e.lastFrames == 0 && e.rate == 0 {
+		// First observation: instant IS the lifetime average, so take it as-is rather than
+		// dragging it halfway to zero.
+		e.rate = instant
+	} else {
+		e.rate = websocketRateEWMAAlpha*instant + (1-websocketRateEWMAAlpha)*e.rate
+	}
+
+	e.lastFrames = current
+	e.lastSample = now
+}
+
+// Rate-sampling bounds. Package-level vars (not consts) so tests can drive sampling
+// deterministically; production never mutates them.
+var (
+	// websocketRateSampleInterval is how often every live connection's frames/sec is
+	// resampled. One pass per pod (not per connection) over a map that holds tens of
+	// entries, so the cost is irrelevant; the interval only bounds how stale a tumble's
+	// ranking can be.
+	websocketRateSampleInterval = 15 * time.Second
+
+	// websocketRateEWMAAlpha weights the newest observation. 0.5 reacts within a couple of
+	// samples — a firehose that starts or stops should change the ranking quickly, since
+	// the whole point is to move whoever is heavy NOW, not whoever was heavy an hour ago.
+	websocketRateEWMAAlpha = 0.5
+)
 
 func newWebsocketConnRegistry() *websocketConnRegistry {
 	return &websocketConnRegistry{
 		conns: make(map[protocol.ServiceID]map[*websocketRequestContext]*websocketConnEntry),
+	}
+}
+
+// startRateSampler runs the per-connection throughput sampler until ctx is done. Started
+// explicitly (rather than from the constructor) so tests can build a registry and drive
+// sampleRates by hand without a background goroutine.
+func (r *websocketConnRegistry) startRateSampler(ctx context.Context) {
+	if r == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(websocketRateSampleInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				r.sampleRates(time.Now())
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// sampleRates refreshes every live connection's frames/sec.
+func (r *websocketConnRegistry) sampleRates(now time.Time) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, svc := range r.conns {
+		for _, entry := range svc {
+			entry.sample(now)
+		}
 	}
 }
 
@@ -65,6 +169,7 @@ func (r *websocketConnRegistry) register(
 	wrc *websocketRequestContext,
 	controller websockets.BridgeController,
 	domain, supplier string,
+	frames func() uint64,
 ) {
 	if r == nil || wrc == nil || controller == nil {
 		return
@@ -80,6 +185,11 @@ func (r *websocketConnRegistry) register(
 		controller: controller,
 		domain:     domain,
 		supplier:   supplier,
+		frames:     frames,
+		// Seed the sampler clock at registration so the first sample measures this
+		// connection's lifetime average rather than being discarded for lack of a
+		// baseline — a connection is then rankable after one tick, not two.
+		lastSample: time.Now(),
 	}
 }
 
@@ -130,11 +240,20 @@ func (r *websocketConnRegistry) updateBinding(
 // non-blocking channel send, so a slow or wedged bridge cannot stall the admin request or
 // block registration of new connections.
 func (r *websocketConnRegistry) tumble(req protocol.WebsocketTumbleRequest) protocol.WebsocketTumbleResult {
+	orderBy := req.OrderBy
+	if orderBy != protocol.TumbleOrderConnections {
+		// Default, and the deliberate one: rank by load, not by socket count.
+		orderBy = protocol.TumbleOrderThroughput
+	}
+
 	result := protocol.WebsocketTumbleResult{
-		ServiceID:    req.ServiceID,
-		ByDomain:     make(map[string]int),
-		DomainCounts: make(map[string]int),
-		DryRun:       req.DryRun,
+		ServiceID:         req.ServiceID,
+		ByDomain:          make(map[string]int),
+		DomainCounts:      make(map[string]int),
+		DomainThroughput:  make(map[string]float64),
+		TumbledThroughput: make(map[string]float64),
+		OrderBy:           string(orderBy),
+		DryRun:            req.DryRun,
 	}
 	if r == nil {
 		return result
@@ -151,30 +270,48 @@ func (r *websocketConnRegistry) tumble(req protocol.WebsocketTumbleRequest) prot
 		return result
 	}
 
-	// Snapshot the current distribution and collect the eligible connections.
+	// Snapshot both distributions and collect the eligible connections. Both are reported
+	// even on a dry run, which is what makes a dry run answer "who is actually carrying
+	// this service" — a question connection counts alone cannot answer.
 	type candidate struct {
 		entry  *websocketConnEntry
 		domain string
+		rate   float64
 	}
 	var candidates []candidate
 	for _, entry := range svc {
 		result.DomainCounts[entry.domain]++
+		result.DomainThroughput[entry.domain] += entry.rate
 		if req.Domain != "" && entry.domain != req.Domain {
 			continue
 		}
-		candidates = append(candidates, candidate{entry: entry, domain: entry.domain})
+		candidates = append(candidates, candidate{entry: entry, domain: entry.domain, rate: entry.rate})
 	}
 	result.Matched = len(candidates)
 
-	// Order by descending domain concentration so a Max cap is spent on the operators
-	// that dominate, which is the whole point of a partial tumble. Ties broken by domain
-	// name to keep the operation deterministic.
+	// Order so a Max cap is spent where it shifts the most load.
+	//
+	// Primary key is the chosen per-domain concentration measure — throughput by default,
+	// because moving the busiest OPERATOR is the point of a partial tumble. Secondary key
+	// is the individual connection's rate, so within the chosen operator the cap moves its
+	// heaviest connections first rather than an arbitrary idle one. Remaining ties break on
+	// domain name to keep the operation deterministic.
 	sort.SliceStable(candidates, func(i, j int) bool {
-		ci, cj := result.DomainCounts[candidates[i].domain], result.DomainCounts[candidates[j].domain]
-		if ci != cj {
-			return ci > cj
+		ci, cj := candidates[i], candidates[j]
+		if orderBy == protocol.TumbleOrderConnections {
+			if a, b := result.DomainCounts[ci.domain], result.DomainCounts[cj.domain]; a != b {
+				return a > b
+			}
+		} else {
+			a, b := result.DomainThroughput[ci.domain], result.DomainThroughput[cj.domain]
+			if a != b {
+				return a > b
+			}
 		}
-		return candidates[i].domain < candidates[j].domain
+		if ci.rate != cj.rate {
+			return ci.rate > cj.rate
+		}
+		return ci.domain < cj.domain
 	})
 
 	for _, c := range candidates {
@@ -184,11 +321,13 @@ func (r *websocketConnRegistry) tumble(req protocol.WebsocketTumbleRequest) prot
 		if req.DryRun {
 			result.Tumbled++
 			result.ByDomain[c.domain]++
+			result.TumbledThroughput[c.domain] += c.rate
 			continue
 		}
 		if c.entry.controller.Tumble() {
 			result.Tumbled++
 			result.ByDomain[c.domain]++
+			result.TumbledThroughput[c.domain] += c.rate
 		} else {
 			result.Skipped++
 		}

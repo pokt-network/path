@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	gorillaws "github.com/gorilla/websocket"
@@ -124,6 +125,16 @@ type websocketRequestContext struct {
 	// AttachBridge.
 	wsRegistry *websocketConnRegistry
 
+	// deliveredFrames counts endpoint→client frames delivered over this connection, for
+	// ranking a capped tumble by load rather than by socket count. One firehose subscriber
+	// can outweigh a dozen idle connections, so socket count is a poor proxy for who is
+	// actually carrying a service.
+	//
+	// Atomic because it is written on the bridge goroutine and read by the registry's rate
+	// sampler and by admin requests, both on other goroutines. A single atomic add per
+	// delivered frame is negligible next to the validation and signing already on that path.
+	deliveredFrames atomic.Uint64
+
 	// reputationService tracks endpoint reputation scores.
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
 	reputationService reputation.ReputationService
@@ -153,7 +164,7 @@ func (wrc *websocketRequestContext) AttachBridge(controller websockets.BridgeCon
 	if err != nil {
 		domain = shannonmetrics.ErrDomain
 	}
-	wrc.wsRegistry.register(wrc.serviceID, wrc, controller, domain, ep.Supplier())
+	wrc.wsRegistry.register(wrc.serviceID, wrc, controller, domain, ep.Supplier(), wrc.deliveredFrames.Load)
 }
 
 // OnTumbleRequested marks the next rebind as operator-initiated so it is labelled
@@ -1609,6 +1620,12 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 	// Domain of the endpoint currently serving the connection — see currentDomain().
 	domain := wrc.currentDomain()
 	serviceID := string(wrc.serviceID)
+
+	// Count every frame the endpoint pushed, whatever becomes of it. The count measures the
+	// LOAD this connection puts on the supplier serving it, so a frame that fails validation
+	// or is swallowed as a replay artefact still cost them the work of sending it. Ranking a
+	// capped tumble on this is the whole point — see deliveredFrames.
+	wrc.deliveredFrames.Add(1)
 
 	// If the endpoint currently serving this connection is a fallback endpoint, skip
 	// validation. Fallback endpoints bypass the protocol so the raw message is forwarded.

@@ -30,16 +30,34 @@ func (f *fakeController) callCount() int {
 	return f.calls
 }
 
-// registerN adds n connections on the given domain and returns their controllers.
+// registerN adds n idle connections (no traffic) on the given domain and returns their
+// controllers.
 func registerN(r *websocketConnRegistry, svc protocol.ServiceID, domain string, n int) []*fakeController {
 	ctrls := make([]*fakeController, n)
 	for i := range ctrls {
 		ctrls[i] = &fakeController{}
 		// A fresh pointer per connection: the registry keys on the request context
 		// pointer, which is unique per live connection.
-		r.register(svc, &websocketRequestContext{}, ctrls[i], domain, "supplier-"+domain)
+		r.register(svc, &websocketRequestContext{}, ctrls[i], domain, "supplier-"+domain, func() uint64 { return 0 })
 	}
 	return ctrls
+}
+
+// registerAtRate adds one connection on the given domain whose delivered-frame counter
+// advances by framesPerSample on every sampling pass, and returns its controller.
+func registerAtRate(
+	r *websocketConnRegistry,
+	svc protocol.ServiceID,
+	domain string,
+	framesPerSample uint64,
+) *fakeController {
+	ctrl := &fakeController{}
+	var count uint64
+	r.register(svc, &websocketRequestContext{}, ctrl, domain, "supplier-"+domain, func() uint64 {
+		count += framesPerSample
+		return count
+	})
+	return ctrl
 }
 
 func Test_websocketTumble_DomainFilterMovesOnlyThatOperator(t *testing.T) {
@@ -73,8 +91,12 @@ func Test_websocketTumble_MaxSpendsItselfOnTheMostConcentratedOperator(t *testin
 	small := registerN(r, "bsc", "smallop.xyz", 2)
 
 	// No domain filter: the cap alone must steer the work toward the dominant operator,
-	// which is the point of a partial tumble.
-	result := r.tumble(protocol.WebsocketTumbleRequest{ServiceID: "bsc", Max: 3})
+	// which is the point of a partial tumble. Ordering is requested explicitly — these
+	// connections are idle, so throughput ordering has nothing to discriminate on and the
+	// assertion would otherwise pass only by the alphabetical tie-break.
+	result := r.tumble(protocol.WebsocketTumbleRequest{
+		ServiceID: "bsc", Max: 3, OrderBy: protocol.TumbleOrderConnections,
+	})
 
 	c.Equal(7, result.Matched, "no domain filter means every connection is eligible")
 	c.Equal(3, result.Tumbled, "Max caps the number actually moved")
@@ -128,7 +150,7 @@ func Test_websocketTumble_DeregisteredConnectionIsNeverTumbled(t *testing.T) {
 
 	ctrl := &fakeController{}
 	wrc := &websocketRequestContext{}
-	r.register("bsc", wrc, ctrl, "bigop.net", "supplier-1")
+	r.register("bsc", wrc, ctrl, "bigop.net", "supplier-1", func() uint64 { return 0 })
 	r.deregister("bsc", wrc)
 
 	result := r.tumble(protocol.WebsocketTumbleRequest{ServiceID: "bsc"})
@@ -143,7 +165,7 @@ func Test_websocketTumble_MatchesWhereTheConnectionIsNowNotWhereItStarted(t *tes
 
 	ctrl := &fakeController{}
 	wrc := &websocketRequestContext{}
-	r.register("bsc", wrc, ctrl, "bigop.net", "supplier-1")
+	r.register("bsc", wrc, ctrl, "bigop.net", "supplier-1", func() uint64 { return 0 })
 
 	// The connection rebinds onto a different operator, as a rollover or a prior tumble
 	// would do. A later domain-filtered tumble must follow it.

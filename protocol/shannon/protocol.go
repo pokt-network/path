@@ -295,6 +295,7 @@ func NewProtocol(
 		FullNode: fullNode,
 
 		// Tracks live websocket connections so they can be redistributed on request.
+		// Its throughput sampler is started below, once the instance exists.
 		wsConnRegistry: newWebsocketConnRegistry(),
 
 		// TODO_MVP(@adshmh): verify the gateway address and private key are valid, by completing the following:
@@ -360,6 +361,13 @@ func NewProtocol(
 	} else {
 		protocolInstance.websocketSessionRebindEnabled = true
 		shannonLogger.Warn().Msg("⚠️ EXPERIMENTAL websocket session rebind ENABLED (default-on; set PATH_WEBSOCKET_SESSION_REBIND=false to disable)")
+	}
+
+	// Sample per-connection websocket throughput so a capped admin tumble can be spent on
+	// the connections actually carrying load rather than on whoever holds the most sockets.
+	// Only rebind-capable connections are registered, so this is tied to the same switch.
+	if protocolInstance.websocketSessionRebindEnabled {
+		protocolInstance.wsConnRegistry.startRateSampler(ctx)
 	}
 
 	// Initialize reputation service if enabled.
