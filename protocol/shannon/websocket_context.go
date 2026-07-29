@@ -318,6 +318,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	selectedEndpointAddr protocol.EndpointAddr,
+	probe protocol.WebsocketProbe,
 ) *protocolobservations.Observations {
 	logger := p.logger.With("method", "CheckWebsocketConnection")
 
@@ -357,11 +358,124 @@ func (p *Protocol) CheckWebsocketConnection(
 		logger.Debug().Err(err).Msg("❌ Failed to connect to websocket endpoint")
 		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
-	// Close the test connection immediately — this is only a connectivity probe.
-	conn.Close()
+	defer conn.Close()
+
+	// Handshake-only probe: connecting was the whole test.
+	//
+	// This is not sufficient on its own. A broken endpoint accepts the handshake exactly
+	// like a healthy one — see protocol.WebsocketProbe for the measurement — so a service
+	// whose rules only reach here cannot have a websocket score that means anything.
+	if probe.IsHandshakeOnly() {
+		return nil
+	}
+
+	if err := p.runWebsocketProbe(ctx, logger, serviceID, selectedEndpoint, conn, probe); err != nil {
+		logger.Debug().Err(err).Msg("❌ websocket probe failed")
+		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+	}
 
 	// A nil observation means no error occurred.
 	return nil
+}
+
+// runWebsocketProbe sends the probe payload over an established endpoint connection and,
+// when the probe demands it, waits for a subscription notification.
+//
+// Frames must be signed and responses validated exactly as the live bridge does them —
+// otherwise the relay miner rejects the payload and every endpoint fails identically, which
+// would be worse than the handshake-only check it replaces. Both are reused here through a
+// minimal request context rather than reimplemented.
+//
+// The deadline comes from ctx, which the health-check executor derives from the rule's
+// configured timeout.
+func (p *Protocol) runWebsocketProbe(
+	ctx context.Context,
+	logger polylog.Logger,
+	serviceID protocol.ServiceID,
+	selectedEndpoint endpoint,
+	conn *gorillaws.Conn,
+	probe protocol.WebsocketProbe,
+) error {
+	signer, err := p.getGatewayModePermittedRelaySigner(p.gatewayMode)
+	if err != nil {
+		return fmt.Errorf("%w: websocket probe signer setup: %s", errRequestContextSetupErrSignerSetup, err.Error())
+	}
+
+	// Minimal context carrying just what signing and validation need. It never starts a
+	// bridge, so it holds no registry, no reconnect provider and no subscription state.
+	probeCtx := &websocketRequestContext{
+		logger:             logger,
+		context:            ctx,
+		fullNode:           p.FullNode,
+		selectedEndpoint:   selectedEndpoint,
+		serviceID:          serviceID,
+		relayRequestSigner: signer,
+	}
+
+	payload := []byte(probe.Payload)
+	if !selectedEndpoint.IsFallback() {
+		signed, signErr := probeCtx.signClientWebsocketMessage(payload)
+		if signErr != nil {
+			// A signing failure is OUR fault, not the endpoint's. Surfacing it as an
+			// endpoint error would penalise every endpoint for a gateway problem.
+			return fmt.Errorf("websocket probe: sign payload: %w", signErr)
+		}
+		payload = signed
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(DefaultWebsocketProbeTimeout)
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return fmt.Errorf("websocket probe: set write deadline: %w", err)
+	}
+	if err := conn.WriteMessage(gorillaws.TextMessage, payload); err != nil {
+		return fmt.Errorf("%w: websocket probe: send payload: %s", errCreatingWebSocketConnection, err.Error())
+	}
+
+	// Read until the deadline. The FIRST decodable frame is the acknowledgement (for a
+	// subscribe, the subscription id); any FURTHER frame is a notification, which is the
+	// only evidence that data actually flows.
+	acked := false
+	for {
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			return fmt.Errorf("websocket probe: set read deadline: %w", err)
+		}
+		_, raw, readErr := conn.ReadMessage()
+		if readErr != nil {
+			switch {
+			case !acked:
+				return fmt.Errorf("%w: websocket probe: no response to payload: %s", errCreatingWebSocketConnection, readErr.Error())
+			case probe.RequireNotification:
+				// The case this check exists for: subscription acknowledged, then silence.
+				// The endpoint looks healthy to every other signal — it connected, it
+				// answered — but it delivers nothing to a real subscriber.
+				return fmt.Errorf("%w: websocket probe: subscription acknowledged but no notification delivered before timeout", errCreatingWebSocketConnection)
+			default:
+				return nil
+			}
+		}
+
+		body, statusCode, validateErr := probeCtx.validateEndpointWebsocketMessage(raw)
+		if validateErr != nil {
+			return fmt.Errorf("%w: websocket probe: invalid response: %s", errCreatingWebSocketConnection, validateErr.Error())
+		}
+		if statusCode < 200 || statusCode >= 300 {
+			return fmt.Errorf("%w: websocket probe: endpoint returned HTTP %d: %s", errCreatingWebSocketConnection, statusCode, string(body))
+		}
+
+		if !acked {
+			acked = true
+			if !probe.RequireNotification {
+				return nil
+			}
+			continue
+		}
+
+		// A second decodable frame arrived: the subscription is genuinely delivering.
+		return nil
+	}
 }
 
 func (p *Protocol) getPreSelectedEndpoint(
@@ -1851,3 +1965,8 @@ func (wrc *websocketRequestContext) recordWebsocketSignal(signal reputation.Sign
 		wrc.logger.Warn().Err(err).Msg("Failed to record websocket reputation signal")
 	}
 }
+
+// DefaultWebsocketProbeTimeout bounds a websocket probe when the caller supplied no
+// deadline. The health-check executor always derives one from the rule's timeout, so this
+// only guards a direct call.
+const DefaultWebsocketProbeTimeout = 10 * time.Second

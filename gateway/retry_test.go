@@ -397,7 +397,7 @@ func (m *mockProtocolForRetry) GetConcurrencyConfig() ConcurrencyConfig {
 	}
 }
 
-func (m *mockProtocolForRetry) CheckWebsocketConnection(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr) *protocolobservations.Observations {
+func (m *mockProtocolForRetry) CheckWebsocketConnection(ctx context.Context, serviceID protocol.ServiceID, endpointAddr protocol.EndpointAddr, probe protocol.WebsocketProbe) *protocolobservations.Observations {
 	return nil
 }
 
