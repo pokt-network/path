@@ -2809,8 +2809,17 @@
 - service_id: eth-beacon
   # Ethereum Beacon Chain (consensus layer) - Beacon REST API, not EVM JSON-RPC.
   # Slot time is a fixed 12s protocol constant | Formula: 300s / 12s = 25 slots.
-  # NOTE: head_slot is not an EVM block height, so sync-allowance filtering may be
-  # inert here even with sync_check set. The checks still gate liveness/reputation.
+  #
+  # NO sync_check here. The Beacon REST API wraps everything in {"data": {...}} and
+  # never returns a top-level "result", so the gateway's block-height extraction had
+  # nothing to read and failed every single check as critical_error - on healthy,
+  # fully-synced endpoints reporting "sync_distance":"0". It was a 100% false positive
+  # against every endpoint on the service.
+  #
+  # Do not re-enable it without both: (a) gateway-side support for data.head_slot, and
+  # (b) a perceived-height source for this service. eth-beacon is type "generic" (NoOp
+  # QoS, no height extraction) with no external_block_sources, so perceived height is
+  # permanently 0 and sync-allowance filtering would be inert even once (a) lands.
   sync_allowance: 25
   check_interval: 30s
   enabled: true
@@ -2823,7 +2832,6 @@
       expected_response_contains: '"is_syncing"'
       timeout: 5s
       reputation_signal: critical_error
-      sync_check: true
     - name: node_version
       type: rest
       method: GET

@@ -17,6 +17,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1177,25 +1178,39 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	// Uses the service's sync_allowance (passed as parameter) to validate block height against perceived block number
 	if check.SyncCheck && syncAllowance > 0 {
 		if err := e.validateSyncCheck(serviceID, responseBody, syncAllowance); err != nil {
-			// Sync check validation failed
-			e.logger.Debug().
-				Err(err).
-				Str("service_id", string(serviceID)).
-				Str("endpoint", string(endpointAddr)).
-				Str("check", check.Name).
-				Uint64("sync_allowance", syncAllowance).
-				Dur("latency", latency).
-				Msg("Sync check failed - endpoint block height outside sync allowance")
+			// The check could not be evaluated at all - the rule points at a response shape
+			// whose block height we cannot read. That is our bug, not the endpoint's, and it
+			// fails identically on every endpoint of the service, so it must not cost the
+			// supplier any reputation. Warn (not Debug) so a misconfigured rule is visible
+			// at the production log levels instead of silently degrading a whole service.
+			if errors.Is(err, errSyncCheckNotApplicable) {
+				e.logger.Warn().
+					Err(err).
+					Str("service_id", string(serviceID)).
+					Str("endpoint", string(endpointAddr)).
+					Str("check", check.Name).
+					Msg("Sync check skipped - cannot read a block height from this response shape; check the rule, not the endpoint")
+			} else {
+				// Sync check validation failed
+				e.logger.Debug().
+					Err(err).
+					Str("service_id", string(serviceID)).
+					Str("endpoint", string(endpointAddr)).
+					Str("check", check.Name).
+					Uint64("sync_allowance", syncAllowance).
+					Dur("latency", latency).
+					Msg("Sync check failed - endpoint block height outside sync allowance")
 
-			// Record relay metric for sync check failure
-			statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
-			signalType := metrics.SignalMajorError
-			if check.ReputationSignal != "" {
-				signalType = check.ReputationSignal
+				// Record relay metric for sync check failure
+				statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
+				signalType := metrics.SignalMajorError
+				if check.ReputationSignal != "" {
+					signalType = check.ReputationSignal
+				}
+				metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, signalType, metrics.RelayTypeHealthCheck, latency.Seconds())
+
+				return latency, err
 			}
-			metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, signalType, metrics.RelayTypeHealthCheck, latency.Seconds())
-
-			return latency, err
 		}
 	}
 
@@ -1969,8 +1984,24 @@ func (e *HealthCheckExecutor) detectKnownErrors(
 	return "", nil
 }
 
+// errSyncCheckNotApplicable marks a sync check that could not be evaluated for reasons
+// that are ours, not the endpoint's: the response shape has no block height we know how
+// to read, or no perceived height exists to compare against.
+//
+// This is deliberately distinct from a genuine "endpoint is behind" failure. A rule
+// pointed at a response shape the extractor does not understand fails identically on
+// every endpoint of the service, forever - so charging it to the supplier's reputation
+// converts a config/gateway bug into a service-wide critical_error storm against healthy,
+// fully-synced endpoints. eth-beacon did exactly this: the Beacon REST API wraps its
+// payload in {"data": {...}} and has no top-level "result", so every node_syncing check
+// on every endpoint failed critical while the endpoints reported "sync_distance":"0".
+var errSyncCheckNotApplicable = errors.New("sync check not applicable")
+
 // validateSyncCheck validates that the endpoint's block height is within sync_allowance
 // of the perceived block number from the QoS instance.
+//
+// Returns an error wrapping errSyncCheckNotApplicable when the check could not be
+// evaluated; callers must not apply a reputation penalty in that case.
 func (e *HealthCheckExecutor) validateSyncCheck(
 	serviceID protocol.ServiceID,
 	responseBody []byte,
@@ -1979,7 +2010,7 @@ func (e *HealthCheckExecutor) validateSyncCheck(
 	// Extract block height from response
 	endpointHeight, err := extractBlockHeight(responseBody)
 	if err != nil {
-		return fmt.Errorf("failed to extract block height: %w", err)
+		return fmt.Errorf("%w: failed to extract block height: %s", errSyncCheckNotApplicable, err)
 	}
 
 	// Block height 0 is always invalid
@@ -2037,6 +2068,7 @@ func (e *HealthCheckExecutor) validateSyncCheck(
 // - {"result": "0x1940c6f5"} (EVM eth_blockNumber)
 // - {"result": {"sync_info": {"latest_block_height": "12345"}}} (Cosmos status)
 // - {"result": 12345} (numeric result)
+// - {"data": {"head_slot": "14874850"}} (Beacon REST API - no top-level "result")
 func extractBlockHeight(responseBody []byte) (int64, error) {
 	var response map[string]interface{}
 	if err := json.Unmarshal(responseBody, &response); err != nil {
@@ -2050,6 +2082,21 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 
 	result, exists := response["result"]
 	if !exists {
+		// Beacon REST API: {"data": {"head_slot": "14874850", "sync_distance": "0", ...}}.
+		// head_slot is a consensus-layer slot, not an execution block number - only ever
+		// compare it against a perceived height derived from the same source.
+		if data, ok := response["data"].(map[string]interface{}); ok {
+			if slotStr, ok := data["head_slot"].(string); ok {
+				slot, err := strconv.ParseInt(slotStr, 10, 64)
+				if err != nil {
+					return 0, fmt.Errorf("invalid head_slot: %w", err)
+				}
+				return slot, nil
+			}
+			if slotNum, ok := data["head_slot"].(float64); ok {
+				return int64(slotNum), nil
+			}
+		}
 		return 0, fmt.Errorf("no result field in response")
 	}
 
