@@ -295,7 +295,7 @@ The per-operator (eTLD+1) cap governs **primary** selection. Retry, hedge and ba
 
 **Size it honestly.** Measured 2026-07-30: primary **2184/s**, retries **209/s**, hedges that fired and won **25/s**. The cap-exempt paths are ~10% of selections, not the majority.
 
-**Enable** (default OFF, per-service or via `defaults:`):
+**Ships ON.** It reweights the band and never filters it, so a retry's reachable set is unchanged at any cap value — the risk is bounded by construction rather than by the flag. **Disable** for one service (or via `defaults:`):
 ```yaml
 services:
   - id: <service>

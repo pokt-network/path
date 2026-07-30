@@ -1159,15 +1159,26 @@ func (c *UnifiedServicesConfig) GetBackendRegistrationWeightCapForService(servic
 // DefaultCapRetryHedgeSelection is whether the per-operator concentration cap governs the
 // retry/hedge/batch band selection when neither the service nor the global defaults say.
 //
-// Shipped OFF. The primary path's cap has been live long enough to be trusted; extending it to
-// the band paths changes where a request goes AFTER one attempt has already failed, and the
-// retry path is the one place where narrowing choice has a direct cost — roughly 60% of retries
-// already fail, so its pool is marginal to begin with. Enabling is therefore a deliberate,
-// separately-attributable rollout rather than something that rides along with an unrelated
-// deploy. The implementation cannot narrow the pool (it reweights, never filters), so the
-// expected effect is a redistribution and not a change in retry availability — but "expected"
-// is not "measured", and OFF is what makes the measurement possible.
-const DefaultCapRetryHedgeSelection = false
+// Shipped ON, deliberately reversing an earlier decision to ship it off.
+//
+// The argument for OFF was that this changes where a request goes AFTER an attempt has already
+// failed, and the retry pool is marginal — roughly 60% of retries already fail. That argument
+// is sound about the risk and wrong about the remedy: a switch that ships off is a switch that
+// never gets measured. Two behaviour changes on this branch shipped dark and sat unvalidated
+// for exactly that reason, while every change that shipped live was validated the same day
+// against the other environment. Off is not the cautious choice here; it is the choice that
+// guarantees no evidence.
+//
+// The risk is bounded by construction rather than by the flag: the cap reweights the band and
+// never filters it, so the set of endpoints a retry can reach is bit-for-bit unchanged at any
+// cap value, and a band that has collapsed to one operator is left uncapped. What changes is
+// which member of an unchanged set is picked.
+//
+// Reverting is a pod restart, not a deploy: PATH_CAP_RETRY_HEDGE_SELECTION=false forces it off
+// fleet-wide. Watch path_relays_total{request_type="retry"} split by status_code — the retry
+// success rate is the number that must not move — and path_supplier_exhausted_total on the thin
+// operators the redistributed share lands on.
+const DefaultCapRetryHedgeSelection = true
 
 // retryHedgeCapOverride is a process-wide tri-state override of CapRetryHedgeSelection, set
 // once at startup from PATH_CAP_RETRY_HEDGE_SELECTION: 0 = unset (config decides), 1 = force

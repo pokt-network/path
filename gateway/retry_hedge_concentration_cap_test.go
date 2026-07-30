@@ -117,7 +117,9 @@ func TestPickFromBand_OffSwitchFullyDisables(t *testing.T) {
 		capEnabled *bool
 	}{
 		{"explicitly disabled", "cap-band-off", boolPtr(false)},
-		{"unset falls back to the shipped default (OFF)", "cap-band-unset", nil},
+		// NOTE: "unset" is deliberately absent. The shipped default is ON, so an unset service
+		// is covered by TestGetCapRetryHedgeSelectionForService and by the reshape tests above —
+		// it is no longer a way to reach the disabled path.
 	}
 
 	for _, tc := range cases {
@@ -314,11 +316,22 @@ func TestPickFromBand_ReturnsConcreteSupplier(t *testing.T) {
 func TestGetCapRetryHedgeSelectionForService(t *testing.T) {
 	c := require.New(t)
 
-	t.Run("shipped default is OFF", func(t *testing.T) {
-		c.False(DefaultCapRetryHedgeSelection, "extending the cap to retry/hedge must be opt-in")
+	t.Run("shipped default is ON", func(t *testing.T) {
+		// Ships live rather than opt-in: a switch that ships off never gets measured, and the
+		// risk here is bounded by construction — the cap reweights the band and never filters
+		// it, so a retry's reachable set is unchanged at any cap value. Reverting is
+		// PATH_CAP_RETRY_HEDGE_SELECTION=false, a pod restart rather than a deploy.
+		c.True(DefaultCapRetryHedgeSelection, "the band cap ships live so it can be measured")
 		cfg := &UnifiedServicesConfig{Services: []ServiceConfig{{ID: "svc"}}}
+		c.True(cfg.GetCapRetryHedgeSelectionForService("svc"))
+		c.True((&UnifiedServicesConfig{}).GetCapRetryHedgeSelectionForService("unknown"))
+	})
+
+	t.Run("per-service false still opts out", func(t *testing.T) {
+		cfg := &UnifiedServicesConfig{
+			Services: []ServiceConfig{{ID: "svc", CapRetryHedgeSelection: boolPtr(false)}},
+		}
 		c.False(cfg.GetCapRetryHedgeSelectionForService("svc"))
-		c.False((&UnifiedServicesConfig{}).GetCapRetryHedgeSelectionForService("unknown"))
 	})
 
 	t.Run("global default applies when per-service is unset", func(t *testing.T) {
