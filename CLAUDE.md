@@ -287,6 +287,40 @@ No-op for operators that register one supplier per URL (distinct-URL count == re
 
 Related: `path_concentration_cap_reshaped_total` should **fall**, since deduped shares often land under the cap and need no water-filling.
 
+## Concentration Cap on the Retry / Hedge Paths
+
+The per-operator (eTLD+1) cap governs **primary** selection. Retry, hedge and batch-item picks come from the top-reputation-score band, which is capped by distinct backend URL but **not by operator** — so an operator fronting most of the band took most of the retries and hedges, on the two paths whose entire purpose is to reach different infrastructure than the attempt that just failed.
+
+**Lowering `max_operator_share` does not close this.** The cap was never the binding constraint on the band paths; it simply did not run there.
+
+**Size it honestly.** Measured 2026-07-30: primary **2184/s**, retries **209/s**, hedges that fired and won **25/s**. The cap-exempt paths are ~10% of selections, not the majority.
+
+**Enable** (default OFF, per-service or via `defaults:`):
+```yaml
+services:
+  - id: <service>
+    cap_retry_hedge_selection: true
+```
+**Process-wide override** (a pod restart instead of a config-map edit per service, for flipping while watching a dashboard):
+```bash
+PATH_CAP_RETRY_HEDGE_SELECTION=true   # or =false to force off everywhere
+```
+Unset leaves config in charge. The share value itself is still `max_operator_share`; this key only decides whether the band paths consult it.
+
+**Metric** — a separate counter, not a new label on `path_concentration_cap_reshaped_total`, so the primary path's already-nonzero series stay a valid baseline:
+```
+path_concentration_cap_band_total{service_id, path="retry|hedge|batch", outcome}
+```
+Recorded on **every** band pick, so `outcome="reshaped"` over the total is the real engagement rate. Retry and hedge differ by an order of magnitude in volume — never sum them.
+
+`outcome` values: `reshaped` (distribution altered) · `no_op` (multi-operator band, none over cap) · `degraded_no_room` (band collapsed to one operator or one candidate — pick left **uncapped**, also logged at Debug) · `disabled` (the cap value itself is off) · `no_candidates` (empty band; the caller falls back to an uncapped pick and warns).
+
+`degraded_no_room` is **expected, not an error** — a retry has already excluded the operators it tried. It is what separates "the cap is doing nothing" from "the cap had no room to do anything", and only the latter is a reason to change the cap value.
+
+**Cannot starve a retry:** the cap reweights the band, it never filters it. The set of endpoints a retry can reach is bit-for-bit what it was before, at any cap value.
+
+**What to watch after enabling:** `path_supplier_exhausted_total` for the **thin** operators the excess lands on, not the capped one — a solo-registration backend gains share while still holding one supplier's per-session allowance. Same failure mode as the backend-URL dedup, and self-correcting. Retry success rate — `path_relays_total{request_type="retry"}` split by `status_code` — must not fall; roughly 60% of retries already fail, so that pool is marginal to begin with.
+
 ## Testing Strategy
 
 - **Unit Tests** - Standard Go tests with `-short` flag

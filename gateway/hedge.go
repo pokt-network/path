@@ -537,7 +537,7 @@ func (hr *hedgeRacer) selectHedgeEndpoint(
 	}
 
 	// Select TOP-ranked from filtered list
-	return hr.rc.selectTopRankedEndpoint(filtered, hr.rpcType)
+	return hr.rc.selectTopRankedEndpoint(filtered, hr.rpcType, metrics.CapPathHedge)
 }
 
 // handleResult extracts response data and tracks suppliers.

@@ -91,7 +91,7 @@ func TestTopRankedInstrumentation_RecordsBandAndExclusions(t *testing.T) {
 	endpoints := protocol.EndpointAddrList{a, b, c}
 	const runs = 50
 	for i := 0; i < runs; i++ {
-		require.NotEmpty(t, rc.selectTopRankedEndpoint(endpoints, rpcType))
+		require.NotEmpty(t, rc.selectTopRankedEndpoint(endpoints, rpcType, metrics.CapPathRetry))
 	}
 
 	// In-band operators are candidates on every selection: they could actually win.
@@ -130,7 +130,7 @@ func TestTopRankedInstrumentation_RecordsSingleEndpointPool(t *testing.T) {
 
 	const runs = 8
 	for i := 0; i < runs; i++ {
-		require.Equal(t, ep, rc.selectTopRankedEndpoint(protocol.EndpointAddrList{ep}, sharedtypes.RPCType_JSON_RPC))
+		require.Equal(t, ep, rc.selectTopRankedEndpoint(protocol.EndpointAddrList{ep}, sharedtypes.RPCType_JSON_RPC, metrics.CapPathRetry))
 	}
 
 	require.Equal(t, float64(runs), topRankedSelected(t, string(serviceID), "solo-op.com")-before,

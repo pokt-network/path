@@ -295,6 +295,14 @@ gateway_config:
       # K=1 is backend-uniform (one machine, one vote); a very large K is
       # registration-proportional. Ships at 2 for every service; set a value here to override.
       # backend_registration_weight_cap: 2
+      # Extend max_operator_share to the retry, hedge and batch-item selections (optional).
+      # Those pick from the top-reputation-score band, which is capped by distinct backend URL
+      # but not by operator — so one operator fronting most of the band took most of the
+      # retries and hedges, on the very paths meant to reach different infrastructure than the
+      # attempt that just failed. Ships OFF: it changes where a request goes AFTER an attempt
+      # has failed, and the retry pool is already marginal. The cap reweights the band and
+      # never filters it, so no retry loses a candidate it would otherwise have had.
+      # cap_retry_hedge_selection: true
       # WebSocket rebind strategy (optional). When true (the default), a session-rollover
       # rebind spreads the target uniformly across operators (each provider equally likely),
       # then picks an endpoint within it — maximizing per-provider spread. When false, the

@@ -633,8 +633,11 @@ properties:
               description: "Per-backend registration weight cap (K) for endpoint selection: a backend URL's selection weight is min(supplier registrations behind it, K). K=1 is backend-uniform (one machine, one vote) and ignores that the chain pays per registration; a very large K is registration-proportional and lets an operator buy unbounded share by stacking registrations behind a single machine. If unset, the global default (2) applies."
               type: integer
               minimum: 1
+            cap_retry_hedge_selection:
+              description: "Extend max_operator_share to the retry, hedge and batch-item endpoint selections, which pick from the top-reputation-score band and are otherwise capped by distinct backend URL but not by operator. The cap reweights the band and never filters it, so no retry loses a candidate; where the band spans a single operator the pick is left uncapped. Defaults to false (primary selection only)."
+              type: boolean
             websocket_rebind_operator_uniform:
-              description: "Select a WebSocket rebind target uniformly per operator rather than per endpoint, so an operator with many registrations does not absorb most rebinds. If unset, the global default (ON) applies."
+              description: "WebSocket rebind target selection for this service. When true (the default), a session-rollover rebind spreads the target uniformly across operators, then picks an endpoint within it. When false, the rebind uses the endpoint-count-weighted max_operator_share cap instead."
               type: boolean
             websocket_http_score_floor:
               description: "Gate WebSocket endpoint selection on the endpoint's json_rpc reputation score. WebSocket checks alone move a score slowly, so this borrows the HTTP signal to avoid binding a connection to an endpoint already known to be bad. If unset, the global default (ON) applies."

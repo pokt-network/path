@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -292,6 +293,9 @@ type ServiceDefaults struct {
 	// for any service that does not set its own. nil falls back to the process-wide K
 	// (selector.DefaultBackendRegistrationWeightCap, overridable by env).
 	BackendRegistrationWeightCap *int `yaml:"backend_registration_weight_cap,omitempty"`
+	// CapRetryHedgeSelection is the default for applying the concentration cap to the
+	// retry/hedge/batch band selection. nil falls back to DefaultCapRetryHedgeSelection (OFF).
+	CapRetryHedgeSelection *bool `yaml:"cap_retry_hedge_selection,omitempty"`
 
 	// WebsocketRebindOperatorUniform is the default WebSocket rebind selection strategy.
 	// nil falls back to DefaultWebsocketRebindOperatorUniform (ON).
@@ -341,9 +345,10 @@ type ServiceConfig struct {
 	// the cap for this service (flat selection ∝ endpoint count).
 	//
 	// Scope: the cap governs the primary single-endpoint selection (the bulk of traffic,
-	// HTTP and WebSocket, plus the WebSocket rebind target). It does NOT reshape
-	// multi-endpoint selection (parallel fan-out / hedge), which draw from the same
-	// reputation-filtered pool via separate code paths.
+	// HTTP and WebSocket, plus the WebSocket rebind target). It reaches the retry, hedge and
+	// batch-item selections only when CapRetryHedgeSelection is enabled. It does NOT reshape
+	// multi-endpoint selection (parallel fan-out), which draws from the same
+	// reputation-filtered pool via a separate code path.
 	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
 
 	// BackendRegistrationWeightCap (K) bounds how much selection weight the supplier
@@ -358,6 +363,29 @@ type ServiceConfig struct {
 	// nil = use the process-wide value (selector.DefaultBackendRegistrationWeightCap, moved
 	// fleet-wide by PATH_BACKEND_REGISTRATION_WEIGHT_CAP). Minimum 1.
 	BackendRegistrationWeightCap *int `yaml:"backend_registration_weight_cap,omitempty"`
+	// CapRetryHedgeSelection extends MaxOperatorShare to the retry, hedge and batch-item
+	// selections — the picks made from the top-reputation-score band, which were capped by
+	// distinct backend URL but not by operator. nil = use the global default
+	// (ServiceDefaults.CapRetryHedgeSelection, then DefaultCapRetryHedgeSelection, which is
+	// OFF).
+	//
+	// These paths are a minority of selections (measured in production: ~2184/s primary
+	// against ~209/s retries and ~25/s winning hedges), so enabling this is a ~10% adjustment,
+	// not a redirection of the service. It is nonetheless where concentration leaked, because
+	// a retry exists precisely to reach infrastructure other than the one that just failed.
+	//
+	// Safe by construction: the cap reweights the band, it never filters it, so no retry loses
+	// a candidate it would otherwise have had. Where the band has collapsed to one operator
+	// the cap has no room and the pick is left uncapped (counted as
+	// path_concentration_cap_band_total{outcome="degraded_no_room"}).
+	//
+	// The retry pool is nonetheless marginal — roughly 60% of retries already fail — so the
+	// thing to watch after enabling is NOT the capped operator but the thin ones the excess
+	// lands on: path_supplier_exhausted_total, since a solo-registration backend gains share
+	// while still holding one supplier's per-session allowance. Same failure mode as the
+	// backend-URL dedup, and self-correcting (an exhausted supplier is filtered per-supplier
+	// and its share redistributes), but it is the expected way this goes wrong.
+	CapRetryHedgeSelection *bool `yaml:"cap_retry_hedge_selection,omitempty"`
 
 	// WebsocketRebindOperatorUniform selects the WebSocket rebind strategy for this service.
 	// When true (the default), a session-rollover rebind picks the target operator uniformly
@@ -1126,6 +1154,57 @@ func (c *UnifiedServicesConfig) GetBackendRegistrationWeightCapForService(servic
 		return *c.Defaults.BackendRegistrationWeightCap
 	}
 	return 0
+}
+
+// DefaultCapRetryHedgeSelection is whether the per-operator concentration cap governs the
+// retry/hedge/batch band selection when neither the service nor the global defaults say.
+//
+// Shipped OFF. The primary path's cap has been live long enough to be trusted; extending it to
+// the band paths changes where a request goes AFTER one attempt has already failed, and the
+// retry path is the one place where narrowing choice has a direct cost — roughly 60% of retries
+// already fail, so its pool is marginal to begin with. Enabling is therefore a deliberate,
+// separately-attributable rollout rather than something that rides along with an unrelated
+// deploy. The implementation cannot narrow the pool (it reweights, never filters), so the
+// expected effect is a redistribution and not a change in retry availability — but "expected"
+// is not "measured", and OFF is what makes the measurement possible.
+const DefaultCapRetryHedgeSelection = false
+
+// retryHedgeCapOverride is a process-wide tri-state override of CapRetryHedgeSelection, set
+// once at startup from PATH_CAP_RETRY_HEDGE_SELECTION: 0 = unset (config decides), 1 = force
+// on for every service, -1 = force off for every service.
+//
+// It exists because this switch is the kind that gets flipped while watching a dashboard, on
+// one environment and not the other, and an env var is a pod restart rather than a config-map
+// edit per service. Same pattern as PATH_OPERATOR_SHARE_BY_BACKEND_URL.
+var retryHedgeCapOverride atomic.Int32
+
+// SetRetryHedgeCapOverride forces the retry/hedge concentration cap on or off for every
+// service, overriding config. Call once at startup.
+func SetRetryHedgeCapOverride(enabled bool) {
+	if enabled {
+		retryHedgeCapOverride.Store(1)
+		return
+	}
+	retryHedgeCapOverride.Store(-1)
+}
+
+// GetCapRetryHedgeSelectionForService reports whether the per-operator concentration cap should
+// govern this service's retry/hedge/batch band selection. The process-wide override wins if
+// set; otherwise per-service config, then global defaults, then DefaultCapRetryHedgeSelection.
+func (c *UnifiedServicesConfig) GetCapRetryHedgeSelectionForService(serviceID protocol.ServiceID) bool {
+	switch retryHedgeCapOverride.Load() {
+	case 1:
+		return true
+	case -1:
+		return false
+	}
+	if svc := c.GetServiceConfig(serviceID); svc != nil && svc.CapRetryHedgeSelection != nil {
+		return *svc.CapRetryHedgeSelection
+	}
+	if c.Defaults.CapRetryHedgeSelection != nil {
+		return *c.Defaults.CapRetryHedgeSelection
+	}
+	return DefaultCapRetryHedgeSelection
 }
 
 // ResolveStaticResponse returns the configured static response for a service's request path

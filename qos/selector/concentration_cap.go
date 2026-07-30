@@ -776,6 +776,120 @@ func pickBackend(
 	}
 }
 
+// BandCapOutcome reports what the per-operator concentration cap did to one retry/hedge band
+// pick. It exists so the caller can attribute the decision to its own path and, above all, so
+// the degraded case is countable instead of silent.
+type BandCapOutcome int
+
+const (
+	// BandCapNoCandidates: the band was empty. Nothing was selected; the caller must fall back.
+	BandCapNoCandidates BandCapOutcome = iota
+	// BandCapDisabled: maxOperatorShare itself is off (<= 0 or >= 1), so the pick is the
+	// uncapped backend-uniform one — byte-for-byte the pre-cap behavior. Reserved strictly for
+	// the cap VALUE being off, so the metric can prove the configured state from the outside;
+	// a band the cap merely cannot act on reports BandCapNoRoom instead.
+	BandCapDisabled
+	// BandCapNoRoom: the cap is on, but there is nowhere to redistribute over-cap mass to —
+	// every candidate in the band belongs to ONE operator, or the band holds one candidate.
+	// Degraded to the uncapped pick. This is the expected outcome for most retries, not an
+	// error: a retry excludes the operators it has already tried, so its remaining band is
+	// frequently single-operator.
+	BandCapNoRoom
+	// BandCapNoOp: the cap is on and the band spans several operators, but none exceeds the
+	// cap — the capped pick reduces exactly to the uncapped one.
+	BandCapNoOp
+	// BandCapReshaped: the cap is on and actually altered the pick's distribution.
+	BandCapReshaped
+)
+
+// String returns the metric label value for an outcome.
+func (o BandCapOutcome) String() string {
+	switch o {
+	case BandCapNoCandidates:
+		return "no_candidates"
+	case BandCapDisabled:
+		return "disabled"
+	case BandCapNoRoom:
+		return "degraded_no_room"
+	case BandCapNoOp:
+		return "no_op"
+	case BandCapReshaped:
+		return "reshaped"
+	default:
+		return "unknown"
+	}
+}
+
+// SelectBandWithConcentrationCap picks one endpoint from an ALREADY quality-filtered band —
+// the reputation-ranked retry/hedge band, whose members are all within the score epsilon and
+// therefore equally acceptable — applying the same per-operator (eTLD+1) concentration cap and
+// water-filling that governs primary selection.
+//
+// Why the band needs it at all: the band pick was uniform over distinct backend URLs, which
+// bounds a single MACHINE's share but not a single OPERATOR's. An operator fronting most of the
+// band's backends therefore took most of the retries and hedges, so concentration leaked
+// through the two paths whose entire purpose is to reach different infrastructure than the
+// attempt that just failed.
+//
+// The cap is applied as a REWEIGHTING, never as a filter. No candidate is ever removed from the
+// band, so a retry can never be starved of somewhere to go: the worst case is that the weights
+// are the same ones it would have used anyway. When the band holds a single operator the cap
+// has no room to redistribute and the pick degrades to the uncapped one, reported as
+// BandCapNoRoom so the degradation is visible rather than inferred.
+//
+// Selection stays two-stage and always resolves to a concrete supplier registration
+// (operator -> backend URL -> supplier), because a relay is signed against a supplier's session
+// and each supplier carries its own per-session service allowance. With backend-URL dedup
+// disabled (PATH_OPERATOR_SHARE_BY_BACKEND_URL=false) the shares are denominated in supplier
+// registrations instead, exactly as on the primary path.
+//
+// Emits no metrics: only the caller knows which path (retry, hedge, batch item) it is on, and
+// that attribution is the point of the outcome return.
+func SelectBandWithConcentrationCap(
+	band protocol.EndpointAddrList,
+	maxOperatorShare float64,
+) (protocol.EndpointAddr, BandCapOutcome) {
+	n := len(band)
+	if n == 0 {
+		return protocol.EndpointAddr(""), BandCapNoCandidates
+	}
+
+	// Cap value disabled (the config off-switch): take the uncapped pick without paying for
+	// the grouping.
+	if maxOperatorShare <= 0 || maxOperatorShare >= 1 {
+		return PickBackendUniform(band), BandCapDisabled
+	}
+
+	// One candidate: nothing to spread. Reported as no-room rather than disabled — the cap is
+	// configured on and the dashboards must not read that as an off gate.
+	if n == 1 {
+		return band[0], BandCapNoRoom
+	}
+
+	// Process-wide K, not a per-service one: this selector is handed a band and a cap value by
+	// its caller and never a serviceID, so there is nothing here to resolve a per-service
+	// override from. A service that overrides backend_registration_weight_cap therefore gets
+	// that K on its primary pick and the fleet-wide K on its band picks. Acceptable while the
+	// band cap is opt-in per service; thread the serviceID through if that changes.
+	pools, totalUnits, maxUnits := groupPool(band, effectiveWeightCap(""))
+	if len(pools) <= 1 {
+		// Single operator: capping it would mean excluding every candidate. Degrade to the
+		// uncapped pick — a retry with no candidate is strictly worse than a retry that lands
+		// on the only operator still available.
+		return PickBackendUniform(band), BandCapNoRoom
+	}
+
+	selected, _, reshaped := pickWeightedFromPools(pools, totalUnits, maxUnits, maxOperatorShare)
+	if selected == "" {
+		// Defensive: pickWeightedFromPools always returns a band member for a non-empty grouping.
+		return PickBackendUniform(band), BandCapNoRoom
+	}
+	if reshaped {
+		return selected, BandCapReshaped
+	}
+	return selected, BandCapNoOp
+}
+
 // CountDistinctBackends returns how many distinct backend URLs a pool spans. Exported for
 // observability: a band of 25 endpoints across 6 backends is far less diverse than its
 // member count suggests, and that gap is the thing worth logging.
