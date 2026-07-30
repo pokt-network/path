@@ -68,23 +68,46 @@ func SelectWithConcentrationCap(
 		counts[p.key] = p.units()
 	}
 
-	// The cap reshapes only when some operator exceeds it (units_i > cap*totalUnits) or the
-	// pool is too concentrated for the cap to be satisfiable (cap*m <= 1 ->
-	// uniform-over-operators). A single operator, or a dominant share already at/under the
-	// cap, is a no-op: the capped weighted pick reduces to a flat pick over units, so take
-	// that directly.
-	infeasible := maxOperatorShare*float64(m) <= 1.0
-	if m == 1 || (!infeasible && float64(maxUnits) <= maxOperatorShare*float64(totalUnits)) {
-		selected, opKey := pickUniformOverUnits(pools, totalUnits)
-		// Instrumented: "the cap was a no-op" is the majority of selections and the case a
-		// reshape-only metric cannot see, so it is exactly where a skew would hide.
-		// m == 1 means the pool reached the selector already collapsed to one operator.
-		metrics.RecordSelectionPool(string(serviceID), metrics.SelectionPathConcentrationCap, counts, totalUnits, opKey)
-		return selected
+	selected, opKey, reshaped := capPickOverPools(pools, totalUnits, maxUnits, maxOperatorShare)
+	if reshaped {
+		// The distribution is actually being altered, so record it.
+		metrics.RecordConcentrationCapReshaped(string(serviceID))
+	}
+	// Instrumented on both outcomes: "the cap was a no-op" is the majority of selections and
+	// the case a reshape-only metric cannot see, so it is exactly where a skew would hide.
+	metrics.RecordSelectionPool(string(serviceID), metrics.SelectionPathConcentrationCap, counts, totalUnits, opKey)
+	return selected
+}
+
+// capPickOverPools is the cap's decision, over pools already grouped by groupPool: a flat
+// pick over units when no operator exceeds the cap, otherwise a water-filled weighted pick
+// of an operator followed by a unit within it and a supplier within the unit. It reports the
+// winning operator's key and whether the distribution was actually reshaped.
+//
+// Factored out so every capped path (primary selection and the retry/hedge band) runs the
+// SAME water-filling, rather than a second implementation that can drift from it. It emits no
+// metrics: each caller attributes the decision to its own path.
+//
+// The cap reshapes only when some operator exceeds it (units_i > cap*totalUnits) or the pool
+// is too concentrated for the cap to be satisfiable (cap*m <= 1 -> uniform-over-operators).
+// A single operator, or a dominant share already at/under the cap, is a no-op: the capped
+// weighted pick reduces to a flat pick over units, so it takes that directly.
+func capPickOverPools(
+	pools []*operatorPool,
+	totalUnits, maxUnits int,
+	maxOperatorShare float64,
+) (selected protocol.EndpointAddr, operatorKey string, reshaped bool) {
+	m := len(pools)
+	if m == 0 || totalUnits <= 0 {
+		return protocol.EndpointAddr(""), "", false
 	}
 
-	// Phase 2 - reshape. The distribution is actually being altered here, so record it.
-	metrics.RecordConcentrationCapReshaped(string(serviceID))
+	infeasible := maxOperatorShare*float64(m) <= 1.0
+	if m == 1 || (!infeasible && float64(maxUnits) <= maxOperatorShare*float64(totalUnits)) {
+		// m == 1 means the pool reached the selector already collapsed to one operator.
+		addr, opKey := pickUniformOverUnits(pools, totalUnits)
+		return addr, opKey, false
+	}
 
 	weights := make([]float64, m)
 	if infeasible {
@@ -101,11 +124,8 @@ func SelectWithConcentrationCap(
 		waterFillToCap(weights, maxOperatorShare)
 	}
 
-	// Weighted pick of an operator, then a unit within it, then a supplier within the unit.
 	chosen := pools[weightedPick(weights)]
-	selected := chosen.pickEndpoint()
-	metrics.RecordSelectionPool(string(serviceID), metrics.SelectionPathConcentrationCap, counts, totalUnits, chosen.key)
-	return selected
+	return chosen.pickEndpoint(), chosen.key, true
 }
 
 // dedupeOperatorShareByBackendURL controls whether an operator's selection share is
@@ -458,6 +478,115 @@ func PickBackendUniform(endpoints protocol.EndpointAddrList) protocol.EndpointAd
 	}
 
 	return order[rand.Intn(len(order))].pick()
+}
+
+// BandCapOutcome reports what the per-operator concentration cap did to one retry/hedge band
+// pick. It exists so the caller can attribute the decision to its own path and, above all, so
+// the degraded case is countable instead of silent.
+type BandCapOutcome int
+
+const (
+	// BandCapNoCandidates: the band was empty. Nothing was selected; the caller must fall back.
+	BandCapNoCandidates BandCapOutcome = iota
+	// BandCapDisabled: maxOperatorShare itself is off (<= 0 or >= 1), so the pick is the
+	// uncapped backend-uniform one — byte-for-byte the pre-cap behavior. Reserved strictly for
+	// the cap VALUE being off, so the metric can prove the configured state from the outside;
+	// a band the cap merely cannot act on reports BandCapNoRoom instead.
+	BandCapDisabled
+	// BandCapNoRoom: the cap is on, but there is nowhere to redistribute over-cap mass to —
+	// every candidate in the band belongs to ONE operator, or the band holds one candidate.
+	// Degraded to the uncapped pick. This is the expected outcome for most retries, not an
+	// error: a retry excludes the operators it has already tried, so its remaining band is
+	// frequently single-operator.
+	BandCapNoRoom
+	// BandCapNoOp: the cap is on and the band spans several operators, but none exceeds the
+	// cap — the capped pick reduces exactly to the uncapped one.
+	BandCapNoOp
+	// BandCapReshaped: the cap is on and actually altered the pick's distribution.
+	BandCapReshaped
+)
+
+// String returns the metric label value for an outcome.
+func (o BandCapOutcome) String() string {
+	switch o {
+	case BandCapNoCandidates:
+		return "no_candidates"
+	case BandCapDisabled:
+		return "disabled"
+	case BandCapNoRoom:
+		return "degraded_no_room"
+	case BandCapNoOp:
+		return "no_op"
+	case BandCapReshaped:
+		return "reshaped"
+	default:
+		return "unknown"
+	}
+}
+
+// SelectBandWithConcentrationCap picks one endpoint from an ALREADY quality-filtered band —
+// the reputation-ranked retry/hedge band, whose members are all within the score epsilon and
+// therefore equally acceptable — applying the same per-operator (eTLD+1) concentration cap and
+// water-filling that governs primary selection.
+//
+// Why the band needs it at all: the band pick was uniform over distinct backend URLs, which
+// bounds a single MACHINE's share but not a single OPERATOR's. An operator fronting most of the
+// band's backends therefore took most of the retries and hedges, so concentration leaked
+// through the two paths whose entire purpose is to reach different infrastructure than the
+// attempt that just failed.
+//
+// The cap is applied as a REWEIGHTING, never as a filter. No candidate is ever removed from the
+// band, so a retry can never be starved of somewhere to go: the worst case is that the weights
+// are the same ones it would have used anyway. When the band holds a single operator the cap
+// has no room to redistribute and the pick degrades to the uncapped one, reported as
+// BandCapNoRoom so the degradation is visible rather than inferred.
+//
+// Selection stays two-stage and always resolves to a concrete supplier registration
+// (operator -> backend URL -> supplier), because a relay is signed against a supplier's session
+// and each supplier carries its own per-session service allowance. With backend-URL dedup
+// disabled (PATH_OPERATOR_SHARE_BY_BACKEND_URL=false) the shares are denominated in supplier
+// registrations instead, exactly as on the primary path.
+//
+// Emits no metrics: only the caller knows which path (retry, hedge, batch item) it is on, and
+// that attribution is the point of the outcome return.
+func SelectBandWithConcentrationCap(
+	band protocol.EndpointAddrList,
+	maxOperatorShare float64,
+) (protocol.EndpointAddr, BandCapOutcome) {
+	n := len(band)
+	if n == 0 {
+		return protocol.EndpointAddr(""), BandCapNoCandidates
+	}
+
+	// Cap value disabled (the config off-switch): take the uncapped pick without paying for
+	// the grouping.
+	if maxOperatorShare <= 0 || maxOperatorShare >= 1 {
+		return PickBackendUniform(band), BandCapDisabled
+	}
+
+	// One candidate: nothing to spread. Reported as no-room rather than disabled — the cap is
+	// configured on and the dashboards must not read that as an off gate.
+	if n == 1 {
+		return band[0], BandCapNoRoom
+	}
+
+	pools, totalUnits, maxUnits := groupPool(band)
+	if len(pools) <= 1 {
+		// Single operator: capping it would mean excluding every candidate. Degrade to the
+		// uncapped pick — a retry with no candidate is strictly worse than a retry that lands
+		// on the only operator still available.
+		return PickBackendUniform(band), BandCapNoRoom
+	}
+
+	selected, _, reshaped := capPickOverPools(pools, totalUnits, maxUnits, maxOperatorShare)
+	if selected == "" {
+		// Defensive: capPickOverPools always returns a band member for a non-empty grouping.
+		return PickBackendUniform(band), BandCapNoRoom
+	}
+	if reshaped {
+		return selected, BandCapReshaped
+	}
+	return selected, BandCapNoOp
 }
 
 // CountDistinctBackends returns how many distinct backend URLs a pool spans. Exported for

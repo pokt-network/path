@@ -701,9 +701,63 @@ var ConcentrationCapReshapedTotal = promauto.NewCounterVec(
 )
 
 // RecordConcentrationCapReshaped increments the concentration-cap reshape counter for a
-// service. Called once per selection whose distribution the cap actually altered.
+// service. Called once per PRIMARY selection whose distribution the cap actually altered.
+//
+// Deliberately left unlabeled by path: the retry/hedge band paths report through
+// ConcentrationCapBandTotal instead, so this counter's existing per-service series keep their
+// continuity and remain a valid before/after baseline for the primary path.
 func RecordConcentrationCapReshaped(serviceID string) {
 	ConcentrationCapReshapedTotal.WithLabelValues(serviceID).Inc()
+}
+
+// ConcentrationCapBandTotal counts endpoint picks made from the top-reputation-score band —
+// the retry, hedge, and batch-item paths — by what the per-operator concentration cap did to
+// each one.
+//
+// It is a SEPARATE counter from ConcentrationCapReshapedTotal rather than a new label on it,
+// for two reasons:
+//   - The primary path's series must stay byte-identical so its already-nonzero rate remains a
+//     usable baseline. Adding a label would end those series and start new ones.
+//   - "Did extending the cap to retry/hedge do anything" needs a counter that starts at zero,
+//     and needs its own denominator: this one is recorded on EVERY band pick, including the
+//     ones the cap left alone, so outcome="reshaped" divided by the total is the real
+//     engagement rate rather than an unanchored count.
+//
+// The `path` label names the call site — retry, hedge, or batch — i.e. a refinement of
+// path="top_ranked" on the selection_* metrics. Retry and hedge do NOT carry comparable
+// volume (measured in production: ~209/s retries against ~25/s winning hedges), so they must
+// never be summed into one "retry/hedge" figure.
+//
+// The `outcome` label is the BandCapOutcome. degraded_no_room is the one to watch: it means
+// the band had collapsed to a single operator and the cap had nowhere to redistribute to, so
+// the pick was left uncapped. That is expected on retries (a retry excludes the operators it
+// already tried) and is the metric that separates "the cap is doing nothing" from "the cap
+// had no room to do anything".
+var ConcentrationCapBandTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "concentration_cap_band_total",
+		Help: "Retry/hedge/batch band endpoint picks, by service_id, call-site path (retry|hedge|batch) and concentration-cap outcome (reshaped|no_op|degraded_no_room|disabled|no_candidates).",
+	},
+	[]string{LabelServiceID, LabelSelectionPath, "outcome"},
+)
+
+// Call-site paths for ConcentrationCapBandTotal's `path` label. These refine
+// SelectionPathTopRanked, which cannot distinguish them.
+const (
+	// CapPathRetry is a retry's replacement-endpoint selection (attempt >= 2), on both the
+	// single-request and parallel paths.
+	CapPathRetry = "retry"
+	// CapPathHedge is the hedge racer's second-endpoint selection.
+	CapPathHedge = "hedge"
+	// CapPathBatch is a batch item's FIRST selection — the primary decision for that item, not
+	// an overflow path. Labeled separately because folding it into "retry" would make a
+	// batch-heavy service's ordinary traffic look like retry traffic.
+	CapPathBatch = "batch"
+)
+
+// RecordConcentrationCapBand records one band pick and what the cap did to it.
+func RecordConcentrationCapBand(serviceID, path, outcome string) {
+	ConcentrationCapBandTotal.WithLabelValues(serviceID, path, outcome).Inc()
 }
 
 // SelectionCandidateTotal counts, per selection, every operator PRESENT in the candidate

@@ -45,6 +45,19 @@ func getServiceQoSInstances(
 		hydratedLogger.Info().Msg("✅ operator concentration share counted by distinct BACKEND URL")
 	}
 
+	// Extend the per-operator concentration cap to the retry/hedge/batch band selections,
+	// overriding per-service config for every service. Default OFF (config decides, and its
+	// default is also OFF): these paths route a request only AFTER an attempt has failed, so
+	// they are rolled out and attributed separately from the primary path's cap.
+	switch os.Getenv("PATH_CAP_RETRY_HEDGE_SELECTION") {
+	case "true":
+		gateway.SetRetryHedgeCapOverride(true)
+		hydratedLogger.Warn().Msg("⚠️ per-operator concentration cap FORCED ON for retry/hedge/batch selection for every service (PATH_CAP_RETRY_HEDGE_SELECTION=true)")
+	case "false":
+		gateway.SetRetryHedgeCapOverride(false)
+		hydratedLogger.Warn().Msg("⚠️ per-operator concentration cap FORCED OFF for retry/hedge/batch selection for every service (PATH_CAP_RETRY_HEDGE_SELECTION=false)")
+	}
+
 	// Wait for the protocol to become healthy before configuring QoS instances.
 	err := waitForProtocolHealth(hydratedLogger, protocolInstance, defaultProtocolHealthTimeout)
 	if err != nil {

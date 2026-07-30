@@ -12,6 +12,7 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/stretchr/testify/require"
 
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/observation"
 	protocolobservations "github.com/pokt-network/path/observation/protocol"
@@ -333,11 +334,17 @@ type mockProtocolForRetry struct {
 	unifiedConfigNil bool
 	retryConfig      *ServiceRetryConfig
 	reputationSvc    reputation.ReputationService // nil unless a test injects one
+	// unifiedConfig, when set, is returned verbatim instead of the synthesized one — for tests
+	// that need real per-service settings (e.g. the retry/hedge concentration cap gate).
+	unifiedConfig *UnifiedServicesConfig
 }
 
 func (m *mockProtocolForRetry) GetUnifiedServicesConfig() *UnifiedServicesConfig {
 	if m.unifiedConfigNil {
 		return nil
+	}
+	if m.unifiedConfig != nil {
+		return m.unifiedConfig
 	}
 	return &UnifiedServicesConfig{
 		Services: []ServiceConfig{
@@ -1233,7 +1240,7 @@ func TestSelectTopRankedEndpoint_SpreadsOverflowAcrossBand(t *testing.T) {
 	counts := map[protocol.EndpointAddr]int{}
 	const iterations = 600
 	for i := 0; i < iterations; i++ {
-		counts[rc.selectTopRankedEndpoint(endpoints, rpcType)]++
+		counts[rc.selectTopRankedEndpoint(endpoints, rpcType, metrics.CapPathRetry)]++
 	}
 
 	// Spread: every in-band endpoint is selected at least once. Under the old strict-#1

@@ -629,6 +629,12 @@ properties:
             max_operator_share:
               description: "Per-operator (registrable domain / eTLD+1) concentration cap for endpoint selection. Caps the fraction of this service's selections any single operator may receive; excess is spread across the other valid operators. Bounds the blast radius of one operator failing when it holds most of the valid pool. Range (0, 1); a value <= 0 or >= 1 disables the cap. If unset, the global default (0.65) applies."
               type: number
+            cap_retry_hedge_selection:
+              description: "Extend max_operator_share to the retry, hedge and batch-item endpoint selections, which pick from the top-reputation-score band and are otherwise capped by distinct backend URL but not by operator. The cap reweights the band and never filters it, so no retry loses a candidate; where the band spans a single operator the pick is left uncapped. Defaults to false (primary selection only)."
+              type: boolean
+            websocket_rebind_operator_uniform:
+              description: "WebSocket rebind target selection for this service. When true (the default), a session-rollover rebind spreads the target uniformly across operators, then picks an endpoint within it. When false, the rebind uses the endpoint-count-weighted max_operator_share cap instead."
+              type: boolean
 
   # Logger Configuration (optional)
   logger_config:

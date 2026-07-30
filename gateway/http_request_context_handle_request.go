@@ -504,7 +504,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			}
 
 			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
-			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType)
+			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType, metrics.CapPathRetry)
 			if newEndpointAddr == "" {
 				logger.Error().Msg("Failed to select endpoint for retry - no endpoints available")
 				lastErr = fmt.Errorf("no endpoints available for retry")
@@ -1191,8 +1191,13 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			break
 		}
 
-		// Select endpoint
-		selectedEndpoint := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType)
+		// Select endpoint. attempt 1 is this batch item's PRIMARY selection, not an overflow
+		// pick — attributing it to "retry" would make ordinary batch traffic read as retries.
+		capPath := metrics.CapPathBatch
+		if attempt > 1 {
+			capPath = metrics.CapPathRetry
+		}
+		selectedEndpoint := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType, capPath)
 		if selectedEndpoint == "" {
 			selectedEndpoint = filteredEndpoints[0]
 		}
@@ -1573,7 +1578,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			}
 
 			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
-			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType)
+			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType, metrics.CapPathRetry)
 			if newEndpointAddr == "" {
 				logger.Error().Int("endpoint_index", index).
 					Msg("Failed to select endpoint for retry in parallel path - no endpoints available")
@@ -2139,10 +2144,15 @@ const retryHedgeScoreEpsilon = 2.0
 // as a QoS validation filter. Treat changes here as changes to the main routing path, not to
 // an overflow path. metrics.RecordTopRankedSelection makes that traffic visible.
 //
+// capPath names the call site for the concentration-cap band metric (metrics.CapPathRetry /
+// CapPathHedge / CapPathBatch). Retry, hedge and batch-item selections all land here and carry
+// very different volumes, so they must be attributable separately.
+//
 // Falls back to the first endpoint in the list if reputation service is unavailable.
 func (rc *requestContext) selectTopRankedEndpoint(
 	endpoints protocol.EndpointAddrList,
 	rpcType sharedtypes.RPCType,
+	capPath string,
 ) protocol.EndpointAddr {
 	if len(endpoints) == 0 {
 		return ""
@@ -2220,15 +2230,10 @@ func (rc *requestContext) selectTopRankedEndpoint(
 	}
 
 	// Pick within the top-scoring band to spread retry/hedge overflow (and blast radius)
-	// instead of always dogpiling the strict #1.
-	//
-	// The pick is uniform over distinct BACKEND URLs, not over band members. Reputation keys
-	// are per-supplier, and several suppliers can register against the same backend, so a
-	// member-uniform pick gave one machine fronted by 7 registrations 7x the traffic of an
-	// equally-scored sibling machine with 1 — the band looked diverse while the traffic was
-	// not. PickBackendUniform still returns a specific supplier registration, so signing and
-	// per-supplier service allowance are unaffected.
-	originalEndpoint := selector.PickBackendUniform(bandEndpoints)
+	// instead of always dogpiling the strict #1. See pickFromBand for the two rules that
+	// govern the pick: uniform over distinct backend URLs, and — when enabled — the
+	// per-operator concentration cap on top of it.
+	originalEndpoint := rc.pickFromBand(bandEndpoints, capPath)
 	if originalEndpoint == "" {
 		// Every band key failed to map back to an endpoint. Shouldn't happen; fall back
 		// rather than return an empty address.
@@ -2249,6 +2254,63 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		Msg("🏆 Selected endpoint from top-scoring band for retry/hedge (spreads overflow)")
 
 	return originalEndpoint
+}
+
+// pickFromBand chooses one endpoint from the top-reputation-score band.
+//
+// Two rules apply, in order:
+//
+//  1. Always: the pick is uniform over distinct BACKEND URLs, not over band members.
+//     Reputation keys are per-supplier and several suppliers can register against the same
+//     backend, so a member-uniform pick gave one machine fronted by 7 registrations 7x the
+//     traffic of an equally-scored sibling machine with 1 — the band looked diverse while the
+//     traffic was not.
+//
+//  2. When cap_retry_hedge_selection is enabled for the service: the per-operator (eTLD+1)
+//     concentration cap is applied on top, via the SAME water-filling the primary path uses.
+//     Rule 1 bounds one machine's share of the band; it does nothing about one OPERATOR
+//     fronting most of the band's machines, which is how concentration reached the two paths
+//     whose entire purpose is to escape the infrastructure that just failed.
+//
+// Either way the result is a concrete supplier registration — a relay is signed against a
+// supplier's session and each supplier carries its own per-session service allowance.
+//
+// The cap can never cost this path a candidate: it reweights the band and never filters it.
+// When the band holds a single operator there is nothing to redistribute to, so the pick stays
+// uncapped and is recorded as outcome="degraded_no_room" — the honest answer for a retry, which
+// needs somewhere to go more than it needs the cap honored. That case is the norm rather than
+// the exception, because a retry has already excluded the operators it tried.
+func (rc *requestContext) pickFromBand(
+	band protocol.EndpointAddrList,
+	capPath string,
+) protocol.EndpointAddr {
+	// Nil receiver / no config reachable: rule 1 only. Mirrors recordTopRankedSelection's
+	// guard — a routing refinement is never worth a panic.
+	if rc == nil || rc.protocol == nil {
+		return selector.PickBackendUniform(band)
+	}
+	unifiedConfig := rc.protocol.GetUnifiedServicesConfig()
+	if unifiedConfig == nil || !unifiedConfig.GetCapRetryHedgeSelectionForService(rc.serviceID) {
+		return selector.PickBackendUniform(band)
+	}
+
+	selected, outcome := selector.SelectBandWithConcentrationCap(
+		band,
+		unifiedConfig.GetMaxOperatorShareForService(rc.serviceID),
+	)
+	metrics.RecordConcentrationCapBand(string(rc.serviceID), capPath, outcome.String())
+
+	if outcome == selector.BandCapNoRoom && rc.logger != nil {
+		// Logged, not silent: "the cap did nothing" and "the cap had no room to do anything"
+		// are different findings, and only one of them is a reason to change the cap value.
+		rc.logger.Debug().
+			Str("cap_path", capPath).
+			Int("band_size", len(band)).
+			Int("distinct_backends_in_band", selector.CountDistinctBackends(band)).
+			Msg("Concentration cap left uncapped: band spans a single operator, nothing to redistribute to")
+	}
+
+	return selected
 }
 
 // recordTopRankedSelection reports one selectTopRankedEndpoint decision to the selection
