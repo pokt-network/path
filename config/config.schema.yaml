@@ -629,6 +629,12 @@ properties:
             max_operator_share:
               description: "Per-operator (registrable domain / eTLD+1) concentration cap for endpoint selection. Caps the fraction of this service's selections any single operator may receive; excess is spread across the other valid operators. Bounds the blast radius of one operator failing when it holds most of the valid pool. Range (0, 1); a value <= 0 or >= 1 disables the cap. If unset, the global default (0.65) applies."
               type: number
+            websocket_rebind_operator_uniform:
+              description: "Select a WebSocket rebind target uniformly per operator rather than per endpoint, so an operator with many registrations does not absorb most rebinds. If unset, the global default (ON) applies."
+              type: boolean
+            websocket_http_score_floor:
+              description: "Gate WebSocket endpoint selection on the endpoint's json_rpc reputation score. WebSocket checks alone move a score slowly, so this borrows the HTTP signal to avoid binding a connection to an endpoint already known to be bad. If unset, the global default (ON) applies."
+              type: boolean
 
   # Logger Configuration (optional)
   logger_config:
