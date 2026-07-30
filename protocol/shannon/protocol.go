@@ -1506,6 +1506,33 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 
 // ** Health Check Integration **
 
+// healthCheckEndpointLookupTimeout bounds the chain work behind ONE service's
+// health-check endpoint lookup: the session list, the current block height and the
+// shared params.
+//
+// Why a bound exists at all: this lookup used to run on context.Background(), so a
+// hung chain node made it block forever. Measured in production on 2026-07-30: a
+// single stalled lookup held the health-check cycle for 21 minutes, during which no
+// service kept more than half its normal check rate and the fleet-wide rate fell to
+// 0.9% of median. Both environments failed together because they share a chain node.
+//
+// Why 3s: all three queries are served from the full-node caches (sturdyc) in the
+// steady state and cost one gRPC round trip on a miss — tens of milliseconds. 3s is
+// roughly two orders of magnitude of headroom, and still far below the 10s
+// health-check cycle interval, so a stalled lookup costs that service one cycle of
+// checks rather than stalling the cycle itself.
+//
+// A var rather than a const only so tests can shrink it; nothing in production writes it.
+//
+// One knock-on to know about: sturdyc kicks early-refresh fetches into a goroutine, and
+// cachingFullNode.GetSession's fetch closure captures the CALLER's ctx rather than the
+// fetchCtx sturdyc hands it (pre-existing). So a session refresh triggered by this lookup
+// is now canceled when the lookup returns, where context.Background() let it finish. It is
+// self-correcting — the record stays due, so the next reader (every user request reads
+// sessions) triggers it again, and past the TTL the refresh becomes synchronous and runs
+// inside this deadline. Fixing it properly means using fetchCtx in fullnode_cache.go.
+var healthCheckEndpointLookupTimeout = 3 * time.Second
+
 // GetEndpointsForHealthCheck returns a function that provides endpoint information
 // for health checks. This is used by the HealthCheckExecutor.RunAllChecks method.
 //
@@ -1518,7 +1545,10 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 //   - Returns []gateway.EndpointInfo suitable for health checks
 func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gateway.EndpointInfo, error) {
 	return func(serviceID protocol.ServiceID) ([]gateway.EndpointInfo, error) {
-		ctx := context.Background()
+		// Deadline-bounded, NOT context.Background(): see healthCheckEndpointLookupTimeout.
+		ctx, cancel := context.WithTimeout(context.Background(), healthCheckEndpointLookupTimeout)
+		defer cancel()
+
 		logger := p.logger.With("method", "GetEndpointsForHealthCheck", "service_id", string(serviceID))
 
 		// Get active sessions for this service (without filtering by reputation)
@@ -1530,6 +1560,16 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 		if len(activeSessions) == 0 {
 			logger.Debug().Msg("No active sessions for service")
 			return nil, nil
+		}
+
+		// The deadline fired somewhere inside the session lookup. The remaining chain
+		// queries below cannot succeed either, and their failure paths are deliberately
+		// lenient (a missing block height disables the session-expiry filter entirely,
+		// which would hand health checks endpoints from already-rolled-over sessions).
+		// Skip the service for this cycle instead; the next cycle retries. Nothing is
+		// cached from a failed fetch, so this cannot poison later lookups.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("endpoint lookup for service %s exceeded %s: %w", serviceID, healthCheckEndpointLookupTimeout, ctxErr)
 		}
 
 		// Get current block height for session validity filtering

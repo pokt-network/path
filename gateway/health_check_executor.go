@@ -115,6 +115,10 @@ type HealthCheckExecutor struct {
 	// supplier represents each backend URL under backend-URL dedup, so every
 	// supplier's own relay path is directly validated every N cycles.
 	cycleCounter uint64
+
+	// endpointLookupBudget caps the endpoint-resolution phase of a cycle.
+	// Zero means defaultEndpointLookupBudget. Only tests set it.
+	endpointLookupBudget time.Duration
 }
 
 // HealthCheckExecutorConfig contains configuration for creating a HealthCheckExecutor.
@@ -1858,6 +1862,112 @@ func groupEndpointsByURL(endpoints []EndpointInfo) [][]EndpointInfo {
 	return groups
 }
 
+const (
+	// defaultEndpointLookupBudget caps the whole endpoint-resolution phase of a cycle.
+	//
+	// The protocol's lookup is itself deadline-bounded, so this is a backstop against a
+	// callback that ignores its own deadline: without it, one non-returning lookup holds
+	// the cycle open indefinitely and NOTHING gets submitted. Sits below the 10s cycle
+	// interval so a stalled resolution costs at most one cycle, and above the protocol's
+	// own per-service deadline so a normally-timing-out lookup always reports back and is
+	// logged as an error rather than silently dropped here.
+	defaultEndpointLookupBudget = 6 * time.Second
+
+	// maxConcurrentEndpointLookups bounds how many per-service lookups are in flight.
+	//
+	// Deliberately at or above the production service count (~64) so resolution is a
+	// single wave: if every lookup hit its deadline, the phase still finishes in one
+	// deadline's time rather than N/limit of them, which is what keeps a chain-wide stall
+	// from degrading services unevenly by config position. The cap exists only to stop an
+	// unbounded fleet from opening unbounded concurrent gRPC calls; the shared queries
+	// (block height, shared params) are single-key and deduped by the full-node cache, so
+	// the real per-cycle chain load is one session query per service either way.
+	maxConcurrentEndpointLookups = 64
+)
+
+// endpointLookupResult carries one service's resolved endpoints back to the cycle.
+type endpointLookupResult struct {
+	serviceID protocol.ServiceID
+	infos     []EndpointInfo
+	err       error
+}
+
+// resolveEndpointInfos resolves every service's endpoints BEFORE any check job is
+// submitted, concurrently, and under a wall-clock budget.
+//
+// getEndpointInfos reaches the chain (session list, block height, shared params). It used
+// to be called inline in the submission loop, which made job submission serial in a chain
+// round trip per service: one hung lookup meant every service AFTER it in config order was
+// never submitted at all. The production fingerprint was asymmetric — the first two or
+// three services trickled while the remaining sixty-one sat at exactly zero.
+//
+// Services that error or miss the budget are absent from the returned map: they are skipped
+// for this cycle and retried by the next one. A late lookup's result is discarded, not
+// cached, so nothing is poisoned.
+func (e *HealthCheckExecutor) resolveEndpointInfos(
+	ctx context.Context,
+	serviceIDs []protocol.ServiceID,
+	getEndpointInfos func(protocol.ServiceID) ([]EndpointInfo, error),
+) map[protocol.ServiceID][]EndpointInfo {
+	resolved := make(map[protocol.ServiceID][]EndpointInfo, len(serviceIDs))
+	if len(serviceIDs) == 0 {
+		return resolved
+	}
+
+	budget := e.endpointLookupBudget
+	if budget <= 0 {
+		budget = defaultEndpointLookupBudget
+	}
+
+	// Buffered for every service so a lookup that returns AFTER the budget expired can
+	// still send and exit; an unbuffered channel would leak those goroutines forever.
+	results := make(chan endpointLookupResult, len(serviceIDs))
+	sem := make(chan struct{}, min(len(serviceIDs), maxConcurrentEndpointLookups))
+
+	for _, serviceID := range serviceIDs {
+		go func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			infos, err := getEndpointInfos(serviceID)
+			results <- endpointLookupResult{serviceID: serviceID, infos: infos, err: err}
+		}()
+	}
+
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+
+	for range serviceIDs {
+		select {
+		case res := <-results:
+			if res.err != nil {
+				e.logger.Warn().
+					Err(res.err).
+					Str("service_id", string(res.serviceID)).
+					Msg("Failed to get endpoints for health checks")
+				continue
+			}
+			resolved[res.serviceID] = res.infos
+
+		case <-timer.C:
+			e.logger.Warn().
+				Int("resolved", len(resolved)).
+				Int("services", len(serviceIDs)).
+				Dur("budget", budget).
+				Msg("Endpoint resolution exceeded its budget - unresolved services skipped this cycle")
+			return resolved
+
+		case <-ctx.Done():
+			e.logger.Debug().
+				Int("resolved", len(resolved)).
+				Int("services", len(serviceIDs)).
+				Msg("Endpoint resolution canceled")
+			return resolved
+		}
+	}
+
+	return resolved
+}
+
 // RunAllChecksViaProtocol runs health checks through the protocol layer for all configured services.
 // This is the main entry point for protocol-based health checks.
 // Health checks are executed in parallel using a pond worker pool.
@@ -1885,6 +1995,22 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 		return nil
 	}
 
+	// Resolve endpoints for every enabled service up front. This MUST stay off the
+	// submission loop below: see resolveEndpointInfos for the starvation it fixes.
+	enabledServiceIDs := make([]protocol.ServiceID, 0, len(serviceConfigs))
+	seenServiceIDs := make(map[protocol.ServiceID]struct{}, len(serviceConfigs))
+	for _, svcConfig := range serviceConfigs {
+		if svcConfig.Enabled != nil && !*svcConfig.Enabled {
+			continue
+		}
+		if _, dup := seenServiceIDs[svcConfig.ServiceID]; dup {
+			continue
+		}
+		seenServiceIDs[svcConfig.ServiceID] = struct{}{}
+		enabledServiceIDs = append(enabledServiceIDs, svcConfig.ServiceID)
+	}
+	resolvedEndpoints := e.resolveEndpointInfos(ctx, enabledServiceIDs, getEndpointInfos)
+
 	// Create a task group to track all submitted jobs
 	group := e.pool.NewGroup()
 	totalJobs := 0
@@ -1900,12 +2026,10 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			continue
 		}
 
-		endpointInfos, err := getEndpointInfos(svcConfig.ServiceID)
-		if err != nil {
-			e.logger.Warn().
-				Err(err).
-				Str("service_id", string(svcConfig.ServiceID)).
-				Msg("Failed to get endpoints for health checks")
+		// Pre-resolved above. Absent means the lookup failed or missed the resolution
+		// budget - both already logged there - so skip the service for this cycle.
+		endpointInfos, resolvedOK := resolvedEndpoints[svcConfig.ServiceID]
+		if !resolvedOK {
 			continue
 		}
 
