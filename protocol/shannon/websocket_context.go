@@ -331,7 +331,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	}
 
 	// Get the websocket-specific URL from the selected endpoint.
-	websocketEndpointURL, err := getWebsocketEndpointURL(logger, selectedEndpoint)
+	websocketEndpointURL, err := getWebsocketEndpointURL(selectedEndpoint)
 	if err != nil {
 		err = fmt.Errorf("%w: selected endpoint does not support websocket RPC type: %s", errCreatingWebSocketConnection, err.Error())
 		logger.Debug().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
@@ -1134,7 +1134,7 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 	logger := wrc.methodLogger("StartWebSocketBridge")
 
 	// Get the websocket-specific URL from the selected endpoint.
-	websocketEndpointURL, err := getWebsocketEndpointURL(logger, wrc.selectedEndpoint)
+	websocketEndpointURL, err := getWebsocketEndpointURL(wrc.selectedEndpoint)
 	if err != nil {
 		err = fmt.Errorf("%w: selected endpoint does not support websocket RPC type: %s", errCreatingWebSocketConnection, err.Error())
 		logger.Error().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
@@ -1292,16 +1292,14 @@ func getRelayMinerConnectionHeaders(logger polylog.Logger, selectedEndpoint endp
 
 // getWebsocketEndpointURL returns the websocket URL for the selected endpoint.
 // This URL is used to establish the websocket connection to the endpoint.
-func getWebsocketEndpointURL(logger polylog.Logger, selectedEndpoint endpoint) (string, error) {
-	logger.With("method", "getWebsocketEndpointURL")
-
-	websocketURL, err := selectedEndpoint.WebsocketURL()
-	if err != nil {
-		logger.Error().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
-		return "", err
-	}
-
-	return websocketURL, nil
+//
+// It deliberately does NOT log. The severity of "this endpoint has no websocket URL" belongs
+// to the caller: on user traffic (startWebSocketBridge) it is a connection-fatal Error, but
+// for a health check it is an expected, uninteresting Debug — a websocket-enabled service
+// routinely contains json_rpc-only endpoints. Logging Error here overrode the callers' intent
+// and was the sole reason that condition flooded the logs at Error level.
+func getWebsocketEndpointURL(selectedEndpoint endpoint) (string, error) {
+	return selectedEndpoint.WebsocketURL()
 }
 
 // generateHandshakeSignature generates a ring signature for the WebSocket handshake.
@@ -1426,7 +1424,7 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoid
 	// onto the operator the client started on.
 	metrics.MoveWebsocketConnection(prevDomain, wrc.currentDomain(), string(wrc.serviceID))
 
-	websocketEndpointURL, err := getWebsocketEndpointURL(logger, ep)
+	websocketEndpointURL, err := getWebsocketEndpointURL(ep)
 	if err != nil {
 		wrc.lastReconnectReason = metrics.WSRebindFailedSelect
 		return nil, fmt.Errorf("resolve websocket URL for reconnect: %w", err)
