@@ -47,6 +47,33 @@ func Test_RecordSupplierSignal_EmptySupplierDropped(t *testing.T) {
 		"empty supplier must not create a series")
 }
 
+// Test_RecordHealthCheck_CollapsesSuppliers locks the de-labeling of
+// path_health_check_status_total. The metric carried a `supplier` label with no
+// cardinality guard at all and reached 221,700 series in production (audit
+// 2026-07-30); nothing consumed it. RecordHealthCheck still ACCEPTS a supplier
+// so no caller changes, but suppliers behind the same backend must collapse onto
+// one series.
+func Test_RecordHealthCheck_CollapsesSuppliers(t *testing.T) {
+	const (
+		domain    = "healthcheck-delabel.example"
+		rpcType   = "json_rpc"
+		serviceID = "eth"
+		checkName = "block_height"
+	)
+
+	// WithLabelValues panics on an arity mismatch, so this call is itself the
+	// assertion that the metric has exactly 5 labels (no `supplier`).
+	series := HealthCheckStatus.WithLabelValues(domain, rpcType, serviceID, checkName, SignalOK)
+	before := testutil.ToFloat64(series)
+
+	RecordHealthCheck(domain, "pokt1supplierone", rpcType, serviceID, checkName, SignalOK)
+	RecordHealthCheck(domain, "pokt1suppliertwo", rpcType, serviceID, checkName, SignalOK)
+	RecordHealthCheck(domain, "", rpcType, serviceID, checkName, SignalOK)
+
+	require.Equal(t, before+3, testutil.ToFloat64(series),
+		"all suppliers behind one domain must land on the same series")
+}
+
 // Test_RecordHedgeSupplierOutcome_Split guards the histogram→(counter+role
 // histogram) split: the role latency histogram is always recorded, but the
 // per-supplier counter is skipped when supplier is empty.

@@ -117,17 +117,26 @@ var ReputationEndpointLeaderboard = promauto.NewGaugeVec(
 
 // =============================================================================
 // Health Check Status (Counter)
-// Labels: domain, supplier, rpc_type, service_id, health_check_name, reputation_signal
+// Labels: domain, rpc_type, service_id, health_check_name, reputation_signal
 // Value: count
-// Purpose: Track health check results per supplier for filtering visibility
+// Purpose: Track health check results per operator for filtering visibility
+//
+// NO `supplier` label, on purpose. It used to carry one, unguarded, and reached
+// 221,700 series on an 11-hour-old production pod (audit 2026-07-30) — the same
+// failure mode as the 945K-series histogram incident that cardinality_guard.go
+// was written for. `supplier` multiplies every other label by the number of
+// registrations behind a backend, and nothing consumed it: every dashboard and
+// alert aggregates this metric by domain / service_id / rpc_type /
+// health_check_name / reputation_signal. Per-supplier health-check outcomes are
+// still available on path_supplier_signal_total and via /ready?detailed=true.
 // =============================================================================
 
 var HealthCheckStatus = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "health_check_status_total",
-		Help: "Health check results by domain, supplier, rpc_type, service_id, health_check_name, and reputation_signal.",
+		Help: "Health check results by domain, rpc_type, service_id, health_check_name, and reputation_signal. No supplier label: it multiplied series ~50x with no consumer (see path_supplier_signal_total for per-supplier outcomes).",
 	},
-	[]string{LabelDomain, LabelSupplier, LabelRPCType, LabelServiceID, LabelHealthCheckName, LabelReputationSignal},
+	[]string{LabelDomain, LabelRPCType, LabelServiceID, LabelHealthCheckName, LabelReputationSignal},
 )
 
 // HealthCheckDeduped counts health check relays SKIPPED by backend-URL deduplication.
@@ -1164,9 +1173,18 @@ var WebsocketEndpointStallTotal = promauto.NewCounterVec(
 // Helper Functions for Recording Metrics
 // =============================================================================
 
-// RecordHealthCheck records a health check result per supplier
-func RecordHealthCheck(domain, supplier, rpcType, serviceID, healthCheckName, reputationSignal string) {
-	HealthCheckStatus.WithLabelValues(domain, supplier, rpcType, serviceID, healthCheckName, reputationSignal).Inc()
+// RecordHealthCheck records a health check result.
+//
+// The second argument is the supplier address. It is accepted and ignored: the
+// signature is kept so callers need no change, but the value is deliberately
+// NOT used as a label (see HealthCheckStatus for why). Multiple suppliers behind
+// one backend collapse onto the same (domain, …) series, which is what every
+// consumer of this metric already aggregates to.
+func RecordHealthCheck(domain, _, rpcType, serviceID, healthCheckName, reputationSignal string) {
+	if !healthCheckStatusGuard.allow(domain, rpcType, serviceID, healthCheckName, reputationSignal) {
+		return
+	}
+	HealthCheckStatus.WithLabelValues(domain, rpcType, serviceID, healthCheckName, reputationSignal).Inc()
 }
 
 // RecordHealthCheckDeduped records a health check relay skipped via backend-URL dedup.
@@ -1427,11 +1445,16 @@ func SetMeanScore(domain, serviceID, rpcType string, score float64) {
 // SetSupplierReputationScore sets the per-(supplier, service_id, rpc_type) reputation gauge.
 // Skipped silently when supplier is empty (e.g., per-domain reputation key)
 // or when the cardinality guard has tripped for this metric.
+//
+// The guard is keyed on all three labels, matching the gauge exactly. It used to
+// key on (supplier, service_id) only, which let one admitted slot create one
+// series per rpc_type — so the guard's tuple count under-reported the series it
+// was capping, and eviction could not delete the series it reclaimed.
 func SetSupplierReputationScore(supplier, serviceID, rpcType string, score float64) {
 	if supplier == "" {
 		return
 	}
-	if !supplierReputationGuard.allow(supplier, serviceID) {
+	if !supplierReputationGuard.allow(supplier, serviceID, rpcType) {
 		return
 	}
 	SupplierReputationScore.WithLabelValues(supplier, serviceID, rpcType).Set(score)
