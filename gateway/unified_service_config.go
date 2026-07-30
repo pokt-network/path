@@ -288,6 +288,11 @@ type ServiceDefaults struct {
 	// service that does not set its own. nil falls back to DefaultMaxOperatorShare.
 	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
 
+	// BackendRegistrationWeightCap is the default per-backend registration weight cap (K)
+	// for any service that does not set its own. nil falls back to the process-wide K
+	// (selector.DefaultBackendRegistrationWeightCap, overridable by env).
+	BackendRegistrationWeightCap *int `yaml:"backend_registration_weight_cap,omitempty"`
+
 	// WebsocketRebindOperatorUniform is the default WebSocket rebind selection strategy.
 	// nil falls back to DefaultWebsocketRebindOperatorUniform (ON).
 	WebsocketRebindOperatorUniform *bool `yaml:"websocket_rebind_operator_uniform,omitempty"`
@@ -340,6 +345,19 @@ type ServiceConfig struct {
 	// multi-endpoint selection (parallel fan-out / hedge), which draw from the same
 	// reputation-filtered pool via separate code paths.
 	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
+
+	// BackendRegistrationWeightCap (K) bounds how much selection weight the supplier
+	// registrations behind ONE backend URL can accumulate: weight = min(registrations, K).
+	//
+	// It sets the BASIS the concentration cap and the serving pick are denominated in.
+	// K = 1 is backend-uniform (one machine, one vote) and ignores that the chain pays per
+	// registration; an arbitrarily large K is registration-proportional and lets an operator
+	// buy unbounded share by stacking registrations behind one machine — one failure domain.
+	// The default (2) pays for the second registration behind a machine and nothing after it.
+	//
+	// nil = use the process-wide value (selector.DefaultBackendRegistrationWeightCap, moved
+	// fleet-wide by PATH_BACKEND_REGISTRATION_WEIGHT_CAP). Minimum 1.
+	BackendRegistrationWeightCap *int `yaml:"backend_registration_weight_cap,omitempty"`
 
 	// WebsocketRebindOperatorUniform selects the WebSocket rebind strategy for this service.
 	// When true (the default), a session-rollover rebind picks the target operator uniformly
@@ -987,12 +1005,24 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 // spans multiple operators. Tuned from production concentration data: a canary survey found
 // the dominant operator held 58–90% of most services' sessions, yet reputation/validation
 // filtering trims its effective valid-pool share enough that a 0.75 cap almost never
-// engaged. 0.65 makes the cap actually bound the concentrated tail (12 of 19 sampled
-// services) at negligible redistribution cost — the excess spreads across a handful of
-// other valid operators — while staying above the uniform-over-operators feasibility floor
-// for services with as few as two operators. Set a per-service or default value of >= 1
-// (or <= 0) to disable.
-const DefaultMaxOperatorShare = 0.65
+// engaged. 0.65 made the cap bound the concentrated tail (12 of 19 sampled services) at
+// negligible redistribution cost.
+//
+// Lowered to 0.45 because the cap only started shaping real traffic when it moved onto the
+// pick that serves requests. Until then it lived on a selector reached from one narrow path —
+// measured at 0.008 selections/s against ~2000/s across the three paths that actually serve —
+// so its value was tuned against a distribution it was barely applying. On the serving pick
+// the same 0.65 is slack for most pools: it is a blast-radius bound, and holding one operator
+// under 45% of a service is the point at which losing it is a degradation rather than an
+// outage.
+//
+// Note the feasibility floor: a cap of 0.45 cannot be satisfied by a pool with only two
+// operators (0.45 * 2 <= 1). Those pools are NOT forced to 50/50 and NOT left uncapped — see
+// selector.infeasibleCapFallbackShare, which keeps them on the 0.65 cap they run under today.
+//
+// Set a per-service or default value of >= 1 (or <= 0) to disable, or override every service
+// at once with PATH_MAX_OPERATOR_SHARE.
+const DefaultMaxOperatorShare = 0.45
 
 // defaultHedgeMaxBatchSize is the largest JSON-RPC batch that is still eligible for hedging
 // when neither the service nor the global defaults specify a value.
@@ -1069,10 +1099,33 @@ func (c *UnifiedServicesConfig) GetMaxOperatorShareForService(serviceID protocol
 	if svc != nil && svc.MaxOperatorShare != nil {
 		return *svc.MaxOperatorShare
 	}
+	return c.GetDefaultMaxOperatorShare()
+}
+
+// GetDefaultMaxOperatorShare returns the concentration cap for a service that sets none of
+// its own: the global default if configured, else DefaultMaxOperatorShare.
+func (c *UnifiedServicesConfig) GetDefaultMaxOperatorShare() float64 {
 	if c.Defaults.MaxOperatorShare != nil {
 		return *c.Defaults.MaxOperatorShare
 	}
 	return DefaultMaxOperatorShare
+}
+
+// GetBackendRegistrationWeightCapForService returns the per-backend registration weight cap
+// (K) configured for a service, or 0 when neither the service nor the global defaults set one.
+//
+// 0 means "unset", NOT "uncapped": the caller falls back to the process-wide K, which is what
+// PATH_BACKEND_REGISTRATION_WEIGHT_CAP moves. Returning a resolved default here instead would
+// make every service override the env var and quietly disable it as a fleet-wide lever.
+func (c *UnifiedServicesConfig) GetBackendRegistrationWeightCapForService(serviceID protocol.ServiceID) int {
+	svc := c.GetServiceConfig(serviceID)
+	if svc != nil && svc.BackendRegistrationWeightCap != nil {
+		return *svc.BackendRegistrationWeightCap
+	}
+	if c.Defaults.BackendRegistrationWeightCap != nil {
+		return *c.Defaults.BackendRegistrationWeightCap
+	}
+	return 0
 }
 
 // ResolveStaticResponse returns the configured static response for a service's request path

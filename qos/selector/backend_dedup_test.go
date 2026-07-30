@@ -51,6 +51,10 @@ func Test_PickBackendUniform_EqualizesMachinesNotRegistrations(t *testing.T) {
 	c := require.New(t)
 	SetOperatorShareBackendURLDedup(true)
 	t.Cleanup(func() { SetOperatorShareBackendURLDedup(true) })
+	// K=1 is the backend-uniform basis this test was written for; it is now the kill switch
+	// rather than the default. Test_BackendWeightCap_K1_ReproducesBackendUniform asserts the
+	// equivalence directly.
+	pinBackendWeightCap(t, 1)
 
 	pool := stackedPool()
 	shares := sampleShares(t, 60000, func() protocol.EndpointAddr {
@@ -68,6 +72,7 @@ func Test_PickBackendUniform_StackingRegistrationsNoLongerBuysTraffic(t *testing
 	c := require.New(t)
 	SetOperatorShareBackendURLDedup(true)
 	t.Cleanup(func() { SetOperatorShareBackendURLDedup(true) })
+	pinBackendWeightCap(t, 1)
 
 	pool := stackedPool()
 	shares := sampleShares(t, 60000, func() protocol.EndpointAddr {
@@ -80,6 +85,27 @@ func Test_PickBackendUniform_StackingRegistrationsNoLongerBuysTraffic(t *testing
 	c.InDelta(0.50, shares["smallop.xyz"], 0.02)
 }
 
+// The shipped default sits between the two extremes: stacking still buys something (the second
+// registration behind a machine) and stops buying anything after that.
+func Test_PickBackendUniform_StackingBuysBoundedTrafficAtDefaultK(t *testing.T) {
+	c := require.New(t)
+	SetOperatorShareBackendURLDedup(true)
+	t.Cleanup(func() { SetOperatorShareBackendURLDedup(true) })
+	pinBackendWeightCap(t, DefaultBackendRegistrationWeightCap)
+
+	pool := stackedPool()
+	shares := sampleShares(t, 60000, func() protocol.EndpointAddr {
+		return PickBackendUniform(pool)
+	}, operatorKeyForTest)
+
+	// Weights: bigop min(6,2)+min(2,2) = 4; smallop 1+1 = 2. Total 6.
+	// So 66.7%/33.3% — above the 50% a machine count alone would give bigop (it does stake
+	// more), and far below the 80% its registration count would have bought.
+	c.InDelta(4.0/6.0, shares["bigop.net"], 0.02,
+		"stacking must buy a bounded increase, not a proportional one")
+	c.InDelta(2.0/6.0, shares["smallop.xyz"], 0.02)
+}
+
 // The constraint the user called out: a relay is signed against a supplier's session and
 // each supplier carries its own per-session service allowance, so a pick must always name a
 // supplier — never collapse to a bare URL — and must spread across the registrations behind
@@ -88,6 +114,7 @@ func Test_PickBackendUniform_ResolvesToASupplierAndSpreadsWithinBackend(t *testi
 	c := require.New(t)
 	SetOperatorShareBackendURLDedup(true)
 	t.Cleanup(func() { SetOperatorShareBackendURLDedup(true) })
+	pinBackendWeightCap(t, 1)
 
 	pool := stackedPool()
 	shares := sampleShares(t, 60000, func() protocol.EndpointAddr {
@@ -123,6 +150,7 @@ func Test_ConcentrationCap_DedupCanRemoveTheNeedToReshape(t *testing.T) {
 	c := require.New(t)
 	SetOperatorShareBackendURLDedup(true)
 	t.Cleanup(func() { SetOperatorShareBackendURLDedup(true) })
+	pinBackendWeightCap(t, 1)
 
 	pool := stackedPool()
 	// bigop is 80% by registration — over a 0.65 cap — but only 50% by backend, under it.

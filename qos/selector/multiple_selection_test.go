@@ -312,7 +312,7 @@ func TestSelectEndpointWithDifferentTLD(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := selectEndpointWithDifferentTLD(tc.availableEndpoints, tc.endpointTLDs, tc.usedTLDs)
+			result, err := selectEndpointWithDifferentTLD("test-svc", tc.availableEndpoints, tc.endpointTLDs, tc.usedTLDs)
 
 			if tc.expectError {
 				require.Error(t, err)

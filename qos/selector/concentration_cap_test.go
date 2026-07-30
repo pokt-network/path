@@ -103,13 +103,42 @@ func TestSelectWithConcentrationCap_Disabled(t *testing.T) {
 	}
 }
 
-func TestSelectWithConcentrationCap_FeasibilityFloor(t *testing.T) {
-	// 2 operators, cap 0.4 < 1/M (0.5) → infeasible. Result must be uniform-over-
-	// operators (~0.5/0.5), NOT the key-weighted 0.75/0.25. No panic, no hang.
+// An infeasible cap (cap * operators <= 1) must neither force an even split nor silently stop
+// capping. It degrades to infeasibleCapFallbackShare, which is feasible for any pool with two
+// or more operators — so the pool is still capped, at the value it ran under before the cap
+// was tightened.
+func TestSelectWithConcentrationCap_InfeasibleCapDegradesToFallback(t *testing.T) {
+	// 2 operators, cap 0.4 < 1/m (0.5) → infeasible. 9 of 10 endpoints on one operator, i.e.
+	// 0.9 uncapped — comfortably over the 0.65 fallback, so the fallback must bind.
+	eps, ops := makeOperatorPool([]int{9, 1})
+	shares := operatorShares(t, eps, 0.4, 200_000)
+	require.InDelta(t, infeasibleCapFallbackShare, shares[ops[0]], 0.02,
+		"an unsatisfiable cap must degrade to the fallback cap, not vanish")
+	require.InDelta(t, 1-infeasibleCapFallbackShare, shares[ops[1]], 0.02)
+}
+
+// Below the fallback cap an infeasible configured cap changes nothing at all. This is the
+// production two-operator case and the whole point of the decision: a 60/40 pool stays 60/40
+// instead of being forced to 50/50, which on the 9 affected services would have raised the
+// smaller operator's traffic by a quarter to two thirds with no ramp.
+func TestSelectWithConcentrationCap_InfeasibleCapIsNoOpBelowFallback(t *testing.T) {
+	eps, ops := makeOperatorPool([]int{3, 2})
+	shares := operatorShares(t, eps, 0.45, 200_000)
+	require.InDelta(t, 0.60, shares[ops[0]], 0.02,
+		"a two-operator pool under the fallback cap must keep its shape")
+	require.InDelta(t, 0.40, shares[ops[1]], 0.02)
+}
+
+// The historical uniform-over-operators fallback stays available behind a switch, for a
+// deliberate canary of the stronger intervention.
+func TestSelectWithConcentrationCap_InfeasibleUniformFallbackIsOptIn(t *testing.T) {
+	SetCapInfeasibleForcesUniform(true)
+	t.Cleanup(func() { SetCapInfeasibleForcesUniform(false) })
+
 	eps, ops := makeOperatorPool([]int{3, 1})
 	shares := operatorShares(t, eps, 0.4, 200_000)
-	require.InDelta(t, 0.5, shares[ops[0]], 0.02, "infeasible cap → uniform over operators")
-	require.InDelta(t, 0.5, shares[ops[1]], 0.02, "infeasible cap → uniform over operators")
+	require.InDelta(t, 0.5, shares[ops[0]], 0.02, "opt-in: infeasible cap → uniform over operators")
+	require.InDelta(t, 0.5, shares[ops[1]], 0.02, "opt-in: infeasible cap → uniform over operators")
 }
 
 func TestSelectWithConcentrationCap_SingleAndEmpty(t *testing.T) {
