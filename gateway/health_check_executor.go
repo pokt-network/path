@@ -840,6 +840,28 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	supplier := extractSupplierFromEndpoint(endpointAddr)
 	rpcTypeStr := metrics.NormalizeRPCType(rpcType.String())
 
+	// Websocket checks: METRIC ONLY. Their reputation signal is written by the OBSERVATION
+	// path inside ExecuteWebSocketCheckViaProtocol, and must be written exactly ONCE.
+	//
+	// Why the observation path owns the write and this one does not:
+	//   - It derives severity from the ACTUAL failure (every probe failure wraps
+	//     errCreatingWebSocketConnection, which classifies as WEBSOCKET_CONNECTION_FAILED
+	//     -> major error), whereas mapSignalType below reads the rule's `reputation_signal`
+	//     and SILENTLY DEFAULTS to minor_error when it is unset. The websocket rules live
+	//     in an externally hot-loaded rules file that is not in this repo, so that default
+	//     cannot be audited here and would change severity invisibly.
+	//   - It is the same writer real user websocket connections go through.
+	//   - It builds its key from the full "<supplier>-<url>" address at rpc type WEBSOCKET
+	//     (recordSignalFromWebsocketConnectionObservation) — the SAME key this function
+	//     builds — so dropping the second write loses nothing.
+	//
+	// Before this split a failing websocket check recorded reputation twice, from two
+	// unrelated severity sources.
+	if check.Type == HealthCheckTypeWebSocket {
+		e.recordWebsocketCheckMetric(serviceID, endpointAddr, check, checkErr, domain, supplier, rpcTypeStr)
+		return
+	}
+
 	if checkErr == nil {
 		// Check passed - record recovery success signal with latency
 		// Health checks use RecoverySuccessSignal (+5) because their purpose is to help
@@ -902,6 +924,67 @@ func (e *HealthCheckExecutor) recordCheckResult(
 		Str("signal", check.ReputationSignal).
 		Str("error", checkErr.Error()).
 		Msg("Health check failed, recorded signal")
+}
+
+// recordWebsocketCheckMetric records ONLY the metric for a websocket check outcome.
+// Reputation for websocket checks is written by the observation path — see the websocket
+// branch of recordCheckResult for why.
+//
+// Everything the metric side of recordCheckResult does is preserved, including the
+// over-serviced (stake-exhaustion) no-penalty branch: an exhausted supplier is counted as
+// exhausted and reported "ok", never as a failure.
+func (e *HealthCheckExecutor) recordWebsocketCheckMetric(
+	serviceID protocol.ServiceID,
+	endpointAddr protocol.EndpointAddr,
+	check HealthCheckConfig,
+	checkErr error,
+	domain, supplier, rpcTypeStr string,
+) {
+	if checkErr == nil {
+		metrics.RecordHealthCheck(domain, supplier, rpcTypeStr, string(serviceID), check.Name, metrics.SignalOK)
+		return
+	}
+
+	// Over-servicing rejections are correct protocol behavior, not a supplier fault: the
+	// application's per-session stake allocation is exhausted. Same no-penalty rule the
+	// request path and the HTTP check path apply.
+	if heuristic.IsOverServicedError(checkErr.Error()) {
+		metrics.RecordSupplierExhausted(supplier, string(serviceID))
+		metrics.RecordHealthCheck(domain, supplier, rpcTypeStr, string(serviceID), check.Name, metrics.SignalOK)
+		e.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Str("check", check.Name).
+			Msg("Websocket check hit an over-serviced (stake-exhausted) supplier - no penalty, no failure recorded")
+		return
+	}
+
+	metrics.RecordHealthCheck(domain, supplier, rpcTypeStr, string(serviceID), check.Name, websocketFailureMetricSignal(check.ReputationSignal))
+
+	e.logger.Debug().
+		Str("service_id", string(serviceID)).
+		Str("endpoint", string(endpointAddr)).
+		Str("check", check.Name).
+		Str("error", checkErr.Error()).
+		Msg("Websocket check failed, recorded failure metric (reputation comes from the observation path)")
+}
+
+// websocketFailureMetricSignal picks the metric label for a FAILED websocket check.
+//
+// mapReputationSignalToMetricSignal returns SignalOK for an unset reputation_signal, so
+// using it for a failure would label that failure "ok" and rebuild exactly the blind spot
+// this exists to close: path_health_check_status_total{rpc_type="websocket"} read 100% "ok"
+// in production while websocket checks were failing, which made the metric useless as
+// evidence. Websocket rules are hot-loaded from outside this repo, so "unset" is the common
+// case.
+//
+// The fallback is the severity the observation path actually charges: every websocket probe
+// failure wraps errCreatingWebSocketConnection -> WEBSOCKET_CONNECTION_FAILED -> major error.
+func websocketFailureMetricSignal(configuredSignal string) string {
+	if configuredSignal == "" {
+		return metrics.SignalMajorError
+	}
+	return mapReputationSignalToMetricSignal(configuredSignal)
 }
 
 // categorizeHealthCheckError categorizes a health check error for metrics.
@@ -1609,8 +1692,47 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 
 	_, protocolObs := e.protocol.CheckWebsocketConnection(checkCtx, serviceID, endpointAddr, probe)
 
-	// Apply observations to protocol (this updates reputation via observations)
-	if protocolObs != nil {
+	// The check's verdict. Without this the function returned nil unconditionally, so
+	// recordCheckResult always took its success branch and EVERY websocket check reported
+	// "ok" no matter what happened — which is why path_health_check_status_total
+	// {rpc_type="websocket"} read 100% ok in production while checks were failing.
+	checkErr := websocketObservationError(protocolObs)
+	latency := time.Since(startTime)
+
+	// Exactly ONE reputation writer per websocket check, decided here rather than split
+	// across this function and recordCheckResult:
+	//
+	//   - observation present  -> ApplyWebSocketObservations writes it, with severity
+	//     derived from the real failure (or a success signal when the error type is
+	//     UNSPECIFIED). recordCheckResult records only the metric.
+	//   - observation present AND over-serviced -> NOBODY writes. Stake exhaustion is not a
+	//     supplier fault; the observation classifier does not exempt it on this path because
+	//     the probe wraps every failure in errCreatingWebSocketConnection, which classifies
+	//     before payload inspection. Skipping the apply is what preserves the no-penalty
+	//     rule the request path and the HTTP check path already honor.
+	//   - no observation and no error -> the recovery-success signal is recorded HERE.
+	//     CheckWebsocketConnection returns NO observation on success (both the
+	//     handshake-only and the probe path return a nil observation set), so the
+	//     observation path writes nothing at all for a passing check. Leaving it to the
+	//     observation path would mean a websocket endpoint that was ever penalized has no
+	//     health-check route back.
+	//
+	// The if/else shape is deliberate: it makes a double write structurally impossible even
+	// if the protocol later starts emitting success observations.
+	switch {
+	case protocolObs == nil:
+		if checkErr == nil {
+			e.recordWebsocketCheckRecovery(ctx, serviceID, endpointAddr, check, latency)
+		}
+
+	case checkErr != nil && heuristic.IsOverServicedError(checkErr.Error()):
+		e.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Str("check", check.Name).
+			Msg("Skipping websocket check reputation signal for over-serviced (stake-exhausted) supplier")
+
+	default:
 		if err := e.protocol.ApplyWebSocketObservations(protocolObs); err != nil {
 			e.logger.Warn().
 				Err(err).
@@ -1619,7 +1741,9 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 				Str("check", check.Name).
 				Msg("Failed to apply WebSocket observations")
 		}
+	}
 
+	if protocolObs != nil {
 		// ENHANCEMENT: Wrap protocol observations in RequestResponseObservations
 		// and publish to reporters for full visibility (old hydrator didn't do this)
 		completedTime := time.Now()
@@ -1647,15 +1771,88 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 			Msg("WebSocket health check observations published")
 	}
 
-	latency := time.Since(startTime)
 	e.logger.Debug().
 		Str("service_id", string(serviceID)).
 		Str("endpoint", string(endpointAddr)).
 		Str("check", check.Name).
 		Dur("latency", latency).
+		Err(checkErr).
 		Msg("WebSocket health check completed via protocol")
 
-	return latency, nil
+	return latency, checkErr
+}
+
+// websocketObservationError turns the observation set returned by CheckWebsocketConnection
+// into the check's verdict: nil when the check passed, a diagnosable error when it did not.
+//
+// This exists because CheckWebsocketConnection reports failure only through observations —
+// it returns no error — so a caller that ignores them cannot tell a passing check from a
+// failing one. Kept as a named helper rather than inlined so the protobuf walking (a oneof
+// plus two optional fields) has one place to be read and tested.
+//
+// Both failure carriers are honored: the connection observation's endpoint error type (the
+// classified supplier-facing failure) and the request-level error (a PATH-side or
+// setup failure). Error details are included verbatim so the log line and the failure metric
+// are actually diagnosable.
+func websocketObservationError(obs *protocolobservations.Observations) error {
+	if obs == nil || obs.GetShannon() == nil {
+		return nil
+	}
+
+	for _, reqObs := range obs.GetShannon().GetObservations() {
+		if connObs := reqObs.GetWebsocketConnectionObservation(); connObs != nil {
+			if errType := connObs.GetErrorType(); errType != protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED {
+				details := connObs.GetErrorDetails()
+				if details == "" {
+					details = "no error details reported"
+				}
+				return fmt.Errorf("websocket check failed: %s: %s", errType.String(), details)
+			}
+		}
+
+		if reqErr := reqObs.GetRequestError(); reqErr != nil {
+			details := reqErr.GetErrorDetails()
+			if details == "" {
+				details = "no error details reported"
+			}
+			return fmt.Errorf("websocket check failed: %s: %s", reqErr.GetErrorType().String(), details)
+		}
+	}
+
+	return nil
+}
+
+// recordWebsocketCheckRecovery records the recovery-success signal for a PASSING websocket
+// check. It is the single reputation writer for that outcome — see the switch in
+// ExecuteWebSocketCheckViaProtocol for why the pass case cannot be left to the observation
+// path (CheckWebsocketConnection emits no observation on success).
+func (e *HealthCheckExecutor) recordWebsocketCheckRecovery(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	endpointAddr protocol.EndpointAddr,
+	check HealthCheckConfig,
+	latency time.Duration,
+) {
+	if e.reputationSvc == nil {
+		return
+	}
+
+	// Same key the observation path writes and tiered selection reads: full
+	// "<supplier>-<url>" address at rpc type WEBSOCKET, through the service's key builder so
+	// key_granularity is respected.
+	keyBuilder := e.reputationSvc.KeyBuilderForService(serviceID)
+	key := keyBuilder.BuildKey(serviceID, endpointAddr, sharedtypes.RPCType_WEBSOCKET)
+
+	signal := reputation.NewRecoverySuccessSignal(latency)
+	signal.IsHealthCheck = true // probe, not user traffic — excluded from the rate-cooldown detector
+	if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
+		e.logger.Warn().
+			Err(err).
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Str("check", check.Name).
+			Msg("Failed to record websocket check recovery success signal")
+	}
 }
 
 // RunChecksForEndpointViaProtocol runs all configured checks for a service through the protocol.
@@ -1676,7 +1873,15 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 	}
 
 	// Run every check type; build the legacy name->error map from the outcomes.
-	outcomes := e.runEndpointChecks(ctx, serviceID, endpointAddr, svcConfig, true, true)
+	//
+	// hasWebsocketURL=false: this entry point takes an endpoint ADDRESS, not an EndpointInfo,
+	// so it cannot know whether the endpoint advertises a websocket URL. Guessing "yes" is
+	// what charged json_rpc-only endpoints a major error for a capability they never claimed
+	// (see the skip in runEndpointChecks), and there is no cheap way to resolve the capability
+	// from an address alone — it needs a session lookup. Websocket checks therefore run only
+	// from the cycle in RunAllChecksViaProtocol, which has the EndpointInfo. This is the
+	// legacy, loop-free entry point and has no callers in this repo.
+	outcomes := e.runEndpointChecks(ctx, serviceID, endpointAddr, svcConfig, true, true, false)
 	results := make(map[string]error, len(outcomes))
 	for i := range outcomes {
 		results[outcomes[i].check.Name] = outcomes[i].err
@@ -1692,6 +1897,12 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 // outcomes are fanned from the representative) and runWS=true (WebSocket connectivity
 // is genuinely per-endpoint and must be probed directly).
 //
+// hasWebsocketURL is the endpoint's ADVERTISED websocket capability (EndpointInfo.WebSocketURL
+// non-empty). A plain bool rather than the whole EndpointInfo: this function is reached from
+// three call sites with different amounts of endpoint context, and the only thing it needs is
+// the one bit — widening the signature to the struct would force the address-only caller to
+// fabricate one.
+//
 // Only HTTP/REST outcomes are returned (they are what gets fanned); WebSocket and gRPC
 // checks are recorded here but not included in the returned slice.
 func (e *HealthCheckExecutor) runEndpointChecks(
@@ -1700,6 +1911,7 @@ func (e *HealthCheckExecutor) runEndpointChecks(
 	endpointAddr protocol.EndpointAddr,
 	svcConfig *ServiceHealthCheckConfig,
 	runHTTP, runWS bool,
+	hasWebsocketURL bool,
 ) []checkOutcome {
 	// Get sync_allowance from service config (0 = disabled)
 	var syncAllowance uint64
@@ -1712,6 +1924,26 @@ func (e *HealthCheckExecutor) runEndpointChecks(
 		switch check.Type {
 		case HealthCheckTypeWebSocket:
 			if !runWS {
+				continue
+			}
+			// An endpoint that advertises no websocket URL cannot be websocket-checked.
+			//
+			// Dispatching anyway is not a harmless no-op: the check fails inside the protocol
+			// with "selected endpoint does not support websocket RPC type", which classifies
+			// as WEBSOCKET_CONNECTION_FAILED -> MAJOR error (-10) on the endpoint's websocket
+			// reputation key. That charged endpoints for lacking a capability they never
+			// claimed. A websocket-enabled service commonly mixes both kinds — roughly 12 of
+			// 50 endpoints on one such service are json_rpc-only, and one pod logged 39 of
+			// these failures in six minutes.
+			//
+			// A skip is neither a pass nor a failure: nothing is recorded, so the endpoint's
+			// websocket series simply does not exist rather than reading falsely healthy.
+			if !hasWebsocketURL {
+				e.logger.Debug().
+					Str("service_id", string(serviceID)).
+					Str("endpoint", string(endpointAddr)).
+					Str("check", check.Name).
+					Msg("Skipping websocket check - endpoint advertises no websocket URL")
 				continue
 			}
 			// Run OFF the cycle. See wsPool: a websocket check can block for its full
@@ -2049,6 +2281,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			for _, endpointInfo := range endpointInfos {
 				endpoint := endpointInfo.Addr
 				sessionID := endpointInfo.SessionID
+				hasWS := endpointInfo.WebSocketURL != ""
 				group.Submit(func() {
 					if ctx.Err() != nil {
 						return
@@ -2056,7 +2289,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 					if sessionID != "" && e.protocol != nil && !e.protocol.IsSessionActive(ctx, serviceID, sessionID) {
 						return
 					}
-					e.runEndpointChecks(ctx, serviceID, endpoint, &cfg, true, true)
+					e.runEndpointChecks(ctx, serviceID, endpoint, &cfg, true, true, hasWS)
 				})
 				totalJobs++
 			}
@@ -2091,7 +2324,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 
 				var outcomes []checkOutcome
 				if e.endpointSessionActive(ctx, serviceID, rep) {
-					outcomes = e.runEndpointChecks(ctx, serviceID, rep.Addr, &cfg, true, true)
+					outcomes = e.runEndpointChecks(ctx, serviceID, rep.Addr, &cfg, true, true, rep.WebSocketURL != "")
 				}
 
 				// Siblings: fan the representative's HTTP outcomes (no relay), and still
@@ -2110,7 +2343,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 					if len(outcomes) > 0 {
 						e.fanOutcomeToSibling(ctx, serviceID, sib.Addr, outcomes)
 					}
-					e.runEndpointChecks(ctx, serviceID, sib.Addr, &cfg, false, true)
+					e.runEndpointChecks(ctx, serviceID, sib.Addr, &cfg, false, true, sib.WebSocketURL != "")
 				}
 			})
 			totalJobs++
