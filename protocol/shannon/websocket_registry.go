@@ -103,6 +103,15 @@ func (e *websocketConnEntry) sample(now time.Time) {
 		e.rate = websocketRateEWMAAlpha*instant + (1-websocketRateEWMAAlpha)*e.rate
 	}
 
+	// A multiplicative decay approaches zero without ever reaching it, so an idle
+	// connection halves its rate every pass forever and ends up in denormal territory: one
+	// live idle-but-bound connection was observed reporting 2.67e-147 frames/s. Ranking
+	// still sorted correctly, but the admin tumble response published that as JSON and no
+	// consumer could test a connection for "no traffic". Snap to exactly zero instead.
+	if e.rate < websocketRateEWMAFloor {
+		e.rate = 0
+	}
+
 	e.lastFrames = current
 	e.lastSample = now
 }
@@ -120,6 +129,14 @@ var (
 	// samples — a firehose that starts or stops should change the ranking quickly, since
 	// the whole point is to move whoever is heavy NOW, not whoever was heavy an hour ago.
 	websocketRateEWMAAlpha = 0.5
+
+	// websocketRateEWMAFloor is the frames/sec below which a connection is treated as
+	// silent. Chosen from what the quantity means rather than from float mechanics: 1e-6
+	// frames/s is one frame per eleven days, and the slowest thing a real subscription
+	// delivers is a newHeads block — seconds apart on the fastest chains, minutes on the
+	// slowest. Nothing legitimate lives between here and zero, so anything under it is
+	// decay residue from an idle connection.
+	websocketRateEWMAFloor = 1e-6
 )
 
 func newWebsocketConnRegistry() *websocketConnRegistry {

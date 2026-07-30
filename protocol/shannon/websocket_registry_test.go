@@ -3,6 +3,7 @@ package shannon
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -178,6 +179,32 @@ func Test_websocketTumble_MatchesWhereTheConnectionIsNowNotWhereItStarted(t *tes
 	current := r.tumble(protocol.WebsocketTumbleRequest{ServiceID: "bsc", Domain: "smallop.xyz"})
 	c.Equal(1, current.Matched, "the connection must match its CURRENT operator")
 	c.Equal(1, ctrl.callCount())
+}
+
+func Test_websocketRateEWMA_IdleConnectionDecaysToExactlyZero(t *testing.T) {
+	c := require.New(t)
+
+	var frames uint64
+	e := &websocketConnEntry{frames: func() uint64 { return frames }}
+
+	base := time.Now()
+	e.lastSample = base
+
+	// One burst of real traffic, then silence: 30 frames over 15s is the shape of a live
+	// subscription that stops delivering while staying bound.
+	frames = 30
+	e.sample(base.Add(websocketRateSampleInterval))
+	c.Greater(e.rate, 0.0, "a connection that delivered frames must report a rate")
+
+	// Halving at alpha=0.5 from 2 frames/s needs ~21 passes to cross 1e-6; 40 leaves margin
+	// without being so many that a missing floor would underflow to zero on its own (that
+	// takes ~1000).
+	for i := 2; i <= 41; i++ {
+		e.sample(base.Add(time.Duration(i) * websocketRateSampleInterval))
+	}
+
+	c.Equal(0.0, e.rate,
+		"an idle connection must read exactly 0 so consumers can test for no traffic, not a denormal")
 }
 
 func Test_websocketTumble_UnknownServiceIsANoOp(t *testing.T) {
