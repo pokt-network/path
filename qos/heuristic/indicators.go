@@ -390,6 +390,13 @@ var capabilityLimitationSubstrings = []string{
 	"missing trie node",
 	"block has been pruned",
 	"height is not available",
+	// CometBFT's real pruned-height message is "height %d is not available, lowest
+	// height is %d" — the height number sits inside the phrase, so the
+	// "height is not available" entry above never matches it. Without this entry a
+	// Cosmos/CometBFT node correctly reporting it pruned the requested height was
+	// scored as a fault: not matched here, so the protocol classifier fell through to
+	// its unknown-payload branch and applied a MINOR (-3) penalty.
+	"is not available, lowest height",
 	// Capability limitation (e.g., Tron lite fullnodes)
 	"lite fullnode",
 	"api is not supported",

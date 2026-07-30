@@ -247,6 +247,56 @@ func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCod
 	return true
 }
 
+// capabilityAttemptBudget is how many attempts a request gets once a failure has been
+// classified as a capability limitation: the attempt that discovered it, plus EXACTLY ONE
+// retry. One retry is genuinely useful — supplier A may run a pruned node while supplier B
+// is archival — but further attempts only spend relays re-learning that the client asked
+// for data the fleet does not retain, and every one of them makes the client wait longer
+// for the same answer.
+const capabilityAttemptBudget = 2
+
+// isCapabilityLimitationFailure reports whether a failed attempt failed because the endpoint
+// cannot serve this request (pruned/non-archival state, lite fullnode, backend that doesn't
+// speak REST) rather than because the endpoint is broken. Such a failure is not the
+// supplier's fault, must not be retried indefinitely, and its response body is the answer
+// the client should see.
+//
+// Two sources, because only one of them is available depending on which layer detected first:
+//   - heuristicResult: present when the GATEWAY ran the heuristic (protocol returned no error).
+//     MatchedPattern is the precise signal.
+//   - err: the protocol layer detects first on the normal path and FLATTENS the structured
+//     AnalysisResult into an error string, dropping MatchedPattern. The response body is
+//     embedded in that string, so a substring scan is the only thing left to key off.
+//
+// TODO_TECHDEBT: the substring fallback exists only because the classification is stringified
+// on its way out of the protocol layer. See DESIGN_UNIFY_ERROR_CLASSIFICATION.md — carrying the
+// structured verdict through protocol.Response removes this function's second branch.
+func isCapabilityLimitationFailure(heuristicResult *heuristic.AnalysisResult, err error) bool {
+	if heuristicResult != nil && heuristicResult.MatchedPattern != "" &&
+		heuristic.IsCapabilityLimitationError(heuristicResult.MatchedPattern) {
+		return true
+	}
+	return err != nil && heuristic.ErrorContainsArchivalPattern(err.Error())
+}
+
+// noteCapabilityFailure records a failed attempt against the capability-limitation retry
+// budget. It returns whether the failure was a capability limitation at all, and whether the
+// budget (initial attempt + exactly one retry) is now spent so the caller must stop retrying.
+//
+// Non-capability failures leave the counter untouched and fall through to the regular
+// shouldRetry() decision.
+func noteCapabilityFailure(
+	capabilityFailures *int,
+	heuristicResult *heuristic.AnalysisResult,
+	err error,
+) (isCapabilityLimitation bool, budgetSpent bool) {
+	if !isCapabilityLimitationFailure(heuristicResult, err) {
+		return false, false
+	}
+	*capabilityFailures++
+	return true, *capabilityFailures >= capabilityAttemptBudget
+}
+
 // isDeceptiveResponsePattern returns true if the heuristic reason indicates a supplier
 // returning fabricated responses (empty/invalid results while passing health checks).
 // These warrant harsher penalties than generic server errors.
@@ -393,6 +443,10 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	var lastCircuitBreakReason string                 // reason for circuit breaking the previous endpoint's domain
 	var lastResponseSnippet string                    // truncated response that triggered the break
 	var lastHeuristicResult *heuristic.AnalysisResult // heuristic result from the last failed attempt
+
+	// Counts attempts that failed on a capability limitation rather than a fault.
+	// Capped at capabilityAttemptBudget — see noteCapabilityFailure.
+	capabilityFailures := 0
 
 	// Track endpoints and domains already tried to ensure retry rotation.
 	// Domain-level tracking prevents retrying different endpoints behind the same broken infrastructure.
@@ -680,6 +734,35 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					markDomainTried(triedDomains, racer.hedgeEndpoint)
 				}
 
+				// A capability limitation is the backend correctly reporting it does not
+				// retain what was asked for. Hand that response to the QoS context so the
+				// client receives the backend's own error verbatim — its shape, its error
+				// code — instead of a synthesized 500 built from the flattened protocol
+				// error string. The normal path below already does this for every failed
+				// attempt; the hedge path is the one path that dropped the bytes entirely,
+				// which is exactly how a "state is pruned" answer became a 500.
+				//
+				// Scoped to capability limitations on purpose: passing every failed hedge
+				// body straight through would also hand clients supplier HTML error pages
+				// and truncated garbage that the QoS error response exists to hide.
+				if isCapability, budgetSpent := noteCapabilityFailure(&capabilityFailures, lastHeuristicResult, lastErr); isCapability {
+					if len(hedgeResponses) > 0 && len(hedgeResponses[0].Bytes) > 0 {
+						rc.qosCtx.UpdateWithResponse(
+							hedgeResponses[0].EndpointAddr,
+							hedgeResponses[0].Bytes,
+							hedgeResponses[0].HTTPStatusCode,
+							hedgeResponses[0].RequestID,
+						)
+					}
+					if budgetSpent {
+						logger.Warn().
+							Int("attempt", attempt).
+							Int("capability_failures", capabilityFailures).
+							Msg("Capability limitation on the hedged attempt - retry budget spent, returning the backend's error to the client")
+						break
+					}
+				}
+
 				// Continue to next attempt (retry)
 				continue
 			}
@@ -834,6 +917,11 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		}
 		lastResponseSnippet = truncateResponse(responseBytesForHeuristic, 512)
 
+		// Classify the failure against the capability-limitation retry budget before the
+		// retry decision below. Counted once per attempt, regardless of whether this is
+		// the last attempt, so the budget stays coherent across the hedge and normal paths.
+		isCapabilityFailure, capabilityBudgetSpent := noteCapabilityFailure(&capabilityFailures, checkResult.HeuristicResult, err)
+
 		// Log the error/failure
 		if err != nil {
 			logger.Warn().Err(err).
@@ -862,7 +950,32 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				endpointForMetrics = string(currentEndpointAddr)
 			}
 
-			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, endpointForMetrics, checkResult.HeuristicResult) {
+			// Capability limitation: exactly one retry, then stop. This branch must come
+			// before shouldRetry() in both directions.
+			//
+			// It cannot ASK shouldRetry: the protocol layer flattened the structured
+			// heuristic result into the error string, so shouldRetry sees an unclassified
+			// error, reports "no retry conditions met", and a pruned-state answer is
+			// returned from the first supplier without ever trying an archival one.
+			//
+			// It must also OVERRIDE shouldRetry, so a request the fleet demonstrably
+			// cannot serve stops after one retry instead of burning the whole retry
+			// budget (and the client's patience) to reach the same answer.
+			if isCapabilityFailure {
+				if capabilityBudgetSpent {
+					logger.Debug().
+						Int("attempt", attempt).
+						Int("capability_failures", capabilityFailures).
+						Msg("Capability limitation confirmed on a second supplier, stopping retries")
+					break
+				}
+				// Attribute the retry so retry dashboards don't show it as unexplained.
+				retryDomain, _ := shannonmetrics.ExtractDomainOrHost(endpointForMetrics)
+				metrics.RecordRetryDistribution(retryDomain, string(rc.detectedRPCType), string(rc.serviceID), metrics.RetryReasonHeuristic)
+				logger.Debug().
+					Int("attempt", attempt).
+					Msg("Capability limitation (e.g. pruned/non-archival state) - retrying once on a different supplier")
+			} else if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, endpointForMetrics, checkResult.HeuristicResult) {
 				logger.Debug().
 					Int("attempt", attempt).
 					Int("status_code", statusCode).
@@ -1147,6 +1260,12 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
 	triedDomains := make(map[string]bool)
 
+	// Counts attempts that failed on a capability limitation rather than a fault.
+	// Capped at capabilityAttemptBudget — see noteCapabilityFailure. Batch items retry
+	// unconditionally (this loop never consults shouldRetry), so without this cap a batch
+	// of N historical calls costs N*maxAttempts relays to return the same pruned-state answer.
+	capabilityFailures := 0
+
 	// Pre-populate triedDomains with broken domains from the cross-pod circuit breaker.
 	if rc.circuitBreaker != nil {
 		for domain := range rc.circuitBreaker.GetBrokenDomains(rc.context, string(rc.serviceID)) {
@@ -1238,6 +1357,14 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 					triedEndpoints[racer.hedgeEndpoint] = true
 					markDomainTried(triedDomains, racer.hedgeEndpoint)
 				}
+				// Capability limitation: exactly one retry, then return the backend's own
+				// error (already captured in lastResponse) to the client.
+				if _, budgetSpent := noteCapabilityFailure(&capabilityFailures, checkResult.HeuristicResult, lastErr); budgetSpent {
+					logger.Debug().
+						Int("attempt", attempt).
+						Msg("Capability limitation confirmed on a second supplier, stopping batch item retries")
+					break
+				}
 				continue
 			}
 			// Hedge failed, fall through to normal request
@@ -1273,6 +1400,15 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 				}
 			}
 			logger.Warn().Err(lastErr).Int("attempt", attempt).Msg("Request failed")
+
+			// Capability limitation: exactly one retry, then return the backend's own
+			// error (already captured in lastResponse) to the client.
+			if _, budgetSpent := noteCapabilityFailure(&capabilityFailures, nil, lastErr); budgetSpent {
+				logger.Debug().
+					Int("attempt", attempt).
+					Msg("Capability limitation confirmed on a second supplier, stopping batch item retries")
+				break
+			}
 			continue
 		}
 
@@ -1325,6 +1461,15 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 						Msg("Skipped circuit break for capability limitation error (retrying on different supplier)")
 				}
 			}
+		}
+
+		// Capability limitation: exactly one retry, then return the backend's own error
+		// (already captured in lastResponse) to the client.
+		if _, budgetSpent := noteCapabilityFailure(&capabilityFailures, checkResult.HeuristicResult, lastErr); budgetSpent {
+			logger.Debug().
+				Int("attempt", attempt).
+				Msg("Capability limitation confirmed on a second supplier, stopping batch item retries")
+			break
 		}
 	}
 

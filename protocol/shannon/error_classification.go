@@ -374,12 +374,19 @@ func classifyMalformedPayloadAsSignal(logger polylog.Logger, payloadContent stri
 	// structured AnalysisResult (and its MatchedPattern) is stringified before reaching
 	// here, so we fall back to a substring scan. See DESIGN_UNIFY_ERROR_CLASSIFICATION.md
 	// for the real fix (carry the classification structured; one classifier, one verdict).
+	//
+	// Latency is deliberately dropped (SuccessSignal(0), the same idiom as the
+	// session-mismatch branch below): a capability rejection is answered without
+	// touching state, so it is one of the fastest responses an endpoint can produce.
+	// Crediting that latency would earn the endpoint the fast-response bonus
+	// multiplier AND feed the fake number into its latency EWMA — an endpoint that
+	// serves nothing would out-rank one doing real work. No penalty, no reward.
 	if heuristic.ErrorContainsArchivalPattern(payloadContent) {
 		logger.Debug().
 			Str("payload_preview", payloadContent[:min(len(payloadContent), 200)]).
 			Msg("Detected capability-limitation (archival) error in payload — skipping reputation penalty")
 		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED,
-			reputation.NewSuccessSignal(latency)
+			reputation.NewSuccessSignal(0)
 	}
 
 	// If this was a heuristic detected error, handle it using the detected reason
