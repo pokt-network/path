@@ -112,9 +112,13 @@ func TestSelectWithConcentrationCap_InfeasibleCapDegradesToFallback(t *testing.T
 	// 0.9 uncapped — comfortably over the 0.65 fallback, so the fallback must bind.
 	eps, ops := makeOperatorPool([]int{9, 1})
 	shares := operatorShares(t, eps, 0.4, 200_000)
-	require.InDelta(t, infeasibleCapFallbackShare, shares[ops[0]], 0.02,
+	// 0.70, not the 0.65 fallback itself: the single-registration operator holds 10% of the
+	// pool's registrations, so the displacement ceiling stops it at 30% and the dominant
+	// operator retains what could not be absorbed.
+	require.InDelta(t, 0.70, shares[ops[0]], 0.02,
 		"an unsatisfiable cap must degrade to the fallback cap, not vanish")
-	require.InDelta(t, 1-infeasibleCapFallbackShare, shares[ops[1]], 0.02)
+	// 0.30 = 3x the 10% its single registration entitles it to, i.e. its displacement ceiling.
+	require.InDelta(t, 0.30, shares[ops[1]], 0.02)
 }
 
 // Below the fallback cap an infeasible configured cap changes nothing at all. This is the
@@ -178,7 +182,7 @@ func TestWaterFillToCap_PreservesMassAndCaps(t *testing.T) {
 		{0.7, 0.28, 0.01, 0.01}, // multi-pass: redistribution pushes op[1] over 0.4
 	}
 	for _, weights := range cases {
-		waterFillToCap(weights, 0.4)
+		waterFillToCap(weights, 0.4, nil)
 		var total float64
 		for _, w := range weights {
 			require.LessOrEqual(t, w, 0.4+concentrationCapEpsilon, "no weight may exceed the cap")

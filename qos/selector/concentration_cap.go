@@ -15,55 +15,46 @@ import (
 // rounding when comparing an operator's weight to the cap.
 const concentrationCapEpsilon = 1e-9
 
-// DefaultBackendRegistrationWeightCap is K in the selection weight of one backend URL:
+// DefaultBackendRegistrationWeightCap is K, a cap on how much selection weight the supplier
+// registrations behind ONE backend URL may accumulate: weight(backend) = min(registrations, K).
 //
-//	weight(backend) = min(supplier registrations at that backend, K)
+// SHIPPED UNCAPPED (0): a provider's share is proportional to the registrations it holds, and
+// how it arranges those registrations across its own machines is not a routing input.
 //
-// WHY a cap instead of either extreme:
+// WHY REGISTRATIONS ARE THE UNIT. Each supplier registration carries its own per-session
+// service allowance, so a provider's ability to serve is set by how many registrations it
+// holds — it is the thing the operator bought, and the thing the chain settles on. Weighting by
+// distinct backend URL instead routes traffic by infrastructure shape: it sends work to
+// providers who lack the allowance to serve it and starves providers who have it. Measured
+// across all 64 production pools, the share of traffic allocated beyond what the receiving
+// provider's allowance covers:
 //
-//   - K = 1 is backend-uniform ("one machine, one vote"). It ignores that the chain pays per
-//     supplier REGISTRATION: an operator staking 5 registrations behind 2 machines then earns
-//     exactly what an operator staking 1 registration behind 1 machine earns, so staking more
-//     buys nothing. We were allocating per machine while the chain paid per registration.
+//	machine-weighted (K=1)      mean 33.4%   worst 51.4%
+//	equal share per provider    mean 43.2%   worst 67.3%
+//	registration-proportional   mean  0.0%   worst  0.0%
 //
-//   - K = infinity is registration-proportional. It pays for stake, but lets an operator buy
-//     unbounded share by stacking registrations behind ONE machine — and one machine is one
-//     failure domain, so the traffic that share attracts is not backed by the redundancy the
-//     registration count implies.
+// Registration-proportional is zero by construction, because share and allowance are then
+// denominated in the same unit.
 //
-// K = 2 pays for a second registration behind a machine and for nothing after it: more stake
-// earns more traffic, up to the point where the extra stake stops representing extra
-// infrastructure. K = 1 reproduces the previous backend-uniform behavior exactly; a K larger
-// than any backend's registration count reproduces registration-proportional weighting exactly.
+// The case that settled it: on one service a provider held 19 of 50 registrations — more than
+// any other provider on that service — and received 7.3% of its traffic, while a provider
+// holding 15 received 45%, purely because the first ran two machines and the second fifteen.
 //
-// SHIPPED AT 1, not 2, on the evidence of a dry run over all 64 production pools
-// (Test_ProductionDryRun_*). K = 2 was intended to reward staking without concentrating
-// traffic. Measured against the real pools it does neither cleanly:
+// CONCENTRATION IS THE CAP'S JOB, NOT THE BASIS'S. Weighting by machines suppressed the largest
+// provider only as a side effect, and paid for it by misallocating a third of all traffic. The
+// per-operator share cap (max_operator_share) is the mechanism that stops one provider owning a
+// session; it is applied on top of this basis and is the only thing that should be tuned for
+// that purpose.
 //
-//	config                mean max MACHINE share    mean max OPERATOR share
-//	K=1 cap 0.65 (before)          10.4%                     54.4%
-//	K=1 cap 0.45                   12.2%                     48.2%
-//	K=2 cap 0.65                   12.3%                     59.1%   <- worse than before
-//	K=2 cap 0.45                   15.1%                     48.8%
-//
-// K = 2 ALONE RAISES operator concentration, from 54.4% to 59.1%. Rewarding stacked
-// registrations rewards whoever stacks hardest, and that is the largest operator (measured at
-// 5.7 registrations per machine against a solo operator's 1.0). The cap delivers essentially
-// all of the concentration benefit on its own — 48.2% at K=1 versus 48.8% at K=2 — while K=2
-// adds 2.9 points of single-machine exposure fleet-wide, because the share the cap displaces is
-// redistributed proportionally to weight and K=2 doubles the weight of exactly the machines
-// that stack.
-//
-// So K > 1 is a deliberate trade of blast radius for a stake-reward property, not a free win.
-// It stays one env var away — PATH_BACKEND_REGISTRATION_WEIGHT_CAP=2 — so it can be canaried
-// against an unchanged control once the fleet has the cap alone.
-const DefaultBackendRegistrationWeightCap = 1
+// K > 0 remains available as a lever — PATH_BACKEND_REGISTRATION_WEIGHT_CAP=1 restores
+// machine-weighted selection, 2 gives a bounded middle — but neither is the default.
+const DefaultBackendRegistrationWeightCap = 0
 
 // DefaultMaxOperatorShareFallback is the per-operator concentration cap used for a service
 // whose resolved configuration has not been published to this package (tests, and any binary
 // that does not run the QoS bootstrap). It MUST track gateway.DefaultMaxOperatorShare, which
 // is the config-layer source of truth; a test in the gateway package asserts they are equal.
-const DefaultMaxOperatorShareFallback = 0.45
+const DefaultMaxOperatorShareFallback = 0.50
 
 // backendWeightCap holds the process-wide K applied to services that do not configure their
 // own. Settable at startup from PATH_BACKEND_REGISTRATION_WEIGHT_CAP so the weighting basis
@@ -153,8 +144,10 @@ func init() {
 // (backend-uniform); registration-proportional weighting is expressed as a large K rather than
 // as 0, so that "unset" stays distinguishable from "uncapped".
 func SetBackendRegistrationWeightCap(k int) {
-	if k < 1 {
-		k = 1
+	// 0 is the shipped value and means uncapped, i.e. registration-proportional. Negatives are
+	// meaningless and collapse to it rather than to the machine-weighted extreme.
+	if k < 0 {
+		k = 0
 	}
 	backendWeightCap.Store(int32(k))
 }
@@ -365,10 +358,18 @@ func pickWeightedFromPools(
 
 	// Per-unit-uniform (units_i/totalUnits) start, then water-fill the over-cap mass down.
 	weights := make([]float64, m)
+	entitlements := make([]float64, m)
+	totalRegistrations := 0
+	for _, p := range pools {
+		totalRegistrations += p.entries
+	}
 	for i, p := range pools {
 		weights[i] = float64(p.units) / float64(totalUnits)
+		if totalRegistrations > 0 {
+			entitlements[i] = float64(p.entries) / float64(totalRegistrations)
+		}
 	}
-	waterFillToCap(weights, maxOperatorShare)
+	waterFillToCap(weights, maxOperatorShare, entitlements)
 
 	chosen := pools[weightedPick(weights)]
 	return chosen.pickEndpoint(), chosen.key, true
@@ -647,45 +648,96 @@ func operatorKey(ep protocol.EndpointAddr) string {
 	return string(ep)
 }
 
-// waterFillToCap clamps any weight above cap and redistributes the excess to the
-// under-cap weights, proportionally to their current weight, until no weight exceeds
-// the cap. The caller only invokes this when the cap is feasible (cap*len(weights) > 1)
-// and some weight is over the cap, so total mass is preserved (≈ 1); the underSum guard
-// keeps it safe even if that ever fails to hold. Operates in place.
-func waterFillToCap(weights []float64, maxShare float64) {
-	// At most len(weights) passes: each pass pins at least one new operator to the cap.
+// DefaultDisplacementCeilingMultiple bounds how much of a capped provider's excess any other
+// provider may be handed, as a multiple of the share its own registrations entitle it to.
+//
+// WHY IT EXISTS. The cap displaces a dominant provider's excess onto everyone under the cap,
+// proportionally to their weight and with no regard for whether they hold the registrations to
+// serve it. Each registration carries its own per-session allowance, so a provider handed many
+// times its ticket share simply cannot serve the traffic. Measured on a 49-versus-1 pool the
+// smaller provider was allocated 17.5x its allowance; across the real pools the worst case was
+// 6.3x. Capping harder makes this worse, not better.
+//
+// Over-servicing is not catastrophic — a supplier past its allowance answers 429 and the
+// request moves to another endpoint — so the ceiling is set for efficiency rather than safety:
+// it stops the selector routing work that is predictably going to bounce.
+//
+// 3x keeps the cap effective (the dominant provider still lands near half of a service on
+// average) while cutting the worst over-allocation from 6.3x to 3.1x. Tighter values buy little
+// extra safety and give the dominant provider back several points of share.
+const DefaultDisplacementCeilingMultiple = 3.0
+
+// waterFillToCap clamps any weight above cap and redistributes the excess to the under-cap
+// weights, proportionally to their current weight, until no weight exceeds the cap.
+//
+// entitlements[i] is the share operator i's REGISTRATIONS entitle it to — what its per-session
+// allowance can actually serve. No operator is pushed above DefaultDisplacementCeilingMultiple
+// times that. Excess nobody can absorb stays with the capped operator: at that point the pool
+// has no one able to serve the displaced traffic, and moving it anyway only produces 429s.
+//
+// A nil entitlements slice disables the ceiling and restores pure proportional water-filling.
+// Operates in place.
+func waterFillToCap(weights []float64, maxShare float64, entitlements []float64) {
+	ceiling := func(i int) float64 {
+		if entitlements == nil {
+			return 1.0
+		}
+		c := entitlements[i] * DefaultDisplacementCeilingMultiple
+		// A provider is always allowed to keep what it already holds; the ceiling bounds what
+		// it is GIVEN, and must never claw back its own entitled share.
+		if c < weights[i] {
+			return weights[i]
+		}
+		return c
+	}
+
+	// At most len(weights) passes: each pass pins at least one operator to the cap or its
+	// ceiling, so the loop cannot cycle.
 	for pass := 0; pass < len(weights); pass++ {
-		var excess, underSum float64
+		var excess, roomSum float64
 		anyOver := false
-		for _, w := range weights {
-			switch {
-			case w > maxShare+concentrationCapEpsilon:
+		for i, w := range weights {
+			if w > maxShare+concentrationCapEpsilon {
 				excess += w - maxShare
 				anyOver = true
-			case w < maxShare-concentrationCapEpsilon:
-				underSum += w
+				continue
+			}
+			// Room is bounded by BOTH the cap and what this provider can serve.
+			limit := maxShare
+			if c := ceiling(i); c < limit {
+				limit = c
+			}
+			if r := limit - w; r > concentrationCapEpsilon {
+				roomSum += r
 			}
 		}
 		if !anyOver {
 			return
 		}
-		// No under-cap operator to absorb the excess (only reachable if the caller's
-		// feasibility guarantee is violated). Clamp what we can and stop rather than
-		// dividing by zero.
-		if underSum <= 0 {
-			for i, w := range weights {
-				if w > maxShare+concentrationCapEpsilon {
-					weights[i] = maxShare
-				}
-			}
+
+		// Nobody has room to absorb the excess — every under-cap provider is already at its
+		// ceiling. Clamping the dominant provider anyway would hand traffic to suppliers that
+		// answer 429, so it keeps the remainder.
+		if roomSum <= 0 {
 			return
 		}
-		// Redistribute excess to the under-cap operators, proportional to their weight.
+
+		absorbed := excess
+		if roomSum < absorbed {
+			absorbed = roomSum
+		}
 		for i, w := range weights {
 			if w > maxShare+concentrationCapEpsilon {
-				weights[i] = maxShare
-			} else if w < maxShare-concentrationCapEpsilon {
-				weights[i] = w + excess*(w/underSum)
+				// Give back whatever the pool could not absorb, in proportion to the overage.
+				weights[i] = maxShare + (w-maxShare)*(excess-absorbed)/excess
+				continue
+			}
+			limit := maxShare
+			if c := ceiling(i); c < limit {
+				limit = c
+			}
+			if r := limit - w; r > concentrationCapEpsilon {
+				weights[i] = w + absorbed*(r/roomSum)
 			}
 		}
 	}

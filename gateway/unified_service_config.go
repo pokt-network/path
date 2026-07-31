@@ -1050,7 +1050,7 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 //
 // Set a per-service or default value of >= 1 (or <= 0) to disable, or override every service
 // at once with PATH_MAX_OPERATOR_SHARE.
-const DefaultMaxOperatorShare = 0.45
+const DefaultMaxOperatorShare = 0.50
 
 // defaultHedgeMaxBatchSize is the largest JSON-RPC batch that is still eligible for hedging
 // when neither the service nor the global defaults specify a value.

@@ -217,10 +217,14 @@ func Test_ServingPick_OperatorCapBinds(t *testing.T) {
 		return PickBackendUniformForService("cap-svc", pool)
 	})
 
-	c.InDelta(0.45, shares[operatorDomain(0)], 0.02, "the dominant operator must be held at the cap")
-	// The 0.30 of excess is redistributed proportionally to the two under-cap operators.
-	c.InDelta(0.275, shares[operatorDomain(1)], 0.02)
-	c.InDelta(0.275, shares[operatorDomain(2)], 0.02)
+	// The cap pushes the dominant operator toward 0.45, but only as far as the others can
+	// absorb. They hold 1 registration each of 14, so their allowance entitles them to 7.1% and
+	// the displacement ceiling stops them at 3x that — 21.4%. The 0.30 of excess is therefore
+	// only half absorbed and the dominant operator keeps the rest: moving it anyway would route
+	// traffic to suppliers that answer 429.
+	c.InDelta(0.572, shares[operatorDomain(0)], 0.02, "the cap binds only as far as the pool can absorb")
+	c.InDelta(0.214, shares[operatorDomain(1)], 0.02, "held at 3x the share its registrations entitle it to")
+	c.InDelta(0.214, shares[operatorDomain(2)], 0.02)
 }
 
 // A pool where nobody exceeds the cap must be left exactly on the weighting basis: a cap that
@@ -364,10 +368,12 @@ func Test_DiversitySelector_ServingPickIsWeightedAndCapped(t *testing.T) {
 		return selected[0]
 	})
 
-	c.InDelta(0.45, shares[operatorDomain(0)], 0.02,
+	// Same pool and therefore the same arithmetic as Test_ServingPick_OperatorCapBinds: the two
+	// thin operators cap out at 3x their entitlement and the dominant one keeps the remainder.
+	c.InDelta(0.572, shares[operatorDomain(0)], 0.02,
 		"the endpoint that serves the request must be capped, not just the helper's output")
-	c.InDelta(0.275, shares[operatorDomain(1)], 0.02)
-	c.InDelta(0.275, shares[operatorDomain(2)], 0.02)
+	c.InDelta(0.214, shares[operatorDomain(1)], 0.02)
+	c.InDelta(0.214, shares[operatorDomain(2)], 0.02)
 }
 
 // poolSizeSample returns the last pool size observed on a (service, path) series.

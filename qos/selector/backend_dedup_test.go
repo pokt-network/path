@@ -91,6 +91,7 @@ func Test_PickBackendUniform_StackingBuysBoundedTrafficAtDefaultK(t *testing.T) 
 	c := require.New(t)
 	SetOperatorShareBackendURLDedup(true)
 	t.Cleanup(func() { SetOperatorShareBackendURLDedup(true) })
+
 	pool := stackedPool()
 	sample := func() map[string]float64 {
 		return sampleShares(t, 60000, func() protocol.EndpointAddr {
@@ -98,23 +99,27 @@ func Test_PickBackendUniform_StackingBuysBoundedTrafficAtDefaultK(t *testing.T) 
 		}, operatorKeyForTest)
 	}
 
-	// At the SHIPPED default (K=1) stacking buys nothing: both operators front 2 machines, so
-	// both get half, regardless of bigop's 8 registrations against smallop's 2. This is the
-	// configuration the fleet runs — a dry run over the real pools showed K>1 raises operator
-	// concentration rather than lowering it, because the operators who stack hardest are the
-	// large ones. See DefaultBackendRegistrationWeightCap.
+	// At the SHIPPED default (K=0, uncapped) share is proportional to REGISTRATIONS: bigop
+	// holds 8 of the 10 in this pool and receives 80%. Registrations are what carries a
+	// per-session allowance, so this is the only basis under which a provider's share is one it
+	// can actually serve. How bigop spreads its 8 registrations over 2 machines is its own
+	// business and must not change what it receives.
 	pinBackendWeightCap(t, DefaultBackendRegistrationWeightCap)
 	atDefault := sample()
-	c.InDelta(0.5, atDefault["bigop.net"], 0.02, "at K=1 stacking must buy nothing")
-	c.InDelta(0.5, atDefault["smallop.xyz"], 0.02)
+	c.InDelta(0.8, atDefault["bigop.net"], 0.02, "share must follow registrations held")
+	c.InDelta(0.2, atDefault["smallop.xyz"], 0.02)
 
-	// At K=2, the opt-in, stacking buys a BOUNDED increase. Weights: bigop min(6,2)+min(2,2) = 4;
-	// smallop 1+1 = 2. So 66.7%/33.3% — above the 50% a machine count alone gives (it does stake
-	// more), far below the 80% its registration count would have bought.
+	// K=1 is the machine-weighted lever: both providers front 2 machines, so both get half and
+	// bigop's extra 6 registrations buy nothing.
+	pinBackendWeightCap(t, 1)
+	atK1 := sample()
+	c.InDelta(0.5, atK1["bigop.net"], 0.02, "K=1 must ignore registrations and count machines")
+	c.InDelta(0.5, atK1["smallop.xyz"], 0.02)
+
+	// K=2 is the bounded middle: bigop min(6,2)+min(2,2) = 4, smallop 1+1 = 2.
 	pinBackendWeightCap(t, 2)
 	atK2 := sample()
-	c.InDelta(4.0/6.0, atK2["bigop.net"], 0.02,
-		"at K=2 stacking must buy a bounded increase, not a proportional one")
+	c.InDelta(4.0/6.0, atK2["bigop.net"], 0.02)
 	c.InDelta(2.0/6.0, atK2["smallop.xyz"], 0.02)
 }
 
@@ -190,8 +195,10 @@ func Test_ConcentrationCap_StillCapsWhenDedupedShareExceedsIt(t *testing.T) {
 		return SelectWithConcentrationCap("svc", pool, 0.65)
 	}, operatorKeyForTest)
 
-	c.InDelta(0.65, shares["bigop.net"], 0.02,
-		"real machine-level dominance must still be capped at maxOperatorShare")
+	c.InDelta(0.70, shares["bigop.net"], 0.02,
+		"the cap binds only as far as the other providers can absorb: smallop holds 1 of 10 "+
+			"registrations, so the displacement ceiling (3x its allowance) stops it at 30% and "+
+			"bigop keeps the remainder rather than the pool answering 429s")
 }
 
 func Test_backendKey_NormalizesTrailingSlashAndCase(t *testing.T) {
