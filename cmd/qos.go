@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -13,6 +15,7 @@ import (
 	"github.com/pokt-network/path/qos/cosmos"
 	"github.com/pokt-network/path/qos/evm"
 	"github.com/pokt-network/path/qos/noop"
+	"github.com/pokt-network/path/qos/selector"
 	"github.com/pokt-network/path/qos/solana"
 )
 
@@ -30,6 +33,21 @@ func getServiceQoSInstances(
 	// Create loggers
 	hydratedLogger := logger.With("module", "qos").With("method", "getServiceQoSInstances").With("protocol", protocolInstance.Name())
 	qosLogger := logger.With("module", "qos").With("protocol", protocolInstance.Name())
+
+	configureEndpointSelection(hydratedLogger, unifiedConfig)
+
+	// Extend the per-operator concentration cap to the retry/hedge/batch band selections,
+	// overriding per-service config for every service. Default OFF (config decides, and its
+	// default is also OFF): these paths route a request only AFTER an attempt has failed, so
+	// they are rolled out and attributed separately from the primary path's cap.
+	switch os.Getenv("PATH_CAP_RETRY_HEDGE_SELECTION") {
+	case "true":
+		gateway.SetRetryHedgeCapOverride(true)
+		hydratedLogger.Warn().Msg("⚠️ per-operator concentration cap FORCED ON for retry/hedge/batch selection for every service (PATH_CAP_RETRY_HEDGE_SELECTION=true)")
+	case "false":
+		gateway.SetRetryHedgeCapOverride(false)
+		hydratedLogger.Warn().Msg("⚠️ per-operator concentration cap FORCED OFF for retry/hedge/batch selection for every service (PATH_CAP_RETRY_HEDGE_SELECTION=false)")
+	}
 
 	// Wait for the protocol to become healthy before configuring QoS instances.
 	err := waitForProtocolHealth(hydratedLogger, protocolInstance, defaultProtocolHealthTimeout)
@@ -116,8 +134,20 @@ func getServiceQoSInstances(
 		// WebSocket initial selection via requestContext.Select. Disabled (>= 1 or <= 0)
 		// leaves selection as a flat random pick.
 		if unifiedConfig != nil {
+			maxOperatorShare := resolveMaxOperatorShare(unifiedConfig, serviceID)
+
+			// Publish the service's resolved selection settings to the selector package. The
+			// pick that serves a request happens inside a shared helper called from four QoS
+			// implementations, none of which carry this config; publishing it here keeps the
+			// cap and the weighting basis service-accurate without threading configuration
+			// through every one of them.
+			selector.SetServiceSelectionSettings(
+				serviceID,
+				unifiedConfig.GetBackendRegistrationWeightCapForService(serviceID),
+				maxOperatorShare,
+			)
+
 			if setter, ok := qosServices[serviceID].(interface{ SetMaxOperatorShare(float64) }); ok {
-				maxOperatorShare := unifiedConfig.GetMaxOperatorShareForService(serviceID)
 				setter.SetMaxOperatorShare(maxOperatorShare)
 				if maxOperatorShare > 0 && maxOperatorShare < 1 {
 					svcLogger.Info().Float64("max_operator_share", maxOperatorShare).Msg("✅ QoS: per-operator concentration cap ENABLED")
@@ -132,6 +162,93 @@ func getServiceQoSInstances(
 
 	hydratedLogger.Info().Msgf("Initialized %d QoS service instances", len(qosServices))
 	return qosServices, nil
+}
+
+// configureEndpointSelection publishes the endpoint-selection weighting knobs before any QoS
+// instance is built.
+//
+// EVERY knob here ships ON and is turned OFF by an env var, never on. A behavior that ships
+// behind a default-off flag is never exercised by a canary — canary and control run the same
+// distribution and the deploy proves nothing — so the flags exist as kill switches, settable
+// on a running deployment without waiting for an image build. Each log line below names the
+// env var that reverts it, so the switch is discoverable from the pod's own startup logs.
+func configureEndpointSelection(logger polylog.Logger, unifiedConfig *gateway.UnifiedServicesConfig) {
+	// Measure an operator's share in distinct BACKEND URLs rather than in supplier
+	// registrations. Several suppliers can register against the same backend, so
+	// registration-counted shares credit one operator's 6 machines as 25 endpoints — past what
+	// its infrastructure represents. This is the BROADEST revert: disabling it also neutralizes
+	// the per-backend weight cap and the operator cap on the serving pick.
+	if os.Getenv("PATH_OPERATOR_SHARE_BY_BACKEND_URL") == "false" {
+		selector.SetOperatorShareBackendURLDedup(false)
+		logger.Warn().Msg("⚠️ operator share counted by SUPPLIER REGISTRATION; per-backend weight cap and serving-pick operator cap are both inert (PATH_OPERATOR_SHARE_BY_BACKEND_URL=false)")
+	} else {
+		logger.Info().Msg("✅ operator share counted by distinct BACKEND URL")
+	}
+
+	// Per-backend registration weight cap (K): weight(backend) = min(registrations, K).
+	// K=1 restores the previous backend-uniform basis exactly.
+	if raw := os.Getenv("PATH_BACKEND_REGISTRATION_WEIGHT_CAP"); raw != "" {
+		k, err := strconv.Atoi(raw)
+		if err != nil || k < 1 {
+			logger.Warn().Str("value", raw).Msg("⚠️ ignoring PATH_BACKEND_REGISTRATION_WEIGHT_CAP: want an integer >= 1")
+		} else {
+			selector.SetBackendRegistrationWeightCap(k)
+			logger.Warn().Int("backend_registration_weight_cap", k).Msg("⚠️ per-backend registration weight cap overridden (PATH_BACKEND_REGISTRATION_WEIGHT_CAP); 1 = previous backend-uniform basis")
+		}
+	}
+	logger.Info().Int("backend_registration_weight_cap", selector.BackendRegistrationWeightCap()).
+		Msg("✅ endpoint selection weighted by min(registrations-per-backend, K); set PATH_BACKEND_REGISTRATION_WEIGHT_CAP=1 to revert to backend-uniform")
+
+	// Whether the pick that serves the request applies the per-operator cap. Off leaves the
+	// new weighting basis in place uncapped, which is how the two halves are A/B-ed apart.
+	if os.Getenv("PATH_PRIMARY_PICK_OPERATOR_CAP") == "false" {
+		selector.SetBackendPickOperatorCap(false)
+		logger.Warn().Msg("⚠️ per-operator concentration cap DISABLED on the serving endpoint pick (PATH_PRIMARY_PICK_OPERATOR_CAP=false)")
+	} else {
+		logger.Info().Msg("✅ per-operator concentration cap applied on the serving endpoint pick")
+	}
+
+	// A cap no assignment can satisfy (cap * operators <= 1) falls back to the previous 0.65
+	// cap rather than to a forced uniform-over-operators split. See
+	// selector.infeasibleCapFallbackShare.
+	if os.Getenv("PATH_SELECTION_CAP_INFEASIBLE_UNIFORM") == "true" {
+		selector.SetCapInfeasibleForcesUniform(true)
+		logger.Warn().Msg("⚠️ an unsatisfiable operator cap now forces UNIFORM-OVER-OPERATORS (PATH_SELECTION_CAP_INFEASIBLE_UNIFORM=true); two-operator services move to 50/50")
+	}
+
+	if unifiedConfig == nil {
+		return
+	}
+
+	defaultShare := unifiedConfig.GetDefaultMaxOperatorShare()
+	// Fleet-wide override of the cap VALUE, so it can be moved (or disabled with >= 1) on a
+	// running deployment without editing per-service config.
+	if raw := os.Getenv("PATH_MAX_OPERATOR_SHARE"); raw != "" {
+		share, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			logger.Warn().Str("value", raw).Msg("⚠️ ignoring PATH_MAX_OPERATOR_SHARE: not a number")
+		} else {
+			maxOperatorShareOverride = &share
+			logger.Warn().Float64("max_operator_share", share).Msg("⚠️ per-operator concentration cap overridden for ALL services (PATH_MAX_OPERATOR_SHARE)")
+		}
+	}
+	if maxOperatorShareOverride != nil {
+		defaultShare = *maxOperatorShareOverride
+	}
+	selector.SetDefaultMaxOperatorShare(defaultShare)
+}
+
+// maxOperatorShareOverride is the PATH_MAX_OPERATOR_SHARE fleet-wide cap override, applied to
+// every service in place of its resolved configuration. nil when unset.
+var maxOperatorShareOverride *float64
+
+// resolveMaxOperatorShare returns the cap to apply to a service, honoring the fleet-wide
+// override.
+func resolveMaxOperatorShare(unifiedConfig *gateway.UnifiedServicesConfig, serviceID protocol.ServiceID) float64 {
+	if maxOperatorShareOverride != nil {
+		return *maxOperatorShareOverride
+	}
+	return unifiedConfig.GetMaxOperatorShareForService(serviceID)
 }
 
 // logGatewayServiceIDs outputs the available service IDs for the gateway.

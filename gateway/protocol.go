@@ -118,8 +118,11 @@ type Protocol interface {
 	// HydrateDisqualifiedEndpointsResponse hydrates the disqualified endpoint response with the protocol-specific data.
 	HydrateDisqualifiedEndpointsResponse(protocol.ServiceID, *devtools.DisqualifiedEndpointResponse)
 
-	// CheckWebsocketConnection checks if the websocket connection to the endpoint is established.
-	CheckWebsocketConnection(context.Context, protocol.ServiceID, protocol.EndpointAddr) *protocolobservations.Observations
+	// CheckWebsocketConnection probes a websocket endpoint and returns its decoded response
+	// alongside the observations, so the caller can judge the response CONTENT — a
+	// connection that opens and answers is not evidence of a working endpoint if the block
+	// height it reports is stale. The body is nil for a handshake-only probe or on failure.
+	CheckWebsocketConnection(context.Context, protocol.ServiceID, protocol.EndpointAddr, protocol.WebsocketProbe) ([]byte, *protocolobservations.Observations)
 
 	// GetReputationService returns the reputation service instance used by the protocol.
 	// This is used by the health check executor to record health check results.

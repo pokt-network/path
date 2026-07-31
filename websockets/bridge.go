@@ -108,8 +108,82 @@ type bridge struct {
 	// Mutated only on the start() goroutine.
 	consecutiveStallRebinds int
 
+	// consecutiveSessionRebinds counts session-expiry-triggered rebinds that did not
+	// resolve the condition. Reset to 0 by any check that finds the bound session current;
+	// at maxConsecutiveSessionRebinds the proactive check stops for this connection.
+	// Deliberately separate from consecutiveStallRebinds: that counter gates
+	// closing the client, and a connection that is still delivering data must never be
+	// closed just because we could not move it. Mutated only on the start() goroutine.
+	consecutiveSessionRebinds int
+
+	// tumble carries an operator-initiated forced rebind (admin tumble) to the start()
+	// loop, so the rebind runs on the bridge goroutine like every other one rather than
+	// on the caller's HTTP goroutine. Buffered (cap 1) and written with a non-blocking
+	// send: an admin request never blocks on a busy bridge, and concurrent requests
+	// coalesce into one rebind. Nil (and never selected) when reconnector == nil —
+	// without the reconnect machinery there is nothing to tumble onto.
+	tumble chan struct{}
+
 	// shutdownOnce ensures shutdown() is only called once to prevent panics from double-closing channels
 	shutdownOnce sync.Once
+}
+
+// BridgeController exposes operator-initiated control over one live bridge. A bridge
+// satisfies it; the reconnector receives it through BridgeAttacher so whoever owns the
+// service-level registry can act on individual connections.
+type BridgeController interface {
+	// Tumble asks the bridge to rebind onto a DIFFERENT supplier while keeping the
+	// client connection open and replaying its subscriptions. Safe to call from any
+	// goroutine. Returns false when the bridge cannot tumble (rebind disabled) or a
+	// tumble is already queued for it.
+	Tumble() bool
+}
+
+// BridgeAttacher is an optional interface an EndpointReconnector may implement to
+// receive a handle to its own bridge. StartBridge calls AttachBridge once the bridge is
+// live, and AttachBridge(nil) when it shuts down, so an implementer can register and
+// deregister the connection in a lookup structure. Reconnectors that do not implement it
+// are unaffected.
+type BridgeAttacher interface {
+	AttachBridge(BridgeController)
+}
+
+// Tumble implements BridgeController.
+func (b *bridge) Tumble() bool {
+	if b.tumble == nil {
+		return false
+	}
+	select {
+	case b.tumble <- struct{}{}:
+		return true
+	default:
+		// A tumble is already queued; a second rebind would be redundant.
+		return false
+	}
+}
+
+// handleAdminTumble performs an operator-requested rebind onto a different supplier.
+//
+// It reuses the staleness watchdog's reconnect path — ErrEndpointTumbled makes
+// handleEndpointDown avoid reselecting the currently bound supplier — but a tumble is
+// explicitly NOT a stall: the bound endpoint may be perfectly healthy and is being moved
+// for traffic-distribution reasons. So it deliberately does not touch
+// consecutiveStallRebinds (which gates the give-up-and-close-the-client limit) and does
+// not report a stall for observability. Tumbling must never be able to close a client.
+//
+// Runs on the start() goroutine, so endpointGen and lastEndpointDataAt are read/written
+// without synchronization, same as every other handler here.
+func (b *bridge) handleAdminTumble() {
+	if b.reconnector == nil {
+		return
+	}
+
+	// Give the incoming endpoint a full staleness window rather than inheriting the
+	// outgoing one's clock, which would let the watchdog fire immediately after a tumble.
+	b.lastEndpointDataAt = time.Now()
+
+	b.logger.Info().Msg("🎲 [WS-TUMBLE] operator-requested rebind — moving connection to a different supplier")
+	b.handleEndpointDown(endpointDisconnect{gen: b.endpointGen, err: ErrEndpointTumbled})
 }
 
 // StartBridge creates a new Bridge instance with connections to both client and endpoint
@@ -201,9 +275,18 @@ func StartBridge(
 	endpointOnDisconnect := cancelOnDisconnect
 	if reconnector != nil {
 		b.endpointDown = make(chan endpointDisconnect, 1)
+		b.tumble = make(chan struct{}, 1)
 		b.endpointCtx, b.endpointCancel = context.WithCancel(b.ctx)
 		endpointLoopCtx = b.endpointCtx
 		endpointOnDisconnect = b.endpointDisconnectFunc(b.endpointGen)
+
+		// Hand the reconnector a handle to this bridge so it can register the live
+		// connection for operator-initiated tumbling. Optional: reconnectors that do not
+		// implement BridgeAttacher simply never become tumble-able. Paired with the
+		// AttachBridge(nil) in shutdown().
+		if attacher, ok := reconnector.(BridgeAttacher); ok {
+			attacher.AttachBridge(b)
+		}
 	}
 
 	b.endpointConn = newConnection(
@@ -302,6 +385,17 @@ func (b *bridge) start() {
 		stalenessC = ticker.C
 	}
 
+	// The bound-session expiry watchdog runs only when the reconnector can answer the
+	// question. Separate from the staleness watchdog because it detects the opposite
+	// condition: staleness catches a supplier that went quiet, this catches one that keeps
+	// streaming past the end of its own session.
+	var sessionExpiryC <-chan time.Time
+	if _, ok := b.reconnector.(SessionExpiryChecker); ok {
+		ticker := time.NewTicker(sessionExpiryCheckInterval)
+		defer ticker.Stop()
+		sessionExpiryC = ticker.C
+	}
+
 	for {
 		select {
 		case msg := <-b.msgChan:
@@ -325,6 +419,19 @@ func (b *bridge) start() {
 		// this goroutine, serialized with message processing and reconnects.
 		case <-stalenessC:
 			b.checkEndpointStaleness()
+
+		// Proactive session-boundary check: detect a supplier still streaming past the end
+		// of the session this connection is bound to, and rebind onto the current session.
+		// Runs inline on this goroutine, serialized with everything else.
+		case <-sessionExpiryC:
+			b.checkBoundSessionExpiry()
+
+		// Operator-requested rebind onto a different supplier. Only ever selected when
+		// rebind is enabled (tumble is nil otherwise, so this case blocks forever).
+		// Handled inline on this goroutine, serialized with message processing and the
+		// other reconnect paths.
+		case <-b.tumble:
+			b.handleAdminTumble()
 
 		case <-b.ctx.Done():
 			b.shutdown(ErrBridgeContextCanceled)
@@ -380,6 +487,57 @@ func (b *bridge) checkEndpointStaleness() {
 	b.handleEndpointDown(endpointDisconnect{gen: b.endpointGen, err: ErrEndpointStalled})
 }
 
+// checkBoundSessionExpiry detects a connection still bound to a session that has ended and
+// rebinds it onto the current one.
+//
+// Nothing else catches this. The relay miner normally closes the socket at session expiry
+// (close 4000), which drives the ordinary rollover rebind; when it does not, the connection
+// keeps streaming because endpoint→client frames are unsigned and need no session, and the
+// staleness watchdog stays quiet precisely because data is still flowing. The result is a
+// connection stranded outside the session — invisible to reputation, unreachable by endpoint
+// selection, and unable to add a subscription because client→endpoint frames are signed
+// against the dead session.
+//
+// Unlike a stall or a tumble, this does NOT need to land on a different supplier: if the
+// supplier is still in the new session, reusing it is the seamless outcome. So it takes the
+// plain rollover path.
+//
+// Runs on the start() goroutine, so all state access is unsynchronized.
+func (b *bridge) checkBoundSessionExpiry() {
+	checker, ok := b.reconnector.(SessionExpiryChecker)
+	if !ok {
+		return
+	}
+
+	if !checker.BoundSessionExpired() {
+		// Healthy: a rebind landed on the current session (or never left it).
+		b.consecutiveSessionRebinds = 0
+		return
+	}
+
+	// Give up checking rather than closing the client. An out-of-session connection is
+	// still delivering data to its subscriber; dropping it would be a worse outcome than
+	// leaving it where it is, and rebinding on every tick forever would be worse still.
+	if b.consecutiveSessionRebinds >= maxConsecutiveSessionRebinds {
+		return
+	}
+	b.consecutiveSessionRebinds++
+
+	// Let the reconnector label the metric distinctly — otherwise this is indistinguishable
+	// from a supplier-initiated rollover, which is the comparison worth measuring.
+	if reporter, ok := b.reconnector.(SessionExpiryReporter); ok {
+		reporter.OnSessionExpiryRebindRequested()
+	}
+
+	// NOTE: Error level ON PURPOSE so the fix is visible in production (both environments
+	// run at LOG_LEVEL=error). Downgrade once validated.
+	b.logger.Error().
+		Int("session_rebind_attempt", b.consecutiveSessionRebinds).
+		Msg("🔁 [WS-SESSION] bound session ended without the supplier disconnecting — rebinding onto the current session")
+
+	b.handleEndpointDown(endpointDisconnect{gen: b.endpointGen, err: ErrEndpointSessionExpired})
+}
+
 // shutdown performs immediate and complete bridge cleanup.
 //
 // Usage:
@@ -401,6 +559,15 @@ func (b *bridge) shutdown(err error) {
 	// Use sync.Once to ensure shutdown is only called once, preventing panics from double-closing channels
 	b.shutdownOnce.Do(func() {
 		b.logger.Warn().Err(err).Msg("🔌👋 Websocket bridge shutting down.")
+
+		// Deregister from the operator-tumble registry before tearing anything down, so
+		// an in-flight admin request cannot hand out a handle to a dying bridge. Tumble()
+		// on an already-shut-down bridge is harmless anyway (the queued signal is never
+		// read), but dropping the reference promptly keeps the registry from pinning
+		// dead connections. Paired with the AttachBridge(b) in StartBridge.
+		if attacher, ok := b.reconnector.(BridgeAttacher); ok {
+			attacher.AttachBridge(nil)
+		}
 
 		// Cancel the context first to signal all goroutines (connLoop, pingLoop, start)
 		// to stop. This must happen before closing connections to prevent connLoop

@@ -303,6 +303,12 @@ type (
 		// If the primary request hasn't completed within this duration, a second request
 		// is started to a different endpoint and the first response wins.
 		HedgeDelay *time.Duration `yaml:"hedge_delay,omitempty"`
+		// HedgeMaxBatchSize suppresses hedging for JSON-RPC batches larger than this many
+		// items. Batches fan out into one relay per item, so hedging an N-item batch costs
+		// up to 2N relays, and large batches exceed HedgeDelay as a matter of course rather
+		// than because anything is wrong. nil applies defaultHedgeMaxBatchSize; 0 disables
+		// the cap and hedges every batch regardless of size.
+		HedgeMaxBatchSize *int `yaml:"hedge_max_batch_size,omitempty"`
 	}
 
 	// ObservationPipelineConfig configures the observation processing pipeline.

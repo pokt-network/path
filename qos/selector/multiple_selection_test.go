@@ -184,7 +184,7 @@ func TestSelectEndpointsWithDiversity(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := SelectEndpointsWithDiversity(logger, tc.endpoints, tc.numEndpoints)
+			result := SelectEndpointsWithDiversity(logger, "test-svc", tc.endpoints, tc.numEndpoints)
 
 			require.Len(t, result, tc.expectedLength)
 
@@ -220,7 +220,7 @@ func TestSelectEndpointsWithDiversity_TLDDiversity(t *testing.T) {
 		"provider5.com", // duplicate TLD
 	}
 
-	result := SelectEndpointsWithDiversity(logger, endpoints, 4)
+	result := SelectEndpointsWithDiversity(logger, "test-svc", endpoints, 4)
 	require.Len(t, result, 4)
 
 	// Count unique TLDs in result
@@ -312,7 +312,7 @@ func TestSelectEndpointWithDifferentTLD(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := selectEndpointWithDifferentTLD(tc.availableEndpoints, tc.endpointTLDs, tc.usedTLDs)
+			result, err := selectEndpointWithDifferentTLD("test-svc", tc.availableEndpoints, tc.endpointTLDs, tc.usedTLDs)
 
 			if tc.expectError {
 				require.Error(t, err)

@@ -78,7 +78,7 @@ func (p *Protocol) GetEndpointLeaderboardData(ctx context.Context) ([]metrics.En
 
 		// Get active sessions for this service (only works in centralized mode)
 		// In delegated mode, this will fail since we don't have an HTTP request context
-		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID)
+		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID, false)
 		if err != nil {
 			logger.Debug().
 				Str("service_id", string(serviceID)).
@@ -238,7 +238,7 @@ func (p *Protocol) GetMeanScoreData(ctx context.Context) ([]metrics.MeanScoreEnt
 		serviceID := serviceConfig.ID
 
 		// Get active sessions for this service
-		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID)
+		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID, false)
 		if err != nil {
 			continue
 		}
@@ -349,7 +349,7 @@ func (p *Protocol) GetSupplierScoreData(ctx context.Context) ([]metrics.Supplier
 	for _, serviceConfig := range p.unifiedServicesConfig.Services {
 		serviceID := serviceConfig.ID
 
-		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID)
+		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID, false)
 		if err != nil || len(activeSessions) == 0 {
 			continue
 		}
@@ -436,7 +436,7 @@ func (p *Protocol) GetCooldownCountData(ctx context.Context) ([]metrics.Cooldown
 	for _, serviceConfig := range p.unifiedServicesConfig.Services {
 		serviceID := serviceConfig.ID
 
-		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID)
+		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID, false)
 		if err != nil || len(activeSessions) == 0 {
 			continue
 		}

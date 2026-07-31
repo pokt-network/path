@@ -37,6 +37,7 @@ type (
 		healthChecker                 *health.Checker
 		circuitBreakerAdmin           CircuitBreakerAdmin
 		chainStateAdmin               ChainStateAdmin
+		websocketAdmin                WebsocketAdmin
 		staticResponses               StaticResponseResolver
 	}
 	gatewayHandler interface {
@@ -63,6 +64,13 @@ type (
 	ChainStateAdmin interface {
 		ResetChainState(ctx context.Context, serviceID string) (found bool, err error)
 	}
+	// WebsocketAdmin allows redistributing live websocket connections via admin
+	// endpoints. A websocket connection binds one endpoint for its whole lifetime, so
+	// connections that landed on a concentrated operator stay there until they rebind;
+	// this forces that rebind without restarting the pod and dropping every client.
+	WebsocketAdmin interface {
+		TumbleWebsockets(req protocol.WebsocketTumbleRequest) protocol.WebsocketTumbleResult
+	}
 )
 
 /* --------------------------------- Init -------------------------------- */
@@ -76,6 +84,7 @@ func NewRouter(
 	config config.RouterConfig,
 	circuitBreakerAdmin CircuitBreakerAdmin,
 	chainStateAdmin ChainStateAdmin,
+	websocketAdmin WebsocketAdmin,
 	staticResponses StaticResponseResolver,
 ) *router {
 	r := &router{
@@ -89,6 +98,7 @@ func NewRouter(
 		healthChecker:                 healthChecker,
 		circuitBreakerAdmin:           circuitBreakerAdmin,
 		chainStateAdmin:               chainStateAdmin,
+		websocketAdmin:                websocketAdmin,
 		staticResponses:               staticResponses,
 	}
 	r.handleRoutes()
@@ -126,6 +136,10 @@ func (r *router) handleRoutes() {
 
 	// POST /admin/chain-state/clear/{serviceId} - resets perceived block height (in-memory + Redis)
 	r.mux.HandleFunc("POST /admin/chain-state/clear/", r.handleChainStateClear)
+
+	// POST /admin/websocket/tumble/{serviceId} - forces live websocket connections to
+	// rebind onto different suppliers (clients stay connected, subscriptions replayed)
+	r.mux.HandleFunc("POST /admin/websocket/tumble/", r.handleWebsocketTumble)
 
 	// requestHandlerFn defines the middleware chain for all service requests.
 	// staticResponseMiddleware runs after the prefix strip (so it sees the cleaned path)

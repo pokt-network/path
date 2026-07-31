@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/pokt-network/path/protocol"
@@ -314,4 +315,78 @@ func (r *router) handleChainStateClear(w http.ResponseWriter, req *http.Request)
 		"service_id": serviceID,
 		"message":    "chain state cleared (perceived block height reset, in-memory + Redis)",
 	})
+}
+
+// handleWebsocketTumble handles POST /admin/websocket/tumble/{serviceId}
+//
+// Forces live websocket connections for the service to rebind onto DIFFERENT suppliers.
+// Clients stay connected throughout — the bridge re-dials an endpoint and replays the
+// client's subscriptions, the same machinery a session rollover or a stall rebind uses.
+//
+// Why this exists: a websocket connection binds one endpoint for its entire lifetime and
+// only moves at a session rollover or a stall. A long-lived high-volume subscriber
+// therefore pins itself to whichever operator it first landed on, and no change to
+// endpoint selection can move it — selection only governs where NEW connections go. The
+// alternative to this endpoint is restarting the pod, which drops every client and
+// resets unrelated in-memory state.
+//
+// Like the other admin endpoints, this operates on PER-POD in-memory state and must be
+// issued to each pod separately.
+//
+// Query parameters (all optional):
+//
+//	domain=<eTLD+1>  only move connections currently bound to this operator
+//	max=<n>          move at most n connections, most-concentrated operators first
+//	dry_run=true     report what would move without moving anything
+func (r *router) handleWebsocketTumble(w http.ResponseWriter, req *http.Request) {
+	if r.websocketAdmin == nil {
+		http.Error(w, `{"error":"websocket admin not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	serviceID := strings.TrimPrefix(req.URL.Path, "/admin/websocket/tumble/")
+	if serviceID == "" {
+		http.Error(w, `{"error":"service ID required: POST /admin/websocket/tumble/{serviceId}"}`, http.StatusBadRequest)
+		return
+	}
+
+	query := req.URL.Query()
+
+	// max must be a non-negative integer; a malformed value is rejected rather than
+	// silently treated as "no cap", which would tumble every connection.
+	maxConns := 0
+	if raw := query.Get("max"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			http.Error(w, `{"error":"max must be a non-negative integer"}`, http.StatusBadRequest)
+			return
+		}
+		maxConns = parsed
+	}
+
+	// order_by controls how a capped tumble ranks candidates. Defaults to throughput —
+	// socket count is a poor proxy for load, so ordering by it spends the cap moving
+	// connections that were not the problem. Rejected rather than silently defaulted, so a
+	// typo does not quietly give the operator the ordering they were trying to avoid.
+	orderBy := protocol.TumbleOrderThroughput
+	switch raw := query.Get("order_by"); raw {
+	case "", string(protocol.TumbleOrderThroughput):
+	case string(protocol.TumbleOrderConnections):
+		orderBy = protocol.TumbleOrderConnections
+	default:
+		http.Error(w, `{"error":"order_by must be one of: throughput, connections"}`, http.StatusBadRequest)
+		return
+	}
+
+	result := r.websocketAdmin.TumbleWebsockets(protocol.WebsocketTumbleRequest{
+		ServiceID: serviceID,
+		Domain:    query.Get("domain"),
+		Max:       maxConns,
+		OrderBy:   orderBy,
+		DryRun:    query.Get("dry_run") == "true",
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
 }

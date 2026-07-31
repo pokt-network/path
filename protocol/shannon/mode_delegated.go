@@ -36,6 +36,7 @@ func (p *Protocol) getDelegatedGatewayModeActiveSession(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	httpReq *http.Request,
+	forceCurrentSession bool,
 ) ([]sessiontypes.Session, error) {
 	logger := p.logger.With("method", "getDelegatedGatewayModeActiveSession")
 
@@ -65,8 +66,9 @@ func (p *Protocol) getDelegatedGatewayModeActiveSession(
 
 	sessions := []sessiontypes.Session{currentSession}
 
-	// During rollover: ALSO fetch extended (previous) session for continuity
-	if p.IsInSessionRollover() {
+	// During rollover: ALSO fetch extended (previous) session for continuity.
+	// forceCurrentSession (websocket callers) opts out: see getActiveGatewaySessions.
+	if !forceCurrentSession && p.IsInSessionRollover() {
 		extendedSession, err := p.GetSessionWithExtendedValidity(ctx, serviceID, extractedAppAddr)
 		if err != nil {
 			logger.Warn().Err(err).

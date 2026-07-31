@@ -283,9 +283,28 @@ gateway_config:
       # endpoint selections that any single operator (registrable domain / eTLD+1) may
       # receive; the excess is spread across the other valid operators. This limits the
       # blast radius when one operator holds most of the valid pool and then degrades.
-      # Ships ON by default at 0.65 for every service — set a value here to override, or
-      # 1.0 (or 0) to disable it for this service.
+      # Ships ON by default at 0.50 for every service — set a value here to override, or
+      # 1.0 (or 0) to disable it for this service. A cap no assignment can satisfy
+      # (cap * operator_count <= 1, which 0.50 is for any two-operator pool) falls back to a
+      # 0.65 cap rather than forcing those two operators to an even split.
       # max_operator_share: 0.6
+      # Per-backend registration weight cap, K (optional). A backend URL's selection weight
+      # is min(supplier registrations behind it, K), so staking more suppliers earns more
+      # traffic — the chain pays per registration — while stacking many registrations behind
+      # one machine cannot buy unbounded share, because one machine is one failure domain.
+      # K=1 is backend-uniform (one machine, one vote); a very large K is
+      # registration-proportional. Ships at 2 for every service; set a value here to override.
+      # backend_registration_weight_cap: 2
+      # Extend max_operator_share to the retry, hedge and batch-item selections (optional).
+      # Those pick from the top-reputation-score band, which is capped by distinct backend URL
+      # but not by operator — so one operator fronting most of the band took most of the
+      # retries and hedges, on the very paths meant to reach different infrastructure than the
+      # attempt that just failed. Ships ON: the cap reweights the band and never filters it, so
+      # a retry's reachable set is unchanged at any cap value — the risk is bounded by the
+      # implementation rather than by keeping the switch off, and a switch that ships off never
+      # gets measured. Set false here to opt one service out; PATH_CAP_RETRY_HEDGE_SELECTION=false
+      # forces it off fleet-wide without a redeploy.
+      # cap_retry_hedge_selection: false
       # WebSocket rebind strategy (optional). When true (the default), a session-rollover
       # rebind spreads the target uniformly across operators (each provider equally likely),
       # then picks an endpoint within it — maximizing per-provider spread. When false, the

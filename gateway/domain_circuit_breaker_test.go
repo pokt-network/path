@@ -24,6 +24,17 @@ func readCircuitBreakerGauge(serviceID, domain string) float64 {
 	return testutil.ToFloat64(metrics.DomainCircuitBreakerState.WithLabelValues(serviceID, domain))
 }
 
+// breakDomain drives a domain past the failure-rate gate so it is actually removed from the
+// pool. A single MarkBroken no longer breaks anything by design: the trigger is a failure
+// RATE, not a first error, because first-error breaking removed high-volume operators
+// sustaining >99% success. Tests that care about cache/TTL/Redis mechanics rather than the
+// gate itself use this to reach the broken state.
+func breakDomain(cb *DomainCircuitBreaker, ctx context.Context, serviceID, domain, reason string) {
+	for i := 0; i < defaultMinFailures; i++ {
+		cb.MarkBroken(ctx, serviceID, domain, reason)
+	}
+}
+
 func TestDomainCircuitBreaker_MarkAndGet(t *testing.T) {
 	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
 	ctx := context.Background()
@@ -35,7 +46,7 @@ func TestDomainCircuitBreaker_MarkAndGet(t *testing.T) {
 	}
 
 	// Mark a domain as broken
-	cb.MarkBroken(ctx, "eth", "rel.spacebelt.xyz", "test")
+	breakDomain(cb, ctx, "eth", "rel.spacebelt.xyz", "test")
 
 	// Should now appear in broken domains
 	domains = cb.GetBrokenDomains(ctx, "eth")
@@ -54,8 +65,8 @@ func TestDomainCircuitBreaker_MultipleDomains(t *testing.T) {
 	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
 	ctx := context.Background()
 
-	cb.MarkBroken(ctx, "eth", "broken1.example.com", "test")
-	cb.MarkBroken(ctx, "eth", "broken2.example.com", "test")
+	breakDomain(cb, ctx, "eth", "broken1.example.com", "test")
+	breakDomain(cb, ctx, "eth", "broken2.example.com", "test")
 
 	domains := cb.GetBrokenDomains(ctx, "eth")
 	if len(domains) != 2 {
@@ -71,14 +82,14 @@ func TestDomainCircuitBreaker_LocalOnlyMode(t *testing.T) {
 	ctx := context.Background()
 
 	// Should work without Redis
-	cb.MarkBroken(ctx, "eth", "broken.example.com", "test")
+	breakDomain(cb, ctx, "eth", "broken.example.com", "test")
 	domains := cb.GetBrokenDomains(ctx, "eth")
 	if !domains["broken.example.com"] {
 		t.Fatal("expected broken.example.com to be broken in local-only mode")
 	}
 
 	// Mark another domain for a different service
-	cb.MarkBroken(ctx, "poly", "broken2.example.com", "test")
+	breakDomain(cb, ctx, "poly", "broken2.example.com", "test")
 	domains = cb.GetBrokenDomains(ctx, "poly")
 	if !domains["broken2.example.com"] {
 		t.Fatal("expected broken2.example.com to be broken for poly")
@@ -97,7 +108,7 @@ func TestDomainCircuitBreaker_TTLExpiry(t *testing.T) {
 	cb.cacheTTL = 10 * time.Millisecond    // Short cache TTL so refresh happens quickly
 	ctx := context.Background()
 
-	cb.MarkBroken(ctx, "eth", "expired.example.com", "test")
+	breakDomain(cb, ctx, "eth", "expired.example.com", "test")
 
 	// Should be broken immediately
 	domains := cb.GetBrokenDomains(ctx, "eth")
@@ -120,7 +131,7 @@ func TestDomainCircuitBreaker_CacheRefresh(t *testing.T) {
 	cb.cacheTTL = 20 * time.Millisecond // Short cache TTL
 	ctx := context.Background()
 
-	cb.MarkBroken(ctx, "eth", "domain1.example.com", "test")
+	breakDomain(cb, ctx, "eth", "domain1.example.com", "test")
 
 	// First read caches the result
 	domains := cb.GetBrokenDomains(ctx, "eth")
@@ -132,7 +143,7 @@ func TestDomainCircuitBreaker_CacheRefresh(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 
 	// Mark another domain — this goes into cache directly
-	cb.MarkBroken(ctx, "eth", "domain2.example.com", "test")
+	breakDomain(cb, ctx, "eth", "domain2.example.com", "test")
 
 	// Next read should trigger refresh and include both
 	domains = cb.GetBrokenDomains(ctx, "eth")
@@ -220,58 +231,108 @@ func TestDomainCircuitBreaker_ConcurrentAccess(t *testing.T) {
 	}
 }
 
-func TestDomainCircuitBreaker_EscalatingTTL(t *testing.T) {
+// Escalation must count EPISODES, not marks.
+//
+// The old behavior escalated whenever MarkBroken was called while the domain was already
+// broken. Batch items fail concurrently on separate goroutines, so a single incident produced
+// ~89 marks in production — six is enough to pin the TTL at the 30-minute cap. One transient
+// burst therefore removed a domain for the maximum duration.
+func TestDomainCircuitBreaker_DuplicateMarksDoNotEscalate(t *testing.T) {
 	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
-	cb.defaultTTL = 100 * time.Millisecond
-	cb.maxTTL = 3200 * time.Millisecond // cap at 32x base for testing
-	cb.cacheTTL = 1 * time.Millisecond  // fast cache refresh
+	cb.defaultTTL = 10 * time.Second
+	ctx := context.Background()
+
+	domain := "concurrent-burst.example.com"
+
+	// One episode: enough failures to pass the gate, then a burst of further marks
+	// representing the other batch items of the same incident failing simultaneously.
+	breakDomain(cb, ctx, "eth", domain, "batch_transport_error: boom")
+	for i := 0; i < 200; i++ {
+		cb.MarkBroken(ctx, "eth", domain, "batch_transport_error: boom")
+	}
+
+	cb.mu.RLock()
+	state := cb.cache["eth"].domains[domain]
+	cb.mu.RUnlock()
+
+	if state.hitCount != 1 {
+		t.Fatalf("one incident must be one episode: hitCount=%d, want 1", state.hitCount)
+	}
+	if got := cb.escalatedTTL(state.hitCount); got != cb.defaultTTL {
+		t.Fatalf("TTL escalated on duplicate marks: got %v, want base %v", got, cb.defaultTTL)
+	}
+}
+
+// Escalation must still punish a domain that breaks AGAIN after being let back in — that is
+// the case exponential backoff exists for.
+func TestDomainCircuitBreaker_EscalatesAcrossEpisodes(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
+	cb.defaultTTL = 30 * time.Millisecond
+	cb.maxTTL = 3200 * time.Millisecond
+	cb.cacheTTL = 1 * time.Millisecond
+	cb.failureWindow = time.Millisecond // roll the rate window fast so each episode is fresh
 	ctx := context.Background()
 
 	domain := "repeat-offender.example.com"
 
-	// Hit 1: base TTL (100ms)
-	cb.MarkBroken(ctx, "eth", domain, "test")
+	for episode := 1; episode <= 3; episode++ {
+		breakDomain(cb, ctx, "eth", domain, "test")
+
+		cb.mu.RLock()
+		state := cb.cache["eth"].domains[domain]
+		cb.mu.RUnlock()
+		if state.hitCount != episode {
+			t.Fatalf("episode %d: hitCount=%d, want %d", episode, state.hitCount, episode)
+		}
+
+		// Let the break expire so the next round is a genuine re-offence.
+		time.Sleep(cb.escalatedTTL(episode) + 20*time.Millisecond)
+		cb.GetBrokenDomains(ctx, "eth") // drives expiry cleanup
+	}
+}
+
+// Break history must survive the break's own expiry, or every re-offence looks like a first
+// offence and the backoff never engages. The old code reset to 1 on expiry, which meant a
+// chronically-broken domain was only ever removed for the base TTL.
+func TestDomainCircuitBreaker_EscalationMemoryExpires(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
+	cb.defaultTTL = 10 * time.Millisecond
+	cb.cacheTTL = 1 * time.Millisecond
+	cb.failureWindow = time.Millisecond
+	// Generous memory for the "within memory" leg: the only thing under test there is that
+	// escalation survives a TTL expiry, not any particular duration. A tight bound here
+	// (e.g. 2x the sleep) makes the test fail whenever the sleep overshoots under -race or
+	// load, which says nothing about the code.
+	cb.escalationMemory = 10 * time.Second
+	ctx := context.Background()
+
+	domain := "forgiven.example.com"
+
+	breakDomain(cb, ctx, "eth", domain, "test")
+	time.Sleep(20 * time.Millisecond)
+	cb.GetBrokenDomains(ctx, "eth")
+
+	// Within memory → escalates.
+	breakDomain(cb, ctx, "eth", domain, "test")
 	cb.mu.RLock()
 	state := cb.cache["eth"].domains[domain]
 	cb.mu.RUnlock()
-	if state.hitCount != 1 {
-		t.Fatalf("expected hitCount=1, got %d", state.hitCount)
-	}
-
-	// Hit 2: should escalate (200ms)
-	cb.MarkBroken(ctx, "eth", domain, "test")
-	cb.mu.RLock()
-	state = cb.cache["eth"].domains[domain]
-	cb.mu.RUnlock()
 	if state.hitCount != 2 {
-		t.Fatalf("expected hitCount=2, got %d", state.hitCount)
+		t.Fatalf("within escalation memory: hitCount=%d, want 2", state.hitCount)
 	}
 
-	// Hit 3: should escalate (400ms)
-	cb.MarkBroken(ctx, "eth", domain, "test")
+	// Beyond memory → forgiven, back to a first offence. Shrink the memory rather than
+	// sleeping it out, so this leg cannot be perturbed by scheduling either: any elapsed
+	// time now exceeds it.
+	cb.escalationMemory = time.Nanosecond
+	time.Sleep(30 * time.Millisecond)
+	cb.GetBrokenDomains(ctx, "eth")
+	breakDomain(cb, ctx, "eth", domain, "test")
 	cb.mu.RLock()
 	state = cb.cache["eth"].domains[domain]
 	cb.mu.RUnlock()
-	if state.hitCount != 3 {
-		t.Fatalf("expected hitCount=3, got %d", state.hitCount)
-	}
-
-	// Hit 4: should escalate (800ms)
-	cb.MarkBroken(ctx, "eth", domain, "test")
-	cb.mu.RLock()
-	state = cb.cache["eth"].domains[domain]
-	cb.mu.RUnlock()
-	if state.hitCount != 4 {
-		t.Fatalf("expected hitCount=4, got %d", state.hitCount)
-	}
-
-	// Hit 5: should escalate (1600ms)
-	cb.MarkBroken(ctx, "eth", domain, "test")
-	cb.mu.RLock()
-	state = cb.cache["eth"].domains[domain]
-	cb.mu.RUnlock()
-	if state.hitCount != 5 {
-		t.Fatalf("expected hitCount=5, got %d", state.hitCount)
+	if state.hitCount != 1 {
+		t.Fatalf("beyond escalation memory: hitCount=%d, want 1 (forgiven)", state.hitCount)
 	}
 }
 
@@ -316,38 +377,6 @@ func TestDomainCircuitBreaker_TTLCapAt30Min(t *testing.T) {
 	ttl = cb.escalatedTTL(10)
 	if ttl != 30*time.Minute {
 		t.Fatalf("expected 30min cap for hit 10, got %v", ttl)
-	}
-}
-
-func TestDomainCircuitBreaker_HitCountResetAfterExpiry(t *testing.T) {
-	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
-	cb.defaultTTL = 50 * time.Millisecond
-	cb.maxTTL = 30 * time.Minute
-	cb.cacheTTL = 1 * time.Millisecond
-	ctx := context.Background()
-
-	domain := "reset.example.com"
-
-	// Hit 1 and 2
-	cb.MarkBroken(ctx, "eth", domain, "test")
-	cb.MarkBroken(ctx, "eth", domain, "test")
-	cb.mu.RLock()
-	state := cb.cache["eth"].domains[domain]
-	cb.mu.RUnlock()
-	if state.hitCount != 2 {
-		t.Fatalf("expected hitCount=2, got %d", state.hitCount)
-	}
-
-	// Wait for TTL to expire (hit 2 TTL = 100ms)
-	time.Sleep(120 * time.Millisecond)
-
-	// Hit count should reset since the previous entry expired
-	cb.MarkBroken(ctx, "eth", domain, "test")
-	cb.mu.RLock()
-	state = cb.cache["eth"].domains[domain]
-	cb.mu.RUnlock()
-	if state.hitCount != 1 {
-		t.Fatalf("expected hitCount to reset to 1 after expiry, got %d", state.hitCount)
 	}
 }
 
@@ -479,14 +508,55 @@ func TestCircuitBreakerEventsCounter(t *testing.T) {
 		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventRecovered,
 	))
 
-	// MarkBroken with a "retry: ..." reason should record one broken event with
-	// reason_category="retry"
-	cb.MarkBroken(ctx, serviceID, domain, "retry: heuristic_html | status=502 | response=oops")
+	preSuppressed := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventSuppressed,
+	))
+	preDuplicate := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventDuplicate,
+	))
+
+	const reason = "retry: heuristic_html | status=502 | response=oops"
+
+	// Triggers below the failure-rate gate are counted as "suppressed", not "broken" —
+	// otherwise a mis-tuned gate silently swallowing real failures is invisible.
+	for i := 0; i < defaultMinFailures-1; i++ {
+		cb.MarkBroken(ctx, serviceID, domain, reason)
+	}
+	if got := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventSuppressed,
+	)) - preSuppressed; got != defaultMinFailures-1 {
+		t.Fatalf("expected %d suppressed events, got %v", defaultMinFailures-1, got)
+	}
+	if got := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventBroken,
+	)) - preBroken; got != 0 {
+		t.Fatalf("suppressed triggers must not count as breaks, got %v", got)
+	}
+
+	// The trigger that crosses the gate records exactly one broken event: one episode.
+	cb.MarkBroken(ctx, serviceID, domain, reason)
 	postBroken := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
 		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventBroken,
 	))
 	if postBroken-preBroken != 1 {
 		t.Fatalf("expected broken counter to increment by 1, got delta=%v", postBroken-preBroken)
+	}
+
+	// Further triggers while already broken are duplicates of the same episode. Counting
+	// them separately is what keeps broken:recovered ~1:1 — it used to run ~89:1 in
+	// production purely from concurrent batch items marking the same incident.
+	for i := 0; i < 10; i++ {
+		cb.MarkBroken(ctx, serviceID, domain, reason)
+	}
+	if got := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventDuplicate,
+	)) - preDuplicate; got != 10 {
+		t.Fatalf("expected 10 duplicate events, got %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.DomainCircuitBreakerEventsTotal.WithLabelValues(
+		serviceID, domain, metrics.CircuitBreakReasonRetry, metrics.CircuitBreakerEventBroken,
+	)) - preBroken; got != 1 {
+		t.Fatalf("duplicate triggers must not count as new breaks, got %v", got)
 	}
 
 	// ClearService should record one recovered event with the same reason_category
@@ -517,7 +587,7 @@ func TestDomainCircuitBreaker_MetricGaugeTransitions(t *testing.T) {
 	}
 
 	// MarkBroken → gauge should flip to 1
-	cb.MarkBroken(ctx, serviceID, domain, "test_reason")
+	breakDomain(cb, ctx, serviceID, domain, "test_reason")
 	if v := readCircuitBreakerGauge(serviceID, domain); v != 1 {
 		t.Fatalf("expected gauge=1 after MarkBroken, got %v", v)
 	}
@@ -529,7 +599,7 @@ func TestDomainCircuitBreaker_MetricGaugeTransitions(t *testing.T) {
 	}
 
 	// MarkBroken again, then wait for TTL expiry, then refresh — gauge should drop to 0
-	cb.MarkBroken(ctx, serviceID, domain, "test_reason_2")
+	breakDomain(cb, ctx, serviceID, domain, "test_reason_2")
 	if v := readCircuitBreakerGauge(serviceID, domain); v != 1 {
 		t.Fatalf("expected gauge=1 after second MarkBroken, got %v", v)
 	}
@@ -546,5 +616,87 @@ func TestDomainCircuitBreaker_MetricGaugeTransitions(t *testing.T) {
 	cb.GetBrokenDomains(ctx, serviceID)
 	if v := readCircuitBreakerGauge(serviceID, domain); v != 0 {
 		t.Fatalf("expected gauge=0 after TTL expiry + refresh, got %v", v)
+	}
+}
+
+// The production regression this gate exists for.
+//
+// An operator sustaining 99.26% success on a batch-heavy service was circuit-broken ~240
+// times in 3 hours, removing 90% of one service's endpoint pool (45 of 50 endpoints sat
+// behind 7 hostnames). The trigger was first-error: any single failed batch item removed the
+// whole hostname. That is volume-sensitive, not quality-sensitive — the operator with the
+// most endpoints receives the most traffic, so it reaches its first error soonest after every
+// TTL expiry and is effectively locked out permanently.
+func TestDomainCircuitBreaker_HighVolumeLowErrorRateIsNotBroken(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
+	cb.failureWindow = time.Hour // one window for the whole test
+	ctx := context.Background()
+
+	const domain = "high-volume.example.com"
+
+	// 10,000 relays at the measured 0.74% failure rate.
+	for i := 0; i < 10000; i++ {
+		if i%135 == 0 {
+			cb.MarkBroken(ctx, "blast", domain, "batch_transport_error: transient")
+		} else {
+			cb.RecordSuccess("blast", domain)
+		}
+	}
+
+	if broken := cb.GetBrokenDomains(ctx, "blast"); broken[domain] {
+		t.Fatalf("a domain succeeding >99%% of the time must not be removed from the pool")
+	}
+}
+
+// The gate must not become a way for a genuinely dead host to keep serving.
+func TestDomainCircuitBreaker_GenuinelyFailingDomainIsBroken(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
+	ctx := context.Background()
+
+	const domain = "dead-host.example.com"
+	for i := 0; i < defaultMinFailures; i++ {
+		cb.MarkBroken(ctx, "blast", domain, "batch_transport_error: connection refused")
+	}
+
+	if broken := cb.GetBrokenDomains(ctx, "blast"); !broken[domain] {
+		t.Fatalf("a domain failing every request must be removed from the pool")
+	}
+}
+
+// Below minFailures nothing breaks, so a lone failure on a quiet domain is not a 100% rate.
+func TestDomainCircuitBreaker_SingleFailureDoesNotBreak(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
+	ctx := context.Background()
+
+	cb.MarkBroken(ctx, "blast", "quiet.example.com", "batch_transport_error: one-off")
+
+	if broken := cb.GetBrokenDomains(ctx, "blast"); broken["quiet.example.com"] {
+		t.Fatal("a single failure must not remove a domain from the pool")
+	}
+}
+
+// A domain that recovers must be judged on its behavior after it returns, not on the failures
+// that removed it — otherwise the counts that caused one break also cause the next.
+func TestDomainCircuitBreaker_WindowResetsAfterBreak(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
+	cb.defaultTTL = 10 * time.Millisecond
+	cb.cacheTTL = time.Millisecond
+	cb.failureWindow = time.Hour
+	ctx := context.Background()
+
+	const domain = "recovering.example.com"
+	breakDomain(cb, ctx, "blast", domain, "test")
+
+	time.Sleep(20 * time.Millisecond)
+	cb.GetBrokenDomains(ctx, "blast") // drive expiry
+
+	// Healthy again: one isolated failure among many successes must not re-break it.
+	for i := 0; i < 500; i++ {
+		cb.RecordSuccess("blast", domain)
+	}
+	cb.MarkBroken(ctx, "blast", domain, "test")
+
+	if broken := cb.GetBrokenDomains(ctx, "blast"); broken[domain] {
+		t.Fatal("stale pre-break failures must not count toward the next break")
 	}
 }

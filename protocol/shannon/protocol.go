@@ -178,6 +178,38 @@ type Protocol struct {
 	// (canary testing); PATH_WEBSOCKET_SESSION_REBIND=false disables. Graduates to YAML
 	// config once canary-validated.
 	websocketSessionRebindEnabled bool
+
+	// wsConnRegistry tracks this pod's live websocket connections so an operator can
+	// force a subset to rebind onto different suppliers without a restart. Populated
+	// only for rebind-capable connections. Always non-nil.
+	wsConnRegistry *websocketConnRegistry
+}
+
+// TumbleWebsockets forces live websocket connections for a service to rebind onto
+// different suppliers, keeping clients connected and replaying their subscriptions.
+//
+// Motivation: a websocket connection binds one endpoint for its whole lifetime and only
+// moves at a session rollover or a stall. A long-lived high-volume subscriber therefore
+// pins itself to whichever operator it first landed on, and no selection-side change can
+// move it. This is the supported alternative to restarting a pod to redistribute
+// connections — a restart drops every client and resets unrelated in-memory state.
+//
+// PER-POD: the registry is in-memory, so this must be issued to each pod separately.
+func (p *Protocol) TumbleWebsockets(req protocol.WebsocketTumbleRequest) protocol.WebsocketTumbleResult {
+	result := p.wsConnRegistry.tumble(req)
+
+	p.logger.With("method", "TumbleWebsockets").Warn().
+		Str("service_id", req.ServiceID).
+		Str("domain_filter", req.Domain).
+		Int("max", req.Max).
+		Bool("dry_run", req.DryRun).
+		Int("total", result.Total).
+		Int("matched", result.Matched).
+		Int("tumbled", result.Tumbled).
+		Int("skipped", result.Skipped).
+		Msg("🎲 [WS-TUMBLE] operator-requested websocket redistribution")
+
+	return result
 }
 
 // serviceFallback holds the fallback information for a service,
@@ -226,6 +258,7 @@ func NewProtocol(
 		}(),
 		ConnectTimeout:             config.RetryConfig.ConnectTimeout,
 		HedgeDelay:                 config.RetryConfig.HedgeDelay,
+		HedgeMaxBatchSize:          config.RetryConfig.HedgeMaxBatchSize,
 		ObservationPipelineEnabled: config.ObservationPipelineConfig.Enabled,
 		SampleRate:                 config.ObservationPipelineConfig.SampleRate,
 		HealthChecksEnabled:        config.ActiveHealthChecksConfig.Enabled,
@@ -260,6 +293,10 @@ func NewProtocol(
 		logger: shannonLogger,
 
 		FullNode: fullNode,
+
+		// Tracks live websocket connections so they can be redistributed on request.
+		// Its throughput sampler is started below, once the instance exists.
+		wsConnRegistry: newWebsocketConnRegistry(),
 
 		// TODO_MVP(@adshmh): verify the gateway address and private key are valid, by completing the following:
 		// 1. Query onchain data for a gateway with the supplied address.
@@ -324,6 +361,13 @@ func NewProtocol(
 	} else {
 		protocolInstance.websocketSessionRebindEnabled = true
 		shannonLogger.Warn().Msg("⚠️ EXPERIMENTAL websocket session rebind ENABLED (default-on; set PATH_WEBSOCKET_SESSION_REBIND=false to disable)")
+	}
+
+	// Sample per-connection websocket throughput so a capped admin tumble can be spent on
+	// the connections actually carrying load rather than on whoever holds the most sockets.
+	// Only rebind-capable connections are registered, so this is tied to the same switch.
+	if protocolInstance.websocketSessionRebindEnabled {
+		protocolInstance.wsConnRegistry.startRateSampler(ctx)
 	}
 
 	// Initialize reputation service if enabled.
@@ -554,7 +598,7 @@ func (p *Protocol) AvailableHTTPEndpoints(
 	)
 
 	// TODO_TECHDEBT(@adshmh): validate "serviceID" is a valid onchain Shannon service.
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, false)
 	if err != nil {
 		logger.Error().Err(err).Msg("Relay request will fail: error building the active sessions for service.")
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -628,7 +672,9 @@ func (p *Protocol) AvailableWebsocketEndpoints(
 	)
 
 	// TODO_TECHDEBT(@adshmh): validate "serviceID" is a valid onchain Shannon service.
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	// forceCurrentSession: the pool a websocket connection is selected from must not
+	// contain previous-session endpoints — the connection would live on that session.
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, true)
 	if err != nil {
 		logger.Error().Err(err).Msg("Relay request will fail: error building the active sessions for service.")
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -718,7 +764,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 		"filter_by_reputation", filterByReputation,
 	)
 
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, false)
 	if err != nil {
 		logger.Error().Err(err).Msgf("Relay request will fail due to error retrieving active sessions for service %s", serviceID)
 		return nil, buildProtocolContextSetupErrorObservation(serviceID, err), err
@@ -1344,7 +1390,7 @@ func (p *Protocol) GetTotalServiceEndpointsCount(serviceID protocol.ServiceID, h
 	ctx := context.Background()
 
 	// Get the list of active sessions for the service ID.
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, false)
 	if err != nil {
 		return 0, err
 	}
@@ -1395,7 +1441,21 @@ func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations [
 // It maps the observation's error type directly to a reputation signal and records it.
 // Also records probation traffic metrics if the endpoint is in probation.
 func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonEndpointObservation) {
+	// Reconstruct the FULL endpoint address (<supplier>-<url>).
+	//
+	// Using the bare URL here silently broke every websocket health check: the reputation
+	// key builder runs at per-supplier granularity in production, so a URL with no supplier
+	// hashes to a different key than the one selection reads — and worse, the supplier
+	// extractor splits on the first "-", so a hostname containing one produced a mangled
+	// key. Health check results, pass or fail, were written somewhere nothing ever looked,
+	// which is why every websocket score sat pinned at its initial value.
+	//
+	// Falls back to the URL alone when the observation carries no supplier, which keeps
+	// fallback endpoints (no staked supplier) working as before.
 	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
+	if supplier := obs.GetSupplier(); supplier != "" {
+		endpointAddr = protocol.EndpointAddr(fmt.Sprintf("%s-%s", supplier, obs.GetEndpointUrl()))
+	}
 
 	// TODO_FUTURE: Add RPC type to ShannonEndpointObservation proto to support RPC-type-aware reputation.
 	// For now, default to JSON_RPC for HTTP observations since the proto doesn't include RPC type.
@@ -1446,6 +1506,33 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 
 // ** Health Check Integration **
 
+// healthCheckEndpointLookupTimeout bounds the chain work behind ONE service's
+// health-check endpoint lookup: the session list, the current block height and the
+// shared params.
+//
+// Why a bound exists at all: this lookup used to run on context.Background(), so a
+// hung chain node made it block forever. Measured in production on 2026-07-30: a
+// single stalled lookup held the health-check cycle for 21 minutes, during which no
+// service kept more than half its normal check rate and the fleet-wide rate fell to
+// 0.9% of median. Both environments failed together because they share a chain node.
+//
+// Why 3s: all three queries are served from the full-node caches (sturdyc) in the
+// steady state and cost one gRPC round trip on a miss — tens of milliseconds. 3s is
+// roughly two orders of magnitude of headroom, and still far below the 10s
+// health-check cycle interval, so a stalled lookup costs that service one cycle of
+// checks rather than stalling the cycle itself.
+//
+// A var rather than a const only so tests can shrink it; nothing in production writes it.
+//
+// One knock-on to know about: sturdyc kicks early-refresh fetches into a goroutine, and
+// cachingFullNode.GetSession's fetch closure captures the CALLER's ctx rather than the
+// fetchCtx sturdyc hands it (pre-existing). So a session refresh triggered by this lookup
+// is now canceled when the lookup returns, where context.Background() let it finish. It is
+// self-correcting — the record stays due, so the next reader (every user request reads
+// sessions) triggers it again, and past the TTL the refresh becomes synchronous and runs
+// inside this deadline. Fixing it properly means using fetchCtx in fullnode_cache.go.
+var healthCheckEndpointLookupTimeout = 3 * time.Second
+
 // GetEndpointsForHealthCheck returns a function that provides endpoint information
 // for health checks. This is used by the HealthCheckExecutor.RunAllChecks method.
 //
@@ -1458,11 +1545,14 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 //   - Returns []gateway.EndpointInfo suitable for health checks
 func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gateway.EndpointInfo, error) {
 	return func(serviceID protocol.ServiceID) ([]gateway.EndpointInfo, error) {
-		ctx := context.Background()
+		// Deadline-bounded, NOT context.Background(): see healthCheckEndpointLookupTimeout.
+		ctx, cancel := context.WithTimeout(context.Background(), healthCheckEndpointLookupTimeout)
+		defer cancel()
+
 		logger := p.logger.With("method", "GetEndpointsForHealthCheck", "service_id", string(serviceID))
 
 		// Get active sessions for this service (without filtering by reputation)
-		activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
+		activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil, false)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get sessions for service %s: %w", serviceID, err)
 		}
@@ -1470,6 +1560,16 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 		if len(activeSessions) == 0 {
 			logger.Debug().Msg("No active sessions for service")
 			return nil, nil
+		}
+
+		// The deadline fired somewhere inside the session lookup. The remaining chain
+		// queries below cannot succeed either, and their failure paths are deliberately
+		// lenient (a missing block height disables the session-expiry filter entirely,
+		// which would hand health checks endpoints from already-rolled-over sessions).
+		// Skip the service for this cycle instead; the next cycle retries. Nothing is
+		// cached from a failed fetch, so this cannot poison later lookups.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("endpoint lookup for service %s exceeded %s: %w", serviceID, healthCheckEndpointLookupTimeout, ctxErr)
 		}
 
 		// Get current block height for session validity filtering
@@ -1784,7 +1884,7 @@ func (p *Protocol) IsSupplierBlacklisted(serviceID protocol.ServiceID, supplierA
 // This is used by health check executor to detect session rollover.
 func (p *Protocol) IsSessionActive(ctx context.Context, serviceID protocol.ServiceID, sessionID string) bool {
 	// Get current active sessions for this service
-	sessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil)
+	sessions, err := p.getActiveGatewaySessions(ctx, serviceID, nil, false)
 	if err != nil {
 		// If we can't get sessions, assume it's active to avoid false negatives
 		return true

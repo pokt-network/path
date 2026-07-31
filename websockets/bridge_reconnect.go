@@ -57,6 +57,47 @@ type EndpointReconnector interface {
 	OnEndpointStallDetected(gaveUp bool)
 }
 
+// TumbleReporter is an optional interface an EndpointReconnector may implement to learn
+// that the upcoming rebind was requested by an operator (admin tumble) rather than
+// caused by a stall or a session rollover. Both a tumble and a stall reach
+// ReconnectEndpoint with avoidCurrentSupplier=true, so without this signal they are
+// indistinguishable and would share a metric label.
+//
+// Called on the bridge's start() goroutine immediately before the reconnect, i.e. the
+// same goroutine that then calls ReconnectEndpoint, so an implementer may record it in
+// unsynchronized state.
+type TumbleReporter interface {
+	OnTumbleRequested()
+}
+
+// SessionExpiryChecker is an optional interface an EndpointReconnector may implement so the
+// bridge can detect, without waiting for the supplier to hang up, that the session its
+// endpoint connection is bound to has ended. See ErrEndpointSessionExpired for why no other
+// trigger catches this.
+//
+// Optional so existing reconnectors (and test doubles) keep compiling; a reconnector that
+// does not implement it simply never gets the proactive check.
+//
+// Called on the bridge's start() goroutine, serialized with message processing and the other
+// rebind paths, so an implementer may read unsynchronized connection state.
+type SessionExpiryChecker interface {
+	// BoundSessionExpired reports whether the session the currently bound endpoint belongs
+	// to has ended, beyond any rollover grace. Implementations must be cheap (this runs per
+	// connection on a timer) and must return false when the answer is unknown — a rebind is
+	// disruptive, so an unavailable block height must never be read as "expired".
+	BoundSessionExpired() bool
+}
+
+// SessionExpiryReporter is an optional interface letting the reconnector learn that the
+// upcoming rebind was triggered by the bound session having expired, so it can label the
+// metric distinctly. Without it such a rebind is indistinguishable from an ordinary
+// supplier-initiated rollover, which is exactly the thing we want to measure separately.
+//
+// Called on the bridge's start() goroutine immediately before the rebind.
+type SessionExpiryReporter interface {
+	OnSessionExpiryRebindRequested()
+}
+
 // ReconnectFailureStage identifies where in a rebind episode a failure happened, so the
 // reconnector can emit a precise failure-reason metric. The bridge knows only the stage;
 // the reconnector (protocol layer) knows the specific selection/dial reason.
@@ -121,6 +162,24 @@ var (
 	maxConsecutiveStallRebinds = 3
 )
 
+// Bound-session expiry watchdog bounds. Package-level vars (not consts) so tests can shrink
+// them; production never mutates them.
+var (
+	// sessionExpiryCheckInterval is how often a connection checks whether the session it is
+	// bound to has ended. Sessions run ~20 minutes, so this only needs to be small relative
+	// to that; the check itself is cheap (a cached block height compared against a height
+	// already held on the endpoint), but it runs per connection, so there is no reason to
+	// make it aggressive.
+	sessionExpiryCheckInterval = 30 * time.Second
+	// maxConsecutiveSessionRebinds caps rebinds triggered by session expiry with no
+	// intervening healthy check. A successful rebind lands on the current session and the
+	// next check passes, resetting this to 0; if it somehow does not, this stops the bridge
+	// from rebinding on every tick forever. Reaching it stops the proactive checking for
+	// that connection rather than closing the client — an out-of-session connection is
+	// still delivering data, so dropping it would be a worse outcome than leaving it.
+	maxConsecutiveSessionRebinds = 3
+)
+
 // endpointDisconnectFunc returns the onDisconnect callback for an endpoint connection
 // of the given generation. It signals the start() loop to attempt a reconnect rather
 // than cancelling the bridge. Non-blocking: the buffered endpointDown channel plus the
@@ -162,9 +221,22 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 	}
 
 	// A stall-triggered disconnect (raised by the staleness watchdog) means the current
-	// supplier is the problem, so the reconnect must avoid reselecting it. An ordinary
+	// supplier is the problem, so the reconnect must avoid reselecting it. An operator
+	// tumble likewise exists precisely to land somewhere else. An ordinary
 	// session-rollover disconnect prefers supplier continuity (tier-1).
-	avoidCurrentSupplier := errors.Is(down.err, ErrEndpointStalled)
+	tumbled := errors.Is(down.err, ErrEndpointTumbled)
+	avoidCurrentSupplier := tumbled || errors.Is(down.err, ErrEndpointStalled)
+
+	// Tell the reconnector this rebind was operator-initiated so it can label the metric
+	// as such — without this it would be indistinguishable from a stall, since both
+	// arrive with avoidCurrentSupplier set. Called before the reconnect so the
+	// reconnector has it in hand by the time it picks the trigger label. Optional
+	// interface; reconnectors that do not implement it just report stall/rollover.
+	if tumbled {
+		if reporter, ok := b.reconnector.(TumbleReporter); ok {
+			reporter.OnTumbleRequested()
+		}
+	}
 
 	// NOTE: logged at Error level ON PURPOSE so rebind activity is visible on canary
 	// (LOG_LEVEL=error). Downgrade or remove once the feature is validated.

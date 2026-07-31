@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -163,6 +164,16 @@ type ServiceRetryConfig struct {
 	// is sent to a different endpoint. The first response wins.
 	// Default: 500ms. Set to 0 to disable hedging.
 	HedgeDelay *time.Duration `yaml:"hedge_delay,omitempty"`
+
+	// HedgeMaxBatchSize suppresses hedging for JSON-RPC batches larger than this many
+	// items. Each batch item is relayed independently (see buildServicePayloads), so a
+	// hedged N-item batch costs up to 2N relays. Large batches are also inherently slower
+	// than the flat hedge_delay — measured p95 for 51-500 item batches runs 2-2.6x the
+	// single-request p95 — so a size-blind delay hedges most of them on latency that is
+	// expected, not anomalous, burning relays for callers who are not latency-sensitive.
+	// Default: 10 (hedge single requests and small batches only). Set to 0 to disable the
+	// cap and hedge every batch regardless of size.
+	HedgeMaxBatchSize *int `yaml:"hedge_max_batch_size,omitempty"`
 }
 
 // ServiceObservationConfig holds per-service observation pipeline configuration.
@@ -278,9 +289,21 @@ type ServiceDefaults struct {
 	// service that does not set its own. nil falls back to DefaultMaxOperatorShare.
 	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
 
+	// BackendRegistrationWeightCap is the default per-backend registration weight cap (K)
+	// for any service that does not set its own. nil falls back to the process-wide K
+	// (selector.DefaultBackendRegistrationWeightCap, overridable by env).
+	BackendRegistrationWeightCap *int `yaml:"backend_registration_weight_cap,omitempty"`
+	// CapRetryHedgeSelection is the default for applying the concentration cap to the
+	// retry/hedge/batch band selection. nil falls back to DefaultCapRetryHedgeSelection (OFF).
+	CapRetryHedgeSelection *bool `yaml:"cap_retry_hedge_selection,omitempty"`
+
 	// WebsocketRebindOperatorUniform is the default WebSocket rebind selection strategy.
 	// nil falls back to DefaultWebsocketRebindOperatorUniform (ON).
 	WebsocketRebindOperatorUniform *bool `yaml:"websocket_rebind_operator_uniform,omitempty"`
+
+	// WebsocketHTTPScoreFloor is the default for gating WebSocket endpoint selection on the
+	// endpoint's json_rpc reputation. nil falls back to DefaultWebsocketHTTPScoreFloor (ON).
+	WebsocketHTTPScoreFloor *bool `yaml:"websocket_http_score_floor,omitempty"`
 }
 
 // ServiceConfig defines configuration for a single service.
@@ -322,10 +345,47 @@ type ServiceConfig struct {
 	// the cap for this service (flat selection ∝ endpoint count).
 	//
 	// Scope: the cap governs the primary single-endpoint selection (the bulk of traffic,
-	// HTTP and WebSocket, plus the WebSocket rebind target). It does NOT reshape
-	// multi-endpoint selection (parallel fan-out / hedge), which draw from the same
-	// reputation-filtered pool via separate code paths.
+	// HTTP and WebSocket, plus the WebSocket rebind target). It reaches the retry, hedge and
+	// batch-item selections only when CapRetryHedgeSelection is enabled. It does NOT reshape
+	// multi-endpoint selection (parallel fan-out), which draws from the same
+	// reputation-filtered pool via a separate code path.
 	MaxOperatorShare *float64 `yaml:"max_operator_share,omitempty"`
+
+	// BackendRegistrationWeightCap (K) bounds how much selection weight the supplier
+	// registrations behind ONE backend URL can accumulate: weight = min(registrations, K).
+	//
+	// It sets the BASIS the concentration cap and the serving pick are denominated in.
+	// K = 1 is backend-uniform (one machine, one vote) and ignores that the chain pays per
+	// registration; an arbitrarily large K is registration-proportional and lets an operator
+	// buy unbounded share by stacking registrations behind one machine — one failure domain.
+	// The default (2) pays for the second registration behind a machine and nothing after it.
+	//
+	// nil = use the process-wide value (selector.DefaultBackendRegistrationWeightCap, moved
+	// fleet-wide by PATH_BACKEND_REGISTRATION_WEIGHT_CAP). Minimum 1.
+	BackendRegistrationWeightCap *int `yaml:"backend_registration_weight_cap,omitempty"`
+	// CapRetryHedgeSelection extends MaxOperatorShare to the retry, hedge and batch-item
+	// selections — the picks made from the top-reputation-score band, which were capped by
+	// distinct backend URL but not by operator. nil = use the global default
+	// (ServiceDefaults.CapRetryHedgeSelection, then DefaultCapRetryHedgeSelection, which is
+	// OFF).
+	//
+	// These paths are a minority of selections (measured in production: ~2184/s primary
+	// against ~209/s retries and ~25/s winning hedges), so enabling this is a ~10% adjustment,
+	// not a redirection of the service. It is nonetheless where concentration leaked, because
+	// a retry exists precisely to reach infrastructure other than the one that just failed.
+	//
+	// Safe by construction: the cap reweights the band, it never filters it, so no retry loses
+	// a candidate it would otherwise have had. Where the band has collapsed to one operator
+	// the cap has no room and the pick is left uncapped (counted as
+	// path_concentration_cap_band_total{outcome="degraded_no_room"}).
+	//
+	// The retry pool is nonetheless marginal — roughly 60% of retries already fail — so the
+	// thing to watch after enabling is NOT the capped operator but the thin ones the excess
+	// lands on: path_supplier_exhausted_total, since a solo-registration backend gains share
+	// while still holding one supplier's per-session allowance. Same failure mode as the
+	// backend-URL dedup, and self-correcting (an exhausted supplier is filtered per-supplier
+	// and its share redistributes), but it is the expected way this goes wrong.
+	CapRetryHedgeSelection *bool `yaml:"cap_retry_hedge_selection,omitempty"`
 
 	// WebsocketRebindOperatorUniform selects the WebSocket rebind strategy for this service.
 	// When true (the default), a session-rollover rebind picks the target operator uniformly
@@ -338,6 +398,14 @@ type ServiceConfig struct {
 	// of endpoint count, so a single-endpoint operator absorbs a full operator-share of the
 	// WebSocket load. Disable per-service if that overloads a small provider.
 	WebsocketRebindOperatorUniform *bool `yaml:"websocket_rebind_operator_uniform,omitempty"`
+
+	// WebsocketHTTPScoreFloor gates WebSocket selection for this service on the endpoint's
+	// json_rpc reputation, in addition to its own :websocket score. nil = use the global
+	// default (ServiceDefaults.WebsocketHTTPScoreFloor, then DefaultWebsocketHTTPScoreFloor).
+	//
+	// Disable per-service where HTTP health genuinely does not predict WebSocket health —
+	// e.g. a service whose suppliers front the two protocols with separate infrastructure.
+	WebsocketHTTPScoreFloor *bool `yaml:"websocket_http_score_floor,omitempty"`
 }
 
 // UnifiedServicesConfig is the top-level configuration for the unified service system.
@@ -601,6 +669,10 @@ func (c *UnifiedServicesConfig) HydrateDefaults() {
 	if c.Defaults.RetryConfig.HedgeDelay == nil {
 		hedgeDelay := 500 * time.Millisecond
 		c.Defaults.RetryConfig.HedgeDelay = &hedgeDelay
+	}
+	if c.Defaults.RetryConfig.HedgeMaxBatchSize == nil {
+		hedgeMaxBatchSize := defaultHedgeMaxBatchSize
+		c.Defaults.RetryConfig.HedgeMaxBatchSize = &hedgeMaxBatchSize
 	}
 
 	// Hydrate default observation pipeline
@@ -876,6 +948,9 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 		if merged.RetryConfig.HedgeDelay == nil {
 			merged.RetryConfig.HedgeDelay = c.Defaults.RetryConfig.HedgeDelay
 		}
+		if merged.RetryConfig.HedgeMaxBatchSize == nil {
+			merged.RetryConfig.HedgeMaxBatchSize = c.Defaults.RetryConfig.HedgeMaxBatchSize
+		}
 	}
 
 	// Merge observation pipeline config
@@ -958,12 +1033,42 @@ func (c *UnifiedServicesConfig) GetMergedServiceConfig(serviceID protocol.Servic
 // spans multiple operators. Tuned from production concentration data: a canary survey found
 // the dominant operator held 58–90% of most services' sessions, yet reputation/validation
 // filtering trims its effective valid-pool share enough that a 0.75 cap almost never
-// engaged. 0.65 makes the cap actually bound the concentrated tail (12 of 19 sampled
-// services) at negligible redistribution cost — the excess spreads across a handful of
-// other valid operators — while staying above the uniform-over-operators feasibility floor
-// for services with as few as two operators. Set a per-service or default value of >= 1
-// (or <= 0) to disable.
-const DefaultMaxOperatorShare = 0.65
+// engaged. 0.65 made the cap bound the concentrated tail (12 of 19 sampled services) at
+// negligible redistribution cost.
+//
+// Lowered to 0.45 because the cap only started shaping real traffic when it moved onto the
+// pick that serves requests. Until then it lived on a selector reached from one narrow path —
+// measured at 0.008 selections/s against ~2000/s across the three paths that actually serve —
+// so its value was tuned against a distribution it was barely applying. On the serving pick
+// the same 0.65 is slack for most pools: it is a blast-radius bound, and holding one operator
+// under 45% of a service is the point at which losing it is a degradation rather than an
+// outage.
+//
+// Note the feasibility floor: a cap of 0.45 cannot be satisfied by a pool with only two
+// operators (0.45 * 2 <= 1). Those pools are NOT forced to 50/50 and NOT left uncapped — see
+// selector.infeasibleCapFallbackShare, which keeps them on the 0.65 cap they run under today.
+//
+// Set a per-service or default value of >= 1 (or <= 0) to disable, or override every service
+// at once with PATH_MAX_OPERATOR_SHARE.
+const DefaultMaxOperatorShare = 0.50
+
+// defaultHedgeMaxBatchSize is the largest JSON-RPC batch that is still eligible for hedging
+// when neither the service nor the global defaults specify a value.
+//
+// A batch is fanned out into one relay per item (buildServicePayloads), each retried and
+// hedged independently, so hedging an N-item batch costs up to 2N relays. Large batches are
+// also legitimately slower than the flat hedge_delay: measured p95 for 51-500 item batches is
+// 2-2.6x the single-request p95 on the same service, well past a 200ms delay. A size-blind
+// hedge therefore fires on most large batches — paying double the relays to shave latency that
+// the caller was never expecting to be low.
+//
+// Production batch sizes are sharply bimodal — nearly all traffic is either a single request or
+// a 51-500 item batch, with very little between (measured: scroll 26.3/s singles, 2.1/s at 2-10,
+// 0.06/s at 11-50, 64.2/s at 51-500). Any threshold in the single digits therefore captures the
+// entire large-batch bucket where the waste is. 10 rather than 5 keeps hedging for more of the
+// small-batch traffic, which is cheap to hedge (<=10 extra relays) and rarely hedges at all since
+// small batches finish well inside the delay. Set to 0 to disable the cap entirely.
+const defaultHedgeMaxBatchSize = 10
 
 // DefaultWebsocketRebindOperatorUniform is the WebSocket rebind strategy applied when neither
 // the service nor the global defaults specify one. Shipped ON: a session-rollover rebind
@@ -971,6 +1076,34 @@ const DefaultMaxOperatorShare = 0.65
 // count, so no single operator accumulates WebSocket connections in proportion to its
 // (often dominant) endpoint share.
 const DefaultWebsocketRebindOperatorUniform = true
+
+// DefaultWebsocketHTTPScoreFloor gates WebSocket endpoint selection on the endpoint's
+// json_rpc reputation in addition to its own :websocket score.
+//
+// Shipped ON because a :websocket score on its own is close to meaningless: reputation is
+// keyed per rpc_type, and the passive WebSocket signals are structurally positive (every
+// delivered frame records an "ok" — measured on bsc at hundreds per second against ~0
+// negatives). Without an active WebSocket probe a :websocket score simply sits at
+// initial_score forever, so filterByReputation had nothing to filter on and an endpoint
+// already proven bad over HTTP stayed freely selectable for WebSocket.
+//
+// The floor is one-directional: bad HTTP disqualifies WebSocket, good HTTP never rescues a
+// WebSocket endpoint its own score has already disqualified. The pool-collapse guard still
+// applies afterwards, so this can never empty the pool.
+const DefaultWebsocketHTTPScoreFloor = true
+
+// GetWebsocketHTTPScoreFloorForService returns whether WebSocket endpoint selection should
+// additionally require a passing json_rpc reputation for the same endpoint. Falls back to
+// the global default, then DefaultWebsocketHTTPScoreFloor.
+func (c *UnifiedServicesConfig) GetWebsocketHTTPScoreFloorForService(serviceID protocol.ServiceID) bool {
+	if svc := c.GetServiceConfig(serviceID); svc != nil && svc.WebsocketHTTPScoreFloor != nil {
+		return *svc.WebsocketHTTPScoreFloor
+	}
+	if c.Defaults.WebsocketHTTPScoreFloor != nil {
+		return *c.Defaults.WebsocketHTTPScoreFloor
+	}
+	return DefaultWebsocketHTTPScoreFloor
+}
 
 // GetWebsocketRebindOperatorUniformForService returns whether the WebSocket rebind should
 // pick the target operator uniformly (true) or via the endpoint-count-weighted concentration
@@ -994,10 +1127,95 @@ func (c *UnifiedServicesConfig) GetMaxOperatorShareForService(serviceID protocol
 	if svc != nil && svc.MaxOperatorShare != nil {
 		return *svc.MaxOperatorShare
 	}
+	return c.GetDefaultMaxOperatorShare()
+}
+
+// GetDefaultMaxOperatorShare returns the concentration cap for a service that sets none of
+// its own: the global default if configured, else DefaultMaxOperatorShare.
+func (c *UnifiedServicesConfig) GetDefaultMaxOperatorShare() float64 {
 	if c.Defaults.MaxOperatorShare != nil {
 		return *c.Defaults.MaxOperatorShare
 	}
 	return DefaultMaxOperatorShare
+}
+
+// GetBackendRegistrationWeightCapForService returns the per-backend registration weight cap
+// (K) configured for a service, or 0 when neither the service nor the global defaults set one.
+//
+// 0 means "unset", NOT "uncapped": the caller falls back to the process-wide K, which is what
+// PATH_BACKEND_REGISTRATION_WEIGHT_CAP moves. Returning a resolved default here instead would
+// make every service override the env var and quietly disable it as a fleet-wide lever.
+func (c *UnifiedServicesConfig) GetBackendRegistrationWeightCapForService(serviceID protocol.ServiceID) int {
+	svc := c.GetServiceConfig(serviceID)
+	if svc != nil && svc.BackendRegistrationWeightCap != nil {
+		return *svc.BackendRegistrationWeightCap
+	}
+	if c.Defaults.BackendRegistrationWeightCap != nil {
+		return *c.Defaults.BackendRegistrationWeightCap
+	}
+	return 0
+}
+
+// DefaultCapRetryHedgeSelection is whether the per-operator concentration cap governs the
+// retry/hedge/batch band selection when neither the service nor the global defaults say.
+//
+// Shipped ON, deliberately reversing an earlier decision to ship it off.
+//
+// The argument for OFF was that this changes where a request goes AFTER an attempt has already
+// failed, and the retry pool is marginal — roughly 60% of retries already fail. That argument
+// is sound about the risk and wrong about the remedy: a switch that ships off is a switch that
+// never gets measured. Two behaviour changes on this branch shipped dark and sat unvalidated
+// for exactly that reason, while every change that shipped live was validated the same day
+// against the other environment. Off is not the cautious choice here; it is the choice that
+// guarantees no evidence.
+//
+// The risk is bounded by construction rather than by the flag: the cap reweights the band and
+// never filters it, so the set of endpoints a retry can reach is bit-for-bit unchanged at any
+// cap value, and a band that has collapsed to one operator is left uncapped. What changes is
+// which member of an unchanged set is picked.
+//
+// Reverting is a pod restart, not a deploy: PATH_CAP_RETRY_HEDGE_SELECTION=false forces it off
+// fleet-wide. Watch path_relays_total{request_type="retry"} split by status_code — the retry
+// success rate is the number that must not move — and path_supplier_exhausted_total on the thin
+// operators the redistributed share lands on.
+const DefaultCapRetryHedgeSelection = true
+
+// retryHedgeCapOverride is a process-wide tri-state override of CapRetryHedgeSelection, set
+// once at startup from PATH_CAP_RETRY_HEDGE_SELECTION: 0 = unset (config decides), 1 = force
+// on for every service, -1 = force off for every service.
+//
+// It exists because this switch is the kind that gets flipped while watching a dashboard, on
+// one environment and not the other, and an env var is a pod restart rather than a config-map
+// edit per service. Same pattern as PATH_OPERATOR_SHARE_BY_BACKEND_URL.
+var retryHedgeCapOverride atomic.Int32
+
+// SetRetryHedgeCapOverride forces the retry/hedge concentration cap on or off for every
+// service, overriding config. Call once at startup.
+func SetRetryHedgeCapOverride(enabled bool) {
+	if enabled {
+		retryHedgeCapOverride.Store(1)
+		return
+	}
+	retryHedgeCapOverride.Store(-1)
+}
+
+// GetCapRetryHedgeSelectionForService reports whether the per-operator concentration cap should
+// govern this service's retry/hedge/batch band selection. The process-wide override wins if
+// set; otherwise per-service config, then global defaults, then DefaultCapRetryHedgeSelection.
+func (c *UnifiedServicesConfig) GetCapRetryHedgeSelectionForService(serviceID protocol.ServiceID) bool {
+	switch retryHedgeCapOverride.Load() {
+	case 1:
+		return true
+	case -1:
+		return false
+	}
+	if svc := c.GetServiceConfig(serviceID); svc != nil && svc.CapRetryHedgeSelection != nil {
+		return *svc.CapRetryHedgeSelection
+	}
+	if c.Defaults.CapRetryHedgeSelection != nil {
+		return *c.Defaults.CapRetryHedgeSelection
+	}
+	return DefaultCapRetryHedgeSelection
 }
 
 // ResolveStaticResponse returns the configured static response for a service's request path
@@ -1164,6 +1382,8 @@ type ParentConfigDefaults struct {
 	ConnectTimeout *time.Duration
 	// HedgeDelay from retry_config.hedge_delay
 	HedgeDelay *time.Duration
+	// HedgeMaxBatchSize from retry_config.hedge_max_batch_size
+	HedgeMaxBatchSize *int
 	// ObservationPipelineEnabled from observation_pipeline.enabled
 	ObservationPipelineEnabled bool
 	// SampleRate from observation_pipeline.sample_rate
@@ -1227,6 +1447,16 @@ func (c *UnifiedServicesConfig) SetDefaultsFromParent(parent ParentConfigDefault
 	}
 	if parent.HedgeDelay != nil && *parent.HedgeDelay > 0 {
 		c.Defaults.RetryConfig.HedgeDelay = parent.HedgeDelay
+	}
+	// The default must be applied HERE, not only in HydrateDefaults: NewProtocol receives
+	// GatewayConfig by value and keeps a pointer into that copy, so the instance serving
+	// requests is the one SetDefaultsFromParent runs on — HydrateDefaults runs on a
+	// different instance and never reaches it. A nil here would silently disable the cap.
+	if parent.HedgeMaxBatchSize != nil {
+		c.Defaults.RetryConfig.HedgeMaxBatchSize = parent.HedgeMaxBatchSize
+	} else if c.Defaults.RetryConfig.HedgeMaxBatchSize == nil {
+		hedgeMaxBatchSize := defaultHedgeMaxBatchSize
+		c.Defaults.RetryConfig.HedgeMaxBatchSize = &hedgeMaxBatchSize
 	}
 
 	// Set observation pipeline defaults

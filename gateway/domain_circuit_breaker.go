@@ -17,6 +17,36 @@ import (
 
 const defaultMaxTTL = 30 * time.Minute
 
+// Failure-rate gate defaults.
+//
+// The trigger used to be first-error: a single failed batch item removed the whole hostname
+// from the pool. That is volume-sensitive rather than quality-sensitive — the operator with
+// the most endpoints receives the most traffic, so it reaches its first error soonest after
+// every TTL expiry and is effectively locked out permanently. Measured in production: an
+// operator sustaining 99.26% success was broken ~240 times in 3 hours, removing 90% of one
+// service's pool, because 45 of its 50 endpoints sat behind 7 hostnames.
+//
+// Gating on RATE instead of count fixes that: a domain must fail both enough times to be
+// statistically meaningful (minFailures) and often enough to be genuinely unhealthy
+// (failureRateThreshold) before it is removed.
+const (
+	// defaultFailureWindow is the sliding window over which failures and successes are
+	// compared. Short enough to react to a real outage, long enough that a burst of
+	// concurrent batch items does not constitute a trend.
+	defaultFailureWindow = 30 * time.Second
+	// defaultMinFailures is the floor below which no rate is trusted. Without it, the
+	// first failure on a quiet domain is a 100% failure rate.
+	defaultMinFailures = 5
+	// defaultFailureRateThreshold is the fraction of attempts that must fail before a
+	// domain is removed. Set well above the error rate healthy high-volume operators
+	// sustain (<1%) and well below what a genuinely broken host produces (~100%).
+	defaultFailureRateThreshold = 0.20
+	// defaultEscalationMemory is how long a domain's break history is remembered after it
+	// recovers. Escalation is meant to punish an domain that breaks AGAIN after being let
+	// back in; without memory across expiry every episode looks like a first offence.
+	defaultEscalationMemory = 60 * time.Minute
+)
+
 // classifyCircuitBreakReason maps the free-text reason string passed to
 // MarkBroken into a bounded category, suitable for use as a Prometheus label.
 // The raw reason contains response snippets, error messages, and status codes
@@ -63,6 +93,34 @@ type DomainCircuitBreaker struct {
 	cacheTTL    time.Duration  // how often to refresh local cache from Redis (5s default)
 	mu          sync.RWMutex
 	cache       map[string]*circuitCacheEntry
+
+	// Failure-rate gate. Guarded by statsMu, kept separate from mu so recording an
+	// outcome never contends with the GetBrokenDomains read path.
+	failureWindow        time.Duration
+	minFailures          int
+	failureRateThreshold float64
+	escalationMemory     time.Duration
+	statsMu              sync.Mutex
+	stats                map[string]map[string]*domainOutcomeWindow // serviceID -> domain
+}
+
+// domainOutcomeWindow is a sliding count of relay outcomes for one domain, plus the memory
+// of its last break episode.
+//
+// windowStart/failures/successes reset together once the window elapses, so the counts always
+// describe recent behavior rather than lifetime totals — a domain that failed heavily hours
+// ago must not stay gated on that history.
+//
+// lastEpisodeAt/lastHitCount survive the window and the break's own expiry: they are what
+// makes escalation mean "broke again after we let it back in" instead of "was marked twice
+// during one incident".
+type domainOutcomeWindow struct {
+	windowStart time.Time
+	failures    int
+	successes   int
+
+	lastEpisodeAt time.Time
+	lastHitCount  int
 }
 
 // brokenDomainState tracks break state for a single domain.
@@ -85,14 +143,97 @@ type circuitCacheEntry struct {
 // Pass nil for redisClient to run in local-only mode (no cross-pod sharing).
 func NewDomainCircuitBreaker(redisClient *redis.Client, logger polylog.Logger) *DomainCircuitBreaker {
 	return &DomainCircuitBreaker{
-		redisClient: redisClient,
-		logger:      logger,
-		keyPrefix:   "path:gw:circuit:",
-		defaultTTL:  1 * time.Minute,
-		maxTTL:      defaultMaxTTL,
-		cacheTTL:    5 * time.Second,
-		cache:       make(map[string]*circuitCacheEntry),
+		redisClient:          redisClient,
+		logger:               logger,
+		keyPrefix:            "path:gw:circuit:",
+		defaultTTL:           1 * time.Minute,
+		maxTTL:               defaultMaxTTL,
+		cacheTTL:             5 * time.Second,
+		cache:                make(map[string]*circuitCacheEntry),
+		failureWindow:        defaultFailureWindow,
+		minFailures:          defaultMinFailures,
+		failureRateThreshold: defaultFailureRateThreshold,
+		escalationMemory:     defaultEscalationMemory,
+		stats:                make(map[string]map[string]*domainOutcomeWindow),
 	}
+}
+
+// RecordSuccess reports a successful relay against a domain, forming the denominator of the
+// failure-rate gate. Without it the gate can only see failures, and any failure looks like a
+// 100% failure rate — which is the first-error behavior this replaces.
+func (cb *DomainCircuitBreaker) RecordSuccess(serviceID, domain string) {
+	if cb == nil || domain == "" {
+		return
+	}
+	cb.statsMu.Lock()
+	defer cb.statsMu.Unlock()
+	w := cb.windowLocked(serviceID, domain, time.Now())
+	w.successes++
+}
+
+// windowLocked returns the outcome window for a domain, rolling it over if the current one
+// has elapsed. Caller must hold statsMu.
+func (cb *DomainCircuitBreaker) windowLocked(serviceID, domain string, now time.Time) *domainOutcomeWindow {
+	byDomain, ok := cb.stats[serviceID]
+	if !ok {
+		byDomain = make(map[string]*domainOutcomeWindow)
+		cb.stats[serviceID] = byDomain
+	}
+	w, ok := byDomain[domain]
+	if !ok {
+		w = &domainOutcomeWindow{windowStart: now}
+		byDomain[domain] = w
+		return w
+	}
+	if now.Sub(w.windowStart) > cb.failureWindow {
+		// Roll the window. Episode memory deliberately survives — it is not part of the
+		// rate calculation, it is what escalation counts.
+		w.windowStart = now
+		w.failures = 0
+		w.successes = 0
+	}
+	return w
+}
+
+// shouldBreak records a failure and reports whether the domain's recent failure RATE justifies
+// removing it from the pool, along with the hit count for this break episode.
+//
+// Both conditions must hold: at least minFailures in the window (so a single failure on a
+// quiet domain is not a 100% rate) and a failure fraction at or above failureRateThreshold
+// (so a high-volume domain with a low error rate is never removed, no matter how many raw
+// failures that volume produces).
+func (cb *DomainCircuitBreaker) shouldBreak(serviceID, domain string, now time.Time) (bool, int) {
+	cb.statsMu.Lock()
+	defer cb.statsMu.Unlock()
+
+	w := cb.windowLocked(serviceID, domain, now)
+	w.failures++
+
+	total := w.failures + w.successes
+	if w.failures < cb.minFailures || total == 0 {
+		return false, 0
+	}
+	if float64(w.failures)/float64(total) < cb.failureRateThreshold {
+		return false, 0
+	}
+
+	// Breaking. Escalate only if this domain broke recently BEFORE this episode — i.e. it
+	// was let back in and failed again. Concurrent duplicate marks within one episode are
+	// filtered upstream in MarkBroken and never reach here.
+	hitCount := 1
+	if !w.lastEpisodeAt.IsZero() && now.Sub(w.lastEpisodeAt) <= cb.escalationMemory {
+		hitCount = w.lastHitCount + 1
+	}
+	w.lastEpisodeAt = now
+	w.lastHitCount = hitCount
+
+	// The window is consumed by the break: keep counting from scratch so the domain is
+	// judged on behavior after it returns, not on the failures that removed it.
+	w.windowStart = now
+	w.failures = 0
+	w.successes = 0
+
+	return true, hitCount
 }
 
 // escalatedTTL calculates the TTL for the given hit count using exponential backoff.
@@ -119,6 +260,28 @@ func (cb *DomainCircuitBreaker) escalatedTTL(hitCount int) time.Duration {
 func (cb *DomainCircuitBreaker) MarkBroken(ctx context.Context, serviceID, domain, reason string) {
 	now := time.Now()
 
+	// Already broken? This trigger belongs to the episode that is already in effect.
+	// Batch items fail concurrently on separate goroutines, so one incident produces many
+	// of these — measured at ~89 per episode in production. Escalating on them drove the
+	// TTL straight to the 30-minute cap (6 hits is enough) on the strength of a single
+	// transient burst. Count it, do not escalate, do not extend the expiry.
+	cb.mu.RLock()
+	if entry, ok := cb.cache[serviceID]; ok {
+		if existing, exists := entry.domains[domain]; exists && existing.expiry.After(now) {
+			cb.mu.RUnlock()
+			metrics.RecordCircuitBreakerEvent(serviceID, domain, classifyCircuitBreakReason(reason), metrics.CircuitBreakerEventDuplicate)
+			return
+		}
+	}
+	cb.mu.RUnlock()
+
+	// Rate gate: a failure alone is not grounds for removing a domain from the pool.
+	breakIt, hitCount := cb.shouldBreak(serviceID, domain, now)
+	if !breakIt {
+		metrics.RecordCircuitBreakerEvent(serviceID, domain, classifyCircuitBreakReason(reason), metrics.CircuitBreakerEventSuppressed)
+		return
+	}
+
 	// Update local cache immediately
 	cb.mu.Lock()
 	entry, ok := cb.cache[serviceID]
@@ -128,12 +291,6 @@ func (cb *DomainCircuitBreaker) MarkBroken(ctx context.Context, serviceID, domai
 			refreshAt: now.Add(cb.cacheTTL),
 		}
 		cb.cache[serviceID] = entry
-	}
-
-	// Escalate hit count if domain is already broken (not yet expired)
-	hitCount := 1
-	if existing, exists := entry.domains[domain]; exists && existing.expiry.After(now) {
-		hitCount = existing.hitCount + 1
 	}
 
 	ttl := cb.escalatedTTL(hitCount)
@@ -147,9 +304,10 @@ func (cb *DomainCircuitBreaker) MarkBroken(ctx context.Context, serviceID, domai
 
 	// Record a "broken" event with reason category so dashboards can show rate
 	// of breaks decomposed by cause (retry / batch_transport / batch_heuristic /
-	// parallel_retry / heuristic / unknown). Counter increments on every call
-	// — including hit-count escalations — which is the right semantic: each
-	// MarkBroken is a discrete trigger event.
+	// parallel_retry / heuristic / unknown). One event per EPISODE — triggers that
+	// the rate gate declined, or that arrived while the domain was already broken,
+	// are counted under "suppressed" and "duplicate" instead. broken:recovered is
+	// therefore ~1:1; it used to run ~89:1 purely from concurrent duplicates.
 	metrics.RecordCircuitBreakerEvent(serviceID, domain, classifyCircuitBreakReason(reason), metrics.CircuitBreakerEventBroken)
 
 	// Always log circuit break events at error level for production visibility.
@@ -396,6 +554,14 @@ func (cb *DomainCircuitBreaker) ClearService(ctx context.Context, serviceID stri
 		delete(cb.cache, serviceID)
 	}
 	cb.mu.Unlock()
+
+	// An admin clear is an explicit "these domains are healthy again", so it must also drop
+	// the escalation memory and the failure window. Otherwise the next single failure would
+	// re-break at the previous hit count and the clear would appear not to have worked —
+	// the same surprise as refreshFromRedis merging local state back.
+	cb.statsMu.Lock()
+	delete(cb.stats, serviceID)
+	cb.statsMu.Unlock()
 
 	if cb.redisClient != nil {
 		cb.redisClient.Del(ctx, cb.keyPrefix+serviceID)

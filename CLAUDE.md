@@ -232,10 +232,103 @@ curl -X POST http://localhost:13069/admin/circuit-breaker/clear/near
 # Response: {"service_id":"near","cleared_domains":3,"message":"circuit breaker state cleared (in-memory + Redis)"}
 ```
 
-**When to use:**
+**WebSocket Tumble** (`POST /admin/websocket/tumble/{serviceId}`)
+Forces live WebSocket connections to rebind onto different suppliers. Clients stay connected — the bridge re-dials an endpoint and replays the client's subscriptions, the same machinery a session rollover uses.
+
+A WebSocket connection binds one endpoint for its entire lifetime and only moves at a session rollover or a stall. A long-lived high-volume subscriber therefore pins itself to whichever operator it first landed on, and no change to endpoint selection can move it — selection only governs where *new* connections go. The alternative is restarting the pod, which drops every client and resets unrelated in-memory state.
+
+Must be called on each pod individually (per-pod in-memory registry).
+```bash
+# See the current distribution without moving anything
+curl -X POST "http://localhost:13069/admin/websocket/tumble/bsc?dry_run=true"
+
+# Move every connection currently bound to one operator
+curl -X POST "http://localhost:13069/admin/websocket/tumble/bsc?domain=example.net"
+
+# Move at most 5, most-concentrated operators first
+curl -X POST "http://localhost:13069/admin/websocket/tumble/bsc?max=5"
+```
+
+Query parameters (all optional): `domain=<eTLD+1>` restricts to connections currently bound to that operator; `max=<n>` caps how many move; `order_by=throughput|connections` picks how a capped tumble ranks candidates (default `throughput`); `dry_run=true` reports without moving.
+
+**`max` is spent by traffic, not by socket count.** Connection count is a poor proxy for load — a single firehose subscriber routinely carries more than a dozen idle sockets on another operator (measured on live bsc: 232 frames/s on one connection vs 2.2 frames/s on another). Ordering by throughput moves the operator actually carrying the service, and within it that operator's busiest connections first. `order_by=connections` restores the old socket-count ordering for when the goal is evening out socket counts irrespective of how busy they are.
+
+Response includes `connections_by_domain` and `throughput_by_domain_msgs_per_sec` (the pre-tumble distributions), `tumbled_by_domain` and `tumbled_throughput_by_domain_msgs_per_sec` (what moved), `order_by`, and `matched`/`tumbled`/`skipped` counts. `skipped` means the connection could not accept a tumble right now — rebind disabled for it, or one already queued.
+
+A `dry_run=true` call is the cheapest way to answer **"who is actually carrying this service"** — the throughput distribution routinely contradicts the connection distribution.
+
+Rebinds land on `path_websocket_rebind_total{trigger="admin"}`, distinct from `rollover`, `stall`, and `session_expired`.
+
+**Automatic rebind triggers** (no admin action needed):
+- `rollover` — the supplier closed the socket at session expiry (close 4000). The healthy path.
+- `stall` — the staleness watchdog saw no subscription data past the threshold; escapes the bound **backend URL**.
+- `session_expired` — PATH noticed the bound session had ended while the supplier kept streaming. Without this a connection is stranded outside the session indefinitely: unsigned endpoint→client frames need no session so data keeps flowing, and the staleness watchdog stays quiet *because* it is flowing. Measured at 21% of live connections before the fix. Watch for `Endpoints = 0` with a blank Mean Score but nonzero WS msg/s on the supplier-quality panel — that combination is the tell.
+
+**Circuit Breaker — when to use:**
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved
 - Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis
+
+## Endpoint Selection — Registration-Weighted, Capped per Operator
+
+A provider's share of a service follows the **supplier registrations** it holds, not the machines it runs. Each registration carries its own per-session service allowance, so registrations are both what a provider can actually serve and what the chain settles on. How a provider spreads its registrations across its own infrastructure is not a routing input.
+
+Selection resolves to a concrete supplier — relays are signed against a supplier's session — and spreads across the registrations behind a chosen backend rather than pinning one, so allowance consumption is shared.
+
+**This reversed an earlier design** that weighted by distinct backend URL. Measured across all 64 production pools, machine-weighting allocated **33.4% of traffic on average (worst 51.4%) beyond what the receiving provider's allowance could serve**, while starving providers who held the tickets: one provider holding 19 of 50 registrations on a service received 7.3% of its traffic, against 45% for a provider holding 15. Registration-weighting is 0% by construction.
+
+**Per-operator cap: `max_operator_share`, default `0.50`.** This is the mechanism that stops one provider owning a session, and the only thing that should be tuned for that purpose. The largest provider holds ~71% of registrations fleet-wide and lands at ~51% of traffic under it.
+
+**Displacement ceiling: 3× (`DefaultDisplacementCeilingMultiple`).** The cap moves a dominant provider's excess onto everyone under it — but a provider handed far more than its own registrations entitle it to cannot serve it. Receivers are capped at 3× their entitlement, and excess nobody can absorb **stays with the capped provider**: moving it anyway only produces 429s and a retry. Without this, a 49-vs-1 pool allocated the single-registration provider 17.5× its allowance.
+
+**Two-operator pools sit at 0.65.** `0.50 × 2 = 1.0` is exactly the infeasibility boundary, so the tightened cap cannot apply to them; they keep the previous cap rather than being forced to an even split.
+
+**Off-switches:**
+```bash
+PATH_OPERATOR_SHARE_BY_BACKEND_URL=false   # flat registration pick, no cap
+PATH_BACKEND_REGISTRATION_WEIGHT_CAP=1     # machine-weighted (the reversed design)
+PATH_BACKEND_REGISTRATION_WEIGHT_CAP=2     # bounded middle: min(registrations, 2) per backend
+PATH_PRIMARY_PICK_OPERATOR_CAP=false       # basis only, no cap on the serving pick
+PATH_MAX_OPERATOR_SHARE=0.65               # move the cap without a config rollout
+```
+
+**What to watch:** `path_supplier_exhausted_total` — over-servicing is opt-in for the supplier and a 429 just moves the request on, so a spike is inefficiency (wasted relays) rather than failure. Also `path_selection_pool_size{path="diversity"}`, which reports the pool in the weighting currency and is the quickest confirmation the basis in force is the one you think.
+
+**Dry run before changing any of this:** `go test ./qos/selector/ -run Test_ProductionDryRun -v` replays the real pools through the shipped selector and gates on nobody dropped, nobody stranded, nobody allocated past both the cap and their own entitlement.
+
+## Concentration Cap on the Retry / Hedge Paths
+
+The per-operator (eTLD+1) cap governs **primary** selection. Retry, hedge and batch-item picks come from the top-reputation-score band, which was weighted within the band but **not capped by operator** — so an operator holding most of the band took most of the retries and hedges, on the two paths whose entire purpose is to reach different infrastructure than the attempt that just failed.
+
+**Lowering `max_operator_share` does not close this.** The cap was never the binding constraint on the band paths; it simply did not run there.
+
+**Size it honestly.** Measured 2026-07-30: primary **2184/s**, retries **209/s**, hedges that fired and won **25/s**. The cap-exempt paths are ~10% of selections, not the majority.
+
+**Ships ON.** It reweights the band and never filters it, so a retry's reachable set is unchanged at any cap value — the risk is bounded by construction rather than by the flag. **Disable** for one service (or via `defaults:`):
+```yaml
+services:
+  - id: <service>
+    cap_retry_hedge_selection: true
+```
+**Process-wide override** (a pod restart instead of a config-map edit per service, for flipping while watching a dashboard):
+```bash
+PATH_CAP_RETRY_HEDGE_SELECTION=true   # or =false to force off everywhere
+```
+Unset leaves config in charge. The share value itself is still `max_operator_share`; this key only decides whether the band paths consult it.
+
+**Metric** — a separate counter, not a new label on `path_concentration_cap_reshaped_total`, so the primary path's already-nonzero series stay a valid baseline:
+```
+path_concentration_cap_band_total{service_id, path="retry|hedge|batch", outcome}
+```
+Recorded on **every** band pick, so `outcome="reshaped"` over the total is the real engagement rate. Retry and hedge differ by an order of magnitude in volume — never sum them.
+
+`outcome` values: `reshaped` (distribution altered) · `no_op` (multi-operator band, none over cap) · `degraded_no_room` (band collapsed to one operator or one candidate — pick left **uncapped**, also logged at Debug) · `disabled` (the cap value itself is off) · `no_candidates` (empty band; the caller falls back to an uncapped pick and warns).
+
+`degraded_no_room` is **expected, not an error** — a retry has already excluded the operators it tried. It is what separates "the cap is doing nothing" from "the cap had no room to do anything", and only the latter is a reason to change the cap value.
+
+**Cannot starve a retry:** the cap reweights the band, it never filters it. The set of endpoints a retry can reach is bit-for-bit what it was before, at any cap value.
+
+**What to watch after enabling:** `path_supplier_exhausted_total` for the **thin** operators the excess lands on, not the capped one — a solo-registration backend gains share while still holding one supplier's per-session allowance. Same failure mode as the backend-URL dedup, and self-correcting. Retry success rate — `path_relays_total{request_type="retry"}` split by `status_code` — must not fall; roughly 60% of retries already fail, so that pool is marginal to begin with.
 
 ## Testing Strategy
 

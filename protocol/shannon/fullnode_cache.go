@@ -275,7 +275,7 @@ func (cfn *cachingFullNode) GetSession(
 		sessionKey,
 		func(fetchCtx context.Context) (sessiontypes.Session, error) {
 			logger.Debug().Str("session_key", sessionKey).Msgf("Fetching session from full node")
-			session, fetchErr := cfn.lazyFullNode.GetSession(ctx, serviceID, appAddr)
+			session, fetchErr := cfn.lazyFullNode.GetSession(fetchCtx, serviceID, appAddr)
 			if fetchErr != nil {
 				return session, fetchErr
 			}

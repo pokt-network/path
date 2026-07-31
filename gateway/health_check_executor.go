@@ -17,6 +17,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -77,6 +78,20 @@ type HealthCheckExecutor struct {
 	// pool is the worker pool for concurrent health check execution.
 	pool pond.Pool
 
+	// wsPool runs websocket checks OFF the main cycle's critical path.
+	//
+	// A cycle ends with group.Wait(), so it cannot finish until every submitted job does.
+	// A websocket check that reads a response blocks until the endpoint answers or the
+	// timeout expires, and an endpoint whose failure mode is silence takes the FULL timeout.
+	// Submitted into the shared group, one such endpoint sets a floor under the whole cycle
+	// and throttles every other check with it. Measured on canary: websocket checks fell to
+	// 3.5/s and json_rpc — which shares the cycle — dropped from ~397/s to ~112/s, with 40%
+	// of websocket reputation series expiring for lack of refreshes.
+	//
+	// Websocket checks therefore get their own pool that the cycle never waits on. Slow ones
+	// delay only each other.
+	wsPool pond.Pool
+
 	// maxWorkers is the configured/calculated worker pool size for logging.
 	maxWorkers int
 
@@ -100,6 +115,10 @@ type HealthCheckExecutor struct {
 	// supplier represents each backend URL under backend-URL dedup, so every
 	// supplier's own relay path is directly validated every N cycles.
 	cycleCounter uint64
+
+	// endpointLookupBudget caps the endpoint-resolution phase of a cycle.
+	// Zero means defaultEndpointLookupBudget. Only tests set it.
+	endpointLookupBudget time.Duration
 }
 
 // HealthCheckExecutorConfig contains configuration for creating a HealthCheckExecutor.
@@ -138,6 +157,21 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 	// Create worker pool for concurrent health check execution
 	pool := pond.NewPool(maxWorkers)
 
+	// Websocket checks are I/O-bound and can each block for their full timeout, so this pool
+	// is sized for concurrency rather than throughput. It is deliberately much smaller than
+	// the main pool: its purpose is isolation, and an unbounded queue of slow checks would
+	// just move the problem.
+	// WithQueueSize BOUNDS the backlog. pond's default queue is effectively unbounded, which
+	// would let TrySubmit accept forever and quietly rebuild the very backlog this pool
+	// exists to prevent — the checks would just stall later instead of sooner. With a bound,
+	// TrySubmit refuses once saturated and the cycle skips that endpoint this round.
+	// WithNonBlocking guarantees a full pool can never block the caller, which is the cycle.
+	wsPool := pond.NewPool(
+		DefaultWebsocketCheckWorkers,
+		pond.WithQueueSize(DefaultWebsocketCheckQueueSize),
+		pond.WithNonBlocking(true),
+	)
+
 	executor := &HealthCheckExecutor{
 		config:          cfg.Config,
 		reputationSvc:   cfg.ReputationSvc,
@@ -145,6 +179,7 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 		protocol:        cfg.Protocol,
 		metricsReporter: cfg.MetricsReporter,
 		pool:            pool,
+		wsPool:          wsPool,
 		maxWorkers:      maxWorkers,
 		// HTTP client for external config fetching only
 		httpClient: &http.Client{
@@ -420,6 +455,9 @@ func (e *HealthCheckExecutor) Stop() {
 	e.stopOnce.Do(func() {
 		if e.stopRefresh != nil {
 			close(e.stopRefresh)
+		}
+		if e.wsPool != nil {
+			e.wsPool.StopAndWait()
 		}
 		if e.pool != nil {
 			e.pool.StopAndWait()
@@ -802,6 +840,28 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	supplier := extractSupplierFromEndpoint(endpointAddr)
 	rpcTypeStr := metrics.NormalizeRPCType(rpcType.String())
 
+	// Websocket checks: METRIC ONLY. Their reputation signal is written by the OBSERVATION
+	// path inside ExecuteWebSocketCheckViaProtocol, and must be written exactly ONCE.
+	//
+	// Why the observation path owns the write and this one does not:
+	//   - It derives severity from the ACTUAL failure (every probe failure wraps
+	//     errCreatingWebSocketConnection, which classifies as WEBSOCKET_CONNECTION_FAILED
+	//     -> major error), whereas mapSignalType below reads the rule's `reputation_signal`
+	//     and SILENTLY DEFAULTS to minor_error when it is unset. The websocket rules live
+	//     in an externally hot-loaded rules file that is not in this repo, so that default
+	//     cannot be audited here and would change severity invisibly.
+	//   - It is the same writer real user websocket connections go through.
+	//   - It builds its key from the full "<supplier>-<url>" address at rpc type WEBSOCKET
+	//     (recordSignalFromWebsocketConnectionObservation) — the SAME key this function
+	//     builds — so dropping the second write loses nothing.
+	//
+	// Before this split a failing websocket check recorded reputation twice, from two
+	// unrelated severity sources.
+	if check.Type == HealthCheckTypeWebSocket {
+		e.recordWebsocketCheckMetric(serviceID, endpointAddr, check, checkErr, domain, supplier, rpcTypeStr)
+		return
+	}
+
 	if checkErr == nil {
 		// Check passed - record recovery success signal with latency
 		// Health checks use RecoverySuccessSignal (+5) because their purpose is to help
@@ -864,6 +924,67 @@ func (e *HealthCheckExecutor) recordCheckResult(
 		Str("signal", check.ReputationSignal).
 		Str("error", checkErr.Error()).
 		Msg("Health check failed, recorded signal")
+}
+
+// recordWebsocketCheckMetric records ONLY the metric for a websocket check outcome.
+// Reputation for websocket checks is written by the observation path — see the websocket
+// branch of recordCheckResult for why.
+//
+// Everything the metric side of recordCheckResult does is preserved, including the
+// over-serviced (stake-exhaustion) no-penalty branch: an exhausted supplier is counted as
+// exhausted and reported "ok", never as a failure.
+func (e *HealthCheckExecutor) recordWebsocketCheckMetric(
+	serviceID protocol.ServiceID,
+	endpointAddr protocol.EndpointAddr,
+	check HealthCheckConfig,
+	checkErr error,
+	domain, supplier, rpcTypeStr string,
+) {
+	if checkErr == nil {
+		metrics.RecordHealthCheck(domain, supplier, rpcTypeStr, string(serviceID), check.Name, metrics.SignalOK)
+		return
+	}
+
+	// Over-servicing rejections are correct protocol behavior, not a supplier fault: the
+	// application's per-session stake allocation is exhausted. Same no-penalty rule the
+	// request path and the HTTP check path apply.
+	if heuristic.IsOverServicedError(checkErr.Error()) {
+		metrics.RecordSupplierExhausted(supplier, string(serviceID))
+		metrics.RecordHealthCheck(domain, supplier, rpcTypeStr, string(serviceID), check.Name, metrics.SignalOK)
+		e.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Str("check", check.Name).
+			Msg("Websocket check hit an over-serviced (stake-exhausted) supplier - no penalty, no failure recorded")
+		return
+	}
+
+	metrics.RecordHealthCheck(domain, supplier, rpcTypeStr, string(serviceID), check.Name, websocketFailureMetricSignal(check.ReputationSignal))
+
+	e.logger.Debug().
+		Str("service_id", string(serviceID)).
+		Str("endpoint", string(endpointAddr)).
+		Str("check", check.Name).
+		Str("error", checkErr.Error()).
+		Msg("Websocket check failed, recorded failure metric (reputation comes from the observation path)")
+}
+
+// websocketFailureMetricSignal picks the metric label for a FAILED websocket check.
+//
+// mapReputationSignalToMetricSignal returns SignalOK for an unset reputation_signal, so
+// using it for a failure would label that failure "ok" and rebuild exactly the blind spot
+// this exists to close: path_health_check_status_total{rpc_type="websocket"} read 100% "ok"
+// in production while websocket checks were failing, which made the metric useless as
+// evidence. Websocket rules are hot-loaded from outside this repo, so "unset" is the common
+// case.
+//
+// The fallback is the severity the observation path actually charges: every websocket probe
+// failure wraps errCreatingWebSocketConnection -> WEBSOCKET_CONNECTION_FAILED -> major error.
+func websocketFailureMetricSignal(configuredSignal string) string {
+	if configuredSignal == "" {
+		return metrics.SignalMajorError
+	}
+	return mapReputationSignalToMetricSignal(configuredSignal)
 }
 
 // categorizeHealthCheckError categorizes a health check error for metrics.
@@ -1177,25 +1298,39 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	// Uses the service's sync_allowance (passed as parameter) to validate block height against perceived block number
 	if check.SyncCheck && syncAllowance > 0 {
 		if err := e.validateSyncCheck(serviceID, responseBody, syncAllowance); err != nil {
-			// Sync check validation failed
-			e.logger.Debug().
-				Err(err).
-				Str("service_id", string(serviceID)).
-				Str("endpoint", string(endpointAddr)).
-				Str("check", check.Name).
-				Uint64("sync_allowance", syncAllowance).
-				Dur("latency", latency).
-				Msg("Sync check failed - endpoint block height outside sync allowance")
+			// The check could not be evaluated at all - the rule points at a response shape
+			// whose block height we cannot read. That is our bug, not the endpoint's, and it
+			// fails identically on every endpoint of the service, so it must not cost the
+			// supplier any reputation. Warn (not Debug) so a misconfigured rule is visible
+			// at the production log levels instead of silently degrading a whole service.
+			if errors.Is(err, errSyncCheckNotApplicable) {
+				e.logger.Warn().
+					Err(err).
+					Str("service_id", string(serviceID)).
+					Str("endpoint", string(endpointAddr)).
+					Str("check", check.Name).
+					Msg("Sync check skipped - cannot read a block height from this response shape; check the rule, not the endpoint")
+			} else {
+				// Sync check validation failed
+				e.logger.Debug().
+					Err(err).
+					Str("service_id", string(serviceID)).
+					Str("endpoint", string(endpointAddr)).
+					Str("check", check.Name).
+					Uint64("sync_allowance", syncAllowance).
+					Dur("latency", latency).
+					Msg("Sync check failed - endpoint block height outside sync allowance")
 
-			// Record relay metric for sync check failure
-			statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
-			signalType := metrics.SignalMajorError
-			if check.ReputationSignal != "" {
-				signalType = check.ReputationSignal
+				// Record relay metric for sync check failure
+				statusCodeStr := metrics.GetStatusCodeCategory(httpStatusCode)
+				signalType := metrics.SignalMajorError
+				if check.ReputationSignal != "" {
+					signalType = check.ReputationSignal
+				}
+				metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, signalType, metrics.RelayTypeHealthCheck, latency.Seconds())
+
+				return latency, err
 			}
-			metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), statusCodeStr, signalType, metrics.RelayTypeHealthCheck, latency.Seconds())
-
-			return latency, err
 		}
 	}
 
@@ -1497,6 +1632,7 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 	serviceID protocol.ServiceID,
 	endpointAddr protocol.EndpointAddr,
 	check HealthCheckConfig,
+	syncAllowance uint64,
 ) (time.Duration, error) {
 	if e.protocol == nil {
 		return 0, fmt.Errorf("protocol not configured for health check executor")
@@ -1524,11 +1660,79 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Use protocol's CheckWebsocketConnection method
-	protocolObs := e.protocol.CheckWebsocketConnection(checkCtx, serviceID, endpointAddr)
+	// Send the rule's payload, if it has one, and judge the response's CONTENT — not merely
+	// that one arrived.
+	//
+	// This is what lets a websocket check fail an endpoint that is perfectly reachable. The
+	// endpoint that motivated it accepted connections, answered eth_blockNumber correctly,
+	// and reported a head 31,470 blocks stale — while the same operator's HTTP side tracked
+	// the chain, so every json_rpc sync check passed and nothing ever looked at the
+	// websocket side's answer.
+	//
+	// The comparison is the SAME one the json_rpc checks use, supplied as a closure so it
+	// stays here where perceived height and sync_allowance already live.
+	probe := protocol.WebsocketProbe{Payload: check.Body}
+	if check.SyncCheck && syncAllowance > 0 {
+		probe.ValidateResponse = func(responseBody []byte) error {
+			syncErr := e.validateSyncCheck(serviceID, responseBody, syncAllowance)
+			// Not applicable means the rule points at a response shape we cannot read a
+			// height from. That is our bug, it fails identically on every endpoint of the
+			// service, and it must never cost a supplier reputation.
+			if errors.Is(syncErr, errSyncCheckNotApplicable) {
+				e.logger.Warn().
+					Err(syncErr).
+					Str("service_id", string(serviceID)).
+					Str("check", check.Name).
+					Msg("WebSocket sync check skipped - cannot read a block height from this response shape; check the rule, not the endpoint")
+				return nil
+			}
+			return syncErr
+		}
+	}
 
-	// Apply observations to protocol (this updates reputation via observations)
-	if protocolObs != nil {
+	_, protocolObs := e.protocol.CheckWebsocketConnection(checkCtx, serviceID, endpointAddr, probe)
+
+	// The check's verdict. Without this the function returned nil unconditionally, so
+	// recordCheckResult always took its success branch and EVERY websocket check reported
+	// "ok" no matter what happened — which is why path_health_check_status_total
+	// {rpc_type="websocket"} read 100% ok in production while checks were failing.
+	checkErr := websocketObservationError(protocolObs)
+	latency := time.Since(startTime)
+
+	// Exactly ONE reputation writer per websocket check, decided here rather than split
+	// across this function and recordCheckResult:
+	//
+	//   - observation present  -> ApplyWebSocketObservations writes it, with severity
+	//     derived from the real failure (or a success signal when the error type is
+	//     UNSPECIFIED). recordCheckResult records only the metric.
+	//   - observation present AND over-serviced -> NOBODY writes. Stake exhaustion is not a
+	//     supplier fault; the observation classifier does not exempt it on this path because
+	//     the probe wraps every failure in errCreatingWebSocketConnection, which classifies
+	//     before payload inspection. Skipping the apply is what preserves the no-penalty
+	//     rule the request path and the HTTP check path already honor.
+	//   - no observation and no error -> the recovery-success signal is recorded HERE.
+	//     CheckWebsocketConnection returns NO observation on success (both the
+	//     handshake-only and the probe path return a nil observation set), so the
+	//     observation path writes nothing at all for a passing check. Leaving it to the
+	//     observation path would mean a websocket endpoint that was ever penalized has no
+	//     health-check route back.
+	//
+	// The if/else shape is deliberate: it makes a double write structurally impossible even
+	// if the protocol later starts emitting success observations.
+	switch {
+	case protocolObs == nil:
+		if checkErr == nil {
+			e.recordWebsocketCheckRecovery(ctx, serviceID, endpointAddr, check, latency)
+		}
+
+	case checkErr != nil && heuristic.IsOverServicedError(checkErr.Error()):
+		e.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Str("check", check.Name).
+			Msg("Skipping websocket check reputation signal for over-serviced (stake-exhausted) supplier")
+
+	default:
 		if err := e.protocol.ApplyWebSocketObservations(protocolObs); err != nil {
 			e.logger.Warn().
 				Err(err).
@@ -1537,7 +1741,9 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 				Str("check", check.Name).
 				Msg("Failed to apply WebSocket observations")
 		}
+	}
 
+	if protocolObs != nil {
 		// ENHANCEMENT: Wrap protocol observations in RequestResponseObservations
 		// and publish to reporters for full visibility (old hydrator didn't do this)
 		completedTime := time.Now()
@@ -1565,15 +1771,88 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 			Msg("WebSocket health check observations published")
 	}
 
-	latency := time.Since(startTime)
 	e.logger.Debug().
 		Str("service_id", string(serviceID)).
 		Str("endpoint", string(endpointAddr)).
 		Str("check", check.Name).
 		Dur("latency", latency).
+		Err(checkErr).
 		Msg("WebSocket health check completed via protocol")
 
-	return latency, nil
+	return latency, checkErr
+}
+
+// websocketObservationError turns the observation set returned by CheckWebsocketConnection
+// into the check's verdict: nil when the check passed, a diagnosable error when it did not.
+//
+// This exists because CheckWebsocketConnection reports failure only through observations —
+// it returns no error — so a caller that ignores them cannot tell a passing check from a
+// failing one. Kept as a named helper rather than inlined so the protobuf walking (a oneof
+// plus two optional fields) has one place to be read and tested.
+//
+// Both failure carriers are honored: the connection observation's endpoint error type (the
+// classified supplier-facing failure) and the request-level error (a PATH-side or
+// setup failure). Error details are included verbatim so the log line and the failure metric
+// are actually diagnosable.
+func websocketObservationError(obs *protocolobservations.Observations) error {
+	if obs == nil || obs.GetShannon() == nil {
+		return nil
+	}
+
+	for _, reqObs := range obs.GetShannon().GetObservations() {
+		if connObs := reqObs.GetWebsocketConnectionObservation(); connObs != nil {
+			if errType := connObs.GetErrorType(); errType != protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED {
+				details := connObs.GetErrorDetails()
+				if details == "" {
+					details = "no error details reported"
+				}
+				return fmt.Errorf("websocket check failed: %s: %s", errType.String(), details)
+			}
+		}
+
+		if reqErr := reqObs.GetRequestError(); reqErr != nil {
+			details := reqErr.GetErrorDetails()
+			if details == "" {
+				details = "no error details reported"
+			}
+			return fmt.Errorf("websocket check failed: %s: %s", reqErr.GetErrorType().String(), details)
+		}
+	}
+
+	return nil
+}
+
+// recordWebsocketCheckRecovery records the recovery-success signal for a PASSING websocket
+// check. It is the single reputation writer for that outcome — see the switch in
+// ExecuteWebSocketCheckViaProtocol for why the pass case cannot be left to the observation
+// path (CheckWebsocketConnection emits no observation on success).
+func (e *HealthCheckExecutor) recordWebsocketCheckRecovery(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	endpointAddr protocol.EndpointAddr,
+	check HealthCheckConfig,
+	latency time.Duration,
+) {
+	if e.reputationSvc == nil {
+		return
+	}
+
+	// Same key the observation path writes and tiered selection reads: full
+	// "<supplier>-<url>" address at rpc type WEBSOCKET, through the service's key builder so
+	// key_granularity is respected.
+	keyBuilder := e.reputationSvc.KeyBuilderForService(serviceID)
+	key := keyBuilder.BuildKey(serviceID, endpointAddr, sharedtypes.RPCType_WEBSOCKET)
+
+	signal := reputation.NewRecoverySuccessSignal(latency)
+	signal.IsHealthCheck = true // probe, not user traffic — excluded from the rate-cooldown detector
+	if err := e.reputationSvc.RecordSignal(ctx, key, signal); err != nil {
+		e.logger.Warn().
+			Err(err).
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(endpointAddr)).
+			Str("check", check.Name).
+			Msg("Failed to record websocket check recovery success signal")
+	}
 }
 
 // RunChecksForEndpointViaProtocol runs all configured checks for a service through the protocol.
@@ -1594,7 +1873,15 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 	}
 
 	// Run every check type; build the legacy name->error map from the outcomes.
-	outcomes := e.runEndpointChecks(ctx, serviceID, endpointAddr, svcConfig, true, true)
+	//
+	// hasWebsocketURL=false: this entry point takes an endpoint ADDRESS, not an EndpointInfo,
+	// so it cannot know whether the endpoint advertises a websocket URL. Guessing "yes" is
+	// what charged json_rpc-only endpoints a major error for a capability they never claimed
+	// (see the skip in runEndpointChecks), and there is no cheap way to resolve the capability
+	// from an address alone — it needs a session lookup. Websocket checks therefore run only
+	// from the cycle in RunAllChecksViaProtocol, which has the EndpointInfo. This is the
+	// legacy, loop-free entry point and has no callers in this repo.
+	outcomes := e.runEndpointChecks(ctx, serviceID, endpointAddr, svcConfig, true, true, false)
 	results := make(map[string]error, len(outcomes))
 	for i := range outcomes {
 		results[outcomes[i].check.Name] = outcomes[i].err
@@ -1610,6 +1897,12 @@ func (e *HealthCheckExecutor) RunChecksForEndpointViaProtocol(
 // outcomes are fanned from the representative) and runWS=true (WebSocket connectivity
 // is genuinely per-endpoint and must be probed directly).
 //
+// hasWebsocketURL is the endpoint's ADVERTISED websocket capability (EndpointInfo.WebSocketURL
+// non-empty). A plain bool rather than the whole EndpointInfo: this function is reached from
+// three call sites with different amounts of endpoint context, and the only thing it needs is
+// the one bit — widening the signature to the struct would force the address-only caller to
+// fabricate one.
+//
 // Only HTTP/REST outcomes are returned (they are what gets fanned); WebSocket and gRPC
 // checks are recorded here but not included in the returned slice.
 func (e *HealthCheckExecutor) runEndpointChecks(
@@ -1618,6 +1911,7 @@ func (e *HealthCheckExecutor) runEndpointChecks(
 	endpointAddr protocol.EndpointAddr,
 	svcConfig *ServiceHealthCheckConfig,
 	runHTTP, runWS bool,
+	hasWebsocketURL bool,
 ) []checkOutcome {
 	// Get sync_allowance from service config (0 = disabled)
 	var syncAllowance uint64
@@ -1632,9 +1926,52 @@ func (e *HealthCheckExecutor) runEndpointChecks(
 			if !runWS {
 				continue
 			}
-			// WebSocket checks use the protocol's CheckWebsocketConnection.
-			latency, err := e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, endpointAddr, check)
-			e.recordCheckResult(ctx, serviceID, endpointAddr, check, err, latency)
+			// An endpoint that advertises no websocket URL cannot be websocket-checked.
+			//
+			// Dispatching anyway is not a harmless no-op: the check fails inside the protocol
+			// with "selected endpoint does not support websocket RPC type", which classifies
+			// as WEBSOCKET_CONNECTION_FAILED -> MAJOR error (-10) on the endpoint's websocket
+			// reputation key. That charged endpoints for lacking a capability they never
+			// claimed. A websocket-enabled service commonly mixes both kinds — roughly 12 of
+			// 50 endpoints on one such service are json_rpc-only, and one pod logged 39 of
+			// these failures in six minutes.
+			//
+			// A skip is neither a pass nor a failure: nothing is recorded, so the endpoint's
+			// websocket series simply does not exist rather than reading falsely healthy.
+			if !hasWebsocketURL {
+				e.logger.Debug().
+					Str("service_id", string(serviceID)).
+					Str("endpoint", string(endpointAddr)).
+					Str("check", check.Name).
+					Msg("Skipping websocket check - endpoint advertises no websocket URL")
+				continue
+			}
+			// Run OFF the cycle. See wsPool: a websocket check can block for its full
+			// timeout, and the cycle waits on everything it submits, so keeping these
+			// inline lets one silent endpoint throttle every other check in the gateway.
+			//
+			// TrySubmit rather than Submit: when the websocket pool is saturated the
+			// right move is to SKIP this round, not to queue. A skipped check costs a
+			// refresh interval; a growing queue reintroduces the stall it is avoiding.
+			wsCheck := check
+			wsEndpoint := endpointAddr
+			wsAllowance := syncAllowance
+			if e.wsPool != nil {
+				if _, ok := e.wsPool.TrySubmit(func() {
+					if ctx.Err() != nil {
+						return
+					}
+					latency, err := e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, wsEndpoint, wsCheck, wsAllowance)
+					e.recordCheckResult(ctx, serviceID, wsEndpoint, wsCheck, err, latency)
+				}); !ok {
+					e.logger.Debug().
+						Str("service_id", string(serviceID)).
+						Str("endpoint", string(wsEndpoint)).
+						Str("check", wsCheck.Name).
+						Uint64("ws_pool_waiting", e.wsPool.WaitingTasks()).
+						Msg("websocket check skipped this round - check pool saturated")
+				}
+			}
 		case HealthCheckTypeGRPC:
 			// gRPC checks not yet implemented
 			e.logger.Debug().
@@ -1757,6 +2094,112 @@ func groupEndpointsByURL(endpoints []EndpointInfo) [][]EndpointInfo {
 	return groups
 }
 
+const (
+	// defaultEndpointLookupBudget caps the whole endpoint-resolution phase of a cycle.
+	//
+	// The protocol's lookup is itself deadline-bounded, so this is a backstop against a
+	// callback that ignores its own deadline: without it, one non-returning lookup holds
+	// the cycle open indefinitely and NOTHING gets submitted. Sits below the 10s cycle
+	// interval so a stalled resolution costs at most one cycle, and above the protocol's
+	// own per-service deadline so a normally-timing-out lookup always reports back and is
+	// logged as an error rather than silently dropped here.
+	defaultEndpointLookupBudget = 6 * time.Second
+
+	// maxConcurrentEndpointLookups bounds how many per-service lookups are in flight.
+	//
+	// Deliberately at or above the production service count (~64) so resolution is a
+	// single wave: if every lookup hit its deadline, the phase still finishes in one
+	// deadline's time rather than N/limit of them, which is what keeps a chain-wide stall
+	// from degrading services unevenly by config position. The cap exists only to stop an
+	// unbounded fleet from opening unbounded concurrent gRPC calls; the shared queries
+	// (block height, shared params) are single-key and deduped by the full-node cache, so
+	// the real per-cycle chain load is one session query per service either way.
+	maxConcurrentEndpointLookups = 64
+)
+
+// endpointLookupResult carries one service's resolved endpoints back to the cycle.
+type endpointLookupResult struct {
+	serviceID protocol.ServiceID
+	infos     []EndpointInfo
+	err       error
+}
+
+// resolveEndpointInfos resolves every service's endpoints BEFORE any check job is
+// submitted, concurrently, and under a wall-clock budget.
+//
+// getEndpointInfos reaches the chain (session list, block height, shared params). It used
+// to be called inline in the submission loop, which made job submission serial in a chain
+// round trip per service: one hung lookup meant every service AFTER it in config order was
+// never submitted at all. The production fingerprint was asymmetric — the first two or
+// three services trickled while the remaining sixty-one sat at exactly zero.
+//
+// Services that error or miss the budget are absent from the returned map: they are skipped
+// for this cycle and retried by the next one. A late lookup's result is discarded, not
+// cached, so nothing is poisoned.
+func (e *HealthCheckExecutor) resolveEndpointInfos(
+	ctx context.Context,
+	serviceIDs []protocol.ServiceID,
+	getEndpointInfos func(protocol.ServiceID) ([]EndpointInfo, error),
+) map[protocol.ServiceID][]EndpointInfo {
+	resolved := make(map[protocol.ServiceID][]EndpointInfo, len(serviceIDs))
+	if len(serviceIDs) == 0 {
+		return resolved
+	}
+
+	budget := e.endpointLookupBudget
+	if budget <= 0 {
+		budget = defaultEndpointLookupBudget
+	}
+
+	// Buffered for every service so a lookup that returns AFTER the budget expired can
+	// still send and exit; an unbuffered channel would leak those goroutines forever.
+	results := make(chan endpointLookupResult, len(serviceIDs))
+	sem := make(chan struct{}, min(len(serviceIDs), maxConcurrentEndpointLookups))
+
+	for _, serviceID := range serviceIDs {
+		go func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			infos, err := getEndpointInfos(serviceID)
+			results <- endpointLookupResult{serviceID: serviceID, infos: infos, err: err}
+		}()
+	}
+
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+
+	for range serviceIDs {
+		select {
+		case res := <-results:
+			if res.err != nil {
+				e.logger.Warn().
+					Err(res.err).
+					Str("service_id", string(res.serviceID)).
+					Msg("Failed to get endpoints for health checks")
+				continue
+			}
+			resolved[res.serviceID] = res.infos
+
+		case <-timer.C:
+			e.logger.Warn().
+				Int("resolved", len(resolved)).
+				Int("services", len(serviceIDs)).
+				Dur("budget", budget).
+				Msg("Endpoint resolution exceeded its budget - unresolved services skipped this cycle")
+			return resolved
+
+		case <-ctx.Done():
+			e.logger.Debug().
+				Int("resolved", len(resolved)).
+				Int("services", len(serviceIDs)).
+				Msg("Endpoint resolution canceled")
+			return resolved
+		}
+	}
+
+	return resolved
+}
+
 // RunAllChecksViaProtocol runs health checks through the protocol layer for all configured services.
 // This is the main entry point for protocol-based health checks.
 // Health checks are executed in parallel using a pond worker pool.
@@ -1784,6 +2227,22 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 		return nil
 	}
 
+	// Resolve endpoints for every enabled service up front. This MUST stay off the
+	// submission loop below: see resolveEndpointInfos for the starvation it fixes.
+	enabledServiceIDs := make([]protocol.ServiceID, 0, len(serviceConfigs))
+	seenServiceIDs := make(map[protocol.ServiceID]struct{}, len(serviceConfigs))
+	for _, svcConfig := range serviceConfigs {
+		if svcConfig.Enabled != nil && !*svcConfig.Enabled {
+			continue
+		}
+		if _, dup := seenServiceIDs[svcConfig.ServiceID]; dup {
+			continue
+		}
+		seenServiceIDs[svcConfig.ServiceID] = struct{}{}
+		enabledServiceIDs = append(enabledServiceIDs, svcConfig.ServiceID)
+	}
+	resolvedEndpoints := e.resolveEndpointInfos(ctx, enabledServiceIDs, getEndpointInfos)
+
 	// Create a task group to track all submitted jobs
 	group := e.pool.NewGroup()
 	totalJobs := 0
@@ -1799,12 +2258,10 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			continue
 		}
 
-		endpointInfos, err := getEndpointInfos(svcConfig.ServiceID)
-		if err != nil {
-			e.logger.Warn().
-				Err(err).
-				Str("service_id", string(svcConfig.ServiceID)).
-				Msg("Failed to get endpoints for health checks")
+		// Pre-resolved above. Absent means the lookup failed or missed the resolution
+		// budget - both already logged there - so skip the service for this cycle.
+		endpointInfos, resolvedOK := resolvedEndpoints[svcConfig.ServiceID]
+		if !resolvedOK {
 			continue
 		}
 
@@ -1824,6 +2281,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 			for _, endpointInfo := range endpointInfos {
 				endpoint := endpointInfo.Addr
 				sessionID := endpointInfo.SessionID
+				hasWS := endpointInfo.WebSocketURL != ""
 				group.Submit(func() {
 					if ctx.Err() != nil {
 						return
@@ -1831,7 +2289,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 					if sessionID != "" && e.protocol != nil && !e.protocol.IsSessionActive(ctx, serviceID, sessionID) {
 						return
 					}
-					e.runEndpointChecks(ctx, serviceID, endpoint, &cfg, true, true)
+					e.runEndpointChecks(ctx, serviceID, endpoint, &cfg, true, true, hasWS)
 				})
 				totalJobs++
 			}
@@ -1866,7 +2324,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 
 				var outcomes []checkOutcome
 				if e.endpointSessionActive(ctx, serviceID, rep) {
-					outcomes = e.runEndpointChecks(ctx, serviceID, rep.Addr, &cfg, true, true)
+					outcomes = e.runEndpointChecks(ctx, serviceID, rep.Addr, &cfg, true, true, rep.WebSocketURL != "")
 				}
 
 				// Siblings: fan the representative's HTTP outcomes (no relay), and still
@@ -1885,7 +2343,7 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 					if len(outcomes) > 0 {
 						e.fanOutcomeToSibling(ctx, serviceID, sib.Addr, outcomes)
 					}
-					e.runEndpointChecks(ctx, serviceID, sib.Addr, &cfg, false, true)
+					e.runEndpointChecks(ctx, serviceID, sib.Addr, &cfg, false, true, sib.WebSocketURL != "")
 				}
 			})
 			totalJobs++
@@ -1969,8 +2427,24 @@ func (e *HealthCheckExecutor) detectKnownErrors(
 	return "", nil
 }
 
+// errSyncCheckNotApplicable marks a sync check that could not be evaluated for reasons
+// that are ours, not the endpoint's: the response shape has no block height we know how
+// to read, or no perceived height exists to compare against.
+//
+// This is deliberately distinct from a genuine "endpoint is behind" failure. A rule
+// pointed at a response shape the extractor does not understand fails identically on
+// every endpoint of the service, forever - so charging it to the supplier's reputation
+// converts a config/gateway bug into a service-wide critical_error storm against healthy,
+// fully-synced endpoints. eth-beacon did exactly this: the Beacon REST API wraps its
+// payload in {"data": {...}} and has no top-level "result", so every node_syncing check
+// on every endpoint failed critical while the endpoints reported "sync_distance":"0".
+var errSyncCheckNotApplicable = errors.New("sync check not applicable")
+
 // validateSyncCheck validates that the endpoint's block height is within sync_allowance
 // of the perceived block number from the QoS instance.
+//
+// Returns an error wrapping errSyncCheckNotApplicable when the check could not be
+// evaluated; callers must not apply a reputation penalty in that case.
 func (e *HealthCheckExecutor) validateSyncCheck(
 	serviceID protocol.ServiceID,
 	responseBody []byte,
@@ -1979,7 +2453,7 @@ func (e *HealthCheckExecutor) validateSyncCheck(
 	// Extract block height from response
 	endpointHeight, err := extractBlockHeight(responseBody)
 	if err != nil {
-		return fmt.Errorf("failed to extract block height: %w", err)
+		return fmt.Errorf("%w: failed to extract block height: %s", errSyncCheckNotApplicable, err)
 	}
 
 	// Block height 0 is always invalid
@@ -2037,6 +2511,7 @@ func (e *HealthCheckExecutor) validateSyncCheck(
 // - {"result": "0x1940c6f5"} (EVM eth_blockNumber)
 // - {"result": {"sync_info": {"latest_block_height": "12345"}}} (Cosmos status)
 // - {"result": 12345} (numeric result)
+// - {"data": {"head_slot": "14874850"}} (Beacon REST API - no top-level "result")
 func extractBlockHeight(responseBody []byte) (int64, error) {
 	var response map[string]interface{}
 	if err := json.Unmarshal(responseBody, &response); err != nil {
@@ -2050,6 +2525,21 @@ func extractBlockHeight(responseBody []byte) (int64, error) {
 
 	result, exists := response["result"]
 	if !exists {
+		// Beacon REST API: {"data": {"head_slot": "14874850", "sync_distance": "0", ...}}.
+		// head_slot is a consensus-layer slot, not an execution block number - only ever
+		// compare it against a perceived height derived from the same source.
+		if data, ok := response["data"].(map[string]interface{}); ok {
+			if slotStr, ok := data["head_slot"].(string); ok {
+				slot, err := strconv.ParseInt(slotStr, 10, 64)
+				if err != nil {
+					return 0, fmt.Errorf("invalid head_slot: %w", err)
+				}
+				return slot, nil
+			}
+			if slotNum, ok := data["head_slot"].(float64); ok {
+				return int64(slotNum), nil
+			}
+		}
 		return 0, fmt.Errorf("no result field in response")
 	}
 
@@ -2113,3 +2603,34 @@ func parseHexBlockNumber(hexStr string) (int64, error) {
 	}
 	return height, nil
 }
+
+// DefaultWebsocketCheckWorkers bounds concurrent websocket health checks.
+//
+// Sizing arithmetic, worth re-deriving if the fleet changes — measured 1054 websocket-capable
+// endpoints across 55 services, on a 10s tick with a 10s check timeout:
+//
+//   - A HEALTHY endpoint answers in ~0.25s, so a full sweep costs ~260 worker-seconds and
+//     any pool above ~30 workers clears it well inside one tick. Healthy load is not the
+//     constraint.
+//   - A SILENT endpoint — accepts the connection, never replies — holds a worker for the
+//     entire timeout, i.e. one whole tick. So the pool size is really a budget for how many
+//     silent endpoints can be in flight before coverage starts being skipped.
+//
+// 64 was the first guess and is too tight: one operator alone had ~29 silent websocket
+// endpoints on a single service. 256 absorbs a large operator going dark across several
+// services without dropping checks for everyone else, and 256 concurrent in-flight dials is
+// modest for I/O-bound work.
+//
+// Beyond this the pool refuses rather than queueing without limit — see
+// DefaultWebsocketCheckQueueSize.
+const DefaultWebsocketCheckWorkers = 256
+
+// DefaultWebsocketCheckQueueSize bounds the websocket check backlog.
+//
+// Load-bearing: pond's DefaultQueueSize is Unbounded, so TrySubmit would accept indefinitely
+// and reconstruct the backlog this pool exists to avoid — stalling later instead of sooner.
+//
+// Sized at roughly one sweep of the fleet (~1054 endpoints). Deliberately not larger: a check
+// that sits queued for several ticks reports staleness that has since changed, so beyond about
+// one sweep the right answer is to skip and re-check next tick rather than to buffer.
+const DefaultWebsocketCheckQueueSize = 1024

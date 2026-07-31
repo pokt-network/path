@@ -2,7 +2,7 @@
 # Pocket Network Health Check Configuration
 # ==========================================
 # Generated for all supported chains at api.pocket.network
-# Last updated: July 20, 2026
+# Last updated: July 29, 2026
 #
 # Service IDs match the subdomain of each endpoint URL
 # Template format: gateway/health_check_config.go
@@ -85,6 +85,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: poly
   # Block time: ~2s | Source: chainspect.app, polygonscan.com
@@ -135,6 +150,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: bsc
   # Block time: ~3s | Source: bscscan.com, bnbchain docs
@@ -187,6 +217,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error # lets penalty but not that hardest
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: avax
   # Block time: ~2s | Source: chainspect.app, snowtrace.io
@@ -299,6 +344,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: sonic
   # Block time: ~1s | Source: sonicscan.org, soniclabs.com docs
@@ -427,6 +487,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: moonriver
   # Block time: ~6s | Source: moonscan.io (same as Moonbeam)
@@ -456,6 +531,21 @@
       expected_response_contains: '0x505"'
       timeout: 5s
       reputation_signal: critical_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: gnosis
   # Block time: ~5s | Source: gnosisscan.io, gnosis chain docs
@@ -498,6 +588,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: celo
   # Block time: ~5s | Source: celoscan.io, celo docs
@@ -607,6 +712,21 @@
       expected_status_code: 200
       timeout: 5s
       reputation_signal: major_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: fuse
   # Block time: ~5s | Source: explorer.fuse.io, fuse docs
@@ -636,6 +756,21 @@
       expected_response_contains: '0x7a"'
       timeout: 5s
       reputation_signal: critical_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: iotex
   # Block time: ~5s | Source: chainspect.app, iotexscan.io
@@ -665,6 +800,21 @@
       expected_response_contains: '0x1251"'
       timeout: 5s
       reputation_signal: critical_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: oasys
   # Block time: ~15s | Source: docs.oasys.games (Hub-Layer same as Ethereum)
@@ -794,6 +944,22 @@
 
 # Hyperliquid is an EVM chain (not Cosmos)
 # KNOWN ISSUE: eth_call ignores block number parameter - always returns latest block context
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
+
 - service_id: hyperliquid
   # Block time: ~1s | Source: hyperliquid docs, block explorer
   # Formula: 300s / 1s = 300 blocks for 5 minutes
@@ -926,6 +1092,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: base
   # Block time: ~2s | Source: chainspect.app, basescan.org
@@ -976,6 +1157,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: poly-zkevm
   # Block time: ~2s | Source: zkevm.polygonscan.com
@@ -1005,6 +1201,21 @@
       expected_response_contains: '0x44d"'
       timeout: 5s
       reputation_signal: critical_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: zksync-era
   # Block time: ~1s | Source: era.zksync.network explorer
@@ -1034,6 +1245,21 @@
       expected_response_contains: '0x144"'
       timeout: 5s
       reputation_signal: critical_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: zklink-nova
   # Block time: ~2s | Source: zkLink Nova explorer
@@ -1063,6 +1289,21 @@
       expected_response_contains: '0xc5cc4"'
       timeout: 5s
       reputation_signal: critical_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: scroll
   # Block time: ~3s | Source: scrollscan.com
@@ -1219,6 +1460,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: boba
   # Block time: ~2s | Source: bobascan.com (OP Stack)
@@ -1257,6 +1513,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: metis
   # Block time: ~2s | Source: andromeda-explorer.metis.io
@@ -1412,6 +1683,21 @@
       timeout: 10s
       archival: true
       reputation_signal: minor_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: fraxtal
   # Block time: ~2s | Source: fraxscan.com (OP Stack)
@@ -1482,6 +1768,21 @@
 # ==========================================
 # TESTNET CHAINS
 # ==========================================
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: eth-sepolia-testnet
   # Block time: ~12s | Source: Same as Ethereum mainnet
@@ -1513,6 +1814,22 @@
       reputation_signal: critical_error
 
 # DEPRECATED from public portal but retained for operators
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
+
 - service_id: eth-holesky-testnet
   # Block time: ~12s | Source: Same as Ethereum mainnet
   # Formula: 300s / 12s = 25 blocks for 5 minutes
@@ -1682,6 +1999,21 @@
       expected_response_contains: '0x161c28"'
       timeout: 5s
       reputation_signal: critical_error
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: giwa-sepolia-testnet
   # Block time: ~12s | Source: Ethereum L2 testnet
@@ -1715,6 +2047,21 @@
 # ==========================================
 # NON-EVM CHAINS
 # ==========================================
+    # WebSocket data-path check. Deliberately sends a request rather than only
+    # opening the socket: a supplier can complete the handshake, answer pings, and
+    # still deliver nothing, so connect-only would score it healthy.
+    # major_error (not critical): websocket scores currently receive no negative
+    # signal at all, so this is the first thing that can move them. Starting at
+    # critical (-50, triggers cooldown) fleet-wide on an unproven check risks mass
+    # websocket cooldowns. Escalate once the false-positive rate is known.
+    - name: ws_eth_blockNumber
+      type: websocket
+      sync_check: true
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_response_contains: '"result"'
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: solana
   # Block time: ~0.4s | Source: chainspect.app, solscan.io
@@ -2261,6 +2608,7 @@
       expected_response_contains: '"syncing"'
       timeout: 5s
       reputation_signal: major_error
+    # NOTE: websocket check intentionally omitted pending upstream work.
 
 - service_id: seda
   # Block time: ~6s | Source: Cosmos SDK default
@@ -2326,6 +2674,14 @@
       expected_response_contains: '0x531"'
       timeout: 5s
       reputation_signal: critical_error
+    # WebSocket connectivity check. Connect-only: this is a Cosmos service, so an
+    # EVM method would fail for reasons unrelated to websocket health. Weaker than
+    # the EVM data-path check but still the only signal these websocket scores get.
+    - name: ws_connect
+      type: websocket
+      path: /
+      timeout: 10s
+      reputation_signal: major_error
 
 - service_id: shentu
   # Block time: ~6s | Source: Cosmos SDK default
@@ -2476,8 +2832,17 @@
 - service_id: eth-beacon
   # Ethereum Beacon Chain (consensus layer) - Beacon REST API, not EVM JSON-RPC.
   # Slot time is a fixed 12s protocol constant | Formula: 300s / 12s = 25 slots.
-  # NOTE: head_slot is not an EVM block height, so sync-allowance filtering may be
-  # inert here even with sync_check set. The checks still gate liveness/reputation.
+  #
+  # NO sync_check here. The Beacon REST API wraps everything in {"data": {...}} and
+  # never returns a top-level "result", so the gateway's block-height extraction had
+  # nothing to read and failed every single check as critical_error - on healthy,
+  # fully-synced endpoints reporting "sync_distance":"0". It was a 100% false positive
+  # against every endpoint on the service.
+  #
+  # Do not re-enable it without both: (a) gateway-side support for data.head_slot, and
+  # (b) a perceived-height source for this service. eth-beacon is type "generic" (NoOp
+  # QoS, no height extraction) with no external_block_sources, so perceived height is
+  # permanently 0 and sync-allowance filtering would be inert even once (a) lands.
   sync_allowance: 25
   check_interval: 30s
   enabled: true
@@ -2490,7 +2855,6 @@
       expected_response_contains: '"is_syncing"'
       timeout: 5s
       reputation_signal: critical_error
-      sync_check: true
     - name: node_version
       type: rest
       method: GET

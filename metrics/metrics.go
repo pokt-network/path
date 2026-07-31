@@ -20,6 +20,7 @@ const (
 	LabelDomain             = "domain"
 	LabelRPCType            = "rpc_type"
 	LabelServiceID          = "service_id"
+	LabelSelectionPath      = "path"
 	LabelTierThreshold      = "tier_threshold"
 	LabelSessionStartHeight = "session_start_height"
 	LabelHealthCheckName    = "health_check_name"
@@ -116,17 +117,26 @@ var ReputationEndpointLeaderboard = promauto.NewGaugeVec(
 
 // =============================================================================
 // Health Check Status (Counter)
-// Labels: domain, supplier, rpc_type, service_id, health_check_name, reputation_signal
+// Labels: domain, rpc_type, service_id, health_check_name, reputation_signal
 // Value: count
-// Purpose: Track health check results per supplier for filtering visibility
+// Purpose: Track health check results per operator for filtering visibility
+//
+// NO `supplier` label, on purpose. It used to carry one, unguarded, and reached
+// 221,700 series on an 11-hour-old production pod (audit 2026-07-30) — the same
+// failure mode as the 945K-series histogram incident that cardinality_guard.go
+// was written for. `supplier` multiplies every other label by the number of
+// registrations behind a backend, and nothing consumed it: every dashboard and
+// alert aggregates this metric by domain / service_id / rpc_type /
+// health_check_name / reputation_signal. Per-supplier health-check outcomes are
+// still available on path_supplier_signal_total and via /ready?detailed=true.
 // =============================================================================
 
 var HealthCheckStatus = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "health_check_status_total",
-		Help: "Health check results by domain, supplier, rpc_type, service_id, health_check_name, and reputation_signal.",
+		Help: "Health check results by domain, rpc_type, service_id, health_check_name, and reputation_signal. No supplier label: it multiplied series ~50x with no consumer (see path_supplier_signal_total for per-supplier outcomes).",
 	},
-	[]string{LabelDomain, LabelSupplier, LabelRPCType, LabelServiceID, LabelHealthCheckName, LabelReputationSignal},
+	[]string{LabelDomain, LabelRPCType, LabelServiceID, LabelHealthCheckName, LabelReputationSignal},
 )
 
 // HealthCheckDeduped counts health check relays SKIPPED by backend-URL deduplication.
@@ -278,6 +288,18 @@ var BatchItemsTotal = promauto.NewCounterVec(
 	[]string{LabelServiceID},
 )
 
+// HedgeSuppressedLargeBatchTotal counts batch items that skipped hedging because the batch
+// exceeded hedge_max_batch_size. Compare against path_hedge_requests_total to see how much
+// hedge traffic the cap removed, and against path_batch_items_total for the share of batch
+// work now running unhedged.
+var HedgeSuppressedLargeBatchTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "hedge_suppressed_large_batch_total",
+		Help: "Batch items whose hedge was suppressed by hedge_max_batch_size, by service.",
+	},
+	[]string{LabelServiceID},
+)
+
 // =============================================================================
 // Request/Response Sizes (Counters)
 // Labels: rpc_type, service_id
@@ -392,6 +414,16 @@ const (
 	LabelCircuitBreakerEvent     = "event"
 	CircuitBreakerEventBroken    = "broken"
 	CircuitBreakerEventRecovered = "recovered"
+	// CircuitBreakerEventSuppressed is a break trigger the failure-rate gate declined to
+	// act on: the domain failed, but not at a rate that justifies removing it from the
+	// pool. Counting these separately is what distinguishes "this domain is healthy" from
+	// "the gate is swallowing real failures" — without it, a mis-tuned gate is invisible.
+	CircuitBreakerEventSuppressed = "suppressed"
+	// CircuitBreakerEventDuplicate is a break trigger arriving while the domain is ALREADY
+	// broken. Batch items fail concurrently on separate goroutines, so one incident
+	// produces many of these. They must not escalate the TTL — one incident is one
+	// episode — but they are counted so the amplification factor stays measurable.
+	CircuitBreakerEventDuplicate = "duplicate"
 )
 
 // CircuitBreakerReasonCategory enumerates the bounded set of reason buckets
@@ -678,9 +710,234 @@ var ConcentrationCapReshapedTotal = promauto.NewCounterVec(
 )
 
 // RecordConcentrationCapReshaped increments the concentration-cap reshape counter for a
-// service. Called once per selection whose distribution the cap actually altered.
+// service. Called once per PRIMARY selection whose distribution the cap actually altered.
+//
+// Deliberately left unlabeled by path: the retry/hedge band paths report through
+// ConcentrationCapBandTotal instead, so this counter's existing per-service series keep their
+// continuity and remain a valid before/after baseline for the primary path.
 func RecordConcentrationCapReshaped(serviceID string) {
 	ConcentrationCapReshapedTotal.WithLabelValues(serviceID).Inc()
+}
+
+// ConcentrationCapBandTotal counts endpoint picks made from the top-reputation-score band —
+// the retry, hedge, and batch-item paths — by what the per-operator concentration cap did to
+// each one.
+//
+// It is a SEPARATE counter from ConcentrationCapReshapedTotal rather than a new label on it,
+// for two reasons:
+//   - The primary path's series must stay byte-identical so its already-nonzero rate remains a
+//     usable baseline. Adding a label would end those series and start new ones.
+//   - "Did extending the cap to retry/hedge do anything" needs a counter that starts at zero,
+//     and needs its own denominator: this one is recorded on EVERY band pick, including the
+//     ones the cap left alone, so outcome="reshaped" divided by the total is the real
+//     engagement rate rather than an unanchored count.
+//
+// The `path` label names the call site — retry, hedge, or batch — i.e. a refinement of
+// path="top_ranked" on the selection_* metrics. Retry and hedge do NOT carry comparable
+// volume (measured in production: ~209/s retries against ~25/s winning hedges), so they must
+// never be summed into one "retry/hedge" figure.
+//
+// The `outcome` label is the BandCapOutcome. degraded_no_room is the one to watch: it means
+// the band had collapsed to a single operator and the cap had nowhere to redistribute to, so
+// the pick was left uncapped. That is expected on retries (a retry excludes the operators it
+// already tried) and is the metric that separates "the cap is doing nothing" from "the cap
+// had no room to do anything".
+var ConcentrationCapBandTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "concentration_cap_band_total",
+		Help: "Retry/hedge/batch band endpoint picks, by service_id, call-site path (retry|hedge|batch) and concentration-cap outcome (reshaped|no_op|degraded_no_room|disabled|no_candidates).",
+	},
+	[]string{LabelServiceID, LabelSelectionPath, "outcome"},
+)
+
+// Call-site paths for ConcentrationCapBandTotal's `path` label. These refine
+// SelectionPathTopRanked, which cannot distinguish them.
+const (
+	// CapPathRetry is a retry's replacement-endpoint selection (attempt >= 2), on both the
+	// single-request and parallel paths.
+	CapPathRetry = "retry"
+	// CapPathHedge is the hedge racer's second-endpoint selection.
+	CapPathHedge = "hedge"
+	// CapPathBatch is a batch item's FIRST selection — the primary decision for that item, not
+	// an overflow path. Labeled separately because folding it into "retry" would make a
+	// batch-heavy service's ordinary traffic look like retry traffic.
+	CapPathBatch = "batch"
+)
+
+// RecordConcentrationCapBand records one band pick and what the cap did to it.
+func RecordConcentrationCapBand(serviceID, path, outcome string) {
+	ConcentrationCapBandTotal.WithLabelValues(serviceID, path, outcome).Inc()
+}
+
+// SelectionCandidateTotal counts, per selection, every operator PRESENT in the candidate
+// pool the selector actually saw. SelectionSelectedTotal counts the one it picked.
+//
+// The pair exists to answer a question no other metric can: is a skewed traffic
+// distribution caused by skewed SELECTION, or by a candidate pool that was already skewed
+// before selection ran? path_relays_total shows only the outcome, and /ready shows the
+// session pool — not the post-filter pool the selector receives, which is what matters.
+//
+// Read it as a per-operator selection rate:
+//
+//	selected / candidate  ~= that operator's chance of winning when it is eligible
+//
+// An operator present in most pools and winning ~its endpoint share is normal. One winning
+// far above its share is a selector problem. One rarely appearing as a candidate at all,
+// despite showing healthy in /ready, means the skew happened upstream in filtering.
+//
+// The `path` label names the DECISION that produced the relay's endpoint. There is more than
+// one, they do NOT carry equal traffic, and — critically — not every selector's output is
+// used: see the SelectionPath* constants. Splitting by path is what makes that visible
+// instead of being folklore, and would show immediately if the balance ever shifted.
+//
+// Only compute a win rate within a single `path`. Mixing them compares a decision that was
+// acted on against one that was discarded, which is how a selector can appear to favor an
+// operator that in fact receives almost no traffic.
+//
+// Cardinality is service_id x domain x path — the service_id/domain pairing that
+// path_relays_total already carries, doubled by a 2-value label.
+var SelectionCandidateTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "selection_candidate_total",
+		Help: "Operators present in the endpoint-selection candidate pool, counted once per operator per selection, by service_id, domain and selector path.",
+	},
+	[]string{LabelServiceID, LabelDomain, LabelSelectionPath},
+)
+
+// SelectionSelectedTotal counts selections won, by the selected endpoint's operator.
+// Divide by SelectionCandidateTotal for that operator's per-selection win rate.
+var SelectionSelectedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "selection_selected_total",
+		Help: "Endpoint selections won, by service_id, the selected endpoint's domain, and selector path.",
+	},
+	[]string{LabelServiceID, LabelDomain, LabelSelectionPath},
+)
+
+// SelectionPoolSize reports the size of the candidate pool the selector received, so a pool
+// that is smaller than /ready implies can be seen directly rather than inferred.
+var SelectionPoolSize = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "selection_pool_size",
+		Help:    "Number of endpoints in the endpoint-selection candidate pool, by service_id.",
+		Buckets: []float64{1, 2, 3, 5, 8, 13, 21, 34, 55},
+	},
+	[]string{LabelServiceID, LabelSelectionPath},
+)
+
+// SelectionPoolOperators reports how many DISTINCT operators were in the candidate pool.
+// A pool that collapses to 1 makes the concentration cap a no-op by definition, which is
+// indistinguishable from "the cap is broken" without this metric.
+var SelectionPoolOperators = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "selection_pool_operators",
+		Help:    "Number of distinct operators (eTLD+1) in the endpoint-selection candidate pool, by service_id.",
+		Buckets: []float64{1, 2, 3, 4, 5, 6, 8, 10},
+	},
+	[]string{LabelServiceID, LabelSelectionPath},
+)
+
+// RecordSelectionPool records the composition of one selection: the pool's size and operator
+// count, every operator that was a candidate, and the operator that won.
+//
+// Called on EVERY selection, including the ones the concentration cap leaves untouched —
+// those are the majority and the ones a reshape-only metric is blind to.
+func RecordSelectionPool(serviceID, selectionPath string, operatorCounts map[string]int, poolSize int, selectedOperator string) {
+	SelectionPoolSize.WithLabelValues(serviceID, selectionPath).Observe(float64(poolSize))
+	SelectionPoolOperators.WithLabelValues(serviceID, selectionPath).Observe(float64(len(operatorCounts)))
+	for op := range operatorCounts {
+		SelectionCandidateTotal.WithLabelValues(serviceID, op, selectionPath).Inc()
+	}
+	SelectionSelectedTotal.WithLabelValues(serviceID, selectedOperator, selectionPath).Inc()
+}
+
+// Selector paths for LabelSelectionPath.
+const (
+	// SelectionPathTopRanked is selectTopRankedEndpoint: uniform random within
+	// retryHedgeScoreEpsilon of the top reputation score. Despite the "retry/hedge" name it
+	// is the PRIMARY selector for batch items and retries, so on batch-heavy services it
+	// decides where nearly every relay goes.
+	SelectionPathTopRanked = "top_ranked"
+	// SelectionPathDiversity is SelectEndpointsWithDiversity when its ordering was actually
+	// used — i.e. it returned fewer endpoints than it was given, so the pick was a decision.
+	SelectionPathDiversity = "diversity"
+	// SelectionPathFilter is SelectEndpointsWithDiversity called with numEndpoints >= pool
+	// size. It returns every endpoint, so the caller is using it purely as a QoS validation
+	// filter and DISCARDS the ordering; the real pick happens afterwards, in
+	// selectTopRankedEndpoint. Recorded separately because attributing these to "diversity"
+	// makes a discarded decision look like a real one.
+	SelectionPathFilter = "filter"
+	// SelectionPathConcentrationCap is SelectWithConcentrationCap, reached only from
+	// SelectWithMetadata.
+	SelectionPathConcentrationCap = "concentration_cap"
+)
+
+// SelectionBandSize reports how many endpoints were inside the top-score band that
+// selectTopRankedEndpoint picks uniformly from. This is the effective choice set: a band of
+// 1 is winner-take-all no matter how large the pool is.
+var SelectionBandSize = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "selection_band_size",
+		Help:    "Endpoints inside the top-reputation-score band eligible for selection, by service_id. 1 means winner-take-all.",
+		Buckets: []float64{1, 2, 3, 4, 5, 6, 8, 10, 15, 25},
+	},
+	[]string{LabelServiceID},
+)
+
+// SelectionBandOperators reports how many DISTINCT operators survived the score band. The
+// band gates on score alone, so a large band drawn from one operator still concentrates all
+// traffic there; only this metric separates "wide choice" from "wide choice of one operator".
+var SelectionBandOperators = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "selection_band_operators",
+		Help:    "Distinct operators (eTLD+1) inside the top-reputation-score band, by service_id.",
+		Buckets: []float64{1, 2, 3, 4, 5, 6, 8, 10},
+	},
+	[]string{LabelServiceID},
+)
+
+// SelectionBandExcludedTotal counts operators that were in the candidate pool but fell
+// outside the top-score band, and so could not be selected at all.
+//
+// This is the metric that explains a healthy-looking operator receiving little traffic: it
+// is present, it passes QoS validation, it is not in cooldown — and it is still ineligible
+// because it sits more than retryHedgeScoreEpsilon below the top score. Without it, that
+// operator simply looks unlucky.
+var SelectionBandExcludedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "selection_band_excluded_total",
+		Help: "Operators present in the candidate pool but excluded by the top-score band, by service_id and domain.",
+	},
+	[]string{LabelServiceID, LabelDomain},
+)
+
+// RecordTopRankedSelection records one selectTopRankedEndpoint decision: the full candidate
+// pool it received, the top-score band it narrowed to, and the operator that won.
+//
+// bandCounts (not poolCounts) feeds SelectionCandidateTotal, so selected/candidate on
+// path="top_ranked" is a true win rate among the endpoints that were actually eligible.
+// Operators in the pool but not the band are counted in SelectionBandExcludedTotal instead —
+// they had a zero chance, and averaging them into the win rate would hide exactly that.
+func RecordTopRankedSelection(
+	serviceID string,
+	poolCounts, bandCounts map[string]int,
+	poolSize, bandSize int,
+	selectedOperator string,
+) {
+	SelectionPoolSize.WithLabelValues(serviceID, SelectionPathTopRanked).Observe(float64(poolSize))
+	SelectionPoolOperators.WithLabelValues(serviceID, SelectionPathTopRanked).Observe(float64(len(poolCounts)))
+	SelectionBandSize.WithLabelValues(serviceID).Observe(float64(bandSize))
+	SelectionBandOperators.WithLabelValues(serviceID).Observe(float64(len(bandCounts)))
+
+	for op := range bandCounts {
+		SelectionCandidateTotal.WithLabelValues(serviceID, op, SelectionPathTopRanked).Inc()
+	}
+	for op := range poolCounts {
+		if _, eligible := bandCounts[op]; !eligible {
+			SelectionBandExcludedTotal.WithLabelValues(serviceID, op).Inc()
+		}
+	}
+	SelectionSelectedTotal.WithLabelValues(serviceID, selectedOperator, SelectionPathTopRanked).Inc()
 }
 
 // ReputationRateCooldownTotal counts endpoints cooled down by the volume-independent
@@ -852,6 +1109,13 @@ const (
 	// often than routine rollovers).
 	WSRebindTriggerRollover = "rollover" // routine Shannon session-boundary reconnect
 	WSRebindTriggerStall    = "stall"    // staleness watchdog forced a rebind off a silent supplier
+	WSRebindTriggerAdmin    = "admin"    // operator asked to redistribute connections (admin tumble)
+	// WSRebindTriggerSessionExpired: PATH itself noticed the bound session had ended while
+	// the supplier kept streaming (it never sent the close 4000 that drives `rollover`).
+	// Distinct from `rollover` on purpose: rollover is supplier-initiated and healthy,
+	// this one counts connections that would otherwise have been stranded outside the
+	// session indefinitely — invisible to reputation and to endpoint selection.
+	WSRebindTriggerSessionExpired = "session_expired"
 
 	// --- WebSocket endpoint-staleness watchdog result labels (experimental)
 	// The `result` dimension of WebsocketEndpointStallTotal. A stall is a silent supplier
@@ -912,6 +1176,29 @@ var WebsocketRebindTotal = promauto.NewCounterVec(
 	[]string{LabelDomain, LabelServiceID, "result", "trigger"},
 )
 
+// WebsocketRebindAvoidNarrowedTotal counts forced rebinds (stall escape, admin tumble) whose
+// avoid-set had to be narrowed because the session held nothing outside the failure domain the
+// rebind was told to escape. Incremented ONLY on a shortfall, so the series stays near-empty
+// on healthy services; the denominator is WebsocketRebindTotal for the matching trigger.
+//
+// This is the signal that a rebind did not actually escape: `requested=backend applied=endpoint`
+// means a stall escape could only drop the one supplier registration and may have landed on a
+// sibling registration fronting the SAME machine — the connection will stall again.
+// `requested=operator applied=backend|endpoint` means a tumble could not leave the operator.
+var WebsocketRebindAvoidNarrowedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_rebind_avoid_narrowed_total",
+		Help: "Forced websocket rebinds whose avoid-set was narrowed for lack of candidates, by service_id, requested scope (backend/operator) and applied scope (backend/endpoint). A nonzero rate means rebinds are not escaping what they were told to escape.",
+	},
+	[]string{LabelServiceID, "requested", "applied"},
+)
+
+// RecordWebsocketRebindAvoidNarrowed records a forced rebind that could not honor its
+// requested avoid scope. See WebsocketRebindAvoidNarrowedTotal.
+func RecordWebsocketRebindAvoidNarrowed(serviceID, requested, applied string) {
+	WebsocketRebindAvoidNarrowedTotal.WithLabelValues(serviceID, requested, applied).Inc()
+}
+
 // WebsocketSubscriptionsReplayedTotal counts subscriptions replayed onto a
 // reconnected endpoint during rebind. EXPERIMENTAL / canary observability.
 var WebsocketSubscriptionsReplayedTotal = promauto.NewCounterVec(
@@ -940,9 +1227,18 @@ var WebsocketEndpointStallTotal = promauto.NewCounterVec(
 // Helper Functions for Recording Metrics
 // =============================================================================
 
-// RecordHealthCheck records a health check result per supplier
-func RecordHealthCheck(domain, supplier, rpcType, serviceID, healthCheckName, reputationSignal string) {
-	HealthCheckStatus.WithLabelValues(domain, supplier, rpcType, serviceID, healthCheckName, reputationSignal).Inc()
+// RecordHealthCheck records a health check result.
+//
+// The second argument is the supplier address. It is accepted and ignored: the
+// signature is kept so callers need no change, but the value is deliberately
+// NOT used as a label (see HealthCheckStatus for why). Multiple suppliers behind
+// one backend collapse onto the same (domain, …) series, which is what every
+// consumer of this metric already aggregates to.
+func RecordHealthCheck(domain, _, rpcType, serviceID, healthCheckName, reputationSignal string) {
+	if !healthCheckStatusGuard.allow(domain, rpcType, serviceID, healthCheckName, reputationSignal) {
+		return
+	}
+	HealthCheckStatus.WithLabelValues(domain, rpcType, serviceID, healthCheckName, reputationSignal).Inc()
 }
 
 // RecordHealthCheckDeduped records a health check relay skipped via backend-URL dedup.
@@ -1122,6 +1418,14 @@ func RecordBatchSize(rpcType, serviceID string, batchCount int, latencySeconds f
 	BatchItemsTotal.WithLabelValues(serviceID).Add(float64(batchCount))
 }
 
+// RecordHedgeSuppressedLargeBatch counts batch items whose hedge was skipped because the
+// batch exceeded hedge_max_batch_size. Counted per ITEM (each item decides independently),
+// so this is directly comparable to the relays it saved: a suppressed item would have cost
+// at most one extra relay.
+func RecordHedgeSuppressedLargeBatch(serviceID string) {
+	HedgeSuppressedLargeBatchTotal.WithLabelValues(serviceID).Inc()
+}
+
 // batchCountBucket maps a raw batch count to one of five fixed bucket labels.
 // Caps cardinality of the batch_count label at 5 values regardless of payload size.
 func batchCountBucket(batchCount int) string {
@@ -1195,11 +1499,16 @@ func SetMeanScore(domain, serviceID, rpcType string, score float64) {
 // SetSupplierReputationScore sets the per-(supplier, service_id, rpc_type) reputation gauge.
 // Skipped silently when supplier is empty (e.g., per-domain reputation key)
 // or when the cardinality guard has tripped for this metric.
+//
+// The guard is keyed on all three labels, matching the gauge exactly. It used to
+// key on (supplier, service_id) only, which let one admitted slot create one
+// series per rpc_type — so the guard's tuple count under-reported the series it
+// was capping, and eviction could not delete the series it reclaimed.
 func SetSupplierReputationScore(supplier, serviceID, rpcType string, score float64) {
 	if supplier == "" {
 		return
 	}
-	if !supplierReputationGuard.allow(supplier, serviceID) {
+	if !supplierReputationGuard.allow(supplier, serviceID, rpcType) {
 		return
 	}
 	SupplierReputationScore.WithLabelValues(supplier, serviceID, rpcType).Set(score)
@@ -1258,6 +1567,22 @@ func RecordWebsocketConnectionClosed(domain, serviceID string, durationSeconds f
 	WebsocketConnectionsActive.WithLabelValues(domain, serviceID).Dec()
 	WebsocketConnectionEventsTotal.WithLabelValues(domain, serviceID, WSEventClosed).Inc()
 	WebsocketConnectionDuration.WithLabelValues(domain, serviceID).Observe(durationSeconds)
+}
+
+// MoveWebsocketConnection hands one connection's active-connection credit from the operator
+// it was bound to onto the one it just rebound to, so the gauge reports where connections
+// ACTUALLY are rather than where they first landed.
+//
+// Pairing: the Inc happens once at establishment and the Dec once at close, both via the
+// connection observation. This moves the outstanding credit in between, and the close path
+// decrements the CURRENT domain, so the Dec always cancels whichever Inc is outstanding no
+// matter how many times the connection moved.
+func MoveWebsocketConnection(oldDomain, newDomain, serviceID string) {
+	if oldDomain == newDomain {
+		return
+	}
+	WebsocketConnectionsActive.WithLabelValues(oldDomain, serviceID).Dec()
+	WebsocketConnectionsActive.WithLabelValues(newDomain, serviceID).Inc()
 }
 
 // RecordWebsocketConnectionFailed records a WebSocket connection failure

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/url"
 	"strconv"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/qos/heuristic"
+	"github.com/pokt-network/path/qos/selector"
 	"github.com/pokt-network/path/reputation"
 )
 
@@ -247,6 +247,56 @@ func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCod
 	return true
 }
 
+// capabilityAttemptBudget is how many attempts a request gets once a failure has been
+// classified as a capability limitation: the attempt that discovered it, plus EXACTLY ONE
+// retry. One retry is genuinely useful — supplier A may run a pruned node while supplier B
+// is archival — but further attempts only spend relays re-learning that the client asked
+// for data the fleet does not retain, and every one of them makes the client wait longer
+// for the same answer.
+const capabilityAttemptBudget = 2
+
+// isCapabilityLimitationFailure reports whether a failed attempt failed because the endpoint
+// cannot serve this request (pruned/non-archival state, lite fullnode, backend that doesn't
+// speak REST) rather than because the endpoint is broken. Such a failure is not the
+// supplier's fault, must not be retried indefinitely, and its response body is the answer
+// the client should see.
+//
+// Two sources, because only one of them is available depending on which layer detected first:
+//   - heuristicResult: present when the GATEWAY ran the heuristic (protocol returned no error).
+//     MatchedPattern is the precise signal.
+//   - err: the protocol layer detects first on the normal path and FLATTENS the structured
+//     AnalysisResult into an error string, dropping MatchedPattern. The response body is
+//     embedded in that string, so a substring scan is the only thing left to key off.
+//
+// TODO_TECHDEBT: the substring fallback exists only because the classification is stringified
+// on its way out of the protocol layer. See DESIGN_UNIFY_ERROR_CLASSIFICATION.md — carrying the
+// structured verdict through protocol.Response removes this function's second branch.
+func isCapabilityLimitationFailure(heuristicResult *heuristic.AnalysisResult, err error) bool {
+	if heuristicResult != nil && heuristicResult.MatchedPattern != "" &&
+		heuristic.IsCapabilityLimitationError(heuristicResult.MatchedPattern) {
+		return true
+	}
+	return err != nil && heuristic.ErrorContainsArchivalPattern(err.Error())
+}
+
+// noteCapabilityFailure records a failed attempt against the capability-limitation retry
+// budget. It returns whether the failure was a capability limitation at all, and whether the
+// budget (initial attempt + exactly one retry) is now spent so the caller must stop retrying.
+//
+// Non-capability failures leave the counter untouched and fall through to the regular
+// shouldRetry() decision.
+func noteCapabilityFailure(
+	capabilityFailures *int,
+	heuristicResult *heuristic.AnalysisResult,
+	err error,
+) (isCapabilityLimitation bool, budgetSpent bool) {
+	if !isCapabilityLimitationFailure(heuristicResult, err) {
+		return false, false
+	}
+	*capabilityFailures++
+	return true, *capabilityFailures >= capabilityAttemptBudget
+}
+
 // isDeceptiveResponsePattern returns true if the heuristic reason indicates a supplier
 // returning fabricated responses (empty/invalid results while passing health checks).
 // These warrant harsher penalties than generic server errors.
@@ -394,6 +444,10 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 	var lastResponseSnippet string                    // truncated response that triggered the break
 	var lastHeuristicResult *heuristic.AnalysisResult // heuristic result from the last failed attempt
 
+	// Counts attempts that failed on a capability limitation rather than a fault.
+	// Capped at capabilityAttemptBudget — see noteCapabilityFailure.
+	capabilityFailures := 0
+
 	// Track endpoints and domains already tried to ensure retry rotation.
 	// Domain-level tracking prevents retrying different endpoints behind the same broken infrastructure.
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
@@ -504,7 +558,7 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 			}
 
 			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
-			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType)
+			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType, metrics.CapPathRetry)
 			if newEndpointAddr == "" {
 				logger.Error().Msg("Failed to select endpoint for retry - no endpoints available")
 				lastErr = fmt.Errorf("no endpoints available for retry")
@@ -680,6 +734,35 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					markDomainTried(triedDomains, racer.hedgeEndpoint)
 				}
 
+				// A capability limitation is the backend correctly reporting it does not
+				// retain what was asked for. Hand that response to the QoS context so the
+				// client receives the backend's own error verbatim — its shape, its error
+				// code — instead of a synthesized 500 built from the flattened protocol
+				// error string. The normal path below already does this for every failed
+				// attempt; the hedge path is the one path that dropped the bytes entirely,
+				// which is exactly how a "state is pruned" answer became a 500.
+				//
+				// Scoped to capability limitations on purpose: passing every failed hedge
+				// body straight through would also hand clients supplier HTML error pages
+				// and truncated garbage that the QoS error response exists to hide.
+				if isCapability, budgetSpent := noteCapabilityFailure(&capabilityFailures, lastHeuristicResult, lastErr); isCapability {
+					if len(hedgeResponses) > 0 && len(hedgeResponses[0].Bytes) > 0 {
+						rc.qosCtx.UpdateWithResponse(
+							hedgeResponses[0].EndpointAddr,
+							hedgeResponses[0].Bytes,
+							hedgeResponses[0].HTTPStatusCode,
+							hedgeResponses[0].RequestID,
+						)
+					}
+					if budgetSpent {
+						logger.Warn().
+							Int("attempt", attempt).
+							Int("capability_failures", capabilityFailures).
+							Msg("Capability limitation on the hedged attempt - retry budget spent, returning the backend's error to the client")
+						break
+					}
+				}
+
 				// Continue to next attempt (retry)
 				continue
 			}
@@ -751,6 +834,12 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
 		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, requestID, logger)
 		if checkResult.Success {
+			// Denominator for the circuit breaker's failure-rate gate — see RecordSuccess.
+			if rc.circuitBreaker != nil && endpointAddr != "" {
+				if domain := extractDomainFromEndpoint(endpointAddr); domain != "" {
+					rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+				}
+			}
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
 				responseBytes := len(responseBytesForHeuristic)
@@ -828,6 +917,11 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 		}
 		lastResponseSnippet = truncateResponse(responseBytesForHeuristic, 512)
 
+		// Classify the failure against the capability-limitation retry budget before the
+		// retry decision below. Counted once per attempt, regardless of whether this is
+		// the last attempt, so the budget stays coherent across the hedge and normal paths.
+		isCapabilityFailure, capabilityBudgetSpent := noteCapabilityFailure(&capabilityFailures, checkResult.HeuristicResult, err)
+
 		// Log the error/failure
 		if err != nil {
 			logger.Warn().Err(err).
@@ -856,7 +950,32 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 				endpointForMetrics = string(currentEndpointAddr)
 			}
 
-			if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, endpointForMetrics, checkResult.HeuristicResult) {
+			// Capability limitation: exactly one retry, then stop. This branch must come
+			// before shouldRetry() in both directions.
+			//
+			// It cannot ASK shouldRetry: the protocol layer flattened the structured
+			// heuristic result into the error string, so shouldRetry sees an unclassified
+			// error, reports "no retry conditions met", and a pruned-state answer is
+			// returned from the first supplier without ever trying an archival one.
+			//
+			// It must also OVERRIDE shouldRetry, so a request the fleet demonstrably
+			// cannot serve stops after one retry instead of burning the whole retry
+			// budget (and the client's patience) to reach the same answer.
+			if isCapabilityFailure {
+				if capabilityBudgetSpent {
+					logger.Debug().
+						Int("attempt", attempt).
+						Int("capability_failures", capabilityFailures).
+						Msg("Capability limitation confirmed on a second supplier, stopping retries")
+					break
+				}
+				// Attribute the retry so retry dashboards don't show it as unexplained.
+				retryDomain, _ := shannonmetrics.ExtractDomainOrHost(endpointForMetrics)
+				metrics.RecordRetryDistribution(retryDomain, string(rc.detectedRPCType), string(rc.serviceID), metrics.RetryReasonHeuristic)
+				logger.Debug().
+					Int("attempt", attempt).
+					Msg("Capability limitation (e.g. pruned/non-archival state) - retrying once on a different supplier")
+			} else if !rc.shouldRetry(err, statusCode, attemptDuration, retryConfig, endpointForMetrics, checkResult.HeuristicResult) {
 				logger.Debug().
 					Int("attempt", attempt).
 					Int("status_code", statusCode).
@@ -1002,7 +1121,7 @@ func (rc *requestContext) handleBatchRelayRequest(payloads []protocol.Payload) e
 			if sem != nil {
 				defer func() { <-sem }()
 			}
-			response, err := rc.processSinglePayloadWithRetry(p, index, rpcType, logger)
+			response, err := rc.processSinglePayloadWithRetry(p, index, len(payloads), rpcType, logger)
 			resultChan <- batchPayloadResult{
 				index:    index,
 				response: response,
@@ -1066,11 +1185,32 @@ func (rc *requestContext) handleBatchRelayRequest(payloads []protocol.Payload) e
 	return nil
 }
 
+// shouldSuppressHedgeForBatch reports whether hedging must be skipped for an item belonging
+// to a batch of batchSize items.
+//
+// A batch is fanned out into one independently-retried, independently-hedged relay per item,
+// so hedging an N-item batch costs up to 2N relays. Large batches also run slower than the
+// flat hedge_delay by nature rather than by fault, so a size-blind hedge fires on nearly all
+// of them — doubling relay spend to chase latency the caller already expects.
+//
+// A nil retry config, an unset cap, or a cap <= 0 all mean "no cap": hedge regardless of size.
+func shouldSuppressHedgeForBatch(retryConfig *ServiceRetryConfig, batchSize int) bool {
+	if retryConfig == nil || retryConfig.HedgeMaxBatchSize == nil {
+		return false
+	}
+	maxBatch := *retryConfig.HedgeMaxBatchSize
+	if maxBatch <= 0 {
+		return false
+	}
+	return batchSize > maxBatch
+}
+
 // processSinglePayloadWithRetry handles a single payload with full retry/hedge/heuristic flow.
 // This is the core logic extracted for batch processing.
 func (rc *requestContext) processSinglePayloadWithRetry(
 	payload protocol.Payload,
 	index int,
+	batchSize int,
 	rpcType sharedtypes.RPCType,
 	parentLogger polylog.Logger,
 ) (protocol.Response, error) {
@@ -1102,10 +1242,29 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		}
 	}
 
+	// Suppress hedging on large batches. Every item in the batch reaches this function on
+	// its own goroutine, so hedging a large batch multiplies relays by up to 2x across the
+	// whole batch — and large batches exceed the flat hedge_delay as a matter of course,
+	// not because anything is wrong, so nearly all of them would hedge.
+	if hedgeDelay > 0 && shouldSuppressHedgeForBatch(retryConfig, batchSize) {
+		logger.Debug().
+			Int("batch_size", batchSize).
+			Int("hedge_max_batch_size", *retryConfig.HedgeMaxBatchSize).
+			Msg("hedging suppressed: batch larger than hedge_max_batch_size")
+		hedgeDelay = 0
+		metrics.RecordHedgeSuppressedLargeBatch(string(rc.serviceID))
+	}
+
 	var lastErr error
 	var lastResponse protocol.Response
 	triedEndpoints := make(map[protocol.EndpointAddr]bool)
 	triedDomains := make(map[string]bool)
+
+	// Counts attempts that failed on a capability limitation rather than a fault.
+	// Capped at capabilityAttemptBudget — see noteCapabilityFailure. Batch items retry
+	// unconditionally (this loop never consults shouldRetry), so without this cap a batch
+	// of N historical calls costs N*maxAttempts relays to return the same pruned-state answer.
+	capabilityFailures := 0
 
 	// Pre-populate triedDomains with broken domains from the cross-pod circuit breaker.
 	if rc.circuitBreaker != nil {
@@ -1151,8 +1310,13 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			break
 		}
 
-		// Select endpoint
-		selectedEndpoint := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType)
+		// Select endpoint. attempt 1 is this batch item's PRIMARY selection, not an overflow
+		// pick — attributing it to "retry" would make ordinary batch traffic read as retries.
+		capPath := metrics.CapPathBatch
+		if attempt > 1 {
+			capPath = metrics.CapPathRetry
+		}
+		selectedEndpoint := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType, capPath)
 		if selectedEndpoint == "" {
 			selectedEndpoint = filteredEndpoints[0]
 		}
@@ -1198,6 +1362,14 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 					triedEndpoints[racer.hedgeEndpoint] = true
 					markDomainTried(triedDomains, racer.hedgeEndpoint)
 				}
+				// Capability limitation: exactly one retry, then return the backend's own
+				// error (already captured in lastResponse) to the client.
+				if _, budgetSpent := noteCapabilityFailure(&capabilityFailures, checkResult.HeuristicResult, lastErr); budgetSpent {
+					logger.Debug().
+						Int("attempt", attempt).
+						Msg("Capability limitation confirmed on a second supplier, stopping batch item retries")
+					break
+				}
 				continue
 			}
 			// Hedge failed, fall through to normal request
@@ -1233,6 +1405,15 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 				}
 			}
 			logger.Warn().Err(lastErr).Int("attempt", attempt).Msg("Request failed")
+
+			// Capability limitation: exactly one retry, then return the backend's own
+			// error (already captured in lastResponse) to the client.
+			if _, budgetSpent := noteCapabilityFailure(&capabilityFailures, nil, lastErr); budgetSpent {
+				logger.Debug().
+					Int("attempt", attempt).
+					Msg("Capability limitation confirmed on a second supplier, stopping batch item retries")
+				break
+			}
 			continue
 		}
 
@@ -1242,6 +1423,15 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 		// Check response success with heuristic
 		checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, resp.RequestID, logger)
 		if checkResult.Success {
+			// Feed the circuit breaker's failure-rate gate. This is the denominator: without
+			// it the gate sees only failures, and any failure reads as a 100% failure rate —
+			// which is the first-error behavior that locked out high-volume operators
+			// sustaining >99% success.
+			if rc.circuitBreaker != nil {
+				if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
+					rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+				}
+			}
 			logger.Debug().
 				Str("endpoint", string(resp.EndpointAddr)).
 				Int("status", resp.HTTPStatusCode).
@@ -1276,6 +1466,15 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 						Msg("Skipped circuit break for capability limitation error (retrying on different supplier)")
 				}
 			}
+		}
+
+		// Capability limitation: exactly one retry, then return the backend's own error
+		// (already captured in lastResponse) to the client.
+		if _, budgetSpent := noteCapabilityFailure(&capabilityFailures, checkResult.HeuristicResult, lastErr); budgetSpent {
+			logger.Debug().
+				Int("attempt", attempt).
+				Msg("Capability limitation confirmed on a second supplier, stopping batch item retries")
+			break
 		}
 	}
 
@@ -1524,7 +1723,7 @@ func (rc *requestContext) executeOneOfParallelRequests(
 			}
 
 			// Select TOP-RANKED endpoint for retry (highest reputation = best chance of success)
-			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType)
+			newEndpointAddr := rc.selectTopRankedEndpoint(filteredEndpoints, rpcType, metrics.CapPathRetry)
 			if newEndpointAddr == "" {
 				logger.Error().Int("endpoint_index", index).
 					Msg("Failed to select endpoint for retry in parallel path - no endpoints available")
@@ -1596,6 +1795,12 @@ func (rc *requestContext) executeOneOfParallelRequests(
 		// Check if the request was successful (combines HTTP status + heuristic payload analysis)
 		checkResult := checkResponseSuccess(err, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, parallelRequestID, logger)
 		if checkResult.Success {
+			// Denominator for the circuit breaker's failure-rate gate — see RecordSuccess.
+			if rc.circuitBreaker != nil && endpointAddr != "" {
+				if domain := extractDomainFromEndpoint(endpointAddr); domain != "" {
+					rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+				}
+			}
 			// Log when status code 0 is treated as success (investigate if this is expected behavior)
 			if statusCode == 0 && err == nil {
 				responseBytes := len(responseBytesForHeuristic)
@@ -2070,31 +2275,48 @@ func computeRegistrableDomainFromEndpoint(endpoint protocol.EndpointAddr) string
 // radius across the genuinely-top tier while still excluding anything meaningfully worse.
 const retryHedgeScoreEpsilon = 2.0
 
-// selectTopRankedEndpoint selects among the highest-reputation endpoints for retry/hedge.
-// It ranks by reputation score, then picks UNIFORMLY AT RANDOM among all endpoints whose
-// score is within retryHedgeScoreEpsilon of the top score. This keeps quality gating
-// (only the top-scoring band is eligible) while avoiding winner-take-all: without it, a
-// sub-point score edge routes every retry and hedge overflow to a single endpoint,
-// dogpiling it and concentrating all blast radius there.
+// selectTopRankedEndpoint selects among the highest-reputation endpoints. It ranks by
+// reputation score, then picks UNIFORMLY AT RANDOM among all endpoints whose score is within
+// retryHedgeScoreEpsilon of the top score. This keeps quality gating (only the top-scoring
+// band is eligible) while avoiding strict winner-take-all: without it, a sub-point score edge
+// routes every selection to a single endpoint, dogpiling it and concentrating all blast
+// radius there.
+//
+// NOTE ON SCOPE: this was written for retry/hedge overflow, but it is also the PRIMARY
+// selector for batch items (processBatchItem) and retries. On batch-heavy services it decides
+// where nearly every relay goes — the diversity selector's ordering is discarded there,
+// because SelectMultipleWithArchival is called with numEndpoints = len(pool) and used purely
+// as a QoS validation filter. Treat changes here as changes to the main routing path, not to
+// an overflow path. metrics.RecordTopRankedSelection makes that traffic visible.
+//
+// capPath names the call site for the concentration-cap band metric (metrics.CapPathRetry /
+// CapPathHedge / CapPathBatch). Retry, hedge and batch-item selections all land here and carry
+// very different volumes, so they must be attributable separately.
 //
 // Falls back to the first endpoint in the list if reputation service is unavailable.
 func (rc *requestContext) selectTopRankedEndpoint(
 	endpoints protocol.EndpointAddrList,
 	rpcType sharedtypes.RPCType,
+	capPath string,
 ) protocol.EndpointAddr {
 	if len(endpoints) == 0 {
 		return ""
 	}
 
-	// If only one endpoint, return it directly
+	// If only one endpoint, return it directly. Still recorded: a pool that has already
+	// collapsed to one endpoint is a concentration cause in its own right, and is
+	// indistinguishable from a selector that keeps choosing the same operator without it.
 	if len(endpoints) == 1 {
+		rc.recordTopRankedSelection(endpoints, endpoints, endpoints[0])
 		return endpoints[0]
 	}
 
 	// Get reputation service
 	reputationSvc := rc.protocol.GetReputationService()
 	if reputationSvc == nil {
-		// No reputation service - fall back to first endpoint
+		// No reputation service - fall back to first endpoint. Only endpoints[0] could have
+		// been chosen, so the effective band is that single endpoint.
+		rc.recordTopRankedSelection(endpoints, endpoints[:1], endpoints[0])
 		return endpoints[0]
 	}
 
@@ -2117,7 +2339,8 @@ func (rc *requestContext) selectTopRankedEndpoint(
 	// Rank endpoints by score (highest first)
 	rankedKeys, err := reputationSvc.RankEndpointsByScore(rc.context, keys)
 	if err != nil || len(rankedKeys) == 0 {
-		// Error ranking - fall back to first endpoint
+		// Error ranking - fall back to first endpoint (effective band of one).
+		rc.recordTopRankedSelection(endpoints, endpoints[:1], endpoints[0])
 		return endpoints[0]
 	}
 
@@ -2140,26 +2363,143 @@ func (rc *requestContext) selectTopRankedEndpoint(
 		}
 	}
 
-	// Pick uniformly at random within the top-scoring band to spread retry/hedge overflow
-	// (and blast radius) instead of always dogpiling the strict #1.
-	topKey := rankedKeys[rand.Intn(bandSize)]
-	originalEndpoint, ok := keyToOriginalEndpoint[topKey.EndpointAddr]
-	if !ok {
-		// Shouldn't happen, but fall back to first endpoint if mapping fails
+	// Resolve the band back to endpoints. Needed both for the metric (which operators were
+	// actually eligible) and for the pick itself. Ranking keys are reputation keys
+	// (per-supplier/per-domain granularity), not endpoint addresses, so they must go back
+	// through keyToOriginalEndpoint.
+	bandEndpoints := make(protocol.EndpointAddrList, 0, bandSize)
+	for _, k := range rankedKeys[:bandSize] {
+		if ep, mapped := keyToOriginalEndpoint[k.EndpointAddr]; mapped {
+			bandEndpoints = append(bandEndpoints, ep)
+		}
+	}
+
+	// Pick within the top-scoring band to spread retry/hedge overflow (and blast radius)
+	// instead of always dogpiling the strict #1. See pickFromBand for the two rules that
+	// govern the pick: uniform over distinct backend URLs, and — when enabled — the
+	// per-operator concentration cap on top of it.
+	originalEndpoint := rc.pickFromBand(bandEndpoints, capPath)
+	if originalEndpoint == "" {
+		// Every band key failed to map back to an endpoint. Shouldn't happen; fall back
+		// rather than return an empty address.
 		rc.logger.Warn().
-			Str("top_key", string(topKey.EndpointAddr)).
-			Msg("Failed to map top-ranked key back to original endpoint, falling back")
+			Int("band_size", bandSize).
+			Msg("Failed to map top-ranked band back to endpoints, falling back")
+		rc.recordTopRankedSelection(endpoints, endpoints[:1], endpoints[0])
 		return endpoints[0]
 	}
 
+	rc.recordTopRankedSelection(endpoints, bandEndpoints, originalEndpoint)
+
 	rc.logger.Debug().
 		Str("selected_endpoint", string(originalEndpoint)).
-		Str("reputation_key", string(topKey.EndpointAddr)).
 		Int("band_size", bandSize).
+		Int("distinct_backends_in_band", selector.CountDistinctBackends(bandEndpoints)).
 		Int("num_candidates", len(endpoints)).
 		Msg("🏆 Selected endpoint from top-scoring band for retry/hedge (spreads overflow)")
 
 	return originalEndpoint
+}
+
+// pickFromBand chooses one endpoint from the top-reputation-score band.
+//
+// Two rules apply, in order:
+//
+//  1. Always: the pick is uniform over distinct BACKEND URLs, not over band members.
+//     Reputation keys are per-supplier and several suppliers can register against the same
+//     backend, so a member-uniform pick gave one machine fronted by 7 registrations 7x the
+//     traffic of an equally-scored sibling machine with 1 — the band looked diverse while the
+//     traffic was not.
+//
+//  2. When cap_retry_hedge_selection is enabled for the service: the per-operator (eTLD+1)
+//     concentration cap is applied on top, via the SAME water-filling the primary path uses.
+//     Rule 1 bounds one machine's share of the band; it does nothing about one OPERATOR
+//     fronting most of the band's machines, which is how concentration reached the two paths
+//     whose entire purpose is to escape the infrastructure that just failed.
+//
+// Either way the result is a concrete supplier registration — a relay is signed against a
+// supplier's session and each supplier carries its own per-session service allowance.
+//
+// The cap can never cost this path a candidate: it reweights the band and never filters it.
+// When the band holds a single operator there is nothing to redistribute to, so the pick stays
+// uncapped and is recorded as outcome="degraded_no_room" — the honest answer for a retry, which
+// needs somewhere to go more than it needs the cap honored. That case is the norm rather than
+// the exception, because a retry has already excluded the operators it tried.
+func (rc *requestContext) pickFromBand(
+	band protocol.EndpointAddrList,
+	capPath string,
+) protocol.EndpointAddr {
+	// Nil receiver / no config reachable: rule 1 only. Mirrors recordTopRankedSelection's
+	// guard — a routing refinement is never worth a panic.
+	if rc == nil || rc.protocol == nil {
+		return selector.PickBackendUniform(band)
+	}
+	unifiedConfig := rc.protocol.GetUnifiedServicesConfig()
+	if unifiedConfig == nil || !unifiedConfig.GetCapRetryHedgeSelectionForService(rc.serviceID) {
+		return selector.PickBackendUniform(band)
+	}
+
+	selected, outcome := selector.SelectBandWithConcentrationCap(
+		band,
+		unifiedConfig.GetMaxOperatorShareForService(rc.serviceID),
+	)
+	metrics.RecordConcentrationCapBand(string(rc.serviceID), capPath, outcome.String())
+
+	if outcome == selector.BandCapNoRoom && rc.logger != nil {
+		// Logged, not silent: "the cap did nothing" and "the cap had no room to do anything"
+		// are different findings, and only one of them is a reason to change the cap value.
+		rc.logger.Debug().
+			Str("cap_path", capPath).
+			Int("band_size", len(band)).
+			Int("distinct_backends_in_band", selector.CountDistinctBackends(band)).
+			Msg("Concentration cap left uncapped: band spans a single operator, nothing to redistribute to")
+	}
+
+	return selected
+}
+
+// recordTopRankedSelection reports one selectTopRankedEndpoint decision to the selection
+// metrics: the candidate pool it received, the top-score band it narrowed to, and the winner,
+// all bucketed by operator (eTLD+1).
+//
+// Operator keys come from extractRegistrableDomain, which is memoized and already used for
+// the retry/hedge exclusion set — so this adds no URL parsing on the hot path beyond the
+// first sighting of each endpoint. Endpoints whose registrable domain cannot be derived fall
+// back to the endpoint address, keeping them singletons rather than merging them into one
+// bucket, which would fabricate concentration.
+func (rc *requestContext) recordTopRankedSelection(
+	pool, band protocol.EndpointAddrList,
+	selected protocol.EndpointAddr,
+) {
+	// selectTopRankedEndpoint returns on a nil receiver for a single-endpoint pool without
+	// ever touching rc, and callers (hedgeRacer.selectHedgeEndpoint) rely on that. Recording
+	// must not be what makes it dereference rc — a metric is never worth a panic.
+	if rc == nil {
+		return
+	}
+
+	operatorOf := func(ep protocol.EndpointAddr) string {
+		if d := extractRegistrableDomain(ep); d != "" {
+			return d
+		}
+		return string(ep)
+	}
+	countByOperator := func(eps protocol.EndpointAddrList) map[string]int {
+		counts := make(map[string]int, len(eps))
+		for _, ep := range eps {
+			counts[operatorOf(ep)]++
+		}
+		return counts
+	}
+
+	metrics.RecordTopRankedSelection(
+		string(rc.serviceID),
+		countByOperator(pool),
+		countByOperator(band),
+		len(pool),
+		len(band),
+		operatorOf(selected),
+	)
 }
 
 // extractSupplierFromEndpoint extracts the supplier address from an endpoint address.

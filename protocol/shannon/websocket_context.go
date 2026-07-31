@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	gorillaws "github.com/gorilla/websocket"
@@ -37,6 +38,15 @@ var _ gateway.ProtocolRequestContextWebsocket = &websocketRequestContext{}
 // It also implements websockets.EndpointReconnector so the bridge can rebind the
 // endpoint connection across a Shannon session rollover (when session rebind is enabled).
 var _ websockets.EndpointReconnector = &websocketRequestContext{}
+
+// The rebind extras are OPTIONAL interfaces the bridge discovers by type assertion, so a
+// drifting signature would silently disable the behaviour rather than fail to compile.
+// Assert them explicitly.
+var (
+	_ websockets.TumbleReporter        = &websocketRequestContext{}
+	_ websockets.SessionExpiryChecker  = &websocketRequestContext{}
+	_ websockets.SessionExpiryReporter = &websocketRequestContext{}
+)
 
 type websocketRequestContext struct {
 	logger polylog.Logger
@@ -72,15 +82,15 @@ type websocketRequestContext struct {
 	registry *websockets.SubscriptionRegistry
 
 	// reconnectProvider re-selects an endpoint for the CURRENT session on a rollover. It
-	// prefers the original supplier+URL (seamless) and, if that supplier rotated out of
-	// the new session, falls back to the best-available endpoint (tier-2) so the client's
-	// connection survives regardless of Shannon supplier rotation. avoidCurrent forces a
-	// different supplier than the one currently bound (used by the staleness watchdog,
-	// where the current supplier is the one stalling). Returns the endpoint, whether a
-	// different supplier was chosen, and (on failure) a metrics reason label. Non-nil only
+	// prefers the CURRENTLY BOUND supplier+URL (seamless) and, if that supplier rotated out
+	// of the new session, falls back to the best-available endpoint (tier-2) so the client's
+	// connection survives regardless of Shannon supplier rotation. avoidScope forces the
+	// rebind out of the currently bound endpoint's failure domain — its backend URL for a
+	// staleness rebind, its whole operator for an admin tumble. Returns the endpoint, whether
+	// a different supplier was chosen, and (on failure) a metrics reason label. Non-nil only
 	// when session rebind is enabled; its presence is what makes this context act as an
 	// EndpointReconnector.
-	reconnectProvider func(ctx context.Context, avoidCurrent bool) (ep endpoint, differentSupplier bool, failureReason string, err error)
+	reconnectProvider func(ctx context.Context, avoidScope rebindAvoidScope) (ep endpoint, differentSupplier bool, failureReason string, err error)
 
 	// lastReconnectDifferentSupplier records whether the most recent successful reconnect
 	// fell back to a different supplier (tier-2). Read by OnReconnectOutcome to tag the
@@ -92,13 +102,75 @@ type websocketRequestContext struct {
 	lastReconnectReason string
 
 	// lastReconnectTrigger holds what initiated the most recent rebind episode
-	// (WSRebindTriggerRollover / WSRebindTriggerStall), consumed by OnReconnectOutcome to
-	// tag the metric. Bridge-goroutine only.
+	// (WSRebindTriggerRollover / WSRebindTriggerStall / WSRebindTriggerAdmin), consumed
+	// by OnReconnectOutcome to tag the metric. Bridge-goroutine only.
 	lastReconnectTrigger string
+
+	// sessionExpiryRebindRequested marks the NEXT rebind as one PATH initiated because the
+	// bound session had ended while the supplier kept streaming. Without it the rebind is
+	// indistinguishable from a supplier-initiated rollover, which is exactly the comparison
+	// worth measuring. Set by OnSessionExpiryRebindRequested and consumed (cleared) by
+	// ReconnectEndpoint; both run on the bridge goroutine, so no synchronization is needed.
+	sessionExpiryRebindRequested bool
+
+	// adminTumbleRequested marks the NEXT rebind as operator-initiated so it is labelled
+	// `admin` instead of `stall` — both arrive with avoidCurrentSupplier set and are
+	// otherwise indistinguishable. Set by OnTumbleRequested and consumed (cleared) by
+	// ReconnectEndpoint; both run on the bridge goroutine, so it needs no
+	// synchronization.
+	adminTumbleRequested bool
+
+	// wsRegistry, when non-nil, holds this pod's live websocket connections so an
+	// operator can force a subset to rebind. Registration is driven by the bridge via
+	// AttachBridge.
+	wsRegistry *websocketConnRegistry
+
+	// deliveredFrames counts endpoint→client frames delivered over this connection, for
+	// ranking a capped tumble by load rather than by socket count. One firehose subscriber
+	// can outweigh a dozen idle connections, so socket count is a poor proxy for who is
+	// actually carrying a service.
+	//
+	// Atomic because it is written on the bridge goroutine and read by the registry's rate
+	// sampler and by admin requests, both on other goroutines. A single atomic add per
+	// delivered frame is negligible next to the validation and signing already on that path.
+	deliveredFrames atomic.Uint64
 
 	// reputationService tracks endpoint reputation scores.
 	// If non-nil, signals are recorded on success/error for gradual reputation tracking.
 	reputationService reputation.ReputationService
+}
+
+// AttachBridge registers (controller != nil) or deregisters (controller == nil) this
+// connection in the pod's tumble registry. Implements websockets.BridgeAttacher; the
+// bridge calls it once when it starts and once when it shuts down, so an entry exists
+// exactly as long as the bridge is alive.
+//
+// A nil wsRegistry (registry not wired, or session rebind disabled — a connection that
+// cannot rebind cannot be tumbled) makes this a no-op.
+func (wrc *websocketRequestContext) AttachBridge(controller websockets.BridgeController) {
+	if wrc.wsRegistry == nil {
+		return
+	}
+
+	if controller == nil {
+		wrc.wsRegistry.deregister(wrc.serviceID, wrc)
+		return
+	}
+
+	// Called on the bridge goroutine before it starts processing, so reading the bound
+	// endpoint here is safe.
+	ep := wrc.signingEndpoint()
+	domain, err := shannonmetrics.ExtractDomainOrHost(ep.PublicURL())
+	if err != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+	wrc.wsRegistry.register(wrc.serviceID, wrc, controller, domain, ep.Supplier(), wrc.deliveredFrames.Load)
+}
+
+// OnTumbleRequested marks the next rebind as operator-initiated so it is labelled
+// `admin` rather than `stall`. Implements websockets.TumbleReporter.
+func (wrc *websocketRequestContext) OnTumbleRequested() {
+	wrc.adminTumbleRequested = true
 }
 
 // signingEndpoint returns the endpoint whose session must be used to sign/validate
@@ -110,6 +182,27 @@ func (wrc *websocketRequestContext) signingEndpoint() endpoint {
 		return wrc.reconnectEndpoint
 	}
 	return wrc.selectedEndpoint
+}
+
+// currentDomain returns the metrics domain of the endpoint CURRENTLY serving this
+// connection.
+//
+// Every per-domain websocket metric must resolve its label through here rather than through
+// selectedEndpoint. A long-lived connection rebinds across operators over its lifetime — every
+// session rollover, every stall escape, every admin tumble — and labelling its frames with
+// wherever it first landed makes the per-operator websocket metrics describe FIRST bind rather
+// than CURRENT bind. That reads as an operator serving heavy traffic while it holds no
+// connections at all, and hides the traffic actually flowing to whoever it moved to.
+func (wrc *websocketRequestContext) currentDomain() string {
+	ep := wrc.signingEndpoint()
+	if ep == nil {
+		return shannonmetrics.ErrDomain
+	}
+	domain, err := shannonmetrics.ExtractDomainOrHost(ep.PublicURL())
+	if err != nil {
+		return shannonmetrics.ErrDomain
+	}
+	return domain
 }
 
 // ---------- Websocket Request Context Setup  ----------
@@ -178,9 +271,20 @@ func (p *Protocol) BuildWebsocketRequestContextForEndpoint(
 	// best-available endpoint if the original supplier rotated out of the new session.
 	if p.websocketSessionRebindEnabled {
 		wrc.registry = websockets.NewSubscriptionRegistry()
-		wrc.reconnectProvider = func(reconnectCtx context.Context, avoidCurrent bool) (endpoint, bool, string, error) {
-			return p.getReconnectEndpoint(reconnectCtx, serviceID, selectedEndpointAddr, httpReq, avoidCurrent)
+		wrc.reconnectProvider = func(reconnectCtx context.Context, avoidScope rebindAvoidScope) (endpoint, bool, string, error) {
+			// Anchor the decision on the endpoint the connection is CURRENTLY bound to, not
+			// the one it started on. After an earlier rebind these differ, and using the
+			// original gets both cases wrong: a rollover would pull the connection back off
+			// the endpoint it had settled on, and — far worse — a stall escape would exclude
+			// an endpoint the connection already left while leaving the one actually stalling
+			// in the candidate set, free to be reselected. signingEndpoint() is the live
+			// binding and is read here on the bridge goroutine, the same goroutine that
+			// writes it in ReconnectEndpoint.
+			return p.getReconnectEndpoint(reconnectCtx, serviceID, wrc.signingEndpoint().Addr(), httpReq, avoidScope)
 		}
+		// Only rebind-capable connections can be tumbled, so the tumble registry is
+		// wired on the same condition.
+		wrc.wsRegistry = p.wsConnRegistry
 	}
 
 	// Create observation channel for connection-level observations only
@@ -214,7 +318,8 @@ func (p *Protocol) CheckWebsocketConnection(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	selectedEndpointAddr protocol.EndpointAddr,
-) *protocolobservations.Observations {
+	probe protocol.WebsocketProbe,
+) ([]byte, *protocolobservations.Observations) {
 	logger := p.logger.With("method", "CheckWebsocketConnection")
 
 	// Get the pre-selected endpoint.
@@ -222,15 +327,15 @@ func (p *Protocol) CheckWebsocketConnection(
 	if err != nil {
 		err = fmt.Errorf("⁉️ SHOULD NEVER HAPPEN: failed to get pre-selected endpoint: %s", err.Error())
 		// Will not lead to reputation penalty as this does not indicate a problem with the endpoint, nor should it ever happen.
-		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
 
 	// Get the websocket-specific URL from the selected endpoint.
-	websocketEndpointURL, err := getWebsocketEndpointURL(logger, selectedEndpoint)
+	websocketEndpointURL, err := getWebsocketEndpointURL(selectedEndpoint)
 	if err != nil {
 		err = fmt.Errorf("%w: selected endpoint does not support websocket RPC type: %s", errCreatingWebSocketConnection, err.Error())
 		logger.Debug().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
-		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
 	logger = logger.With("websocket_url", websocketEndpointURL)
 
@@ -239,7 +344,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	if err != nil {
 		err = fmt.Errorf("%w: failed to get websocket connection headers: %s", errCreatingWebSocketConnection, err.Error())
 		logger.Debug().Err(err).Msg("❌ Failed to get websocket connection headers")
-		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
 
 	// Test the websocket connection to the endpoint.
@@ -251,13 +356,122 @@ func (p *Protocol) CheckWebsocketConnection(
 	if err != nil {
 		err = fmt.Errorf("%w: failed to connect to websocket endpoint: %s", errCreatingWebSocketConnection, err.Error())
 		logger.Debug().Err(err).Msg("❌ Failed to connect to websocket endpoint")
-		return getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
-	// Close the test connection immediately — this is only a connectivity probe.
-	conn.Close()
+	defer conn.Close()
 
-	// A nil observation means no error occurred.
-	return nil
+	// Handshake-only probe: connecting was the whole test.
+	//
+	// This is not sufficient on its own. A broken endpoint accepts the handshake exactly
+	// like a healthy one — see protocol.WebsocketProbe for the measurement — so a service
+	// whose rules only reach here cannot have a websocket score that means anything.
+	if probe.IsHandshakeOnly() {
+		return nil, nil
+	}
+
+	body, err := p.runWebsocketProbe(ctx, logger, serviceID, selectedEndpoint, conn, probe)
+	if err != nil {
+		logger.Debug().Err(err).Msg("❌ websocket probe failed")
+		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
+	}
+
+	// The response goes back so the executor can judge its CONTENT. A connection that opens
+	// and answers is not evidence of a working endpoint: the one that motivated this replied
+	// correctly with a block height a full day stale.
+	return body, nil
+}
+
+// runWebsocketProbe sends the probe payload over an established endpoint connection and
+// returns the endpoint's decoded response, so the caller can judge its CONTENT.
+//
+// It deliberately does ONE round-trip and returns. An earlier version waited for a
+// subscription notification to prove data actually flows. That detects a dead feed, but it
+// makes every check against a non-delivering endpoint occupy a slot in the shared,
+// concurrency-bounded health-check loop for its full timeout. On a service where one
+// operator holds most of the websocket endpoints, those blocked checks starve everything
+// behind them: measured on canary, websocket check throughput across ALL services fell from
+// 55.66/s to 0.06/s within minutes of enabling it — and because the checks never completed,
+// no failure was ever recorded and nothing was demoted, so it defeated its own purpose.
+//
+// Returning the response instead lets the executor apply the SAME staleness comparison the
+// json_rpc sync checks already use. That catches the case the notification wait was built
+// for — the endpoint that motivated it answered correctly with a head 31,470 blocks stale
+// while its HTTP side tracked the chain — in one round-trip, with no blocking.
+//
+// Frames are signed and responses validated exactly as the live bridge does them, otherwise
+// the relay miner rejects the payload and every endpoint fails identically.
+func (p *Protocol) runWebsocketProbe(
+	ctx context.Context,
+	logger polylog.Logger,
+	serviceID protocol.ServiceID,
+	selectedEndpoint endpoint,
+	conn *gorillaws.Conn,
+	probe protocol.WebsocketProbe,
+) ([]byte, error) {
+	signer, err := p.getGatewayModePermittedRelaySigner(p.gatewayMode)
+	if err != nil {
+		return nil, fmt.Errorf("%w: websocket probe signer setup: %s", errRequestContextSetupErrSignerSetup, err.Error())
+	}
+
+	// Minimal context carrying just what signing and validation need. It never starts a
+	// bridge, so it holds no registry, no reconnect provider and no subscription state.
+	probeCtx := &websocketRequestContext{
+		logger:             logger,
+		context:            ctx,
+		fullNode:           p.FullNode,
+		selectedEndpoint:   selectedEndpoint,
+		serviceID:          serviceID,
+		relayRequestSigner: signer,
+	}
+
+	payload := []byte(probe.Payload)
+	if !selectedEndpoint.IsFallback() {
+		signed, signErr := probeCtx.signClientWebsocketMessage(payload)
+		if signErr != nil {
+			// A signing failure is OURS, not the endpoint's. Surfacing it as an endpoint
+			// error would penalise every endpoint for a gateway problem.
+			return nil, fmt.Errorf("websocket probe: sign payload: %w", signErr)
+		}
+		payload = signed
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(DefaultWebsocketProbeTimeout)
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("websocket probe: set write deadline: %w", err)
+	}
+	if err := conn.WriteMessage(gorillaws.TextMessage, payload); err != nil {
+		return nil, fmt.Errorf("%w: websocket probe: send payload: %s", errCreatingWebSocketConnection, err.Error())
+	}
+
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("websocket probe: set read deadline: %w", err)
+	}
+	_, raw, err := conn.ReadMessage()
+	if err != nil {
+		return nil, fmt.Errorf("%w: websocket probe: no response to payload: %s", errCreatingWebSocketConnection, err.Error())
+	}
+
+	body, statusCode, err := probeCtx.validateEndpointWebsocketMessage(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: websocket probe: invalid response: %s", errCreatingWebSocketConnection, err.Error())
+	}
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("%w: websocket probe: endpoint returned HTTP %d: %s", errCreatingWebSocketConnection, statusCode, string(body))
+	}
+
+	// Judge the CONTENT. A well-formed answer carrying a stale block height fails here,
+	// which is the whole point: the endpoint this was built for answered correctly and was
+	// a full day behind.
+	if probe.ValidateResponse != nil {
+		if err := probe.ValidateResponse(body); err != nil {
+			return nil, fmt.Errorf("%w: websocket probe: %s", errCreatingWebSocketConnection, err.Error())
+		}
+	}
+
+	return body, nil
 }
 
 func (p *Protocol) getPreSelectedEndpoint(
@@ -269,7 +483,9 @@ func (p *Protocol) getPreSelectedEndpoint(
 ) (endpoint, error) {
 	logger := p.logger.With("method", "getPreSelectedEndpoint")
 
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	// forceCurrentSession: a websocket connection binds a session for its lifetime, so it
+	// must never be bound to the previous session during rollover.
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, true)
 	if err != nil {
 		logger.Error().Err(err).Msgf("Relay request will fail due to error retrieving active sessions for service %s", serviceID)
 		return nil, err
@@ -319,23 +535,29 @@ func (p *Protocol) getPreSelectedEndpoint(
 }
 
 // getReconnectEndpoint re-selects a websocket endpoint for the CURRENT session on a
-// session rollover. Its selection policy depends on whether the per-operator concentration
-// cap is engaged for the service:
+// session rollover.
 //
-//   - Cap ENGAGED (0 < maxOperatorShare < 1): do NOT auto-prefer the original supplier.
+// preferredAddr is the endpoint the connection is CURRENTLY bound to, which after an earlier
+// rebind is not the one it started on. Seamlessness means staying where the connection
+// actually is, and a forced rebind must escape what it is actually on — anchoring on the
+// setup-time endpoint would get both wrong.
+//
+// The selection policy depends on whether the per-operator concentration cap is engaged:
+//
+//   - Cap ENGAGED (0 < maxOperatorShare < 1): do NOT auto-prefer the bound supplier.
 //     Route every rebind through the capped selector so WebSocket connections re-spread
 //     across the tied-best operator band each session boundary instead of pinning to
-//     whichever supplier was selected first. The original endpoint stays eligible (it is
+//     whichever supplier was selected first. The bound endpoint stays eligible (it is
 //     still in the candidate set), so a 1-endpoint pool never fails and a strictly-best
-//     original still wins — only the tied band is reshuffled. Rotating off a still-present
-//     supplier is cheap: the bridge already replays subscriptions on any rebind.
+//     bound endpoint still wins — only the tied band is reshuffled. Rotating off a
+//     still-present supplier is cheap: the bridge replays subscriptions on any rebind.
 //   - Cap DISABLED (maxOperatorShare <= 0 or >= 1): keep the seamless tier-1 behavior — if
-//     the ORIGINAL supplier+URL is still in the new session, reuse it (same node → no data
+//     the BOUND supplier+URL is still in the new session, reuse it (same node → no data
 //     seam). This is load-bearing: with the cap off the capped selector collapses to a
 //     deterministic smallest-address pick, which would funnel ALL connections onto one
 //     endpoint — strictly worse than pinning.
 //
-// In both cases, if the original supplier rotated OUT of the new session, selection falls
+// In both cases, if the bound supplier rotated OUT of the new session, selection falls
 // back to the best-available endpoint so the client's connection survives regardless.
 // Shannon supplier rotation is a protocol detail; the client only wants uninterrupted data.
 //
@@ -346,20 +568,25 @@ func (p *Protocol) getPreSelectedEndpoint(
 // when the rebind re-homed the connection onto a different endpoint than the original;
 // failureReason is a metrics label on error.
 //
-// avoidPreferred skips reuse entirely and excludes preferredAddr from the candidate set:
-// the staleness watchdog sets it because the currently bound supplier is the one stalling,
-// so reselecting it would just stall again. When it is the only endpoint in the new
-// session, selection fails with WSRebindFailedNoEndpoints and the bridge closes the client.
+// avoidScope skips reuse entirely and excludes the bound endpoint's failure domain from the
+// candidate set — its backend URL for a staleness rebind (the machine went silent, so every
+// registration fronting it would stall again) or its whole operator for an admin tumble (the
+// point is redistributing off that operator). It narrows automatically when the session has
+// nothing outside that domain; only when even the bound endpoint alone cannot be excluded does
+// selection fail with WSRebindFailedNoEndpoints and the bridge close the client.
 func (p *Protocol) getReconnectEndpoint(
 	ctx context.Context,
 	serviceID protocol.ServiceID,
 	preferredAddr protocol.EndpointAddr,
 	httpReq *http.Request,
-	avoidPreferred bool,
+	avoidScope rebindAvoidScope,
 ) (endpoint, bool, string, error) {
 	logger := p.logger.With("method", "getReconnectEndpoint", "service_id", serviceID)
 
-	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq)
+	// forceCurrentSession: this rebind fires AT the session boundary, which is exactly the
+	// window where the rollover grace logic would return the session that just ended —
+	// rebinding the connection back onto the session it is trying to escape.
+	activeSessions, err := p.getActiveGatewaySessions(ctx, serviceID, httpReq, true)
 	if err != nil {
 		logger.Error().Err(err).Msg("rebind: failed to retrieve active sessions for the new session")
 		return nil, false, metrics.WSRebindFailedSessionError, err
@@ -372,8 +599,8 @@ func (p *Protocol) getReconnectEndpoint(
 	// S1 (disqualify-only): reputation filtering applies on rebind too, so a rollover does
 	// not rebind onto a proven-bad WS endpoint (cooldown / below threshold). The preferred
 	// (original) supplier is still kept if in cooldown via requestedEndpointAddr
-	// race-protection in filterByReputation; the stall watchdog's avoidPreferred path
-	// additionally deletes it below. Tiered ranking stays OFF for WS
+	// race-protection in filterByReputation; a forced rebind's avoidScope additionally
+	// deletes it (and its backend/operator siblings) below. Tiered ranking stays OFF for WS
 	// (guarded in getSessionsUniqueEndpoints). The WS safety net there prevents an empty pool.
 	const filterByReputation = true
 	endpoints, _, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, filterByReputation, sharedtypes.RPCType_WEBSOCKET, allowedSuppliers, preferredAddr)
@@ -402,11 +629,101 @@ func (p *Protocol) getReconnectEndpoint(
 		serviceID,
 		endpoints,
 		preferredAddr,
-		avoidPreferred,
+		avoidScope,
 		maxOperatorShare,
 		operatorUniform,
 		p.websocketReconnectScoreFunc(ctx, serviceID, endpoints),
 	)
+}
+
+// rebindAvoidScope describes how much of the currently bound endpoint a rebind must move away
+// from. Excluding only the bound endpoint address is too narrow for both non-rollover
+// triggers, because one machine can carry several supplier registrations and one operator can
+// carry several machines:
+//
+//   - a STALL means that backend went silent. A sibling registration at the same URL is the
+//     same machine, so rebinding onto it escapes nothing and the connection stalls again.
+//   - an ADMIN TUMBLE exists to redistribute away from an operator. Hopping to another
+//     registration at that same operator leaves the concentration exactly where it was.
+//
+// The scopes are strictly nested (operator ⊇ backend ⊇ endpoint), which lets selection request
+// the widest scope and narrow only when honoring it would strand the client.
+type rebindAvoidScope int
+
+const (
+	// avoidNothing: routine session rollover — the bound endpoint stays a candidate.
+	avoidNothing rebindAvoidScope = iota
+	// avoidBoundEndpoint: exclude exactly the bound supplier+URL. The narrowest useful
+	// exclusion and the last rung before giving up.
+	avoidBoundEndpoint
+	// avoidBoundBackend: exclude every supplier registration sharing the bound backend URL.
+	// What a stall escape requires.
+	avoidBoundBackend
+	// avoidBoundOperator: exclude every endpoint at the bound operator (eTLD+1). What an
+	// admin tumble requires.
+	avoidBoundOperator
+)
+
+func (s rebindAvoidScope) String() string {
+	switch s {
+	case avoidBoundEndpoint:
+		return "endpoint"
+	case avoidBoundBackend:
+		return "backend"
+	case avoidBoundOperator:
+		return "operator"
+	default:
+		return "none"
+	}
+}
+
+// excludedByScope reports whether addr is ruled out for a rebind that must move away from
+// preferredAddr at the given scope.
+func excludedByScope(addr, preferredAddr protocol.EndpointAddr, scope rebindAvoidScope) bool {
+	switch scope {
+	case avoidBoundOperator:
+		return selector.OperatorKey(addr) == selector.OperatorKey(preferredAddr)
+	case avoidBoundBackend:
+		return selector.BackendKey(addr) == selector.BackendKey(preferredAddr)
+	case avoidBoundEndpoint:
+		return addr == preferredAddr
+	default:
+		return false
+	}
+}
+
+// applyAvoidScope removes from endpoints everything ruled out by `want`, falling back one rung
+// at a time whenever the wider exclusion would empty the pool. It returns the scope actually
+// applied, which is avoidNothing only when even excluding the single bound endpoint leaves
+// nothing — the caller treats that as "nowhere to escape to".
+//
+// Narrowing rather than failing is deliberate: a service whose session holds one operator (or
+// one machine) must still be able to escape a stalling supplier onto a sibling registration.
+// Refusing would close a client that today survives. The returned scope tells the caller how
+// much of the request was actually honored so the shortfall is reported rather than hidden.
+func applyAvoidScope(
+	endpoints map[protocol.EndpointAddr]endpoint,
+	preferredAddr protocol.EndpointAddr,
+	want rebindAvoidScope,
+) rebindAvoidScope {
+	for scope := want; scope > avoidNothing; scope-- {
+		survivors := 0
+		for addr := range endpoints {
+			if !excludedByScope(addr, preferredAddr, scope) {
+				survivors++
+			}
+		}
+		if survivors == 0 {
+			continue
+		}
+		for addr := range endpoints {
+			if excludedByScope(addr, preferredAddr, scope) {
+				delete(endpoints, addr)
+			}
+		}
+		return scope
+	}
+	return avoidNothing
 }
 
 // chooseRebindEndpoint applies the rebind selection policy to a non-empty candidate set. It
@@ -414,9 +731,10 @@ func (p *Protocol) getReconnectEndpoint(
 // or reputation service — getReconnectEndpoint builds `endpoints`, `maxOperatorShare`, and
 // `scoreOf`, and this decides which one to rebind onto.
 //
-//   - avoidPreferred (staleness watchdog): the currently bound supplier is stalling, so
-//     exclude it and force a different supplier. If it was the only endpoint there is nothing
-//     to escape to → error so the bridge closes the client.
+//   - avoidScope > avoidNothing (staleness watchdog or admin tumble): exclude the bound
+//     endpoint's backend or operator per the scope and force a different one. If not even the
+//     bound endpoint alone can be excluded, there is nothing to escape to → error so the
+//     bridge closes the client.
 //   - ROTATE (operator-uniform on, or the concentration cap engaged): skip the reuse shortcut
 //     and route through the selected strategy so the connection re-spreads across operators.
 //     The original endpoint stays a candidate, so a rebind that lands back on it is still
@@ -436,26 +754,37 @@ func chooseRebindEndpoint(
 	serviceID protocol.ServiceID,
 	endpoints map[protocol.EndpointAddr]endpoint,
 	preferredAddr protocol.EndpointAddr,
-	avoidPreferred bool,
+	avoidScope rebindAvoidScope,
 	maxOperatorShare float64,
 	operatorUniform bool,
 	scoreOf func(endpoint) float64,
 ) (endpoint, bool, string, error) {
-	// Staleness rebind: the current supplier is the one stalling, so exclude it and force
-	// a different supplier. If it was the session's only endpoint, there is nothing to
-	// escape to → fail so the bridge closes the client.
-	if avoidPreferred {
-		delete(endpoints, preferredAddr)
-		if len(endpoints) == 0 {
-			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape a stalling supplier", protocol.ErrEndpointUnavailable, serviceID)
+	// Forced rebind (stall escape or admin tumble): exclude the bound endpoint's backend or
+	// operator and pick something outside it. If not even the bound endpoint alone can be
+	// excluded, there is nothing to escape to → fail so the bridge closes the client.
+	if avoidScope > avoidNothing {
+		applied := applyAvoidScope(endpoints, preferredAddr, avoidScope)
+		if applied == avoidNothing {
+			err := fmt.Errorf("%w: service %s new session has no alternate websocket endpoint to escape the bound supplier", protocol.ErrEndpointUnavailable, serviceID)
 			return nil, false, metrics.WSRebindFailedNoEndpoints, err
 		}
+
+		// The requested scope could not be honored in full: the session had nothing outside
+		// the bound backend/operator. The rebind still moves, but it lands closer to what it
+		// was told to escape than intended — a stall escape narrowed to `endpoint` can land
+		// on the same machine, which is exactly the case worth counting.
+		if applied < avoidScope {
+			metrics.RecordWebsocketRebindAvoidNarrowed(string(serviceID), avoidScope.String(), applied.String())
+		}
+
 		ep := selectRebindEndpoint(serviceID, endpoints, scoreOf, maxOperatorShare, operatorUniform)
 		logger.Warn().
-			Str("stalling_endpoint", string(preferredAddr)).
+			Str("previous_endpoint", string(preferredAddr)).
 			Str("replacement_endpoint", string(ep.Addr())).
 			Str("replacement_supplier", ep.Supplier()).
-			Msg("🔀 [WS-STALL] excluding stalling supplier — rebinding to a different supplier for the current session")
+			Str("avoid_scope_requested", avoidScope.String()).
+			Str("avoid_scope_applied", applied.String()).
+			Msg("🔀 [WS-REBIND-AVOID] excluding the bound endpoint's failure domain — rebinding for the current session")
 		return ep, true, "", nil
 	}
 
@@ -742,7 +1071,21 @@ func (p *Protocol) recordReputationSignalsFromWebsocketObservations(shannonObser
 
 // recordSignalFromWebsocketConnectionObservation records a reputation signal for a websocket connection observation.
 func (p *Protocol) recordSignalFromWebsocketConnectionObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonWebsocketConnectionObservation) {
+	// Reconstruct the FULL endpoint address (<supplier>-<url>).
+	//
+	// Using the bare URL here silently broke every websocket health check: the reputation
+	// key builder runs at per-supplier granularity in production, so a URL with no supplier
+	// hashes to a different key than the one selection reads — and worse, the supplier
+	// extractor splits on the first "-", so a hostname containing one produced a mangled
+	// key. Health check results, pass or fail, were written somewhere nothing ever looked,
+	// which is why every websocket score sat pinned at its initial value.
+	//
+	// Falls back to the URL alone when the observation carries no supplier, which keeps
+	// fallback endpoints (no staked supplier) working as before.
 	endpointAddr := protocol.EndpointAddr(obs.GetEndpointUrl())
+	if supplier := obs.GetSupplier(); supplier != "" {
+		endpointAddr = protocol.EndpointAddr(fmt.Sprintf("%s-%s", supplier, obs.GetEndpointUrl()))
+	}
 
 	// Build endpoint key using key builder to respect key_granularity setting
 	rpcType := sharedtypes.RPCType_WEBSOCKET
@@ -791,7 +1134,7 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 	logger := wrc.methodLogger("StartWebSocketBridge")
 
 	// Get the websocket-specific URL from the selected endpoint.
-	websocketEndpointURL, err := getWebsocketEndpointURL(logger, wrc.selectedEndpoint)
+	websocketEndpointURL, err := getWebsocketEndpointURL(wrc.selectedEndpoint)
 	if err != nil {
 		err = fmt.Errorf("%w: selected endpoint does not support websocket RPC type: %s", errCreatingWebSocketConnection, err.Error())
 		logger.Error().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
@@ -888,8 +1231,14 @@ func (wrc *websocketRequestContext) startWebSocketBridge(
 		// Wait for the bridge to complete (blocks until Websocket connection terminates)
 		<-bridgeCompletionChan
 		// Send closure observation, stamping the actual close time.
+		//
+		// Attributed to the endpoint the connection was serving WHEN IT CLOSED, not the one
+		// it opened on — that is the operator holding the active-connection credit by then,
+		// so this is the Dec that cancels it. Reading signingEndpoint() here is race-free:
+		// the bridge goroutine that writes it is the same one whose deferred
+		// close(completionChan) released the receive above, so its writes are visible.
 		wrc.logger.Debug().Msg("Websocket connection closed, sending closure observation")
-		connectionObservationChan <- getWebsocketConnectionClosedObservation(wrc.logger, wrc.serviceID, wrc.selectedEndpoint, establishedAt, time.Now())
+		connectionObservationChan <- getWebsocketConnectionClosedObservation(wrc.logger, wrc.serviceID, wrc.signingEndpoint(), establishedAt, time.Now())
 	}()
 
 	return nil
@@ -943,16 +1292,14 @@ func getRelayMinerConnectionHeaders(logger polylog.Logger, selectedEndpoint endp
 
 // getWebsocketEndpointURL returns the websocket URL for the selected endpoint.
 // This URL is used to establish the websocket connection to the endpoint.
-func getWebsocketEndpointURL(logger polylog.Logger, selectedEndpoint endpoint) (string, error) {
-	logger.With("method", "getWebsocketEndpointURL")
-
-	websocketURL, err := selectedEndpoint.WebsocketURL()
-	if err != nil {
-		logger.Error().Err(err).Msg("❌ Selected endpoint does not support websocket RPC type")
-		return "", err
-	}
-
-	return websocketURL, nil
+//
+// It deliberately does NOT log. The severity of "this endpoint has no websocket URL" belongs
+// to the caller: on user traffic (startWebSocketBridge) it is a connection-fatal Error, but
+// for a health check it is an expected, uninteresting Debug — a websocket-enabled service
+// routinely contains json_rpc-only endpoints. Logging Error here overrode the callers' intent
+// and was the sole reason that condition flooded the logs at Error level.
+func getWebsocketEndpointURL(selectedEndpoint endpoint) (string, error) {
+	return selectedEndpoint.WebsocketURL()
 }
 
 // generateHandshakeSignature generates a ring signature for the WebSocket handshake.
@@ -1019,21 +1366,44 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoid
 		return nil, fmt.Errorf("websocket session rebind not configured")
 	}
 
-	// Record what triggered this rebind so OnReconnectOutcome can tag the metric: the
-	// staleness watchdog sets avoidCurrentSupplier, everything else is a routine rollover.
-	if avoidCurrentSupplier {
+	// Record what triggered this rebind so OnReconnectOutcome can tag the metric. An
+	// operator tumble and the staleness watchdog both arrive with avoidCurrentSupplier
+	// set, so the explicit admin flag has to be checked first; everything else is a
+	// routine rollover.
+	//
+	// The trigger also fixes how much of the current binding the rebind must move away from.
+	// A stall condemns the BACKEND (the machine went silent, so every supplier registration
+	// fronting that URL would stall again); an operator tumble condemns the OPERATOR (moving
+	// to another registration at the same operator would redistribute nothing). A rollover
+	// condemns nothing — it may reuse the current endpoint.
+	var avoidScope rebindAvoidScope
+	switch {
+	case wrc.adminTumbleRequested:
+		wrc.lastReconnectTrigger = metrics.WSRebindTriggerAdmin
+		wrc.adminTumbleRequested = false
+		avoidScope = avoidBoundOperator
+	case avoidCurrentSupplier:
 		wrc.lastReconnectTrigger = metrics.WSRebindTriggerStall
-	} else {
+		avoidScope = avoidBoundBackend
+	case wrc.sessionExpiryRebindRequested:
+		// PATH-initiated because the bound session ended and the supplier never hung up.
+		// Condemns nothing: if that supplier is in the new session, reusing it is the
+		// seamless outcome — the connection just needs a live session, not a new operator.
+		wrc.lastReconnectTrigger = metrics.WSRebindTriggerSessionExpired
+		wrc.sessionExpiryRebindRequested = false
+		avoidScope = avoidNothing
+	default:
 		wrc.lastReconnectTrigger = metrics.WSRebindTriggerRollover
+		avoidScope = avoidNothing
 	}
 
-	// Re-select an endpoint for the current session: the original supplier if it is still
-	// in the new session (seamless), else the best-available endpoint (tier-2). When
-	// avoidCurrentSupplier is set (staleness watchdog), the original supplier is excluded
-	// so the rebind escapes it. Only a session lookup failure or a session with no usable
+	// Re-select an endpoint for the current session: the currently bound supplier if it is
+	// still in the new session (seamless), else the best-available endpoint (tier-2). When
+	// avoidScope is set, the bound endpoint's backend or operator is excluded so the rebind
+	// escapes it. Only a session lookup failure or a session with no usable
 	// endpoints errors here — the bridge then falls back to closing the client with
 	// reconnect guidance.
-	ep, differentSupplier, failureReason, err := wrc.reconnectProvider(ctx, avoidCurrentSupplier)
+	ep, differentSupplier, failureReason, err := wrc.reconnectProvider(ctx, avoidScope)
 	if err != nil {
 		wrc.lastReconnectReason = failureReason
 		return nil, fmt.Errorf("re-select endpoint for current session: %w", err)
@@ -1042,10 +1412,19 @@ func (wrc *websocketRequestContext) ReconnectEndpoint(ctx context.Context, avoid
 	// Update the signing endpoint FIRST so the URL/headers/handshake below (and all
 	// subsequent message signing) use the new session. Record whether this is a
 	// different-supplier (tier-2) rebind so OnReconnectOutcome can tag the metric.
+	prevDomain := wrc.currentDomain()
 	wrc.reconnectEndpoint = ep
 	wrc.lastReconnectDifferentSupplier = differentSupplier
 
-	websocketEndpointURL, err := getWebsocketEndpointURL(logger, ep)
+	// Hand this connection's active-connection credit to the operator now serving it. Done
+	// immediately after the binding moves — NOT after the dial below succeeds — so the gauge
+	// stays in lockstep with signingEndpoint() on every path, including a failed dial. The
+	// close observation decrements currentDomain(), so keeping the two in lockstep is what
+	// guarantees the Dec cancels the outstanding Inc instead of leaking a phantom connection
+	// onto the operator the client started on.
+	metrics.MoveWebsocketConnection(prevDomain, wrc.currentDomain(), string(wrc.serviceID))
+
+	websocketEndpointURL, err := getWebsocketEndpointURL(ep)
 	if err != nil {
 		wrc.lastReconnectReason = metrics.WSRebindFailedSelect
 		return nil, fmt.Errorf("resolve websocket URL for reconnect: %w", err)
@@ -1133,6 +1512,14 @@ func (wrc *websocketRequestContext) OnReconnectOutcome(success bool, replayedSub
 	}
 	metrics.RecordWebsocketRebind(domain, serviceID, result, trigger, replayedSubscriptions)
 
+	// Re-point the tumble registry at the endpoint this connection is now bound to, so a
+	// later domain-filtered tumble matches where the connection IS rather than where it
+	// started. Only on success — a failed rebind leaves the old binding in place (and the
+	// bridge is closing the client anyway, which deregisters the entry).
+	if success {
+		wrc.wsRegistry.updateBinding(wrc.serviceID, wrc, domain, wrc.signingEndpoint().Supplier())
+	}
+
 	// Error level ON PURPOSE for canary visibility. Temporary — downgrade once validated.
 	wrc.logger.Error().
 		Bool("success", success).
@@ -1160,6 +1547,62 @@ func (wrc *websocketRequestContext) reconnectResultLabel(success bool, stage web
 		}
 		return metrics.WSRebindFailedSelect
 	}
+}
+
+// boundSessionGraceBlocks is how far past its end height a bound session is tolerated before
+// the connection is considered stranded. Matched to the rollover grace the session logic
+// itself applies (sessionRolloverBlocks), so the proactive check never fires inside the window
+// where the ending session is still legitimately serving and a supplier-initiated rollover may
+// still arrive on its own.
+const boundSessionGraceBlocks = 10
+
+// BoundSessionExpired reports whether the session this connection's endpoint belongs to has
+// ended, beyond the rollover grace. Implements websockets.SessionExpiryChecker.
+//
+// Needed because nothing else notices. The relay miner normally closes the socket at session
+// expiry, which drives the ordinary rollover rebind; a supplier that keeps streaming instead
+// leaves the connection bound to a dead session, and because endpoint→client frames are
+// unsigned the data keeps flowing, so the staleness watchdog never fires either.
+//
+// Compares the end height already carried on the bound endpoint's session header against the
+// current block height, which the full node caches — no session fetch, no chain round-trip on
+// the common path.
+//
+// Returns FALSE whenever the answer is not known (no session header, no end height, block
+// height unavailable). A rebind costs the client a gap in its subscription stream, so an
+// unknown height must never be read as "expired".
+//
+// Runs on the bridge goroutine, the same one that writes reconnectEndpoint, so
+// signingEndpoint() is read without synchronization.
+func (wrc *websocketRequestContext) BoundSessionExpired() bool {
+	ep := wrc.signingEndpoint()
+	if ep == nil || wrc.fullNode == nil {
+		return false
+	}
+
+	session := ep.Session()
+	if session == nil || session.Header == nil {
+		return false
+	}
+	endHeight := session.Header.SessionEndBlockHeight
+	if endHeight <= 0 {
+		return false
+	}
+
+	currentHeight, err := wrc.fullNode.GetCurrentBlockHeight(wrc.context)
+	if err != nil || currentHeight <= 0 {
+		// Unknown height — say nothing rather than disrupt a working connection.
+		return false
+	}
+
+	return currentHeight > endHeight+boundSessionGraceBlocks
+}
+
+// OnSessionExpiryRebindRequested marks the next rebind as PATH-initiated due to bound-session
+// expiry, so it is labelled `session_expired` rather than `rollover`. Implements
+// websockets.SessionExpiryReporter.
+func (wrc *websocketRequestContext) OnSessionExpiryRebindRequested() {
+	wrc.sessionExpiryRebindRequested = true
 }
 
 // HasActiveSubscriptions reports whether the client holds at least one established
@@ -1209,11 +1652,8 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 
 	logger.Debug().Msgf("received message from client: %s", string(msgData))
 
-	// Extract domain for message metrics
-	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
-	if domainErr != nil {
-		domain = shannonmetrics.ErrDomain
-	}
+	// Domain of the endpoint currently serving the connection — see currentDomain().
+	domain := wrc.currentDomain()
 	serviceID := string(wrc.serviceID)
 
 	// Session rebind: record an eth_subscribe for later replay, and rewrite an
@@ -1225,10 +1665,16 @@ func (wrc *websocketRequestContext) ProcessProtocolClientWebsocketMessage(msgDat
 		msgData = wrc.registry.TrackClientMessage(msgData)
 	}
 
-	// If the selected endpoint is a fallback endpoint, skip signing the message.
+	// If the endpoint currently serving this connection is a fallback endpoint, skip signing.
 	// Fallback endpoints bypass the protocol so the raw message is sent to the endpoint.
+	//
+	// This MUST test the live endpoint, not the setup-time one: a rebind can cross the
+	// fallback boundary in either direction, and branching on the original would either send
+	// unsigned frames to a protocol endpoint (the miner rejects them) or sign frames for a
+	// fallback endpoint that expects raw ones. signClientWebsocketMessage below already signs
+	// against signingEndpoint(), so only this branch was left behind.
 	// TODO_IMPROVE(@commoddity,@adshmh): Cleanly separate fallback endpoint handling from the protocol package.
-	if wrc.selectedEndpoint.IsFallback() {
+	if wrc.signingEndpoint().IsFallback() {
 		// Record message metric for client→endpoint direction (fallback = always success)
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionClientToEndpoint, metrics.SignalOK)
 		return msgData, nil
@@ -1293,22 +1739,28 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 
 	logger.Debug().Msgf("received message from endpoint: %s", string(msgData))
 
-	// Extract domain for message metrics
-	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.selectedEndpoint.PublicURL())
-	if domainErr != nil {
-		domain = shannonmetrics.ErrDomain
-	}
+	// Domain of the endpoint currently serving the connection — see currentDomain().
+	domain := wrc.currentDomain()
 	serviceID := string(wrc.serviceID)
 
-	// If the selected endpoint is a fallback endpoint, skip validation.
-	// Fallback endpoints bypass the protocol so the raw message is sent to the endpoint.
+	// Count every frame the endpoint pushed, whatever becomes of it. The count measures the
+	// LOAD this connection puts on the supplier serving it, so a frame that fails validation
+	// or is swallowed as a replay artefact still cost them the work of sending it. Ranking a
+	// capped tumble on this is the whole point — see deliveredFrames.
+	wrc.deliveredFrames.Add(1)
+
+	// If the endpoint currently serving this connection is a fallback endpoint, skip
+	// validation. Fallback endpoints bypass the protocol so the raw message is forwarded.
+	// Must test the live endpoint for the same reason as the client-side branch above: a
+	// rebind can cross the fallback boundary, and validateEndpointWebsocketMessage already
+	// works against the live session.
 	// TODO_IMPROVE(@commoddity,@adshmh): Cleanly separate fallback endpoint handling from the protocol package.
-	if wrc.selectedEndpoint.IsFallback() {
+	if wrc.signingEndpoint().IsFallback() {
 		// Record success signal for fallback endpoint messages
 		wrc.recordWebsocketSignal(reputation.NewSuccessSignal(time.Since(startTime)))
 		// Record message metric for endpoint→client direction
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalOK)
-		return msgData, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+		return msgData, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData), nil
 	}
 
 	// If the selected endpoint is a protocol endpoint, we need to validate the message.
@@ -1319,7 +1771,7 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 		wrc.recordWebsocketSignal(reputation.NewMajorErrorSignal("ws_message_validation_failed", time.Since(startTime)))
 		// Record message metric for endpoint→client direction with error
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMajorError)
-		return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, err), err
+		return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData, err), err
 	}
 
 	// A non-2xx status carried in a POKTHTTPResponse envelope (e.g. "session
@@ -1348,7 +1800,7 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 			// Error level for canary visibility (LOG_LEVEL=error). Temporary.
 			logger.Error().Msg("🤫 [WS-REBIND] swallowing session-expiry (410) advisory — rebind will reconnect transparently")
 			metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMinorError)
-			return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, fmt.Errorf("session expired (rebind pending)")), nil
+			return nil, getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData, fmt.Errorf("session expired (rebind pending)")), nil
 		}
 
 		logger.Warn().
@@ -1357,7 +1809,7 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 			Msg("⚠️ endpoint returned a non-2xx response over websocket — forwarding decoded body, no reputation change")
 		metrics.RecordWebsocketMessage(domain, serviceID, metrics.WSDirectionEndpointToClient, metrics.SignalMinorError)
 		return endpointMessageBz,
-			getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData, fmt.Errorf("endpoint returned HTTP %d over websocket", statusCode)),
+			getWebsocketMessageErrorObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData, fmt.Errorf("endpoint returned HTTP %d over websocket", statusCode)),
 			nil
 	}
 
@@ -1377,9 +1829,9 @@ func (wrc *websocketRequestContext) ProcessProtocolEndpointWebsocketMessage(
 	// A swallowed replay response is a valid, successful endpoint reply (recorded above)
 	// that must not reach the client — return a nil body so the bridge drops it.
 	if !forward {
-		return nil, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+		return nil, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData), nil
 	}
-	return endpointMessageBz, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.selectedEndpoint, msgData), nil
+	return endpointMessageBz, getWebsocketMessageSuccessObservation(logger, wrc.serviceID, wrc.signingEndpoint(), msgData), nil
 }
 
 // validateEndpointWebsocketMessage validates a message from the endpoint using the
@@ -1521,3 +1973,8 @@ func (wrc *websocketRequestContext) recordWebsocketSignal(signal reputation.Sign
 		wrc.logger.Warn().Err(err).Msg("Failed to record websocket reputation signal")
 	}
 }
+
+// DefaultWebsocketProbeTimeout bounds a websocket probe when the caller supplied no
+// deadline. The health-check executor always derives one from the rule's timeout, so this
+// only guards a direct call.
+const DefaultWebsocketProbeTimeout = 10 * time.Second
