@@ -1349,13 +1349,8 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 
 	// Return session endpoints if available.
 	if len(endpoints) > 0 {
-		// Apply tiered selection if enabled - only return endpoints from the highest available tier
-		// SKIP tiered filtering when filterByReputation is false (e.g., for leaderboard metrics gathering)
-		// because tiered selection is based on reputation scores.
-		// S1: tiered selection (ranking) stays OFF for WebSocket — there are no active WS
-		// health checks yet, so ranking on WS scores is deferred to S2. WS still gets
-		// blacklist + session-exhaustion + reputation threshold/cooldown disqualification above.
-		if filterByReputation && filterByRPCType != sharedtypes.RPCType_WEBSOCKET && p.tieredSelector != nil && p.tieredSelector.Config().Enabled {
+		// Apply tiered selection if enabled - only return endpoints from the highest available tier.
+		if p.shouldApplyTieredSelection(filterByReputation, effectiveAllowedSuppliers, filterByRPCType) {
 			endpoints = p.filterToHighestTier(ctx, serviceID, endpoints, filterByRPCType, logger, requestedEndpointAddr)
 		}
 
@@ -1367,6 +1362,35 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 	// Don't log here - error will be logged at the top-level caller to avoid duplicate logs
 	err := fmt.Errorf("%w: service %s", errProtocolContextSetupNoEndpoints, serviceID)
 	return nil, filterByRPCType, err
+}
+
+// shouldApplyTieredSelection reports whether tiered (highest-tier-only) selection should run
+// for this endpoint lookup.
+//
+// Tiered selection is derived entirely from reputation scores, so it is skipped wherever the
+// threshold/cooldown reputation filter is skipped:
+//
+//   - filterByReputation is false — health checks and leaderboard metrics gathering, which must
+//     see every endpoint including the ones reputation has already disqualified.
+//   - allowedSuppliers is non-empty — a Target-Suppliers pin. filterToHighestTier returns an
+//     EMPTY map when no endpoint reaches any tier (all below MinThreshold), and its
+//     requestedEndpointAddr escape hatch also requires score >= MinThreshold. Without this skip
+//     the header cannot reach a cooled-down or score-0 supplier, which is precisely the case
+//     operators use it to diagnose.
+//
+// S1: tiered selection (ranking) stays OFF for WebSocket — there are no active WS health checks
+// yet, so ranking on WS scores is deferred to S2. WS still gets blacklist + session-exhaustion +
+// reputation threshold/cooldown disqualification.
+func (p *Protocol) shouldApplyTieredSelection(
+	filterByReputation bool,
+	allowedSuppliers []string,
+	rpcType sharedtypes.RPCType,
+) bool {
+	return filterByReputation &&
+		len(allowedSuppliers) == 0 &&
+		rpcType != sharedtypes.RPCType_WEBSOCKET &&
+		p.tieredSelector != nil &&
+		p.tieredSelector.Config().Enabled
 }
 
 // ** Fallback Endpoint Handling **

@@ -157,11 +157,21 @@ curl -X POST http://localhost:3069/v1 \
 **Behavior:**
 - When `Target-Suppliers` header is present, PATH will:
   - Filter available endpoints to only those from the specified suppliers
-  - Skip reputation-based filtering (allows targeting suppliers with low reputation)
+  - Skip **all** reputation-derived filtering — both the score-threshold/cooldown filter and
+    tiered (highest-tier-only) selection. A score-0, fully-cooled-down supplier is reachable.
   - Still apply RPC type filtering (only endpoints supporting the requested RPC type)
+  - Still apply the config `blocked_suppliers` list, the endpoint policy (`require_https` /
+    `require_domain`), and the supplier blacklist (signature/validation failures). None of these
+    are reputation, and the header does not override them.
   - Log filtered supplier list and endpoint counts
 - If none of the specified suppliers are available in the current session, the request will fail
 - Header takes precedence over load testing configuration (if any)
+
+Tiered selection used to run *after* the supplier allowlist, so pinning a supplier whose
+endpoints were all below `min_threshold` returned `no valid endpoints available for service` —
+the header failed exactly when it was most needed, on a supplier you were trying to diagnose.
+Health checks were unaffected throughout (they pass `filterByReputation=false`), which is why a
+dark supplier still shows health-check traffic while serving zero user traffic.
 
 **App-Address** (Delegated Mode Only)
 Specifies the target application address when PATH is running in delegated mode.
