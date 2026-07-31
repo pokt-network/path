@@ -91,19 +91,31 @@ func Test_PickBackendUniform_StackingBuysBoundedTrafficAtDefaultK(t *testing.T) 
 	c := require.New(t)
 	SetOperatorShareBackendURLDedup(true)
 	t.Cleanup(func() { SetOperatorShareBackendURLDedup(true) })
-	pinBackendWeightCap(t, DefaultBackendRegistrationWeightCap)
-
 	pool := stackedPool()
-	shares := sampleShares(t, 60000, func() protocol.EndpointAddr {
-		return PickBackendUniform(pool)
-	}, operatorKeyForTest)
+	sample := func() map[string]float64 {
+		return sampleShares(t, 60000, func() protocol.EndpointAddr {
+			return PickBackendUniform(pool)
+		}, operatorKeyForTest)
+	}
 
-	// Weights: bigop min(6,2)+min(2,2) = 4; smallop 1+1 = 2. Total 6.
-	// So 66.7%/33.3% — above the 50% a machine count alone would give bigop (it does stake
-	// more), and far below the 80% its registration count would have bought.
-	c.InDelta(4.0/6.0, shares["bigop.net"], 0.02,
-		"stacking must buy a bounded increase, not a proportional one")
-	c.InDelta(2.0/6.0, shares["smallop.xyz"], 0.02)
+	// At the SHIPPED default (K=1) stacking buys nothing: both operators front 2 machines, so
+	// both get half, regardless of bigop's 8 registrations against smallop's 2. This is the
+	// configuration the fleet runs — a dry run over the real pools showed K>1 raises operator
+	// concentration rather than lowering it, because the operators who stack hardest are the
+	// large ones. See DefaultBackendRegistrationWeightCap.
+	pinBackendWeightCap(t, DefaultBackendRegistrationWeightCap)
+	atDefault := sample()
+	c.InDelta(0.5, atDefault["bigop.net"], 0.02, "at K=1 stacking must buy nothing")
+	c.InDelta(0.5, atDefault["smallop.xyz"], 0.02)
+
+	// At K=2, the opt-in, stacking buys a BOUNDED increase. Weights: bigop min(6,2)+min(2,2) = 4;
+	// smallop 1+1 = 2. So 66.7%/33.3% — above the 50% a machine count alone gives (it does stake
+	// more), far below the 80% its registration count would have bought.
+	pinBackendWeightCap(t, 2)
+	atK2 := sample()
+	c.InDelta(4.0/6.0, atK2["bigop.net"], 0.02,
+		"at K=2 stacking must buy a bounded increase, not a proportional one")
+	c.InDelta(2.0/6.0, atK2["smallop.xyz"], 0.02)
 }
 
 // The constraint the user called out: a relay is signed against a supplier's session and

@@ -35,7 +35,29 @@ const concentrationCapEpsilon = 1e-9
 // earns more traffic, up to the point where the extra stake stops representing extra
 // infrastructure. K = 1 reproduces the previous backend-uniform behavior exactly; a K larger
 // than any backend's registration count reproduces registration-proportional weighting exactly.
-const DefaultBackendRegistrationWeightCap = 2
+//
+// SHIPPED AT 1, not 2, on the evidence of a dry run over all 64 production pools
+// (Test_ProductionDryRun_*). K = 2 was intended to reward staking without concentrating
+// traffic. Measured against the real pools it does neither cleanly:
+//
+//	config                mean max MACHINE share    mean max OPERATOR share
+//	K=1 cap 0.65 (before)          10.4%                     54.4%
+//	K=1 cap 0.45                   12.2%                     48.2%
+//	K=2 cap 0.65                   12.3%                     59.1%   <- worse than before
+//	K=2 cap 0.45                   15.1%                     48.8%
+//
+// K = 2 ALONE RAISES operator concentration, from 54.4% to 59.1%. Rewarding stacked
+// registrations rewards whoever stacks hardest, and that is the largest operator (measured at
+// 5.7 registrations per machine against a solo operator's 1.0). The cap delivers essentially
+// all of the concentration benefit on its own — 48.2% at K=1 versus 48.8% at K=2 — while K=2
+// adds 2.9 points of single-machine exposure fleet-wide, because the share the cap displaces is
+// redistributed proportionally to weight and K=2 doubles the weight of exactly the machines
+// that stack.
+//
+// So K > 1 is a deliberate trade of blast radius for a stake-reward property, not a free win.
+// It stays one env var away — PATH_BACKEND_REGISTRATION_WEIGHT_CAP=2 — so it can be canaried
+// against an unchanged control once the fleet has the cap alone.
+const DefaultBackendRegistrationWeightCap = 1
 
 // DefaultMaxOperatorShareFallback is the per-operator concentration cap used for a service
 // whose resolved configuration has not been published to this package (tests, and any binary

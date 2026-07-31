@@ -174,13 +174,15 @@ func TestSelectBandWithConcentrationCap_ResolvesToConcreteSupplier(t *testing.T)
 	c.Len(seenSuppliers, len(band), "every supplier registration behind a chosen backend must be reachable")
 
 	// cap*operators = 0.4*2 <= 1, so no assignment can satisfy the configured cap. It degrades
-	// to infeasibleCapFallbackShare (0.65) rather than forcing uniform-over-operators, so the
-	// big operator is held at 0.65 instead of being shoved down to 0.5. Forcing uniform here
+	// to infeasibleCapFallbackShare (0.65) rather than forcing uniform-over-operators, which
 	// would move a two-operator pool by 15 points in one step; the fallback is deliberately the
-	// cap those pools already ran under. Shares by weight are 4/6 and 2/6 — K=2 clamps the big
-	// operator's two backends (6 and 2 registrations) to 2 each — i.e. 0.667 before it binds.
-	c.InDelta(0.65, float64(operatorCounts["bigop.net"])/float64(draws), 0.02, "big operator share")
-	c.InDelta(0.35, float64(operatorCounts["smallop.xyz"])/float64(draws), 0.02, "small operator share")
+	// cap those pools already ran under.
+	//
+	// At the shipped K=1 both operators front 2 machines, so both weigh 2/4 = 0.5. Neither
+	// exceeds the 0.65 fallback, so nothing is reshaped and the split stays even — the same
+	// numbers forced uniform would produce, reached without forcing anything.
+	c.InDelta(0.5, float64(operatorCounts["bigop.net"])/float64(draws), 0.02, "big operator share")
+	c.InDelta(0.5, float64(operatorCounts["smallop.xyz"])/float64(draws), 0.02, "small operator share")
 
 	// The historical forced-uniform fallback is still available, opt-in, and still splits 50/50.
 	SetCapInfeasibleForcesUniform(true)
