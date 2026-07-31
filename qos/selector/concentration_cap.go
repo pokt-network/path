@@ -76,8 +76,8 @@ var applyOperatorCapOnBackendPick atomic.Bool
 // fleet ran under before the cap was tightened, and it is feasible for every pool with two or
 // more operators (0.65 * 2 > 1), so it always resolves the infeasibility it is invoked for.
 //
-// THE EDGE CASE IT EXISTS FOR. A cap of 0.45 is infeasible for every service whose valid pool
-// spans exactly two operators — 0.45 * 2 <= 1 — and production has 9 of those. The two obvious
+// THE EDGE CASE IT EXISTS FOR. A cap of 0.50 is infeasible for every service whose valid pool
+// spans exactly two operators — 0.50 * 2 <= 1 — and production has 9 of those. The two obvious
 // treatments are both bad:
 //
 //   - Fall back to uniform-over-operators (the historical behavior). For two operators that is
@@ -88,7 +88,7 @@ var applyOperatorCapOnBackendPick atomic.Bool
 //     it.
 //
 //   - Drop the cap entirely. That is a REGRESSION: those pools are capped today at 0.65, and
-//     lowering the configured cap to 0.45 would silently stop capping them altogether.
+//     lowering the configured cap to 0.50 would silently stop capping them altogether.
 //
 // So neither the tightest nor the loosest treatment is acceptable, and the clamp that first
 // suggests itself — effective cap = max(configured, 1/m) — is not a middle ground either: with

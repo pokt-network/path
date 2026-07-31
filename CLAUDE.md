@@ -269,27 +269,36 @@ Rebinds land on `path_websocket_rebind_total{trigger="admin"}`, distinct from `r
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved
 - Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis
 
-## Endpoint Selection — Backend-URL Weighting
+## Endpoint Selection — Registration-Weighted, Capped per Operator
 
-Several suppliers can register against the **same backend URL**. Selection weights an operator's share by **distinct backend URL**, not by supplier registration, so stacking registrations behind one machine does not buy that machine more traffic.
+A provider's share of a service follows the **supplier registrations** it holds, not the machines it runs. Each registration carries its own per-session service allowance, so registrations are both what a provider can actually serve and what the chain settles on. How a provider spreads its registrations across its own infrastructure is not a routing input.
 
-Selection is two-stage: pick a backend URL uniformly, then pick a supplier registration uniformly within it. The result is always a concrete supplier — relays are signed against a supplier's session and each supplier carries its own per-session service allowance.
+Selection resolves to a concrete supplier — relays are signed against a supplier's session — and spreads across the registrations behind a chosen backend rather than pinning one, so allowance consumption is shared.
 
-Applies to every real decision path: `SelectWithConcentrationCap`, `SelectEndpointsWithDiversity` (including its first pick, which has no TLD-diversity logic), `selectTopRankedEndpoint` (retry/hedge band), and `SelectOperatorUniform` (WS rebind).
+**This reversed an earlier design** that weighted by distinct backend URL. Measured across all 64 production pools, machine-weighting allocated **33.4% of traffic on average (worst 51.4%) beyond what the receiving provider's allowance could serve**, while starving providers who held the tickets: one provider holding 19 of 50 registrations on a service received 7.3% of its traffic, against 45% for a provider holding 15. Registration-weighting is 0% by construction.
 
-**Off-switch** — restores registration-counted behavior exactly:
+**Per-operator cap: `max_operator_share`, default `0.50`.** This is the mechanism that stops one provider owning a session, and the only thing that should be tuned for that purpose. The largest provider holds ~71% of registrations fleet-wide and lands at ~51% of traffic under it.
+
+**Displacement ceiling: 3× (`DefaultDisplacementCeilingMultiple`).** The cap moves a dominant provider's excess onto everyone under it — but a provider handed far more than its own registrations entitle it to cannot serve it. Receivers are capped at 3× their entitlement, and excess nobody can absorb **stays with the capped provider**: moving it anyway only produces 429s and a retry. Without this, a 49-vs-1 pool allocated the single-registration provider 17.5× its allowance.
+
+**Two-operator pools sit at 0.65.** `0.50 × 2 = 1.0` is exactly the infeasibility boundary, so the tightened cap cannot apply to them; they keep the previous cap rather than being forced to an even split.
+
+**Off-switches:**
 ```bash
-PATH_OPERATOR_SHARE_BY_BACKEND_URL=false
+PATH_OPERATOR_SHARE_BY_BACKEND_URL=false   # flat registration pick, no cap
+PATH_BACKEND_REGISTRATION_WEIGHT_CAP=1     # machine-weighted (the reversed design)
+PATH_BACKEND_REGISTRATION_WEIGHT_CAP=2     # bounded middle: min(registrations, 2) per backend
+PATH_PRIMARY_PICK_OPERATOR_CAP=false       # basis only, no cap on the serving pick
+PATH_MAX_OPERATOR_SHARE=0.65               # move the cap without a config rollout
 ```
-No-op for operators that register one supplier per URL (distinct-URL count == registration count).
 
-**What to watch after enabling:** `path_supplier_exhausted_total` for the **small** operators, not the large one. A solo-registration backend's share rises (on a 50-registration/17-backend service, roughly 3x) while it still has only one supplier's allowance. Exhaustion is self-correcting — an exhausted supplier is filtered out per-supplier and its share redistributes — but a spike there is the expected failure mode.
+**What to watch:** `path_supplier_exhausted_total` — over-servicing is opt-in for the supplier and a 429 just moves the request on, so a spike is inefficiency (wasted relays) rather than failure. Also `path_selection_pool_size{path="diversity"}`, which reports the pool in the weighting currency and is the quickest confirmation the basis in force is the one you think.
 
-Related: `path_concentration_cap_reshaped_total` should **fall**, since deduped shares often land under the cap and need no water-filling.
+**Dry run before changing any of this:** `go test ./qos/selector/ -run Test_ProductionDryRun -v` replays the real pools through the shipped selector and gates on nobody dropped, nobody stranded, nobody allocated past both the cap and their own entitlement.
 
 ## Concentration Cap on the Retry / Hedge Paths
 
-The per-operator (eTLD+1) cap governs **primary** selection. Retry, hedge and batch-item picks come from the top-reputation-score band, which is capped by distinct backend URL but **not by operator** — so an operator fronting most of the band took most of the retries and hedges, on the two paths whose entire purpose is to reach different infrastructure than the attempt that just failed.
+The per-operator (eTLD+1) cap governs **primary** selection. Retry, hedge and batch-item picks come from the top-reputation-score band, which was weighted within the band but **not capped by operator** — so an operator holding most of the band took most of the retries and hedges, on the two paths whose entire purpose is to reach different infrastructure than the attempt that just failed.
 
 **Lowering `max_operator_share` does not close this.** The cap was never the binding constraint on the band paths; it simply did not run there.
 

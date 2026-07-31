@@ -111,7 +111,8 @@ func Test_ProductionDryRun_BeforeAfter(t *testing.T) {
 		}
 	})
 
-	// AFTER: what is about to ship — registration-weighted at K=2, cap 0.45.
+	// AFTER: what ships — registration-proportional (K=0, uncapped per machine), cap 0.50,
+	// with displacement bounded at 3x each receiver's entitlement.
 	after := map[string]map[string]float64{}
 	withSelectionConfig(t, services, DefaultBackendRegistrationWeightCap, DefaultMaxOperatorShareFallback, func() {
 		for _, svc := range names {
@@ -172,7 +173,8 @@ func Test_ProductionDryRun_BeforeAfter(t *testing.T) {
 	}
 
 	// 2. NO OPERATOR EXCEEDS THE CAP where the cap is satisfiable. Pools with fewer than three
-	//    operators cannot satisfy 0.45 and fall back to 0.65 by design, so they are held to that.
+	//    operators cannot satisfy the shipped cap and fall back to 0.65 by design, so they are
+	//    held to that.
 	for _, svc := range names {
 		operators := len(before[svc])
 		limit := DefaultMaxOperatorShareFallback
@@ -254,7 +256,7 @@ func Test_ProductionDryRun_BeforeAfter(t *testing.T) {
 	overCapBefore := 0
 	for _, svc := range names {
 		for _, share := range before[svc] {
-			if share > 0.45 {
+			if share > DefaultMaxOperatorShareFallback {
 				overCapBefore++
 				break
 			}
