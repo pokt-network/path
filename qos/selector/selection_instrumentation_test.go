@@ -262,3 +262,60 @@ func TestSelectionInstrumentation_NarrowingStaysOnDiversityPath(t *testing.T) {
 		t.Errorf("narrowing leaked into filter path: got %v, want 0", got)
 	}
 }
+
+func reshapedCount(t *testing.T, serviceID, path string) float64 {
+	t.Helper()
+	return testutil.ToFloat64(metrics.ConcentrationCapReshapedTotal.WithLabelValues(serviceID, path))
+}
+
+// The reshape counter carried only service_id, so the WebSocket selector and the HTTP serving
+// pick incremented the SAME series. HTTP runs three to four orders of magnitude more
+// selections per second, so "does the cap ever engage on a WebSocket selection?" was
+// unanswerable from it — the WS contribution was inside the noise of the HTTP rate.
+//
+// SelectWithConcentrationCap is reached only from a QoS type's single-endpoint Select, whose
+// sole production caller is the WebSocket bridge setup; SelectEndpointsWithDiversity is the
+// HTTP path. Tagging each with the SelectionPath it already reports to the pool metrics makes
+// the two separable, and joinable with those pool series on `path`.
+func TestSelectionInstrumentation_ReshapeCounterSeparatesWebsocketFromHTTP(t *testing.T) {
+	const svc = "instr-reshape-path"
+	logger := polyzero.NewLogger()
+	// 4 of 5 endpoints on one operator: 0.8 > 0.65, so the cap reshapes on both paths.
+	eps := protocol.EndpointAddrList{
+		"s1-https://a.big-op.com", "s2-https://b.big-op.com",
+		"s3-https://c.big-op.com", "s4-https://d.big-op.com",
+		"s5-https://e.small-op.com",
+	}
+
+	beforeWS := reshapedCount(t, svc, metrics.SelectionPathConcentrationCap)
+	beforeHTTP := reshapedCount(t, svc, metrics.SelectionPathDiversity)
+
+	const wsRuns = 7
+	for i := 0; i < wsRuns; i++ {
+		SelectWithConcentrationCap(svc, eps, 0.65)
+	}
+
+	// Only the WebSocket-path series moved.
+	if got := reshapedCount(t, svc, metrics.SelectionPathConcentrationCap) - beforeWS; got != wsRuns {
+		t.Errorf("websocket-path reshapes = %v, want %d", got, wsRuns)
+	}
+	if got := reshapedCount(t, svc, metrics.SelectionPathDiversity) - beforeHTTP; got != 0 {
+		t.Errorf("HTTP-path reshapes moved on a websocket selection: %v, want 0", got)
+	}
+
+	const httpRuns = 25
+	for i := 0; i < httpRuns; i++ {
+		if got := SelectEndpointsWithDiversity(logger, svc, eps, 1); len(got) != 1 {
+			t.Fatalf("expected 1 endpoint, got %d", len(got))
+		}
+	}
+
+	// The HTTP series moved by its own count, and the websocket series did not move again —
+	// so a busy HTTP service can no longer drown out or fabricate websocket engagement.
+	if got := reshapedCount(t, svc, metrics.SelectionPathDiversity) - beforeHTTP; got != httpRuns {
+		t.Errorf("HTTP-path reshapes = %v, want %d", got, httpRuns)
+	}
+	if got := reshapedCount(t, svc, metrics.SelectionPathConcentrationCap) - beforeWS; got != wsRuns {
+		t.Errorf("websocket-path reshapes changed during HTTP selections: %v, want %d", got, wsRuns)
+	}
+}

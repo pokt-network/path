@@ -297,7 +297,12 @@ func SelectWithConcentrationCap(
 	selected, opKey, reshaped := pickWeightedFromPools(pools, totalUnits, maxUnits, maxOperatorShare)
 	if reshaped {
 		// The distribution is actually being altered here, so record it.
-		metrics.RecordConcentrationCapReshaped(string(serviceID))
+		//
+		// Tagged with the same path the pool metric below reports. This selector is reached
+		// only from a QoS type's single-endpoint Select, whose sole production caller is the
+		// WebSocket bridge setup — so this series is what answers "does the cap ever engage on
+		// a WebSocket selection", a question the previously unlabeled counter could not.
+		metrics.RecordConcentrationCapReshaped(string(serviceID), metrics.SelectionPathConcentrationCap)
 	}
 	// Instrumented on every path, including the no-op one: "the cap was a no-op" is the
 	// majority of selections and the case a reshape-only metric cannot see, so it is exactly

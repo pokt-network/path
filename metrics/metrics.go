@@ -699,24 +699,43 @@ var HedgeSelfOperatorAvoidedTotal = promauto.NewCounterVec(
 // exceeded the cap and its excess was water-filled to other operators, or the pool was
 // too concentrated to satisfy the cap and selection fell back to uniform-over-operators.
 // Selections where no operator exceeded the cap (the cap is a no-op) are NOT counted, so a
-// nonzero rate on a service_id is the live signal that the cap is bounding a real
-// concentration — the operational proof the shipped-on default is doing something.
+// nonzero rate is the live signal that the cap is bounding a real concentration — the
+// operational proof the shipped-on default is doing something.
+//
+// The `path` label carries the same SelectionPath* value the pool metrics already report, and
+// it is what separates HTTP from WebSocket engagement:
+//
+//   - path="diversity"         — SelectEndpointsWithDiversity, the HTTP serving pick.
+//   - path="concentration_cap" — SelectWithConcentrationCap, reached only from a QoS type's
+//     single-endpoint Select, whose sole production caller is the WebSocket bridge setup
+//     (gateway/websocket_request_context.go). This is the WebSocket series.
+//
+// Without this split the two collapse into one counter and HTTP, running three to four orders
+// of magnitude more selections per second, completely masks whether the cap ever engages on a
+// WebSocket selection at all. That question came up repeatedly and was unanswerable from the
+// unlabeled counter.
 var ConcentrationCapReshapedTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "concentration_cap_reshaped_total",
-		Help: "Endpoint selections reshaped by the per-operator (eTLD+1) concentration cap, by service_id. Nonzero = the cap is actively bounding a dominant operator's selection share.",
+		Help: "Endpoint selections reshaped by the per-operator (eTLD+1) concentration cap, by service_id and selector path. path=\"concentration_cap\" is the WebSocket selection path; path=\"diversity\" is the HTTP serving pick.",
 	},
-	[]string{LabelServiceID},
+	[]string{LabelServiceID, LabelSelectionPath},
 )
 
 // RecordConcentrationCapReshaped increments the concentration-cap reshape counter for a
 // service. Called once per PRIMARY selection whose distribution the cap actually altered.
 //
-// Deliberately left unlabeled by path: the retry/hedge band paths report through
-// ConcentrationCapBandTotal instead, so this counter's existing per-service series keep their
-// continuity and remain a valid before/after baseline for the primary path.
-func RecordConcentrationCapReshaped(serviceID string) {
-	ConcentrationCapReshapedTotal.WithLabelValues(serviceID).Inc()
+// selectionPath must be one of the SelectionPath* constants, matching the value the same call
+// site passes to RecordSelectionPool — so pool composition and reshape counts can be joined on
+// `path` for the same selection.
+//
+// The retry/hedge band paths do NOT report here; they report through ConcentrationCapBandTotal,
+// which keeps its own separate `path` vocabulary (retry|hedge|batch).
+//
+// NOTE FOR DASHBOARDS: this counter previously had only service_id, so any panel matching its
+// series exactly needs `sum by (service_id)` added. Aggregate queries are unaffected.
+func RecordConcentrationCapReshaped(serviceID, selectionPath string) {
+	ConcentrationCapReshapedTotal.WithLabelValues(serviceID, selectionPath).Inc()
 }
 
 // ConcentrationCapBandTotal counts endpoint picks made from the top-reputation-score band —

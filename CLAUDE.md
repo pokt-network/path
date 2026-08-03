@@ -296,6 +296,22 @@ PATH_MAX_OPERATOR_SHARE=0.65               # move the cap without a config rollo
 
 **Dry run before changing any of this:** `go test ./qos/selector/ -run Test_ProductionDryRun -v` replays the real pools through the shipped selector and gates on nobody dropped, nobody stranded, nobody allocated past both the cap and their own entitlement.
 
+### Is the cap engaging on WebSocket? Read the `path` label
+
+The cap covers WebSocket selection already — a WS connection reaches it through a QoS type's single-endpoint `Select` (`gateway/websocket_request_context.go` → `qos/*/…Select` → `SelectWithConcentrationCap`), while HTTP reaches it through `SelectMultipleWithArchival` → `SelectEndpointsWithDiversity`. **Do not add a second cap for WebSocket; it is the same cap.**
+
+The two are separable on `path_concentration_cap_reshaped_total{service_id, path}`:
+
+- `path="concentration_cap"` — the **WebSocket** selection path.
+- `path="diversity"` — the HTTP serving pick.
+
+Same `path` vocabulary as `path_selection_pool_size` / `path_selection_selected_total`, so pool composition and reshape counts join on it. Before this label existed the two shared one series, and HTTP — running three to four orders of magnitude more selections per second — completely masked whether the cap ever engaged on a WebSocket selection.
+
+**A near-zero WS series is not proof the cap is broken.** Three things concentrate WebSocket traffic that no cap can touch, and they should be excluded before touching selection:
+1. **A WS connection binds one endpoint for its lifetime.** Selection governs only *new* connections; existing ones move only on rollover / stall / `session_expired` / `POST /admin/websocket/tumble/{svc}`.
+2. **Reputation removes whole operators from the pool before the cap sees it** (`path_reputation_disqualified_total{rpc_type="websocket"}`). The cap water-fills across survivors; it cannot restore what the floor deleted.
+3. **Supply** — some services have only one operator offering WS endpoints at all.
+
 ## Concentration Cap on the Retry / Hedge Paths
 
 The per-operator (eTLD+1) cap governs **primary** selection. Retry, hedge and batch-item picks come from the top-reputation-score band, which was weighted within the band but **not capped by operator** — so an operator holding most of the band took most of the retries and hedges, on the two paths whose entire purpose is to reach different infrastructure than the attempt that just failed.
@@ -316,7 +332,7 @@ PATH_CAP_RETRY_HEDGE_SELECTION=true   # or =false to force off everywhere
 ```
 Unset leaves config in charge. The share value itself is still `max_operator_share`; this key only decides whether the band paths consult it.
 
-**Metric** — a separate counter, not a new label on `path_concentration_cap_reshaped_total`, so the primary path's already-nonzero series stay a valid baseline:
+**Metric** — a separate counter rather than another value in `path_concentration_cap_reshaped_total`'s `path` label, so the primary path's already-nonzero series stay a valid baseline. The two counters keep independent `path` vocabularies: `retry|hedge|batch` here, `diversity|concentration_cap` (HTTP vs WebSocket) there.
 ```
 path_concentration_cap_band_total{service_id, path="retry|hedge|batch", outcome}
 ```

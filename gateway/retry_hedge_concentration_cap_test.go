@@ -281,8 +281,13 @@ func TestSelectTopRankedEndpoint_CapReachesRetryAndHedgePaths(t *testing.T) {
 
 	// And the primary path's own counter must be untouched by any of this: its existing
 	// per-service rate has to stay a valid before/after baseline.
-	c.Zero(testutil.ToFloat64(metrics.ConcentrationCapReshapedTotal.WithLabelValues(string(serviceID))),
-		"band-path reshapes must not be charged to the primary path's counter")
+	// Checked on BOTH primary-path series — the counter is labelled by selector path so the
+	// websocket pick and the HTTP serving pick stay separable; a band reshape must land on
+	// neither.
+	for _, path := range []string{metrics.SelectionPathDiversity, metrics.SelectionPathConcentrationCap} {
+		c.Zero(testutil.ToFloat64(metrics.ConcentrationCapReshapedTotal.WithLabelValues(string(serviceID), path)),
+			"band-path reshapes must not be charged to the primary path's counter (path=%s)", path)
+	}
 }
 
 // Two-stage selection must survive the cap on the band paths too: the winner is always a
