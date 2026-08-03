@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/alitto/pond/v2"
@@ -111,10 +110,24 @@ type HealthCheckExecutor struct {
 	// Health checks defined here are merged with local/external configs.
 	unifiedServicesConfig *UnifiedServicesConfig
 
-	// cycleCounter increments once per health check cycle. Used to rotate which
-	// supplier represents each backend URL under backend-URL dedup, so every
-	// supplier's own relay path is directly validated every N cycles.
-	cycleCounter uint64
+	// Per-service scheduling state, guarded by scheduleMu.
+	//
+	// The health check loop ticks at ONE global period (the smallest configured
+	// check_interval in the fleet). Without this state every enabled service ran on
+	// every tick, so a service's own check_interval could only ever lower the global
+	// floor - never raise its own rate. Measured 2026-08-03: 33 of 69 services ran
+	// faster than their own config asked for, up to 6x (robinhood: 60s configured,
+	// 10s actual), and services with zero user traffic were the worst offenders
+	// (manta: 14.4 health-check req/s against 0 req/s of real traffic).
+	//
+	// serviceLastRun records when each service last had checks submitted;
+	// serviceCycle is its own rotation counter for backend-URL dedup. The counter is
+	// per-service on purpose: a global one advanced by N per service run, so a
+	// service on a 30s interval whose backend group size divides 3 would re-probe the
+	// same representative forever and never directly validate its siblings.
+	scheduleMu     sync.Mutex
+	serviceLastRun map[protocol.ServiceID]time.Time
+	serviceCycle   map[protocol.ServiceID]uint64
 
 	// endpointLookupBudget caps the endpoint-resolution phase of a cycle.
 	// Zero means defaultEndpointLookupBudget. Only tests set it.
@@ -195,6 +208,8 @@ func NewHealthCheckExecutor(cfg HealthCheckExecutorConfig) *HealthCheckExecutor 
 		qosInstances:              make(map[protocol.ServiceID]QoSService),
 		unifiedServicesConfig:     cfg.UnifiedServicesConfig,
 		perServiceExternalConfigs: make(map[protocol.ServiceID][]HealthCheckConfig),
+		serviceLastRun:            make(map[protocol.ServiceID]time.Time),
+		serviceCycle:              make(map[protocol.ServiceID]uint64),
 	}
 
 	if cfg.Logger != nil {
@@ -2052,6 +2067,115 @@ func representativeIndex(cycle uint64, groupSize int) int {
 	return int(cycle % uint64(groupSize))
 }
 
+// serviceCheckInterval returns the effective check interval for a service config,
+// falling back to the default when unset. External configs reach the executor without
+// passing through hydrateDefaults, so the fallback cannot be assumed applied upstream.
+func serviceCheckInterval(cfg ServiceHealthCheckConfig) time.Duration {
+	if cfg.CheckInterval > 0 {
+		return cfg.CheckInterval
+	}
+	return DefaultHealthCheckInterval
+}
+
+// MinCheckInterval returns the smallest configured check interval across all services,
+// which is the period the health check loop must tick at to be able to honor every
+// service's own interval. Defaults to DefaultHealthCheckInterval when nothing is
+// configured. This is the single source of truth for the loop's tick period.
+func (e *HealthCheckExecutor) MinCheckInterval() time.Duration {
+	if e == nil {
+		return DefaultHealthCheckInterval
+	}
+
+	minInterval := time.Duration(0)
+	for _, cfg := range e.GetServiceConfigs() {
+		if cfg.Enabled != nil && !*cfg.Enabled {
+			continue
+		}
+		if iv := serviceCheckInterval(cfg); minInterval == 0 || iv < minInterval {
+			minInterval = iv
+		}
+	}
+
+	if minInterval <= 0 {
+		return DefaultHealthCheckInterval
+	}
+	return minInterval
+}
+
+// dueServices reports which services are due for checks on this tick and, for each,
+// the rotation counter its backend-URL dedup should use. Services not returned are
+// skipped entirely this cycle - including their endpoint resolution, which is the
+// expensive part (see resolveEndpointInfos).
+//
+// A service is due when the time since its last run has reached its own
+// check_interval, minus half a tick of slack. The slack is load-bearing: the loop
+// ticks on a fixed period, so a 30s service compared against a bare `elapsed >= 30s`
+// would miss the t=30s tick by microseconds of cycle jitter and fire at t=40s
+// instead - silently converting every interval into the next multiple of the tick.
+//
+// Calling this MARKS the returned services as run, so it must be called exactly once
+// per cycle.
+func (e *HealthCheckExecutor) dueServices(
+	serviceConfigs []ServiceHealthCheckConfig,
+	now time.Time,
+	tick time.Duration,
+) map[protocol.ServiceID]uint64 {
+	if tick <= 0 {
+		tick = DefaultHealthCheckInterval
+	}
+	slack := tick / 2
+
+	due := make(map[protocol.ServiceID]uint64, len(serviceConfigs))
+
+	e.scheduleMu.Lock()
+	defer e.scheduleMu.Unlock()
+
+	if e.serviceLastRun == nil {
+		e.serviceLastRun = make(map[protocol.ServiceID]time.Time, len(serviceConfigs))
+	}
+	if e.serviceCycle == nil {
+		e.serviceCycle = make(map[protocol.ServiceID]uint64, len(serviceConfigs))
+	}
+
+	// Track which services the current config knows about, so state for services
+	// dropped by an external config reload does not accumulate.
+	live := make(map[protocol.ServiceID]struct{}, len(serviceConfigs))
+
+	for _, cfg := range serviceConfigs {
+		if cfg.Enabled != nil && !*cfg.Enabled {
+			continue
+		}
+		live[cfg.ServiceID] = struct{}{}
+
+		// GetServiceConfigs can return the same service more than once after a merge;
+		// the first entry decides, and the duplicate must not re-mark it as run.
+		if _, decided := due[cfg.ServiceID]; decided {
+			continue
+		}
+
+		// A service never run before is always due, including on the first cycle
+		// after startup (zero time => elapsed is effectively unbounded).
+		lastRun, seen := e.serviceLastRun[cfg.ServiceID]
+		if seen && now.Sub(lastRun) < serviceCheckInterval(cfg)-slack {
+			continue
+		}
+
+		e.serviceLastRun[cfg.ServiceID] = now
+		cycle := e.serviceCycle[cfg.ServiceID] + 1
+		e.serviceCycle[cfg.ServiceID] = cycle
+		due[cfg.ServiceID] = cycle
+	}
+
+	for serviceID := range e.serviceLastRun {
+		if _, ok := live[serviceID]; !ok {
+			delete(e.serviceLastRun, serviceID)
+			delete(e.serviceCycle, serviceID)
+		}
+	}
+
+	return due
+}
+
 // endpointSessionActive reports whether the endpoint's session is still active, so a
 // stale (rolled-over) endpoint is skipped. Endpoints without a session ID are treated
 // as active (nothing to invalidate against).
@@ -2227,19 +2351,23 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 		return nil
 	}
 
-	// Resolve endpoints for every enabled service up front. This MUST stay off the
+	// Decide which services are due on this tick. The loop ticks at the fleet-wide
+	// minimum interval; this is what lets a service's own check_interval raise its
+	// period above that floor instead of being ignored.
+	dueCycles := e.dueServices(serviceConfigs, time.Now(), e.MinCheckInterval())
+	if len(dueCycles) == 0 {
+		e.logger.Debug().Msg("No services due for health checks this cycle")
+		return nil
+	}
+
+	// Resolve endpoints for every DUE service up front. This MUST stay off the
 	// submission loop below: see resolveEndpointInfos for the starvation it fixes.
-	enabledServiceIDs := make([]protocol.ServiceID, 0, len(serviceConfigs))
-	seenServiceIDs := make(map[protocol.ServiceID]struct{}, len(serviceConfigs))
-	for _, svcConfig := range serviceConfigs {
-		if svcConfig.Enabled != nil && !*svcConfig.Enabled {
-			continue
-		}
-		if _, dup := seenServiceIDs[svcConfig.ServiceID]; dup {
-			continue
-		}
-		seenServiceIDs[svcConfig.ServiceID] = struct{}{}
-		enabledServiceIDs = append(enabledServiceIDs, svcConfig.ServiceID)
+	// Skipping not-due services here is the point of the gate - endpoint resolution
+	// is the expensive phase, so scheduling that only skipped the relays would leave
+	// most of the cost in place.
+	enabledServiceIDs := make([]protocol.ServiceID, 0, len(dueCycles))
+	for serviceID := range dueCycles {
+		enabledServiceIDs = append(enabledServiceIDs, serviceID)
 	}
 	resolvedEndpoints := e.resolveEndpointInfos(ctx, enabledServiceIDs, getEndpointInfos)
 
@@ -2248,15 +2376,20 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 	totalJobs := 0
 
 	dedup := e.backendDedupEnabled()
-	// One rotation tick per cycle: every backend-URL group advances its representative
-	// by exactly one, giving each supplier on a URL a directly-probed turn every N cycles.
-	cycle := atomic.AddUint64(&e.cycleCounter, 1)
+	seenServiceIDs := make(map[protocol.ServiceID]struct{}, len(dueCycles))
 
 	// Submit health check jobs to the worker pool
 	for _, svcConfig := range serviceConfigs {
-		if svcConfig.Enabled != nil && !*svcConfig.Enabled {
+		// Per-service rotation counter, advanced once per run of THIS service.
+		// Absent means the service is not due this cycle (or is disabled).
+		cycle, isDue := dueCycles[svcConfig.ServiceID]
+		if !isDue {
 			continue
 		}
+		if _, dup := seenServiceIDs[svcConfig.ServiceID]; dup {
+			continue
+		}
+		seenServiceIDs[svcConfig.ServiceID] = struct{}{}
 
 		// Pre-resolved above. Absent means the lookup failed or missed the resolution
 		// budget - both already logged there - so skip the service for this cycle.
@@ -2356,7 +2489,10 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 	}
 
 	e.logger.Info().
-		Int("service_count", len(serviceConfigs)).
+		// Services DUE this tick, not services configured: most ticks now check a
+		// subset, so the two differ and only the first explains total_jobs.
+		Int("service_count", len(dueCycles)).
+		Int("configured_service_count", len(serviceConfigs)).
 		Int("total_jobs", totalJobs).
 		Int("max_workers", e.maxWorkers).
 		Int("pool_running_workers", int(e.pool.RunningWorkers())).
