@@ -162,6 +162,59 @@ var (
 	maxConsecutiveStallRebinds = 3
 )
 
+// Idle-connection reaper bounds. Package-level vars (not consts) so tests can shrink them;
+// production mutates idleConnectionThreshold only once, at startup, via
+// SetIdleConnectionThreshold.
+//
+// This closes the one gap the other two watchdogs leave open by design. Ping/pong keeps a
+// socket alive for as long as the peer answers, and the staleness watchdog arms only on a
+// connection that HAS a subscription. A connection that never subscribes and never sends a
+// frame therefore lives until the client hangs up — which, measured on production, some
+// never do: five services held 241 connections holding zero subscriptions between them,
+// costing ~1370 rebinds/hour that replayed nothing.
+var (
+	// idleConnectionThreshold is how long a connection may hold NO established subscription
+	// and send NO client frame before the bridge closes it.
+	//
+	// Sized to be unreachable by any client that is actually using the connection rather
+	// than to be aggressive. A websocket JSON-RPC client between requests is the case this
+	// must not break, so the bar is "sent nothing whatsoever for half an hour". A subscriber
+	// is exempt on a separate condition entirely (HasActiveSubscriptions), so a subscription
+	// to a rare event — quiet for hours and legitimately so — is never a candidate no matter
+	// how long it stays quiet.
+	//
+	// Zero or negative disables the reaper.
+	idleConnectionThreshold = 30 * time.Minute
+	// idleCheckInterval is how often the reaper evaluates. Worst-case reap latency is
+	// idleConnectionThreshold + idleCheckInterval. Coarse on purpose: it runs per
+	// connection, and nothing about this condition is urgent.
+	idleCheckInterval = 60 * time.Second
+)
+
+// SetIdleConnectionThreshold overrides how long a connection may stay subscription-less and
+// silent before the bridge reaps it. Zero or negative disables the reaper entirely.
+//
+// Call once during startup, before any bridge is created — bridges read the threshold on
+// their own goroutines and it is not synchronized.
+func SetIdleConnectionThreshold(d time.Duration) {
+	idleConnectionThreshold = d
+}
+
+// IdleReporter is an optional interface an EndpointReconnector may implement to learn that
+// the bridge is closing a client for idleness, so the implementer (which knows service and
+// domain) can emit the metric.
+//
+// Deliberately NOT part of EndpointReconnector: existing reconnectors and test doubles keep
+// compiling, and an implementer that skips it simply gets no metric.
+//
+// Called on the bridge's start() goroutine immediately before shutdown.
+type IdleReporter interface {
+	// OnIdleTimeout reports that a connection is being closed for holding no subscription
+	// and sending nothing for idleFor. This is a client-side condition: implementations
+	// must not attribute it to the bound endpoint's reputation.
+	OnIdleTimeout(idleFor time.Duration)
+}
+
 // Bound-session expiry watchdog bounds. Package-level vars (not consts) so tests can shrink
 // them; production never mutates them.
 var (

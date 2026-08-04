@@ -274,6 +274,24 @@ Rebinds land on `path_websocket_rebind_total{trigger="admin"}`, distinct from `r
 - `stall` — the staleness watchdog saw no subscription data past the threshold; escapes the bound **backend URL**.
 - `session_expired` — PATH noticed the bound session had ended while the supplier kept streaming. Without this a connection is stranded outside the session indefinitely: unsigned endpoint→client frames need no session so data keeps flowing, and the staleness watchdog stays quiet *because* it is flowing. Measured at 21% of live connections before the fix. Watch for `Endpoints = 0` with a blank Mean Score but nonzero WS msg/s on the supplier-quality panel — that combination is the tell.
 
+**Idle-connection reaper** (`websocket_idle_timeout`, default `30m`)
+
+A connection that has **never established a subscription** and has **sent no client frame** for the threshold is closed with **1000 (Normal Closure)**. Nothing else reaped it: ping/pong keeps a socket alive for as long as the peer answers, and the staleness watchdog arms only on connections that *have* a subscription — a quiet subscription-less connection was assumed to be a WebSocket JSON-RPC client between requests.
+
+Measured 2026-08-04: five services (`eth-sepolia-testnet` 134 conns, `blast` 40, `sei` 23, `moonbeam` 22, `bera` 22) held **241 connections with zero subscriptions between them**, costing **~1370 rebinds/hour that replayed nothing**. The tell is `path_websocket_rebind_total` high with `path_websocket_subscriptions_replayed_total` at **exactly 0** for the same `service_id` — compare against `eth` (188 rebinds → 182 replays). At the edge these were four WebSocket-only client IPs making no HTTP at all, holding sockets 4-6.5h and receiving ~1.5 KB each.
+
+**The two conditions are ANDed, and each alone is wrong.** Silence alone reaps a subscriber watching a rare event (legitimately quiet for hours). No-subscription alone reaps a WebSocket JSON-RPC client between requests. Neither at once, for half an hour, is neither shape.
+
+Not an endpoint fault, so it **never touches reputation** — the supplier was never asked for anything. Reaps land on `path_websocket_idle_reaped_total{service_id, domain}`, deliberately a separate counter: the shared close path already emits `event="closed"`, and folding reaps in would break established/closed reconciliation, which is the check that separates a gauge leak from real accumulation.
+
+```yaml
+router_config:
+  websocket_idle_timeout: 30m   # negative disables reaping entirely
+```
+```bash
+PATH_WEBSOCKET_IDLE_TIMEOUT=45m   # pod restart instead of a config-map edit
+```
+
 **Circuit Breaker — when to use:**
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved

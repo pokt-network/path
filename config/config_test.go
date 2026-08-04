@@ -102,6 +102,7 @@ func Test_LoadGatewayConfigFromYAML(t *testing.T) {
 					WebsocketMessageBufferSize:        8192, // Matches example config
 					MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 					MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
+					WebsocketIdleTimeout:              defaultWebsocketIdleTimeout,
 				},
 				Logger: LoggerConfig{
 					Level: "info", // Matches example config
@@ -202,6 +203,7 @@ logger_config:
 					WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 					MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 					MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
+					WebsocketIdleTimeout:              defaultWebsocketIdleTimeout,
 				},
 				Logger: LoggerConfig{
 					Level: "debug",
@@ -417,6 +419,7 @@ logger_config:
 					WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 					MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 					MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
+					WebsocketIdleTimeout:              defaultWebsocketIdleTimeout,
 				},
 				Logger: LoggerConfig{
 					Level: "info",

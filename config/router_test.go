@@ -70,6 +70,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 				MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 				MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
+				WebsocketIdleTimeout:              defaultWebsocketIdleTimeout,
 			},
 			wantErr: false,
 		},
@@ -88,6 +89,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 				MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 				MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
+				WebsocketIdleTimeout:              defaultWebsocketIdleTimeout,
 			},
 			wantErr: false,
 		},
@@ -124,6 +126,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				WebsocketMessageBufferSize:        500, // Custom value should be preserved
 				MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 				MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
+				WebsocketIdleTimeout:              defaultWebsocketIdleTimeout,
 			},
 			wantErr: false,
 		},
@@ -142,6 +145,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 				MaxConcurrentWebsocketConnections: -1, // Negative preserved: limit disabled
 				MaxRequestBodyBytes:               defaultMaxRequestBodyBytes,
+				WebsocketIdleTimeout:              defaultWebsocketIdleTimeout,
 			},
 			wantErr: false,
 		},
@@ -160,6 +164,7 @@ func TestRouterConfig_hydrateRouterDefaults(t *testing.T) {
 				WebsocketMessageBufferSize:        defaultWebsocketMessageBufferSize,
 				MaxConcurrentWebsocketConnections: defaultMaxConcurrentWebsocketConnections,
 				MaxRequestBodyBytes:               -1, // Negative preserved: limit disabled
+				WebsocketIdleTimeout:              defaultWebsocketIdleTimeout,
 			},
 			wantErr: false,
 		},

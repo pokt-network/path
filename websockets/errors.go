@@ -53,4 +53,19 @@ var (
 	// (supplier continuity is fine if the supplier is still in the new session), unlike
 	// ErrEndpointStalled/ErrEndpointTumbled which must land elsewhere.
 	ErrEndpointSessionExpired = errors.New("endpoint session expired: bound session ended without the supplier disconnecting")
+
+	// ErrBridgeIdleTimeout indicates the client has held the connection open without ever
+	// establishing a subscription and without sending a frame for idleConnectionThreshold.
+	//
+	// Every other liveness mechanism deliberately spares this connection. Ping/pong keeps
+	// the socket alive as long as the peer answers, and the staleness watchdog arms only
+	// when HasActiveSubscriptions() is true — a quiet connection with no subscription was
+	// treated as legitimate, on the assumption that it is a websocket JSON-RPC client
+	// between requests. That holds for a client that sends requests; it does not hold for
+	// one that sends nothing at all, which is indistinguishable from an abandoned socket
+	// and is not free: the connection stays bound to a supplier and is rebound at every
+	// session rollover, replaying zero subscriptions each time.
+	//
+	// Reaping it is NOT an endpoint fault and must never reach reputation.
+	ErrBridgeIdleTimeout = errors.New("bridge idle timeout: no subscription and no client activity past the idle threshold")
 )

@@ -1160,6 +1160,21 @@ var WebsocketConnectionEventsTotal = promauto.NewCounterVec(
 	[]string{LabelDomain, LabelServiceID, "event"},
 )
 
+// WebsocketIdleReapedTotal counts connections closed by the idle reaper — no subscription
+// ever established and no client frame for the idle threshold.
+//
+// A separate counter rather than another `event` value on WebsocketConnectionEventsTotal:
+// every reap also emits event="closed" there (the close path is shared), so folding it in
+// would double-count closures and break established/closed reconciliation, which is the
+// check that tells a real connection leak from real accumulation.
+var WebsocketIdleReapedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_idle_reaped_total",
+		Help: "WebSocket connections closed for idleness (no subscription, no client traffic) by domain and service_id.",
+	},
+	[]string{LabelDomain, LabelServiceID},
+)
+
 var WebsocketConnectionDuration = promauto.NewHistogramVec(
 	prometheus.HistogramOpts{
 		Name: MetricPrefix + "websocket_connection_duration_seconds",
@@ -1602,6 +1617,13 @@ func MoveWebsocketConnection(oldDomain, newDomain, serviceID string) {
 	}
 	WebsocketConnectionsActive.WithLabelValues(oldDomain, serviceID).Dec()
 	WebsocketConnectionsActive.WithLabelValues(newDomain, serviceID).Inc()
+}
+
+// RecordWebsocketIdleReaped records a connection closed by the idle reaper. The paired
+// event="closed" / duration observation still comes from RecordWebsocketConnectionClosed on
+// the shared close path; this only labels WHY.
+func RecordWebsocketIdleReaped(domain, serviceID string) {
+	WebsocketIdleReapedTotal.WithLabelValues(domain, serviceID).Inc()
 }
 
 // RecordWebsocketConnectionFailed records a WebSocket connection failure

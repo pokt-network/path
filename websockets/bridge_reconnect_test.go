@@ -34,6 +34,7 @@ type mockReconnector struct {
 	avoidCurrentCalls   int32 // ReconnectEndpoint calls that requested a different supplier
 	stallRebindReported int32 // OnEndpointStallDetected(gaveUp=false)
 	stallGiveupReported int32 // OnEndpointStallDetected(gaveUp=true)
+	idleReported        int32 // OnIdleTimeout — see bridge_idle_test.go
 }
 
 func (m *mockReconnector) ReconnectEndpoint(_ context.Context, avoidCurrentSupplier bool) (*websocket.Conn, error) {

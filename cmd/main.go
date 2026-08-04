@@ -24,6 +24,7 @@ import (
 	"github.com/pokt-network/path/reputation"
 	"github.com/pokt-network/path/request"
 	"github.com/pokt-network/path/router"
+	"github.com/pokt-network/path/websockets"
 )
 
 // Version information injected at build time via ldflags
@@ -292,6 +293,11 @@ func main() {
 	// This enables /ready/<service>?detailed=true to include archival status information.
 	protocol.SetQoSServiceRegistry(requestParser)
 
+	// Apply the websocket idle-reaper threshold before any bridge can be created. Bridges
+	// read it on their own goroutines without synchronization, so this must happen before
+	// the server starts accepting connections.
+	configureWebsocketIdleTimeout(logger, config.GetRouterConfig().WebsocketIdleTimeout)
+
 	// NOTE: the gateway uses the requestParser to get the correct QoS instance for any incoming request.
 	gtw := &gateway.Gateway{
 		Logger:                     logger,
@@ -470,6 +476,41 @@ func main() {
 }
 
 /* -------------------- Gateway Init Helpers -------------------- */
+
+// configureWebsocketIdleTimeout applies the websocket idle-reaper threshold, letting
+// PATH_WEBSOCKET_IDLE_TIMEOUT override the config value.
+//
+// The env override exists so the threshold can be moved (or reaping switched off) with a
+// pod restart while watching path_websocket_idle_reaped_total, instead of a config-map edit
+// — the same escape hatch PATH_MAX_OPERATOR_SHARE provides for the concentration cap.
+// Accepts any Go duration ("45m", "2h"); a non-positive value disables reaping.
+func configureWebsocketIdleTimeout(logger polylog.Logger, configured time.Duration) {
+	timeout := configured
+
+	if raw := os.Getenv("PATH_WEBSOCKET_IDLE_TIMEOUT"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			logger.Warn().
+				Str("value", raw).
+				Msg("⚠️ ignoring PATH_WEBSOCKET_IDLE_TIMEOUT: not a duration (expected e.g. 30m)")
+		} else {
+			timeout = parsed
+			logger.Warn().
+				Str("value", raw).
+				Msg("⚠️ websocket idle timeout OVERRIDDEN by PATH_WEBSOCKET_IDLE_TIMEOUT")
+		}
+	}
+
+	websockets.SetIdleConnectionThreshold(timeout)
+
+	if timeout <= 0 {
+		logger.Warn().Msg("⚠️ websocket idle reaping DISABLED: connections with no subscription and no traffic are never closed")
+		return
+	}
+	logger.Info().
+		Dur("websocket_idle_timeout", timeout).
+		Msg("🧹 websocket idle reaping enabled")
+}
 
 // getConfigPath returns the full path to the config file relative to the executable.
 //
