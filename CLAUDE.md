@@ -292,10 +292,118 @@ router_config:
 PATH_WEBSOCKET_IDLE_TIMEOUT=45m   # pod restart instead of a config-map edit
 ```
 
+**Reputation Drain** (`POST /admin/reputation/drain/{serviceId}`)
+
+Temporarily benches every **scored** endpoint of one operator (eTLD+1) for a service by
+writing a cooldown expiry onto its score. Selection already excludes endpoints in cooldown
+regardless of score, so this reuses a filter every selection path is guaranteed to consult
+rather than adding a second exclusion some path could miss.
+
+Answers "where would this traffic go if operator X were unavailable" without waiting for X
+to fail.
+
+**Tumble is not a substitute.** A tumble re-dials but leaves every operator eligible, so the
+connection can land straight back where it started. Measured on gnosis: **8 consecutive
+tumbles failed to move a ~500 frames/s subscription** off the two operators already carrying
+it, because each rebind could reselect them. Drain first, *then* tumble — the rebind then has
+nowhere else to go.
+
+```bash
+# what would be benched (always do this first — the response lists domains_seen, so a typo
+# reads as "matched 0, and here is what actually exists" rather than a silent no-op)
+curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=spacebelt.xyz&rpc_type=websocket&dry_run=true"
+
+# bench for 20m, websocket only — the operator's json_rpc / rest traffic is untouched
+curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=spacebelt.xyz&rpc_type=websocket&duration=20m"
+
+# then move the live connections that are already bound
+curl -X POST "http://localhost:13069/admin/websocket/tumble/gnosis"
+
+# release early
+curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=spacebelt.xyz&rpc_type=websocket&duration=0"
+```
+
+Query parameters: `domain=<eTLD+1>` (**required** — a drain with no domain would bench the
+whole service, which is never what anyone meant to type) · `duration=<go duration>` (default
+`15m`; `0` releases) · `rpc_type=<websocket|json_rpc|rest|…>` (default all) · `dry_run=true`.
+
+**Not a penalty.** `Value`, `CriticalStrikes` and `RecentCriticalRate` are left untouched, so
+the quality signal stays readable *while* the drain is in effect — which matters, because
+reading it is usually the entire point of draining. A drain that rewrote the score would
+destroy the measurement it exists to enable.
+
+**Release is deliberately narrow:** it lifts only cooldowns the drain itself wrote and that
+nothing has overwritten since. A cooldown earned for real while the drain was up survives —
+otherwise "undo my experiment" would silently un-bench a legitimately failing endpoint.
+
+**Known limit — a drain is not airtight.** The cooldown lives on the score, so an endpoint the
+reputation service has never observed is treated by selection as "initial score, not in
+cooldown" and stays selectable. The response carries `unscored_warning` rather than letting a
+partial drain read as complete. On a service with health checks running everything is scored,
+so it is usually complete.
+
+Per-pod in-memory state like the other admin endpoints — issue it to **each pod**. Expires on
+its own; does not survive a restart.
+
 **Circuit Breaker — when to use:**
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved
 - Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis
+
+## WebSocket Frames Are Reward-Eligible Relays
+
+**Every endpoint→client WebSocket frame is signed by the relay miner and mined as a
+reward-eligible relay**, paired with the *most recent* request. poktroll
+`pkg/relayer/proxy/websockets/bridge.go`:
+
+> Each message (inbound or outbound) is treated as a reward-eligible relay. For example, with
+> eth_subscribe, both the initial subscription request and each received event would be
+> eligible for rewards. […] Currently, the RelayMiner is paid for each incoming and outgoing
+> message transmitted.
+
+PATH validates that signature in `validateEndpointWebsocketMessage` → `ValidateRelayResponse`
+(`protocol/shannon/websocket_context.go`).
+
+**The asymmetry:** HTTP is 1 client request = 1 relay, client-driven. A WS subscription is 1
+signed request = **unbounded** relays, and the push rate is chosen by **the supplier being
+paid**. PATH signs the anchoring subscribe with its *own* application key, so the gateway's app
+stake funds it. The only brake is `relayMeter.IsOverServicing(...)` — the application's
+per-session allowance — and `path_supplier_exhausted_total` was **0 fleetwide** when checked,
+so that brake is dormant.
+
+Consequence: a per-domain frames/s number is closer to a **settlement-volume** meter than a
+demand meter. Do not reason about it as load on the supplier.
+
+### `path_websocket_connection_frame_rate` — the distribution, not the sum
+
+Histogram `{service_id, domain}`, every live connection observed every 15s, buckets
+`0.1 … 2500`. Emitted from the same `sampleRates` pass that feeds the tumble ranking, so the
+two can never disagree.
+
+**Why it exists:** `path_websocket_messages_total` is a per-domain SUM, and a sum cannot tell
+*one firehose plus a hundred idle sockets* apart from *a hundred ordinary subscribers*. Those
+have opposite explanations and the difference is not academic — measured fleetwide, one
+operator held **16.9% of WS connections and earned 66.1% of WS relays** (3.9× over-index),
+while on gnosis **2 connections out of ~70 carried ~97% of frames**. A handful of connections
+can produce that entire fleetwide number without the operator doing anything.
+
+```promql
+histogram_quantile(0.5,  sum by (le, domain) (rate(path_websocket_connection_frame_rate_bucket{service_id="gnosis"}[10m])))
+histogram_quantile(0.99, sum by (le, domain) (rate(path_websocket_connection_frame_rate_bucket{service_id="gnosis"}[10m])))
+```
+
+**Read it as:** p50 ≈ 0 with p99 in the hundreds → a few firehoses landed there, a placement
+artifact, nobody is doing anything. p50 materially above other operators → systematic across
+that operator's whole connection population.
+
+**Idle connections are observed at 0 deliberately.** Dropping them would leave the quantiles
+describing only the connections that carry traffic — exactly the population the metric exists
+to be measured *against*.
+
+**Trap:** clients do not choose their operator; selection assigns it. So which operator a
+high-volume subscriber lands on is effectively a random draw, and any per-operator *average*
+conflates "inflates every stream" with "the big streams landed here". Only the distribution —
+or a same-client-different-operator comparison via a drain — separates them.
 
 ## Endpoint Selection — Registration-Weighted, Capped per Operator
 
