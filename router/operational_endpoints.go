@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 )
 
 // ServiceReadinessReporter provides readiness information for services.
@@ -315,6 +317,79 @@ func (r *router) handleChainStateClear(w http.ResponseWriter, req *http.Request)
 		"service_id": serviceID,
 		"message":    "chain state cleared (perceived block height reset, in-memory + Redis)",
 	})
+}
+
+// handleReputationDrain handles POST /admin/reputation/drain/{serviceId}
+//
+// Temporarily benches every scored endpoint belonging to one operator (eTLD+1) for the
+// service, by writing a cooldown expiry onto its score. Selection already excludes
+// endpoints in cooldown regardless of score, so this reuses a filter every selection path
+// is guaranteed to consult.
+//
+// Why this exists: questions of the form "where would this traffic go if operator X were
+// not available" are otherwise only answerable by waiting for X to fail. Tumbling a
+// websocket connection is not a substitute — a tumble re-dials but leaves every operator
+// eligible, so the connection can and does land straight back where it started.
+//
+// This is NOT a penalty. Value, CriticalStrikes and RecentCriticalRate are left alone, so
+// the quality signal stays readable while the drain is in effect — which matters, because
+// reading it is usually the entire point of draining.
+//
+// Per-pod in-memory state like the other admin endpoints; issue it to each pod.
+//
+// Query parameters:
+//
+//	domain=<eTLD+1>   operator to bench (REQUIRED)
+//	duration=<dur>    how long, Go duration (default 15m). 0 releases this pod's drain.
+//	rpc_type=<type>   narrow to one protocol (websocket, json_rpc, …); default all
+//	dry_run=true      report what would be benched without writing
+//
+// A drain expires on its own. It does not survive a pod restart.
+func (r *router) handleReputationDrain(w http.ResponseWriter, req *http.Request) {
+	if r.reputationAdmin == nil {
+		http.Error(w, `{"error":"reputation admin not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	serviceID := strings.TrimPrefix(req.URL.Path, "/admin/reputation/drain/")
+	if serviceID == "" {
+		http.Error(w, `{"error":"service ID required: POST /admin/reputation/drain/{serviceId}"}`, http.StatusBadRequest)
+		return
+	}
+
+	query := req.URL.Query()
+
+	// Required rather than defaulted: a drain with no domain would bench the whole
+	// service, which is never what anyone meant to type.
+	domain := query.Get("domain")
+	if domain == "" {
+		http.Error(w, `{"error":"domain required: ?domain=<eTLD+1>"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Default 15m — long enough to collect a clean rate window, short enough that a
+	// forgotten drain heals itself well inside a shift.
+	duration := 15 * time.Minute
+	if raw := query.Get("duration"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed < 0 {
+			http.Error(w, `{"error":"duration must be a non-negative Go duration (e.g. 15m); 0 releases"}`, http.StatusBadRequest)
+			return
+		}
+		duration = parsed
+	}
+
+	result := r.reputationAdmin.DrainDomain(req.Context(), reputation.DrainRequest{
+		ServiceID: protocol.ServiceID(serviceID),
+		Domain:    domain,
+		Duration:  duration,
+		RPCType:   query.Get("rpc_type"),
+		DryRun:    query.Get("dry_run") == "true",
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 // handleWebsocketTumble handles POST /admin/websocket/tumble/{serviceId}

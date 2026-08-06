@@ -51,6 +51,11 @@ type service struct {
 	// (ArchivalExpiresAt) is still checked at read time in GetArchivalEndpoints.
 	archivalIndex map[protocol.ServiceID]map[EndpointKey]struct{}
 
+	// drainedKeys records the cooldown expiry that an admin drain wrote for a key, so a
+	// later release can lift ONLY what the drain benched and leave a genuinely earned
+	// cooldown in place. Guarded by mu. See DrainDomain.
+	drainedKeys map[EndpointKey]time.Time
+
 	// Async write handling
 	writeCh   chan writeRequest
 	stopCh    chan struct{}

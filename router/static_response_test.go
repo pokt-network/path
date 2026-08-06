@@ -39,6 +39,7 @@ func newStaticTestRouter(t *testing.T, resolver StaticResponseResolver) (*Mockga
 		nil,
 		nil,
 		nil,
+		nil,
 		resolver,
 	)
 	ts := httptest.NewServer(r.mux)

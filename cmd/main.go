@@ -347,6 +347,14 @@ func main() {
 	// failing startup.
 	websocketAdmin, _ := protocol.(router.WebsocketAdmin)
 
+	// Admin handler to temporarily bench one operator's endpoints for a service via
+	// POST /admin/reputation/drain/{serviceId}. nil when reputation is disabled, which
+	// leaves the endpoint reporting 503 rather than failing startup.
+	var reputationAdmin router.ReputationAdmin
+	if reputationSvc := protocol.GetReputationService(); reputationSvc != nil {
+		reputationAdmin = reputationSvc
+	}
+
 	// Initialize the API router to serve requests to the PATH API.
 	apiRouter := router.NewRouter(
 		logger,
@@ -357,6 +365,7 @@ func main() {
 		gtw.DomainCircuitBreaker,
 		chainStateAdmin,
 		websocketAdmin,
+		reputationAdmin,
 		unifiedServicesConfig,
 	)
 

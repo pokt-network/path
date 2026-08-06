@@ -356,6 +356,12 @@ type ReputationService interface {
 	// Used for administrative purposes or testing.
 	ResetScore(ctx context.Context, key EndpointKey) error
 
+	// DrainDomain temporarily benches every scored endpoint of one operator (eTLD+1)
+	// for a service by writing a cooldown expiry, without altering reputation itself.
+	// Administrative / experimental: it makes "what happens when this operator is not
+	// available" answerable without waiting for the operator to actually fail.
+	DrainDomain(ctx context.Context, req DrainRequest) DrainResult
+
 	// KeyBuilderForService returns the KeyBuilder for the given service.
 	// Uses service-specific config if available, otherwise falls back to global default.
 	KeyBuilderForService(serviceID protocol.ServiceID) KeyBuilder

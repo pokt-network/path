@@ -15,6 +15,7 @@ import (
 	"github.com/pokt-network/path/health"
 	"github.com/pokt-network/path/metrics/devtools"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 	"github.com/pokt-network/path/request"
 )
 
@@ -38,6 +39,7 @@ type (
 		circuitBreakerAdmin           CircuitBreakerAdmin
 		chainStateAdmin               ChainStateAdmin
 		websocketAdmin                WebsocketAdmin
+		reputationAdmin               ReputationAdmin
 		staticResponses               StaticResponseResolver
 	}
 	gatewayHandler interface {
@@ -71,6 +73,12 @@ type (
 	WebsocketAdmin interface {
 		TumbleWebsockets(req protocol.WebsocketTumbleRequest) protocol.WebsocketTumbleResult
 	}
+	// ReputationAdmin allows temporarily benching one operator's endpoints for a service
+	// via admin endpoints, so "what does this service look like without operator X" is
+	// answerable on demand instead of only when X happens to fail. Expires on its own.
+	ReputationAdmin interface {
+		DrainDomain(ctx context.Context, req reputation.DrainRequest) reputation.DrainResult
+	}
 )
 
 /* --------------------------------- Init -------------------------------- */
@@ -85,6 +93,7 @@ func NewRouter(
 	circuitBreakerAdmin CircuitBreakerAdmin,
 	chainStateAdmin ChainStateAdmin,
 	websocketAdmin WebsocketAdmin,
+	reputationAdmin ReputationAdmin,
 	staticResponses StaticResponseResolver,
 ) *router {
 	r := &router{
@@ -99,6 +108,7 @@ func NewRouter(
 		circuitBreakerAdmin:           circuitBreakerAdmin,
 		chainStateAdmin:               chainStateAdmin,
 		websocketAdmin:                websocketAdmin,
+		reputationAdmin:               reputationAdmin,
 		staticResponses:               staticResponses,
 	}
 	r.handleRoutes()
@@ -140,6 +150,10 @@ func (r *router) handleRoutes() {
 	// POST /admin/websocket/tumble/{serviceId} - forces live websocket connections to
 	// rebind onto different suppliers (clients stay connected, subscriptions replayed)
 	r.mux.HandleFunc("POST /admin/websocket/tumble/", r.handleWebsocketTumble)
+
+	// POST /admin/reputation/drain/{serviceId} - temporarily benches one operator's
+	// endpoints for a service (cooldown only; reputation itself is left untouched)
+	r.mux.HandleFunc("POST /admin/reputation/drain/", r.handleReputationDrain)
 
 	// requestHandlerFn defines the middleware chain for all service requests.
 	// staticResponseMiddleware runs after the prefix strip (so it sees the cleaned path)
