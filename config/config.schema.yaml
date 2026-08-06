@@ -394,6 +394,19 @@ properties:
             description: "Enable/disable health checks."
             type: boolean
             default: false
+          sync_allowance:
+            description: "Default blocks behind the latest an endpoint may be before it counts as out of sync. Per-service entries in local[] override it. 0 disables the sync check."
+            type: integer
+            minimum: 0
+            default: 0
+          max_workers:
+            description: "Maximum concurrent health check workers. Auto-sized from service and check counts when unset."
+            type: integer
+            minimum: 1
+          backend_dedup:
+            description: "Fire ONE relay per unique backend URL each cycle (a rotating representative supplier) and fan the result to the other suppliers sharing that URL. Cuts redundant health-check relay volume by the redundancy factor. WebSocket checks are never deduped. Default: true."
+            type: boolean
+            default: true
           coordination:
             description: "Leader election configuration for multi-instance deployments."
             type: object
@@ -447,6 +460,10 @@ properties:
                   description: "Enable/disable health checks for this service."
                   type: boolean
                   default: true
+                sync_allowance:
+                  description: "Blocks behind the latest an endpoint may be before it counts as out of sync. Overrides the global default for this service. 0 disables the sync check."
+                  type: integer
+                  minimum: 0
                 checks:
                   description: "List of health check configurations."
                   type: array
@@ -461,8 +478,17 @@ properties:
                         description: "Name of the health check."
                         type: string
                       type:
-                        description: "Type of health check (e.g., 'jsonrpc')."
+                        description: "RPC protocol type (must match service's rpc_types): json_rpc, rest, comet_bft, websocket, grpc."
                         type: string
+                        enum: ["json_rpc", "rest", "comet_bft", "websocket", "grpc"]
+                      enabled:
+                        description: "Enable/disable this individual check."
+                        type: boolean
+                      headers:
+                        description: "Request headers."
+                        type: object
+                        additionalProperties:
+                          type: string
                       method:
                         description: "HTTP method (GET, POST)."
                         type: string
@@ -481,10 +507,17 @@ properties:
                       timeout:
                         description: "Request timeout."
                         type: string
+                      archival:
+                        description: "Archival-specific check: only runs on endpoints marked archival."
+                        type: boolean
+                      sync_check:
+                        description: "Enable sync check validation. When true, extracts block height from the response and validates against the service's sync_allowance. Requires sync_allowance > 0."
+                        type: boolean
+                        default: false
                       reputation_signal:
                         description: "Reputation signal to emit on failure."
                         type: string
-                        enum: ["minor_error", "major_error", "critical_error"]
+                        enum: ["minor_error", "major_error", "critical_error", "fatal_error"]
 
       # ====================================
       # UNIFIED SERVICE CONFIGURATION
