@@ -42,7 +42,7 @@ func TestSelectWithMetadata_ConcentrationCap_EndToEnd(t *testing.T) {
 		}
 	}
 
-	before := testutil.ToFloat64(metrics.ConcentrationCapReshapedTotal.WithLabelValues("eth"))
+	before := testutil.ToFloat64(metrics.ConcentrationCapReshapedTotal.WithLabelValues("eth", metrics.SelectionPathConcentrationCap))
 
 	counts := map[string]int{}
 	const draws = 60_000
@@ -59,7 +59,7 @@ func TestSelectWithMetadata_ConcentrationCap_EndToEnd(t *testing.T) {
 		float64(counts["op0.tech"])/float64(draws))
 
 	// The reshape metric fired for this service (the cap actually bit on every draw here).
-	after := testutil.ToFloat64(metrics.ConcentrationCapReshapedTotal.WithLabelValues("eth"))
+	after := testutil.ToFloat64(metrics.ConcentrationCapReshapedTotal.WithLabelValues("eth", metrics.SelectionPathConcentrationCap))
 	require.Greater(t, after-before, 0.0, "concentration_cap_reshaped_total must increment when the cap reshapes")
 }
 

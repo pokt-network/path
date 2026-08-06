@@ -157,11 +157,21 @@ curl -X POST http://localhost:3069/v1 \
 **Behavior:**
 - When `Target-Suppliers` header is present, PATH will:
   - Filter available endpoints to only those from the specified suppliers
-  - Skip reputation-based filtering (allows targeting suppliers with low reputation)
+  - Skip **all** reputation-derived filtering — both the score-threshold/cooldown filter and
+    tiered (highest-tier-only) selection. A score-0, fully-cooled-down supplier is reachable.
   - Still apply RPC type filtering (only endpoints supporting the requested RPC type)
+  - Still apply the config `blocked_suppliers` list, the endpoint policy (`require_https` /
+    `require_domain`), and the supplier blacklist (signature/validation failures). None of these
+    are reputation, and the header does not override them.
   - Log filtered supplier list and endpoint counts
 - If none of the specified suppliers are available in the current session, the request will fail
 - Header takes precedence over load testing configuration (if any)
+
+Tiered selection used to run *after* the supplier allowlist, so pinning a supplier whose
+endpoints were all below `min_threshold` returned `no valid endpoints available for service` —
+the header failed exactly when it was most needed, on a supplier you were trying to diagnose.
+Health checks were unaffected throughout (they pass `filterByReputation=false`), which is why a
+dark supplier still shows health-check traffic while serving zero user traffic.
 
 **App-Address** (Delegated Mode Only)
 Specifies the target application address when PATH is running in delegated mode.
@@ -264,6 +274,24 @@ Rebinds land on `path_websocket_rebind_total{trigger="admin"}`, distinct from `r
 - `stall` — the staleness watchdog saw no subscription data past the threshold; escapes the bound **backend URL**.
 - `session_expired` — PATH noticed the bound session had ended while the supplier kept streaming. Without this a connection is stranded outside the session indefinitely: unsigned endpoint→client frames need no session so data keeps flowing, and the staleness watchdog stays quiet *because* it is flowing. Measured at 21% of live connections before the fix. Watch for `Endpoints = 0` with a blank Mean Score but nonzero WS msg/s on the supplier-quality panel — that combination is the tell.
 
+**Idle-connection reaper** (`websocket_idle_timeout`, default `30m`)
+
+A connection that has **never established a subscription** and has **sent no client frame** for the threshold is closed with **1000 (Normal Closure)**. Nothing else reaped it: ping/pong keeps a socket alive for as long as the peer answers, and the staleness watchdog arms only on connections that *have* a subscription — a quiet subscription-less connection was assumed to be a WebSocket JSON-RPC client between requests.
+
+Measured 2026-08-04: five services (`eth-sepolia-testnet` 134 conns, `blast` 40, `sei` 23, `moonbeam` 22, `bera` 22) held **241 connections with zero subscriptions between them**, costing **~1370 rebinds/hour that replayed nothing**. The tell is `path_websocket_rebind_total` high with `path_websocket_subscriptions_replayed_total` at **exactly 0** for the same `service_id` — compare against `eth` (188 rebinds → 182 replays). At the edge these were four WebSocket-only client IPs making no HTTP at all, holding sockets 4-6.5h and receiving ~1.5 KB each.
+
+**The two conditions are ANDed, and each alone is wrong.** Silence alone reaps a subscriber watching a rare event (legitimately quiet for hours). No-subscription alone reaps a WebSocket JSON-RPC client between requests. Neither at once, for half an hour, is neither shape.
+
+Not an endpoint fault, so it **never touches reputation** — the supplier was never asked for anything. Reaps land on `path_websocket_idle_reaped_total{service_id, domain}`, deliberately a separate counter: the shared close path already emits `event="closed"`, and folding reaps in would break established/closed reconciliation, which is the check that separates a gauge leak from real accumulation.
+
+```yaml
+router_config:
+  websocket_idle_timeout: 30m   # negative disables reaping entirely
+```
+```bash
+PATH_WEBSOCKET_IDLE_TIMEOUT=45m   # pod restart instead of a config-map edit
+```
+
 **Circuit Breaker — when to use:**
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved
@@ -296,6 +324,22 @@ PATH_MAX_OPERATOR_SHARE=0.65               # move the cap without a config rollo
 
 **Dry run before changing any of this:** `go test ./qos/selector/ -run Test_ProductionDryRun -v` replays the real pools through the shipped selector and gates on nobody dropped, nobody stranded, nobody allocated past both the cap and their own entitlement.
 
+### Is the cap engaging on WebSocket? Read the `path` label
+
+The cap covers WebSocket selection already — a WS connection reaches it through a QoS type's single-endpoint `Select` (`gateway/websocket_request_context.go` → `qos/*/…Select` → `SelectWithConcentrationCap`), while HTTP reaches it through `SelectMultipleWithArchival` → `SelectEndpointsWithDiversity`. **Do not add a second cap for WebSocket; it is the same cap.**
+
+The two are separable on `path_concentration_cap_reshaped_total{service_id, path}`:
+
+- `path="concentration_cap"` — the **WebSocket** selection path.
+- `path="diversity"` — the HTTP serving pick.
+
+Same `path` vocabulary as `path_selection_pool_size` / `path_selection_selected_total`, so pool composition and reshape counts join on it. Before this label existed the two shared one series, and HTTP — running three to four orders of magnitude more selections per second — completely masked whether the cap ever engaged on a WebSocket selection.
+
+**A near-zero WS series is not proof the cap is broken.** Three things concentrate WebSocket traffic that no cap can touch, and they should be excluded before touching selection:
+1. **A WS connection binds one endpoint for its lifetime.** Selection governs only *new* connections; existing ones move only on rollover / stall / `session_expired` / `POST /admin/websocket/tumble/{svc}`.
+2. **Reputation removes whole operators from the pool before the cap sees it** (`path_reputation_disqualified_total{rpc_type="websocket"}`). The cap water-fills across survivors; it cannot restore what the floor deleted.
+3. **Supply** — some services have only one operator offering WS endpoints at all.
+
 ## Concentration Cap on the Retry / Hedge Paths
 
 The per-operator (eTLD+1) cap governs **primary** selection. Retry, hedge and batch-item picks come from the top-reputation-score band, which was weighted within the band but **not capped by operator** — so an operator holding most of the band took most of the retries and hedges, on the two paths whose entire purpose is to reach different infrastructure than the attempt that just failed.
@@ -316,7 +360,7 @@ PATH_CAP_RETRY_HEDGE_SELECTION=true   # or =false to force off everywhere
 ```
 Unset leaves config in charge. The share value itself is still `max_operator_share`; this key only decides whether the band paths consult it.
 
-**Metric** — a separate counter, not a new label on `path_concentration_cap_reshaped_total`, so the primary path's already-nonzero series stay a valid baseline:
+**Metric** — a separate counter rather than another value in `path_concentration_cap_reshaped_total`'s `path` label, so the primary path's already-nonzero series stay a valid baseline. The two counters keep independent `path` vocabularies: `retry|hedge|batch` here, `diversity|concentration_cap` (HTTP vs WebSocket) there.
 ```
 path_concentration_cap_band_total{service_id, path="retry|hedge|batch", outcome}
 ```

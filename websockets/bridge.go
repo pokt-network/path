@@ -102,6 +102,17 @@ type bridge struct {
 	// swap), so it needs no synchronization.
 	lastEndpointDataAt time.Time
 
+	// lastClientDataAt is the time the client last sent a frame toward the endpoint. The
+	// idle reaper compares it against idleConnectionThreshold to detect a client that
+	// opened a connection and then did nothing with it.
+	//
+	// Client frames only, deliberately. Endpoint→client data is not evidence the client is
+	// using the connection, and pings/pongs are handled below the bridge (connection.go)
+	// and never reach here — which is the point: transport liveness is exactly what an
+	// abandoned socket still has. Mutated only on the start() goroutine (bridge start and
+	// handleClientMessage), so it needs no synchronization.
+	lastClientDataAt time.Time
+
 	// consecutiveStallRebinds counts staleness-triggered rebinds with no intervening
 	// endpoint data. Reset to 0 by any endpoint data frame; when it reaches
 	// maxConsecutiveStallRebinds the bridge stops rebinding and closes the client.
@@ -374,6 +385,20 @@ func (b *bridge) start() {
 
 	// Start the fresh-data clock so the watchdog measures silence from bridge start.
 	b.lastEndpointDataAt = time.Now()
+	// Same for the idle reaper: a client that connects and never speaks is measured from
+	// the moment it connected.
+	b.lastClientDataAt = time.Now()
+
+	// The idle reaper needs the reconnector only to ask whether a subscription exists —
+	// without one, every quiet connection would look reapable, including subscribers.
+	// Nil reconnector (rebind disabled) therefore means no reaping, and idleC stays nil so
+	// its select case blocks forever. Disabled outright by a non-positive threshold.
+	var idleC <-chan time.Time
+	if b.reconnector != nil && idleConnectionThreshold > 0 {
+		ticker := time.NewTicker(idleCheckInterval)
+		defer ticker.Stop()
+		idleC = ticker.C
+	}
 
 	// The staleness watchdog runs only when rebind is enabled (it needs the reconnect
 	// machinery to escape a stalling supplier). When disabled, stalenessC stays nil and
@@ -425,6 +450,12 @@ func (b *bridge) start() {
 		// Runs inline on this goroutine, serialized with everything else.
 		case <-sessionExpiryC:
 			b.checkBoundSessionExpiry()
+
+		// Idle-client check: close a connection that holds no subscription and has sent
+		// nothing for the idle threshold. Runs inline on this goroutine like every other
+		// watchdog, so it cannot race a message or a rebind.
+		case <-idleC:
+			b.checkIdleConnection()
 
 		// Operator-requested rebind onto a different supplier. Only ever selected when
 		// rebind is enabled (tumble is nil otherwise, so this case blocks forever).
@@ -485,6 +516,58 @@ func (b *bridge) checkEndpointStaleness() {
 	// Reuse the standard rebind path; ErrEndpointStalled marks it so the reconnect avoids
 	// the current (stalling) supplier.
 	b.handleEndpointDown(endpointDisconnect{gen: b.endpointGen, err: ErrEndpointStalled})
+}
+
+// checkIdleConnection closes a client that has held the connection open without ever
+// establishing a subscription and without sending a single frame for
+// idleConnectionThreshold.
+//
+// This is the mirror image of checkEndpointStaleness. That one asks "the client wants data
+// — is the supplier delivering?" and rebinds the supplier. This one asks "does the client
+// want anything at all?" and, when the answer is no, closes the client rather than moving
+// it: there is no supplier to blame and nowhere better to put a connection nobody is using.
+//
+// The two conditions are ANDed on purpose, and each alone would be wrong:
+//   - Subscription with no traffic is the normal shape of a subscriber. Closing on silence
+//     alone would reap a client watching a rare event, which is a legitimate and possibly
+//     hours-quiet use of a websocket.
+//   - No subscription is the normal shape of a websocket JSON-RPC client. Closing on that
+//     alone would reap a client between requests.
+//
+// Neither at once, for half an hour, is neither shape.
+//
+// Runs on the start() goroutine, so all state access is unsynchronized.
+func (b *bridge) checkIdleConnection() {
+	// Without a reconnector there is no way to ask whether a subscription exists, and
+	// guessing would reap subscribers. start() already withholds the ticker in that case;
+	// this keeps the method safe if it is ever called directly.
+	if b.reconnector == nil {
+		return
+	}
+
+	// A subscriber is exempt regardless of how quiet it or its endpoint is. If its endpoint
+	// has gone silent that is a stall, and checkEndpointStaleness owns it.
+	if b.reconnector.HasActiveSubscriptions() {
+		return
+	}
+
+	idleFor := time.Since(b.lastClientDataAt)
+	if idleFor < idleConnectionThreshold {
+		return
+	}
+
+	// Report before shutting down: the reporter reads connection state that shutdown tears
+	// down. Optional interface — a reconnector without it just gets no metric.
+	if reporter, ok := b.reconnector.(IdleReporter); ok {
+		reporter.OnIdleTimeout(idleFor)
+	}
+
+	b.logger.Info().
+		Dur("idle_for", idleFor).
+		Dur("idle_threshold", idleConnectionThreshold).
+		Msg("🧹 [WS-IDLE] closing connection: no subscription established and no client frame past the idle threshold")
+
+	b.shutdown(fmt.Errorf("%w: idle for %s with no subscription", ErrBridgeIdleTimeout, idleFor.Round(time.Second)))
 }
 
 // checkBoundSessionExpiry detects a connection still bound to a session that has ended and
@@ -681,6 +764,14 @@ func (b *bridge) determineCloseCodeAndMessage(err error) (int, string) {
 		// Endpoint issues - encourage reconnection (may be temporary)
 		return websocket.CloseServiceRestart, "endpoint temporarily unavailable, please reconnect"
 
+	case errors.Is(err, ErrBridgeIdleTimeout):
+		// Nothing failed. 1000 (Normal Closure) is the honest code: an unused connection
+		// was closed cleanly. Deliberately NOT 1012/1011 — those tell a client to
+		// reconnect, and a client that reconnects into the same idleness just re-creates
+		// the connection this reaped. A client that actually wants the connection will
+		// open a new one when it next has something to say.
+		return websocket.CloseNormalClosure, "idle: no subscription and no activity, closing"
+
 	case errors.Is(err, ErrBridgeMessageProcessingFailed):
 		// Message processing errors - could be transient or client issue
 		return websocket.CloseInternalServerErr, "message processing error occurred"
@@ -708,6 +799,10 @@ func (b *bridge) determineCloseCodeAndMessage(err error) (int, string) {
 // - Message processing errors: shutdown() immediately (application-level failure)
 // - Write errors to endpoint: shutdown() immediately (communication failure)
 func (b *bridge) handleClientMessage(msg message) {
+	// The client spoke, so it is not idle — recorded before processing, since a frame the
+	// processor rejects is still evidence of a client that is using the connection.
+	b.lastClientDataAt = time.Now()
+
 	// Process the message through the client message handler
 	processedData, err := b.websocketMessageProcessor.ProcessClientWebsocketMessage(msg.data)
 	if err != nil {

@@ -1612,6 +1612,28 @@ func (wrc *websocketRequestContext) HasActiveSubscriptions() bool {
 	return wrc.registry != nil && wrc.registry.HasActiveSubscriptions()
 }
 
+// OnIdleTimeout records that the bridge is closing a client for holding no subscription and
+// sending nothing past the idle threshold. Implements websockets.IdleReporter.
+//
+// Records the metric ONLY. Unlike a stall, this carries no signal about the bound endpoint:
+// the supplier was never asked for anything, so there is nothing it could have done wrong.
+// Feeding it into reputation would penalize whichever supplier happened to be holding an
+// abandoned socket — and, since the reaper targets exactly the connections that generate no
+// traffic, would concentrate that penalty on the operators serving the quietest services.
+func (wrc *websocketRequestContext) OnIdleTimeout(idleFor time.Duration) {
+	domain, domainErr := shannonmetrics.ExtractDomainOrHost(wrc.signingEndpoint().PublicURL())
+	if domainErr != nil {
+		domain = shannonmetrics.ErrDomain
+	}
+
+	metrics.RecordWebsocketIdleReaped(domain, string(wrc.serviceID))
+
+	wrc.logger.Info().
+		Str("domain", domain).
+		Dur("idle_for", idleFor).
+		Msg("🧹 [WS-IDLE] idle connection reaped")
+}
+
 // OnEndpointStallDetected records that the staleness watchdog fired, for canary
 // observability. gaveUp=false: forcing a rebind onto a different supplier; gaveUp=true:
 // the endpoint stayed silent across repeated rebinds and the bridge is closing the client.

@@ -50,6 +50,20 @@ const (
 	// concurrent websocket load (Polygon is the primary websocket service).
 	// Set to a negative value in config to disable the limit entirely.
 	defaultMaxConcurrentWebsocketConnections = 10000
+
+	// defaultWebsocketIdleTimeout is how long a websocket connection may hold no
+	// established subscription AND send no client frame before PATH closes it.
+	//
+	// Nothing else reaps such a connection: ping/pong keeps it alive as long as the peer
+	// answers, and the endpoint-staleness watchdog arms only on connections that HAVE a
+	// subscription. It is not free — it stays bound to a supplier and is rebound at every
+	// session rollover, replaying nothing.
+	//
+	// 30 minutes is set to be unreachable by a client that is using the connection, not to
+	// be aggressive: a subscriber is exempt on a different condition entirely, so this only
+	// has to clear a websocket JSON-RPC client's gap between requests.
+	// Set to a negative value in config to disable reaping entirely.
+	defaultWebsocketIdleTimeout = 30 * time.Minute
 )
 
 /* --------------------------------- Router Config Struct -------------------------------- */
@@ -74,6 +88,10 @@ type RouterConfig struct {
 	// MaxRequestBodyBytes caps the size (in bytes) of an HTTP request body PATH
 	// will read into memory. Default: 10MB. A negative value disables the limit.
 	MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
+	// WebsocketIdleTimeout is how long a websocket connection may hold no established
+	// subscription and send no client frame before PATH closes it. Default: 30m. A
+	// negative value disables idle reaping.
+	WebsocketIdleTimeout time.Duration `yaml:"websocket_idle_timeout"`
 }
 
 /* --------------------------------- Router Config Private Helpers -------------------------------- */
@@ -109,6 +127,11 @@ func (c *RouterConfig) hydrateRouterDefaults() error {
 	}
 	if c.MaxRequestBodyBytes == 0 {
 		c.MaxRequestBodyBytes = defaultMaxRequestBodyBytes
+	}
+	// Same convention as the limits above: only an unset (zero) value takes the default,
+	// so a negative value survives hydration as an explicit "disable reaping".
+	if c.WebsocketIdleTimeout == 0 {
+		c.WebsocketIdleTimeout = defaultWebsocketIdleTimeout
 	}
 	if c.SystemOverheadAllowanceDuration >= c.ReadTimeout || c.SystemOverheadAllowanceDuration >= c.WriteTimeout {
 		return fmt.Errorf("system overhead allowance duration %v must be less than read timeout %v and write timeout %v", c.SystemOverheadAllowanceDuration, c.ReadTimeout, c.WriteTimeout)

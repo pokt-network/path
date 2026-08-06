@@ -100,12 +100,23 @@ type requestContext struct {
 	// endpointObservations:
 	//   - Captures observations about endpoints used during request handling.
 	//   - Includes enhanced error classification for raw payload analysis.
-	//   - Thread-safe: collected via channel during parallel relay processing.
+	//   - Guarded by endpointObservationsMu: see recordEndpointObservation.
 	endpointObservations []*protocolobservations.ShannonEndpointObservation
 
-	// observationsChan is used to safely collect endpoint observations from concurrent goroutines.
-	// A collector goroutine reads from this channel and appends to endpointObservations.
-	observationsChan chan *protocolobservations.ShannonEndpointObservation
+	// endpointObservationsMu guards endpointObservations.
+	//
+	// A mutex rather than the previous "collector goroutine + channel" scheme, because the
+	// writers are NOT confined to a single HandleServiceRequest call. A hedge race hands the
+	// SAME requestContext (gateway's rc.protocolContexts[0]) to a goroutine that deliberately
+	// outlives the race by defaultLoserGraceWindow, so the losing branch is still recording an
+	// observation while the request path has moved on and is reading the slice via
+	// GetObservations(). That is a concurrent read/append on one slice header, and it crashed a
+	// production pod with a SIGSEGV inside handleEndpointSuccess.
+	//
+	// The channel could not cover that case: it was created per parallel batch and reset to nil
+	// once the batch drained, so a late writer saw nil and fell through to a bare append. The
+	// nil check itself was racing with that reset.
+	endpointObservationsMu sync.Mutex
 
 	// currentRelayMinerError:
 	//   - Tracks RelayMinerError data from the current relay response for reporting.
@@ -283,8 +294,33 @@ func (rc *requestContext) sendSingleRelay(payload protocol.Payload) (protocol.Re
 //   - handleEndpointSuccess
 //   - handleEndpointError
 //
+// recordEndpointObservation appends an endpoint observation under endpointObservationsMu.
+//
+// Every writer goes through here. Callers can be:
+//   - the single-relay path,
+//   - the parallel batch relay goroutines,
+//   - a hedge race branch that LOST and is still finishing on its detached context, after the
+//     request path has already returned and read the slice.
+//
+// The last one is why this is a mutex and not a per-call channel: the losing branch shares the
+// gateway's protocol context with the reader, so the write can land at any time.
+//
+// Bounded by MaxBatchPayloads so a pathological batch cannot grow the slice without limit; the
+// cap previously lived in the collector goroutine and is preserved here.
+func (rc *requestContext) recordEndpointObservation(obs *protocolobservations.ShannonEndpointObservation) {
+	rc.endpointObservationsMu.Lock()
+	defer rc.endpointObservationsMu.Unlock()
+
+	if maxObs := rc.concurrencyConfig.MaxBatchPayloads; maxObs > 0 && len(rc.endpointObservations) >= maxObs {
+		// Silently drop excess observations (shouldn't happen with batch size limit).
+		return
+	}
+	rc.endpointObservations = append(rc.endpointObservations, obs)
+}
+
 // handleParallelRelayRequests orchestrates parallel relay requests to a single endpoint.
-// Uses pond worker pool for bounded concurrency and channels for thread-safe observation collection.
+// Uses pond worker pool for bounded concurrency; observations are collected under
+// endpointObservationsMu via recordEndpointObservation.
 // This prevents DoS attacks via large batch requests that could spawn unbounded goroutines.
 func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payload) ([]protocol.Response, error) {
 	maxBatchPayloads := rc.concurrencyConfig.MaxBatchPayloads
@@ -296,21 +332,8 @@ func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payloa
 		Int("max_concurrent", maxBatchPayloads).
 		Msg("Starting parallel relay processing with worker pool")
 
-	// Initialize observations channel for thread-safe collection from workers
-	rc.observationsChan = make(chan *protocolobservations.ShannonEndpointObservation, len(payloads))
-
-	// Start collector goroutine to gather observations from workers
-	// Cap at max_batch_payloads since batch size is already limited to that
-	observationsCollected := make(chan struct{})
-	go func() {
-		defer close(observationsCollected)
-		for obs := range rc.observationsChan {
-			if len(rc.endpointObservations) < maxBatchPayloads {
-				rc.endpointObservations = append(rc.endpointObservations, obs)
-			}
-			// Silently drop excess observations (shouldn't happen with batch size limit)
-		}
-	}()
+	// Observations from the relay goroutines are appended under endpointObservationsMu by
+	// recordEndpointObservation, so no collector goroutine is needed here.
 
 	// Create a task group from the shared pool for this batch of requests.
 	// The shared pool bounds global concurrency across all requests.
@@ -348,11 +371,6 @@ func (rc *requestContext) handleParallelRelayRequests(payloads []protocol.Payloa
 	if err != nil {
 		return nil, err
 	}
-
-	// Close observations channel and wait for collector to finish
-	close(rc.observationsChan)
-	<-observationsCollected
-	rc.observationsChan = nil // Reset to nil so single relay mode works normally
 
 	return rc.convertResultsToResponses(results, payloads, rc.findFirstError(results))
 }
@@ -455,6 +473,18 @@ func extractJSONRPCRequestID(payloadData string) string {
 //
 // - Implements gateway.ProtocolRequestContext interface.
 func (rc *requestContext) GetObservations() protocolobservations.Observations {
+	// Snapshot under the mutex rather than handing out the live slice.
+	//
+	// A hedge race's losing branch keeps running for defaultLoserGraceWindow on a detached
+	// context and records its observation through recordEndpointObservation — which can happen
+	// after the request path has returned and called this. Reading the slice header while that
+	// append reallocates is the data race that crashed a pod; passing the live slice to a caller
+	// that outlives the lock would reintroduce it one step later.
+	rc.endpointObservationsMu.Lock()
+	endpointObservations := make([]*protocolobservations.ShannonEndpointObservation, len(rc.endpointObservations))
+	copy(endpointObservations, rc.endpointObservations)
+	rc.endpointObservationsMu.Unlock()
+
 	return protocolobservations.Observations{
 		Shannon: &protocolobservations.ShannonObservationsList{
 			Observations: []*protocolobservations.ShannonRequestObservations{
@@ -463,7 +493,7 @@ func (rc *requestContext) GetObservations() protocolobservations.Observations {
 					RequestError: rc.requestErrorObservation.Load(),
 					ObservationData: &protocolobservations.ShannonRequestObservations_HttpObservations{
 						HttpObservations: &protocolobservations.ShannonHTTPEndpointObservations{
-							EndpointObservations: rc.endpointObservations,
+							EndpointObservations: endpointObservations,
 						},
 					},
 				},
@@ -1236,13 +1266,8 @@ func (rc *requestContext) handleEndpointError(
 		rc.getCurrentRPCType(),           // Use RPC type from request context
 	)
 
-	// Track endpoint error observation for metrics
-	// Use channel if available (parallel processing), otherwise append directly (single relay)
-	if rc.observationsChan != nil {
-		rc.observationsChan <- endpointObs
-	} else {
-		rc.endpointObservations = append(rc.endpointObservations, endpointObs)
-	}
+	// Track endpoint error observation for metrics.
+	rc.recordEndpointObservation(endpointObs)
 
 	// Record reputation signal if reputation service is enabled.
 	// This provides gradual scoring based on error severity.
@@ -1335,13 +1360,8 @@ func (rc *requestContext) handleEndpointSuccess(
 		rc.getCurrentRPCType(),           // Use RPC type from request context
 	)
 
-	// Track endpoint success observation for metrics
-	// Use channel if available (parallel processing), otherwise append directly (single relay)
-	if rc.observationsChan != nil {
-		rc.observationsChan <- endpointObs
-	} else {
-		rc.endpointObservations = append(rc.endpointObservations, endpointObs)
-	}
+	// Track endpoint success observation for metrics.
+	rc.recordEndpointObservation(endpointObs)
 
 	// Record reputation signal if reputation service is enabled.
 	latency := time.Since(endpointQueryTime)

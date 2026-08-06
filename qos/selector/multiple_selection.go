@@ -169,7 +169,7 @@ func SelectEndpointsWithDiversity(
 		// discards this ordering and picks again, so counting a reshape there would inflate
 		// the counter with decisions that never happen.
 		if firstPick.capReshaped && selectionPath == metrics.SelectionPathDiversity {
-			metrics.RecordConcentrationCapReshaped(string(serviceID))
+			metrics.RecordConcentrationCapReshaped(string(serviceID), selectionPath)
 		}
 	}
 

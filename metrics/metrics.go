@@ -699,24 +699,43 @@ var HedgeSelfOperatorAvoidedTotal = promauto.NewCounterVec(
 // exceeded the cap and its excess was water-filled to other operators, or the pool was
 // too concentrated to satisfy the cap and selection fell back to uniform-over-operators.
 // Selections where no operator exceeded the cap (the cap is a no-op) are NOT counted, so a
-// nonzero rate on a service_id is the live signal that the cap is bounding a real
-// concentration — the operational proof the shipped-on default is doing something.
+// nonzero rate is the live signal that the cap is bounding a real concentration — the
+// operational proof the shipped-on default is doing something.
+//
+// The `path` label carries the same SelectionPath* value the pool metrics already report, and
+// it is what separates HTTP from WebSocket engagement:
+//
+//   - path="diversity"         — SelectEndpointsWithDiversity, the HTTP serving pick.
+//   - path="concentration_cap" — SelectWithConcentrationCap, reached only from a QoS type's
+//     single-endpoint Select, whose sole production caller is the WebSocket bridge setup
+//     (gateway/websocket_request_context.go). This is the WebSocket series.
+//
+// Without this split the two collapse into one counter and HTTP, running three to four orders
+// of magnitude more selections per second, completely masks whether the cap ever engages on a
+// WebSocket selection at all. That question came up repeatedly and was unanswerable from the
+// unlabeled counter.
 var ConcentrationCapReshapedTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "concentration_cap_reshaped_total",
-		Help: "Endpoint selections reshaped by the per-operator (eTLD+1) concentration cap, by service_id. Nonzero = the cap is actively bounding a dominant operator's selection share.",
+		Help: "Endpoint selections reshaped by the per-operator (eTLD+1) concentration cap, by service_id and selector path. path=\"concentration_cap\" is the WebSocket selection path; path=\"diversity\" is the HTTP serving pick.",
 	},
-	[]string{LabelServiceID},
+	[]string{LabelServiceID, LabelSelectionPath},
 )
 
 // RecordConcentrationCapReshaped increments the concentration-cap reshape counter for a
 // service. Called once per PRIMARY selection whose distribution the cap actually altered.
 //
-// Deliberately left unlabeled by path: the retry/hedge band paths report through
-// ConcentrationCapBandTotal instead, so this counter's existing per-service series keep their
-// continuity and remain a valid before/after baseline for the primary path.
-func RecordConcentrationCapReshaped(serviceID string) {
-	ConcentrationCapReshapedTotal.WithLabelValues(serviceID).Inc()
+// selectionPath must be one of the SelectionPath* constants, matching the value the same call
+// site passes to RecordSelectionPool — so pool composition and reshape counts can be joined on
+// `path` for the same selection.
+//
+// The retry/hedge band paths do NOT report here; they report through ConcentrationCapBandTotal,
+// which keeps its own separate `path` vocabulary (retry|hedge|batch).
+//
+// NOTE FOR DASHBOARDS: this counter previously had only service_id, so any panel matching its
+// series exactly needs `sum by (service_id)` added. Aggregate queries are unaffected.
+func RecordConcentrationCapReshaped(serviceID, selectionPath string) {
+	ConcentrationCapReshapedTotal.WithLabelValues(serviceID, selectionPath).Inc()
 }
 
 // ConcentrationCapBandTotal counts endpoint picks made from the top-reputation-score band —
@@ -1139,6 +1158,21 @@ var WebsocketConnectionEventsTotal = promauto.NewCounterVec(
 		Help: "WebSocket connection events by domain, service_id, and event type (established/closed/failed).",
 	},
 	[]string{LabelDomain, LabelServiceID, "event"},
+)
+
+// WebsocketIdleReapedTotal counts connections closed by the idle reaper — no subscription
+// ever established and no client frame for the idle threshold.
+//
+// A separate counter rather than another `event` value on WebsocketConnectionEventsTotal:
+// every reap also emits event="closed" there (the close path is shared), so folding it in
+// would double-count closures and break established/closed reconciliation, which is the
+// check that tells a real connection leak from real accumulation.
+var WebsocketIdleReapedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_idle_reaped_total",
+		Help: "WebSocket connections closed for idleness (no subscription, no client traffic) by domain and service_id.",
+	},
+	[]string{LabelDomain, LabelServiceID},
 )
 
 var WebsocketConnectionDuration = promauto.NewHistogramVec(
@@ -1583,6 +1617,13 @@ func MoveWebsocketConnection(oldDomain, newDomain, serviceID string) {
 	}
 	WebsocketConnectionsActive.WithLabelValues(oldDomain, serviceID).Dec()
 	WebsocketConnectionsActive.WithLabelValues(newDomain, serviceID).Inc()
+}
+
+// RecordWebsocketIdleReaped records a connection closed by the idle reaper. The paired
+// event="closed" / duration observation still comes from RecordWebsocketConnectionClosed on
+// the shared close path; this only labels WHY.
+func RecordWebsocketIdleReaped(domain, serviceID string) {
+	WebsocketIdleReapedTotal.WithLabelValues(domain, serviceID).Inc()
 }
 
 // RecordWebsocketConnectionFailed records a WebSocket connection failure
