@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/websockets"
 )
@@ -166,17 +167,45 @@ func (r *websocketConnRegistry) startRateSampler(ctx context.Context) {
 	}()
 }
 
-// sampleRates refreshes every live connection's frames/sec.
+// sampleRates refreshes every live connection's frames/sec, and publishes each connection's
+// rate as a histogram observation.
+//
+// The per-connection observation is the point: path_websocket_messages_total is a per-domain
+// SUM, and a sum cannot tell "one firehose among a hundred idle sockets" apart from "a
+// hundred ordinary subscribers". Emitting here rather than from a separate ticker reuses the
+// pass that already computes the rate, so the distribution can never disagree with the
+// ranking a tumble is spent on.
+//
+// Observations are collected under the lock but recorded after releasing it: a Prometheus
+// histogram takes its own internal lock, and nesting that inside the registry mutex would put
+// an unrelated subsystem on the critical path of every admin tumble and rebind.
 func (r *websocketConnRegistry) sampleRates(now time.Time) {
 	if r == nil {
 		return
 	}
+
+	type rateSample struct {
+		domain    string
+		serviceID string
+		rate      float64
+	}
+	var samples []rateSample
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, svc := range r.conns {
+	for serviceID, svc := range r.conns {
 		for _, entry := range svc {
 			entry.sample(now)
+			samples = append(samples, rateSample{
+				domain:    entry.domain,
+				serviceID: string(serviceID),
+				rate:      entry.rate,
+			})
 		}
+	}
+	r.mu.Unlock()
+
+	for _, s := range samples {
+		metrics.RecordWebsocketConnectionFrameRate(s.domain, s.serviceID, s.rate)
 	}
 }
 

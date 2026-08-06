@@ -1195,6 +1195,36 @@ var WebsocketMessagesTotal = promauto.NewCounterVec(
 	[]string{LabelDomain, LabelServiceID, "direction", LabelReputationSignal},
 )
 
+// WebsocketConnectionFrameRate observes EVERY live connection's endpoint→client frames/sec
+// on each sampler pass, bucketed per service and operator.
+//
+// Why a histogram when path_websocket_messages_total already exists: that counter is a per
+// domain SUM, and a sum cannot distinguish "one firehose plus a hundred idle sockets" from
+// "a hundred ordinary subscribers". Those two have completely different explanations —
+// the first is where a high-volume client happened to land, the second is a property of
+// the operator — and per-operator earnings differ by ~4x fleetwide on exactly that
+// ambiguity. Only the distribution separates them.
+//
+// Both frame directions are reward-eligible under the relay miner (each endpoint→client
+// push is signed and mined paired with the most recent request), so this is closer to a
+// settlement-volume distribution than a traffic one.
+//
+// Idle connections are observed at 0 deliberately. Dropping them would leave the p50
+// describing only the connections that carry traffic, which is precisely the population
+// the metric exists to size against everything else.
+//
+// Buckets span one frame per ten seconds (a newHeads subscription on a slow chain) to
+// thousands per second (a logs/pendingTransactions firehose), with resolution concentrated
+// in 1..500 where the interesting separation lives.
+var WebsocketConnectionFrameRate = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "websocket_connection_frame_rate",
+		Help:    "Per-connection endpoint→client frames/sec, sampled periodically, by domain and service_id. Reveals the DISTRIBUTION that path_websocket_messages_total sums away.",
+		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500},
+	},
+	[]string{LabelDomain, LabelServiceID},
+)
+
 // WebsocketRebindTotal counts websocket session-rebind episodes by outcome.
 // EXPERIMENTAL / canary observability for the session-rebind feature
 // (PATH_WEBSOCKET_SESSION_REBIND). result is one of the WSRebind* labels above:
@@ -1635,6 +1665,13 @@ func RecordWebsocketConnectionFailed(domain, serviceID string) {
 // direction should be WSDirectionClientToEndpoint or WSDirectionEndpointToClient
 func RecordWebsocketMessage(domain, serviceID, direction, reputationSignal string) {
 	WebsocketMessagesTotal.WithLabelValues(domain, serviceID, direction, reputationSignal).Inc()
+}
+
+// RecordWebsocketConnectionFrameRate observes one live connection's current frames/sec.
+// Called once per connection per sampler pass, including for connections currently at
+// zero — see WebsocketConnectionFrameRate for why the zeros are load-bearing.
+func RecordWebsocketConnectionFrameRate(domain, serviceID string, framesPerSec float64) {
+	WebsocketConnectionFrameRate.WithLabelValues(domain, serviceID).Observe(framesPerSec)
 }
 
 // RecordWebsocketRebind records a websocket session-rebind episode outcome and, on
