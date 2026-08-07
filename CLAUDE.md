@@ -323,9 +323,30 @@ curl -X POST "http://localhost:13069/admin/websocket/tumble/gnosis"
 curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=spacebelt.xyz&rpc_type=websocket&duration=0"
 ```
 
-Query parameters: `domain=<eTLD+1>` (**required** — a drain with no domain would bench the
-whole service, which is never what anyone meant to type) · `duration=<go duration>` (default
-`15m`; `0` releases) · `rpc_type=<websocket|json_rpc|rest|…>` (default all) · `dry_run=true`.
+Query parameters: `domain=<eTLD+1|hostname|url>` (**required**, `url=` is an alias — a drain
+with no target would bench the whole service, which is never what anyone meant to type) ·
+`duration=<go duration>` (default `15m`; `0` releases) · `rpc_type=<websocket|json_rpc|rest|…>`
+(default all) · `dry_run=true`.
+
+**Target by URL/domain, never by node id.** The handler resolves the target against live
+endpoint details into *every* identifier a reputation key could carry — full endpoint address,
+supplier address, URL, hostname, eTLD+1 — because key granularity is per-service config. The
+same operator is a hostname on one service and a `pokt1…` supplier address on another. An
+eTLD+1-only filter returns `matched: 0` on a supplier-keyed service while looking like it
+worked; check `identifiers_resolved` and `matched_endpoints` in the response to tell "target
+names nothing" apart from "names endpoints that carry no score yet".
+
+**The bench is an overlay, not a score write.** It lives in `drainedKeys` and is applied when
+scores are read. This is load-bearing: an earlier version wrote `CooldownUntil` onto the Score,
+and `refreshFromStorage` — which overwrites the local cache from Redis unconditionally —
+erased every drain within a refresh cycle while the endpoint still reported `drained=N`.
+**Anything that must outlive a storage refresh cannot live on the score.** Same trap as the
+circuit breaker's `refreshFromRedis`, approached from the other direction.
+
+**The gate is `GetScores` → `IsInCooldown()`** in `protocol/shannon/reputation.go`, not
+`FilterByScore` — that one only compares `Value` against the threshold and ignores cooldown
+entirely. A test asserting on `Score.CooldownUntil` proves nothing about whether selection
+will honour a drain; assert through `GetScores`.
 
 **Not a penalty.** `Value`, `CriticalStrikes` and `RecentCriticalRate` are left untouched, so
 the quality signal stays readable *while* the drain is in effect — which matters, because

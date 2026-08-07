@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -359,11 +361,14 @@ func (r *router) handleReputationDrain(w http.ResponseWriter, req *http.Request)
 
 	query := req.URL.Query()
 
-	// Required rather than defaulted: a drain with no domain would bench the whole
+	// Required rather than defaulted: a drain with no target would bench the whole
 	// service, which is never what anyone meant to type.
-	domain := query.Get("domain")
-	if domain == "" {
-		http.Error(w, `{"error":"domain required: ?domain=<eTLD+1>"}`, http.StatusBadRequest)
+	target := query.Get("domain")
+	if target == "" {
+		target = query.Get("url")
+	}
+	if target == "" {
+		http.Error(w, `{"error":"target required: ?domain=<eTLD+1|hostname|url>"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -379,17 +384,95 @@ func (r *router) handleReputationDrain(w http.ResponseWriter, req *http.Request)
 		duration = parsed
 	}
 
+	// Resolve the human-facing target (an operator domain, hostname, or URL) into the
+	// concrete identifiers a reputation key can carry. This MUST happen here rather than
+	// inside the reputation service: key granularity is per-service config — endpoint
+	// address, URL, domain, or supplier address — so the same operator is a hostname on
+	// one service and a pokt1… supplier address on another, and only the protocol layer
+	// holds the supplier→URL mapping that bridges them.
+	reporter, ok := r.readinessReporter()
+	if !ok {
+		http.Error(w, `{"error":"endpoint details unavailable; cannot resolve target"}`, http.StatusServiceUnavailable)
+		return
+	}
+	details, err := reporter.GetServiceEndpointDetails(protocol.ServiceID(serviceID))
+	if err != nil {
+		http.Error(w, `{"error":"failed to list endpoints for service"}`, http.StatusInternalServerError)
+		return
+	}
+
+	identifiers, matchedEndpoints := resolveDrainIdentifiers(details, target)
+
 	result := r.reputationAdmin.DrainDomain(req.Context(), reputation.DrainRequest{
-		ServiceID: protocol.ServiceID(serviceID),
-		Domain:    domain,
-		Duration:  duration,
-		RPCType:   query.Get("rpc_type"),
-		DryRun:    query.Get("dry_run") == "true",
+		ServiceID:   protocol.ServiceID(serviceID),
+		Identifiers: identifiers,
+		Label:       target,
+		Duration:    duration,
+		RPCType:     query.Get("rpc_type"),
+		DryRun:      query.Get("dry_run") == "true",
 	})
+	result.MatchedEndpoints = matchedEndpoints
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+// resolveDrainIdentifiers maps a human-facing target — an eTLD+1, a hostname, or a full
+// URL — onto every reputation-key identifier the matching endpoints could be keyed under,
+// and reports how many endpoints matched.
+//
+// Every granularity is emitted for each matching endpoint (full address, supplier address,
+// URL, hostname, eTLD+1) rather than trying to detect which one the service uses. Emitting
+// a superset is safe because matching is exact string equality against keys that already
+// belong to the requested service, and it means the drain does not silently bench nothing
+// when a service's granularity is not what the caller assumed — which is exactly how the
+// supplier-address-keyed services defeated an eTLD+1-only filter.
+func resolveDrainIdentifiers(details []protocol.EndpointDetails, target string) ([]string, int) {
+	target = strings.ToLower(strings.TrimSpace(target))
+	// Accept a full URL as the target by reducing it to its host.
+	if u, err := url.Parse(target); err == nil && u.Host != "" {
+		target = strings.ToLower(u.Hostname())
+	}
+
+	set := make(map[string]struct{})
+	matched := 0
+	for _, d := range details {
+		host := ""
+		if u, err := url.Parse(d.URL); err == nil {
+			host = strings.ToLower(u.Hostname())
+		}
+		if host == "" {
+			continue
+		}
+		if host != target && registrableDomain(host) != target {
+			continue
+		}
+		matched++
+		for _, id := range []string{d.Address, d.SupplierAddress, d.URL, host, registrableDomain(host)} {
+			if id != "" {
+				set[id] = struct{}{}
+			}
+		}
+	}
+
+	out := make([]string, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, matched
+}
+
+// registrableDomain returns the last two labels of a host ("rm-01.eu.example.com" →
+// "example.com"). Deliberately the same naive rule the metrics layer uses for the `domain`
+// label, so an operator identified from a dashboard resolves to the same thing here.
+func registrableDomain(host string) string {
+	parts := strings.Split(host, ".")
+	if len(parts) < 2 {
+		return host
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
 }
 
 // handleWebsocketTumble handles POST /admin/websocket/tumble/{serviceId}

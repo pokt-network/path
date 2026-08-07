@@ -11,10 +11,7 @@ import (
 	"github.com/pokt-network/path/protocol"
 )
 
-// drainTestService builds a started service seeded with endpoints across three operators,
-// mirroring the shape that motivated the drain: several backends per operator, one
-// service, one RPC type unless a test says otherwise.
-func drainTestService(t *testing.T) (ReputationService, context.Context) {
+func drainTestService(t *testing.T) (*service, Storage, context.Context) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -28,150 +25,193 @@ func drainTestService(t *testing.T) (ReputationService, context.Context) {
 	require.NoError(t, svc.Start(ctx))
 	t.Cleanup(func() { _ = svc.Stop() })
 
-	return svc, ctx
+	return svc.(*service), store, ctx
 }
 
-func seedScored(t *testing.T, svc ReputationService, ctx context.Context, addr string, rpcType sharedtypes.RPCType) EndpointKey {
+func seedScored(t *testing.T, svc *service, ctx context.Context, addr string, rpcType sharedtypes.RPCType) EndpointKey {
 	t.Helper()
 	key := NewEndpointKey("gnosis", protocol.EndpointAddr(addr), rpcType)
 	require.NoError(t, svc.RecordSignal(ctx, key, NewSuccessSignal(10*time.Millisecond)))
 	return key
 }
 
-func TestDrainDomain_BenchesOnlyTheRequestedOperator(t *testing.T) {
-	svc, ctx := drainTestService(t)
-
-	target := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
-	target2 := seedScored(t, svc, ctx, "https://rm-02.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
-	bystander := seedScored(t, svc, ctx, "https://rm-01.kalorius.tech", sharedtypes.RPCType_WEBSOCKET)
-
-	before, err := svc.GetScore(ctx, target)
+// isBenched asks the question selection actually asks, through the call selection makes.
+//
+// The gate lives in protocol/shannon/reputation.go, which reads scores via GetScores and
+// drops any endpoint whose IsInCooldown() is true. So the contract a drain must satisfy is
+// precisely "GetScores reports this key as in cooldown" — not "the cached Score struct has
+// CooldownUntil set", which is what the original tests asserted and is exactly why they
+// passed while a storage refresh silently erased every bench.
+//
+// Note FilterByScore is NOT the gate: it only compares Value against the threshold and
+// ignores cooldown entirely.
+func isBenched(t *testing.T, svc *service, ctx context.Context, key EndpointKey) bool {
+	t.Helper()
+	scores, err := svc.GetScores(ctx, []EndpointKey{key})
 	require.NoError(t, err)
+	score, ok := scores[key]
+	return ok && score.IsInCooldown()
+}
 
-	res := svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis",
-		Domain:    "spacebelt.xyz",
-		Duration:  15 * time.Minute,
+// THE REGRESSION TEST. The first implementation wrote CooldownUntil onto the Score, and
+// refreshFromStorage overwrites the local cache from storage unconditionally — so every
+// drain silently evaporated on the next refresh tick while the endpoint kept reporting
+// drained=N. Any drain that does not survive this is not a drain.
+func TestDrainDomain_SurvivesStorageRefresh(t *testing.T) {
+	svc, store, ctx := drainTestService(t)
+	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+
+	// Persist the pre-drain score, so a refresh has something to clobber the drain with.
+	pre, err := svc.GetScore(ctx, key)
+	require.NoError(t, err)
+	require.NoError(t, store.Set(ctx, key, pre))
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID:   "gnosis",
+		Identifiers: []string{"https://rm-01.spacebelt.xyz"},
+		Duration:    15 * time.Minute,
 	})
-	require.Equal(t, 2, res.Matched)
-	require.Equal(t, 2, res.Drained)
+	require.True(t, isBenched(t, svc, ctx, key), "endpoint must be benched immediately after draining")
 
-	for _, k := range []EndpointKey{target, target2} {
-		score, err := svc.GetScore(ctx, k)
-		require.NoError(t, err)
-		require.True(t, score.IsInCooldown(), "drained endpoint must be benched")
+	require.NoError(t, svc.refreshFromStorage(ctx))
+
+	require.True(t, isBenched(t, svc, ctx, key),
+		"drain must survive a storage refresh — this is the bug that shipped")
+}
+
+// Ordinary traffic must not wash the bench out either: RecordSignal rewrites the cached
+// Score on every observation, and health checks alone fire constantly.
+func TestDrainDomain_SurvivesRecordSignal(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
+	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID:   "gnosis",
+		Identifiers: []string{"https://rm-01.spacebelt.xyz"},
+		Duration:    15 * time.Minute,
+	})
+
+	for i := 0; i < 25; i++ {
+		require.NoError(t, svc.RecordSignal(ctx, key, NewSuccessSignal(5*time.Millisecond)))
 	}
 
-	// The bystander operator is untouched — a drain is scoped to one operator or it is
-	// not a drain, it is an outage.
-	other, err := svc.GetScore(ctx, bystander)
-	require.NoError(t, err)
-	require.False(t, other.IsInCooldown())
-
-	// Reputation itself must survive the drain: the whole point is to read quality while
-	// an operator is benched, which is impossible if benching rewrites the score.
-	after, err := svc.GetScore(ctx, target)
-	require.NoError(t, err)
-	require.Equal(t, before.Value, after.Value, "drain must not alter score value")
-	require.Equal(t, before.CriticalStrikes, after.CriticalStrikes)
-	require.Equal(t, before.SuccessCount, after.SuccessCount)
+	require.True(t, isBenched(t, svc, ctx, key), "a stream of successes must not lift an admin drain")
 }
 
-func TestDrainDomain_RPCTypeNarrowing(t *testing.T) {
-	svc, ctx := drainTestService(t)
+func TestDrainDomain_ReleaseRestoresSelectability(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
+	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 15 * time.Minute,
+	})
+	require.True(t, isBenched(t, svc, ctx, key))
+
+	res := svc.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 0,
+	})
+	require.Equal(t, 1, res.Released)
+	require.False(t, isBenched(t, svc, ctx, key), "release must return the endpoint to selection")
+}
+
+// A drain must expire on its own — a forgotten bench that never lifts is an outage.
+func TestDrainDomain_ExpiresOnItsOwn(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
+	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+
+	svc.mu.Lock()
+	svc.drainedKeys = map[EndpointKey]time.Time{key: time.Now().Add(-time.Second)}
+	svc.mu.Unlock()
+
+	require.False(t, isBenched(t, svc, ctx, key), "an expired drain must not still bench")
+}
+
+// Releasing must never disturb a cooldown the endpoint earned on its own. With the drain
+// held as an overlay this is true by construction — the drain never wrote to the Score —
+// but it is the property operators rely on, so it is pinned.
+func TestDrainDomain_ReleaseLeavesEarnedCooldownAlone(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
+	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 15 * time.Minute,
+	})
+
+	earned := time.Now().Add(42 * time.Minute)
+	svc.mu.Lock()
+	sc := svc.cache[key]
+	sc.CooldownUntil = earned
+	svc.setScoreLocked(key, sc)
+	svc.mu.Unlock()
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 0,
+	})
+
+	require.True(t, isBenched(t, svc, ctx, key), "an independently earned cooldown must survive a release")
+	got, err := svc.GetScore(ctx, key)
+	require.NoError(t, err)
+	require.WithinDuration(t, earned, got.CooldownUntil, time.Second)
+}
+
+func TestDrainDomain_ScopedToServiceAndRPCType(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
 
 	ws := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
-	jsonRPC := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_JSON_RPC)
+	httpKey := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_JSON_RPC)
+	otherSvc := NewEndpointKey("bsc", "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+	require.NoError(t, svc.RecordSignal(ctx, otherSvc, NewSuccessSignal(time.Millisecond)))
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"},
+		RPCType: "websocket", Duration: 15 * time.Minute,
+	})
+
+	require.True(t, isBenched(t, svc, ctx, ws))
+	require.False(t, isBenched(t, svc, ctx, httpKey), "draining websocket must leave HTTP serving")
+	require.False(t, isBenched(t, svc, ctx, otherSvc), "a drain must not leak across services")
+}
+
+// Identifier matching is exact, so a superset of granularities is safe. This pins that a
+// supplier-address-keyed service is benchable — the case that defeated the eTLD+1 filter
+// in production and returned matched=0 while looking successful.
+func TestDrainDomain_MatchesSupplierAddressGranularity(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
+	supplierKey := seedScored(t, svc, ctx, "pokt1pzdwzgmj9ttfjcmv2r9anwqlajnjzsz6yhzdmn", sharedtypes.RPCType_WEBSOCKET)
 
 	res := svc.DrainDomain(ctx, DrainRequest{
 		ServiceID: "gnosis",
-		Domain:    "spacebelt.xyz",
-		Duration:  15 * time.Minute,
-		RPCType:   "websocket",
+		Identifiers: []string{
+			"spacebelt.xyz", "rm-01.spacebelt.xyz", "https://rm-01.spacebelt.xyz",
+			"pokt1pzdwzgmj9ttfjcmv2r9anwqlajnjzsz6yhzdmn",
+		},
+		Duration: 15 * time.Minute,
 	})
 	require.Equal(t, 1, res.Matched)
-
-	wsScore, err := svc.GetScore(ctx, ws)
-	require.NoError(t, err)
-	require.True(t, wsScore.IsInCooldown())
-
-	// Draining an operator's websocket endpoints must not take its HTTP traffic with it.
-	httpScore, err := svc.GetScore(ctx, jsonRPC)
-	require.NoError(t, err)
-	require.False(t, httpScore.IsInCooldown())
+	require.True(t, isBenched(t, svc, ctx, supplierKey))
 }
 
-func TestDrainDomain_DryRunWritesNothing(t *testing.T) {
-	svc, ctx := drainTestService(t)
+func TestDrainDomain_DryRunChangesNothing(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
 	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
 
 	res := svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis",
-		Domain:    "spacebelt.xyz",
-		Duration:  15 * time.Minute,
-		DryRun:    true,
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"},
+		Duration: 15 * time.Minute, DryRun: true,
 	})
 	require.Equal(t, 1, res.Matched)
-	require.Equal(t, 1, res.Drained, "dry run reports what it would do")
-
-	score, err := svc.GetScore(ctx, key)
-	require.NoError(t, err)
-	require.False(t, score.IsInCooldown(), "dry run must not bench anything")
+	require.Equal(t, 1, res.Drained)
+	require.False(t, isBenched(t, svc, ctx, key), "a dry run must bench nothing")
 }
 
-// A release must lift the drain's own bench and nothing else. If it cleared cooldowns
-// wholesale it would un-bench an endpoint that failed for real while the drain was up —
-// the one outcome nobody running an experiment would intend.
-func TestDrainDomain_ReleaseLeavesEarnedCooldownAlone(t *testing.T) {
-	svc, ctx := drainTestService(t)
+// An empty identifier set must bench nothing rather than everything — a failed resolution
+// upstream must never widen into a service-wide outage.
+func TestDrainDomain_EmptyIdentifiersBenchNothing(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
+	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
 
-	drained := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
-	earned := seedScored(t, svc, ctx, "https://rm-02.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
-
-	svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis",
-		Domain:    "spacebelt.xyz",
-		Duration:  15 * time.Minute,
-	})
-
-	// Simulate the second endpoint earning a real cooldown after the drain landed, which
-	// overwrites the drain's expiry with a different one.
-	realCooldown := time.Now().Add(42 * time.Minute)
-	svcImpl := svc.(*service)
-	svcImpl.mu.Lock()
-	s := svcImpl.cache[earned]
-	s.CooldownUntil = realCooldown
-	svcImpl.setScoreLocked(earned, s)
-	svcImpl.mu.Unlock()
-
-	res := svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis",
-		Domain:    "spacebelt.xyz",
-		Duration:  0,
-	})
-	require.Equal(t, 1, res.Released, "only the untouched drain should be released")
-
-	releasedScore, err := svc.GetScore(ctx, drained)
-	require.NoError(t, err)
-	require.False(t, releasedScore.IsInCooldown(), "drain-applied bench must be lifted")
-
-	keptScore, err := svc.GetScore(ctx, earned)
-	require.NoError(t, err)
-	require.True(t, keptScore.IsInCooldown(), "independently earned cooldown must survive a release")
-	require.WithinDuration(t, realCooldown, keptScore.CooldownUntil, time.Second)
-}
-
-func TestDrainDomain_UnknownDomainReportsWhatExists(t *testing.T) {
-	svc, ctx := drainTestService(t)
-	seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
-
-	res := svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis",
-		Domain:    "typo.example",
-		Duration:  15 * time.Minute,
-	})
+	res := svc.DrainDomain(ctx, DrainRequest{ServiceID: "gnosis", Duration: 15 * time.Minute})
 	require.Equal(t, 0, res.Matched)
-	require.Contains(t, res.DomainsSeen, "spacebelt.xyz",
-		"a typo must surface the real domains rather than look like a successful drain")
-	require.NotEmpty(t, res.UnscoredWarning)
+	require.NotEmpty(t, res.Warning)
+	require.False(t, isBenched(t, svc, ctx, key))
 }

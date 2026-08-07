@@ -288,6 +288,9 @@ func (s *service) GetScore(ctx context.Context, key EndpointKey) (Score, error) 
 
 	s.mu.RLock()
 	score, exists := s.cache[key]
+	if exists {
+		score = s.drainOverlayLocked(key, score)
+	}
 	s.mu.RUnlock()
 
 	if !exists {
@@ -376,7 +379,7 @@ func (s *service) GetScores(ctx context.Context, keys []EndpointKey) (map[Endpoi
 	result := make(map[EndpointKey]Score, len(keys))
 	for _, key := range keys {
 		if score, exists := s.cache[key]; exists {
-			result[key] = score
+			result[key] = s.drainOverlayLocked(key, score)
 		}
 	}
 
@@ -449,6 +452,11 @@ func (s *service) FilterByScore(ctx context.Context, keys []EndpointKey, minThre
 	keyScores := make([]keyScore, len(keys))
 	for i, key := range keys {
 		score, exists := s.cache[key]
+		if exists {
+			// Overlay the admin drain BEFORE the recovery check: a drained endpoint must
+			// not be recovered out of its bench by the same pass that reads it.
+			score = s.drainOverlayLocked(key, score)
+		}
 		keyScores[i] = keyScore{
 			key:          key,
 			score:        score,
