@@ -11,11 +11,15 @@ import (
 )
 
 // fakeController is a websockets.BridgeController that records Tumble calls and can
-// refuse them, standing in for a bridge with a tumble already queued.
+// refuse them, standing in for a bridge with a tumble already queued. It also records
+// Close calls, and can block in Close to stand in for a bridge whose peer never answers
+// the close handshake.
 type fakeController struct {
-	mu     sync.Mutex
-	calls  int
-	refuse bool
+	mu      sync.Mutex
+	calls   int
+	refuse  bool
+	closes  int
+	closeAt chan struct{} // when non-nil, Close blocks until it is closed
 }
 
 func (f *fakeController) Tumble() bool {
@@ -23,6 +27,26 @@ func (f *fakeController) Tumble() bool {
 	defer f.mu.Unlock()
 	f.calls++
 	return !f.refuse
+}
+
+func (f *fakeController) Close(string) {
+	f.mu.Lock()
+	block := f.closeAt
+	f.mu.Unlock()
+
+	if block != nil {
+		<-block
+	}
+
+	f.mu.Lock()
+	f.closes++
+	f.mu.Unlock()
+}
+
+func (f *fakeController) closeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closes
 }
 
 func (f *fakeController) callCount() int {

@@ -212,6 +212,27 @@ func (p *Protocol) TumbleWebsockets(req protocol.WebsocketTumbleRequest) protoco
 	return result
 }
 
+// ShutdownWebsockets closes every live websocket bridge on this pod with a proper close
+// handshake, so a rollout reaches clients as 1012 ("please reconnect") and endpoints as an
+// orderly close, instead of both peers seeing the socket vanish.
+//
+// Must be called on SIGTERM before the HTTP server is shut down: http.Server.Shutdown does
+// not close hijacked connections, and every websocket is hijacked, so nothing else in the
+// termination path touches these.
+//
+// Bounded by ctx — a pod that cannot finish being polite inside its grace period must still
+// exit. Returns the number of connections actually closed.
+func (p *Protocol) ShutdownWebsockets(ctx context.Context, reason string) int {
+	closed := p.wsConnRegistry.shutdownAll(ctx, reason)
+	if closed > 0 {
+		p.logger.With("method", "ShutdownWebsockets").Info().
+			Int("closed", closed).
+			Str("reason", reason).
+			Msg("🔌 closed live websocket connections with a close handshake before exiting")
+	}
+	return closed
+}
+
 // serviceFallback holds the fallback information for a service,
 // including the endpoints and whether to send all traffic to fallback.
 type serviceFallback struct {

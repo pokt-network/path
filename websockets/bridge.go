@@ -148,6 +148,12 @@ type BridgeController interface {
 	// goroutine. Returns false when the bridge cannot tumble (rebind disabled) or a
 	// tumble is already queued for it.
 	Tumble() bool
+
+	// Close tears the bridge down with a proper close handshake on both sides and
+	// blocks until the frames have been written (or their short deadlines expire).
+	// Safe to call from any goroutine and idempotent — the underlying shutdown is
+	// sync.Once guarded, so racing with a self-initiated shutdown is harmless.
+	Close(reason string)
 }
 
 // BridgeAttacher is an optional interface an EndpointReconnector may implement to
@@ -171,6 +177,15 @@ func (b *bridge) Tumble() bool {
 		// A tumble is already queued; a second rebind would be redundant.
 		return false
 	}
+}
+
+// Close implements BridgeController.
+//
+// Routed through the same shutdown() every other teardown uses, so both peers get the
+// close-frame write, the registry deregistration and the observation-channel close in the
+// established order. reason is carried into the close frame's text.
+func (b *bridge) Close(reason string) {
+	b.shutdown(fmt.Errorf("%w: %s", ErrBridgeGatewayShuttingDown, reason))
 }
 
 // handleAdminTumble performs an operator-requested rebind onto a different supplier.
@@ -756,6 +771,13 @@ func (b *bridge) determineCloseCodeAndMessage(err error) (int, string) {
 
 	// Check for specific error types using errors.Is for proper error chain handling
 	switch {
+	case errors.Is(err, ErrBridgeGatewayShuttingDown):
+		// A deploy, not a fault. 1012 is the code that exists for exactly this and tells
+		// the client to come back — which it should, onto a replica that is not
+		// terminating. Distinguishing it from a crash is the entire point: a rollout
+		// previously reached both peers as 1006.
+		return websocket.CloseServiceRestart, "gateway shutting down, please reconnect"
+
 	case errors.Is(err, ErrBridgeContextCanceled):
 		// Expected shutdown - encourage reconnection
 		return websocket.CloseServiceRestart, "service restarting, please reconnect"

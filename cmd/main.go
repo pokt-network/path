@@ -38,6 +38,22 @@ var (
 // the executable to get the full path to the config file.
 const defaultConfigPath = "config/.config.yaml"
 
+// websocketShutdownTimeout bounds the close-handshake sweep over live websocket
+// connections at termination.
+//
+// The sweep runs the closes concurrently, so this is a ceiling on the slowest peer rather
+// than a per-connection cost — five seconds is far past the one-second write deadline on
+// each close frame, and comfortably inside the pod's 30s termination grace period. Being
+// polite must never be the reason a pod gets SIGKILLed, which would produce exactly the
+// abrupt teardown the sweep exists to prevent.
+const websocketShutdownTimeout = 5 * time.Second
+
+// websocketShutdowner is implemented by protocols that hold live websocket bridges and
+// must close them explicitly at termination.
+type websocketShutdowner interface {
+	ShutdownWebsockets(ctx context.Context, reason string) int
+}
+
 func main() {
 	log.Printf(`{"level":"info","message":"PATH 🌿 gateway starting..."}`)
 
@@ -441,6 +457,30 @@ func main() {
 	<-stop
 
 	logger.Info().Msg("Shutting down PATH...")
+
+	// Close live websocket connections FIRST, and with a close handshake.
+	//
+	// server.Shutdown below cannot do this: it explicitly does not close hijacked
+	// connections, and every websocket is hijacked. Without this the process just exits,
+	// every socket dies with its TCP connection, and both peers see an abnormal closure
+	// (1006) — indistinguishable from a crash for the client, and logged as their own
+	// fault by the endpoint. Fleetwide that made every rollout emit a burst of 1006s
+	// across all services within the same second.
+	//
+	// Before backgroundCancel() so the bridges are torn down deliberately rather than
+	// racing a context cancellation that would reach them as a generic failure.
+	//
+	// Its own short budget, well inside the pod's termination grace period: the close
+	// frames are best-effort and a peer that will not answer must not delay exiting.
+	//
+	// Behind an assertion rather than a method on gateway.Protocol: holding live
+	// websocket bridges is a property of the protocol implementation, not of the
+	// interface, and a protocol that holds none needs nothing here.
+	if wsShutdowner, ok := protocol.(websocketShutdowner); ok {
+		wsCtx, wsCancel := context.WithTimeout(context.Background(), websocketShutdownTimeout)
+		wsShutdowner.ShutdownWebsockets(wsCtx, "gateway shutting down")
+		wsCancel()
+	}
 
 	// Cancel background context to stop all background services (pprof, health checks)
 	backgroundCancel()

@@ -48,14 +48,34 @@ func startIdleTestBridge(t *testing.T, reconnector *mockReconnector) *websocket.
 	processor := &mockWebsocketMessageProcessor{}
 	obsChan := make(chan *observation.RequestResponseObservations, 100)
 
+	// Published out of the upgrade handler so cleanup can wait for the bridge goroutine to
+	// actually exit. Without the wait it outlives the test and keeps reading the package
+	// vars that shrinkIdleBounds restores on cleanup — a data race that fails -race for
+	// the whole package. Cleanups run LIFO and shrinkIdleBounds is always called first, so
+	// registering the wait here guarantees it runs before the restore.
+	bridgeDone := make(chan (<-chan struct{}), 1)
+
 	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, err := StartBridge(
+		completion, err := StartBridge(
 			context.Background(), polyzero.NewLogger(), r, w,
 			wsURL(endpoint), http.Header{}, processor, obsChan, reconnector,
 		)
 		c.NoError(err)
+		bridgeDone <- completion
 	}))
 	t.Cleanup(clientServer.Close)
+	t.Cleanup(func() {
+		select {
+		case completion := <-bridgeDone:
+			select {
+			case <-completion:
+			case <-time.After(5 * time.Second):
+				t.Error("bridge goroutine did not exit")
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("bridge never started")
+		}
+	})
 
 	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL(clientServer), nil)
 	c.NoError(err)
