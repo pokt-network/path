@@ -365,3 +365,80 @@ func TestDrainDomain_ReportsPropagationFailure(t *testing.T) {
 	require.Contains(t, res.Warning, "THIS POD ONLY")
 	require.True(t, isBenched(t, pod, ctx, key), "the local bench still applies")
 }
+
+// ---------- Isolation from the scoring system ----------
+
+// A drain must not contaminate the persisted score. If the overlay ever leaked into a
+// write, an operator benched for a 20-minute experiment would carry a real cooldown
+// afterwards — and the reputation record would be a lie about their behaviour.
+func TestDrainDomain_DoesNotContaminateStoredScore(t *testing.T) {
+	svc, store, ctx := drainTestService(t)
+	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+
+	before, err := svc.GetScore(ctx, key)
+	require.NoError(t, err)
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 20 * time.Minute,
+	})
+	require.True(t, isBenched(t, svc, ctx, key))
+
+	// The RAW cached score — not the overlaid read — must be untouched.
+	svc.mu.RLock()
+	raw := svc.cache[key]
+	svc.mu.RUnlock()
+
+	require.True(t, raw.CooldownUntil.IsZero(), "a drain must never write CooldownUntil onto the score")
+	require.Equal(t, before.Value, raw.Value)
+	require.Equal(t, before.CriticalStrikes, raw.CriticalStrikes)
+	require.Equal(t, before.RateCooldownCount, raw.RateCooldownCount)
+
+	// And nothing benched may reach persistence either. The drain queues no score write at
+	// all now, so whatever is stored came from ordinary signal recording.
+	if stored, storeErr := store.Get(ctx, key); storeErr == nil {
+		require.True(t, stored.CooldownUntil.IsZero(), "the drain must not be persisted onto the score")
+	}
+}
+
+// The rate-cooldown escalation ladder keys off the PREVIOUS CooldownUntil: each
+// consecutive trip benches for longer. If a drain were visible to it, benching an operator
+// for an experiment would silently escalate their next real cooldown — punishing them for
+// something we did.
+func TestDrainDomain_DoesNotEscalateRateCooldown(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
+	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 20 * time.Minute,
+	})
+
+	for i := 0; i < 20; i++ {
+		require.NoError(t, svc.RecordSignal(ctx, key, NewSuccessSignal(time.Millisecond)))
+	}
+
+	svc.mu.RLock()
+	raw := svc.cache[key]
+	svc.mu.RUnlock()
+
+	require.Zero(t, raw.RateCooldownCount, "a drain must be invisible to the escalation ladder")
+	require.True(t, raw.CooldownUntil.IsZero())
+}
+
+// Recovery resets the Score. It must neither lift the drain nor be lifted by it.
+func TestDrainDomain_UnaffectedByScoreRecovery(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
+	key := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 20 * time.Minute,
+	})
+
+	svc.recoverScore(ctx, key)
+
+	require.True(t, isBenched(t, svc, ctx, key), "recovering the score must not lift an admin drain")
+
+	svc.mu.RLock()
+	raw := svc.cache[key]
+	svc.mu.RUnlock()
+	require.True(t, raw.CooldownUntil.IsZero(), "recovery must not pick up the overlay either")
+}
