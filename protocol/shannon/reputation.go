@@ -111,15 +111,25 @@ func (p *Protocol) filterByReputation(
 		rpcTypeStr := strings.ToLower(rpcType.String())
 		kept := cached[:0:0]
 		drained := 0
+		// NO exemption for requestedEndpointAddr here, deliberately — every other filter in
+		// this function grants one, and granting it to drains defeated them entirely.
+		//
+		// A websocket rebind passes the endpoint it is ALREADY bound to as preferredAddr
+		// (ReconnectEndpoint in websocket_context.go), and a connection re-selects at every
+		// session rollover. So the exemption fired on precisely the connections a drain
+		// exists to move: each rollover re-picked the drained endpoint because it was
+		// "preferred". Measured in production 2026-08-07 — drain applied fleet-wide, every
+		// connection tumbled, path_endpoints_drained reporting 170 benched, and four
+		// minutes later the drained operator still served 73% of the service's frames.
+		//
+		// Sticky placement is what a drain overrides; it cannot also be what protects an
+		// endpoint from one. The pool-empty branch below is the real safety net, and it is
+		// sufficient: an endpoint is only kept when dropping it would leave nothing.
 		for _, ak := range cached {
-			// The pre-selected endpoint keeps its usual escape hatch: dropping it here would
-			// fail the request outright rather than route it elsewhere.
-			if ak.addr != requestedEndpointAddr {
-				if domain, domainErr := shannonmetrics.ExtractDomainOrHost(ak.ep.GetURL(rpcType)); domainErr == nil &&
-					p.reputationService.IsDomainDrained(serviceID, domain, rpcTypeStr) {
-					drained++
-					continue
-				}
+			if domain, domainErr := shannonmetrics.ExtractDomainOrHost(ak.ep.GetURL(rpcType)); domainErr == nil &&
+				p.reputationService.IsDomainDrained(serviceID, domain, rpcTypeStr) {
+				drained++
+				continue
 			}
 			kept = append(kept, ak)
 		}

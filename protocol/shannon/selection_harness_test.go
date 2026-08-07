@@ -140,6 +140,41 @@ func (s *selectionScenario) Survivors(rpcType sharedtypes.RPCType) []string {
 	return out
 }
 
+// SurvivorsPreferring is Survivors for the callers that pass a preferred endpoint —
+// which is every websocket path. Bridge setup passes selectedEndpointAddr and, critically,
+// a rebind passes preferredAddr: the endpoint the connection is ALREADY bound to.
+//
+// Survivors' hardcoded "" is why three drain tests passed while production kept serving a
+// drained operator. A websocket connection re-selects on every session rollover, so the
+// preferred-endpoint path is the one that decides whether a drain ever takes effect on the
+// traffic that matters — and it was the one path no test called.
+func (s *selectionScenario) SurvivorsPreferring(rpcType sharedtypes.RPCType, preferredURL string) []string {
+	s.t.Helper()
+	preferred := protocol.EndpointAddr(s.supplierOf[preferredURL] + "-" + preferredURL)
+	filtered := s.p.filterByReputation(
+		s.ctx, s.serviceID, s.endpointMap(), rpcType, polyzero.NewLogger(), preferred,
+	)
+	out := make([]string, 0, len(filtered))
+	for _, ep := range filtered {
+		out = append(out, ep.GetURL(rpcType))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// AssertExcludedPreferring fails unless the drained URL is absent even when it is the
+// endpoint the caller would prefer to keep.
+func (s *selectionScenario) AssertExcludedPreferring(rpcType sharedtypes.RPCType, preferredURL string, unwanted ...string) {
+	s.t.Helper()
+	got := s.SurvivorsPreferring(rpcType, preferredURL)
+	for _, u := range unwanted {
+		require.NotContains(s.t, got, u,
+			"%s must not be selectable for %s even when preferred — a websocket rebind always "+
+				"prefers where it already is, so an exemption there means the drain never applies",
+			u, rpcTypeName(rpcType))
+	}
+}
+
 // AssertServes fails unless selection returns exactly the given URLs.
 func (s *selectionScenario) AssertServes(rpcType sharedtypes.RPCType, want ...string) {
 	s.t.Helper()
@@ -232,6 +267,46 @@ func TestSelection_DrainRemovesOperatorFromTheReturnedSet(t *testing.T) {
 	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
 	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA, spacebeltB)
 	s.AssertSelectable(sharedtypes.RPCType_WEBSOCKET, rpcgateA, kaloriusA)
+}
+
+// BUG 4 — the drain exempted requestedEndpointAddr, and every websocket path supplies one.
+//
+// A websocket rebind passes the endpoint it is ALREADY bound to as preferredAddr
+// (websocket_context.go, ReconnectEndpoint). The exemption therefore fired on exactly the
+// connections a drain is meant to move: each rollover re-selected the drained endpoint
+// because it was "preferred", and a connection re-selects every session.
+//
+// Measured in production 2026-08-07: drain applied fleet-wide with path_endpoints_drained
+// reporting 170 endpoints benched, all connections tumbled, and four minutes later the
+// drained operator still served 73% of the service's websocket frames.
+//
+// The three earlier drain tests all passed because Survivors() hardcodes "" — the one call
+// shape the websocket path never uses.
+func TestSelection_DrainAppliesEvenToThePreferredEndpoint(t *testing.T) {
+	s := newSelectionScenario(t, "gnosis", spacebeltA, spacebeltB, rpcgateA, kaloriusA)
+
+	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+
+	// A rebind on a connection currently bound to spacebeltA prefers spacebeltA.
+	s.AssertExcludedPreferring(sharedtypes.RPCType_WEBSOCKET, spacebeltA, spacebeltA, spacebeltB)
+
+	// ...and still has somewhere to go.
+	got := s.SurvivorsPreferring(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+	require.Contains(t, got, rpcgateA)
+	require.Contains(t, got, kaloriusA)
+}
+
+// The pool-empty guard is what keeps the above from being an outage: when the preferred
+// endpoint is the ONLY thing left, yielding is correct — a bench is an operator preference,
+// not a correctness constraint.
+func TestSelection_PreferredEndpointSurvivesWhenItIsAllThatRemains(t *testing.T) {
+	s := newSelectionScenario(t, "gnosis", spacebeltA)
+
+	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+
+	require.Equal(t, []string{spacebeltA},
+		s.SurvivorsPreferring(sharedtypes.RPCType_WEBSOCKET, spacebeltA),
+		"a drain must never empty the pool, even against the preferred endpoint")
 }
 
 // BUG 2 — the bench was a snapshot of EndpointKeys, so a session rollover silently lifted it.
