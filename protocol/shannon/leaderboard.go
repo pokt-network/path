@@ -2,6 +2,7 @@ package shannon
 
 import (
 	"context"
+	"strings"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
@@ -418,7 +419,7 @@ func (p *Protocol) GetCooldownCountData(ctx context.Context) ([]metrics.Cooldown
 	// Counts only cooldowns the endpoint EARNED. Drains are reported separately by
 	// GetDrainedCountData so a bench we applied on purpose never reads as a fault.
 	return p.countBenchedEndpoints(ctx, "GetCooldownCountData",
-		func(_ reputation.EndpointKey, score reputation.Score) bool {
+		func(_ reputation.EndpointKey, score reputation.Score, _ string, _ sharedtypes.RPCType) bool {
 			return score.IsInCooldown()
 		})
 }
@@ -432,8 +433,8 @@ func (p *Protocol) GetCooldownCountData(ctx context.Context) ([]metrics.Cooldown
 // as a cooldown would corrupt the very signal it exists to produce.
 func (p *Protocol) GetDrainedCountData(ctx context.Context) ([]metrics.CooldownCountEntry, error) {
 	return p.countBenchedEndpoints(ctx, "GetDrainedCountData",
-		func(key reputation.EndpointKey, _ reputation.Score) bool {
-			return p.reputationService.IsDrained(ctx, key)
+		func(key reputation.EndpointKey, _ reputation.Score, domain string, rpcType sharedtypes.RPCType) bool {
+			return p.reputationService.IsDomainDrained(key.ServiceID, domain, strings.ToLower(rpcType.String()))
 		})
 }
 
@@ -443,7 +444,7 @@ func (p *Protocol) GetDrainedCountData(ctx context.Context) ([]metrics.CooldownC
 func (p *Protocol) countBenchedEndpoints(
 	ctx context.Context,
 	method string,
-	include func(reputation.EndpointKey, reputation.Score) bool,
+	include func(reputation.EndpointKey, reputation.Score, string, sharedtypes.RPCType) bool,
 ) ([]metrics.CooldownCountEntry, error) {
 	logger := p.logger.With("method", method)
 
@@ -480,25 +481,26 @@ func (p *Protocol) countBenchedEndpoints(
 			}
 
 			for endpointAddr, ep := range endpoints {
-				keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
-				key := keyBuilder.BuildKey(serviceID, endpointAddr, actualRPCType)
-				// GetScoreRaw, NOT GetScore: the drain overlay makes GetScore report a
-				// benched endpoint as in cooldown, which would fold deliberate drains into
-				// the fault metric and make every drain look like a quality incident.
-				score, scoreErr := p.reputationService.GetScoreRaw(ctx, key)
-				if scoreErr != nil {
-					// No score recorded → can't be benched. Skip silently.
-					continue
-				}
-				if !include(key, score) {
-					continue
-				}
-
 				endpointURL := ep.GetURL(actualRPCType)
 				domain, domainErr := shannonmetrics.ExtractDomainOrHost(endpointURL)
 				if domainErr != nil {
 					domain = shannonmetrics.ErrDomain
 				}
+
+				// Resolved before the include check because a drain is matched on DOMAIN,
+				// not on a reputation key — an unscored endpoint at a drained operator is
+				// still benched, so it must still be counted.
+				keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+				key := keyBuilder.BuildKey(serviceID, endpointAddr, actualRPCType)
+				// A drain never writes to the Score, so this reports only cooldowns the
+				// endpoint EARNED. Drains are counted separately by GetDrainedCountData,
+				// keeping a deliberate bench from reading as a quality incident.
+				score, _ := p.reputationService.GetScore(ctx, key)
+
+				if !include(key, score, domain, actualRPCType) {
+					continue
+				}
+
 				k := groupKey{
 					Domain:    domain,
 					ServiceID: string(serviceID),

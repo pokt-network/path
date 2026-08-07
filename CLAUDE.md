@@ -381,7 +381,7 @@ every drain read as a quality incident on the dashboards the drain exists to let
 and would eventually page someone over a bench we applied ourselves. Selection excludes both;
 only reporting distinguishes them.
 
-**It cannot be forgotten.** `duration` is capped at **2h** (rejected, not clamped — silently
+**It cannot be forgotten.** `duration` is capped at **5h** (rejected, not clamped — silently
 shortening a drain is worse than saying no), the shared key carries a TTL past its longest
 drain, and expired entries are filtered on read and reaped. There is no way to bench an
 operator indefinitely through this endpoint. Re-issue to extend.

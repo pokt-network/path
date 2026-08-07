@@ -17,57 +17,45 @@ func drainTestEndpoints() []protocol.EndpointDetails {
 	}
 }
 
-// An operator is named by its eTLD+1 on a dashboard, so that must be the accepted input —
-// requiring node ids is what made the endpoint unusable in practice.
-func TestResolveDrainIdentifiers_ByOperatorDomain(t *testing.T) {
-	ids, matched := resolveDrainIdentifiers(drainTestEndpoints(), "spacebelt.xyz")
+// An operator is named by its eTLD+1 on a dashboard, so that must be the accepted input.
+func TestResolveDrainDomain_ByOperatorDomain(t *testing.T) {
+	domain, matched := resolveDrainDomain(drainTestEndpoints(), "spacebelt.xyz")
 
+	require.Equal(t, "spacebelt.xyz", domain)
 	require.Equal(t, 2, matched, "both spacebelt backends must resolve")
-	require.Subset(t, ids, []string{
-		"pokt1aaa", "pokt1bbb",
-		"https://f019.spacebelt.xyz", "https://f026.spacebelt.xyz",
-		"f019.spacebelt.xyz", "f026.spacebelt.xyz",
-		"spacebelt.xyz",
-		"pokt1aaa-https://f019.spacebelt.xyz",
-	}, "every granularity a reputation key could use must be emitted")
-
-	// Nothing belonging to another operator may leak in.
-	for _, id := range ids {
-		require.NotContains(t, id, "rpcgate")
-		require.NotContains(t, id, "kalorius")
-		require.NotEqual(t, "pokt1ccc", id)
-		require.NotEqual(t, "pokt1ddd", id)
-	}
 }
 
-func TestResolveDrainIdentifiers_BySingleHostname(t *testing.T) {
-	ids, matched := resolveDrainIdentifiers(drainTestEndpoints(), "f019.spacebelt.xyz")
+// A hostname must still bench the whole OPERATOR, not just that machine. Benching one
+// hostname would be defeated the moment a session rotated in a sibling machine — the same
+// class of bug as keying the drain on endpoint addresses.
+func TestResolveDrainDomain_HostnameBenchesTheOperator(t *testing.T) {
+	domain, matched := resolveDrainDomain(drainTestEndpoints(), "f019.spacebelt.xyz")
 
-	require.Equal(t, 1, matched, "a hostname must select exactly one backend")
-	require.Contains(t, ids, "pokt1aaa")
-	require.NotContains(t, ids, "pokt1bbb", "a sibling backend must not be dragged in")
+	require.Equal(t, "spacebelt.xyz", domain,
+		"a hostname must widen to the operator, or a rotation defeats the drain")
+	require.Equal(t, 1, matched)
 }
 
-func TestResolveDrainIdentifiers_ByFullURL(t *testing.T) {
-	ids, matched := resolveDrainIdentifiers(drainTestEndpoints(), "https://r001.rpcgate.xyz/some/path")
+func TestResolveDrainDomain_ByFullURL(t *testing.T) {
+	domain, matched := resolveDrainDomain(drainTestEndpoints(), "https://r001.rpcgate.xyz/some/path")
 
-	require.Equal(t, 1, matched, "a full URL must reduce to its host")
-	require.Contains(t, ids, "pokt1ccc")
+	require.Equal(t, "rpcgate.xyz", domain, "a full URL must reduce to its operator domain")
+	require.Equal(t, 1, matched)
 }
 
-// A target naming nothing must produce an empty set, so the drain benches nothing rather
-// than falling back to something broader.
-func TestResolveDrainIdentifiers_UnknownTargetResolvesToNothing(t *testing.T) {
-	ids, matched := resolveDrainIdentifiers(drainTestEndpoints(), "typo.example")
+// A target naming nothing resolves to no domain here; the handler then falls back to the
+// literal registrable domain so the drain still applies to endpoints that rotate in later.
+func TestResolveDrainDomain_UnknownTarget(t *testing.T) {
+	domain, matched := resolveDrainDomain(drainTestEndpoints(), "typo.example")
 
 	require.Zero(t, matched)
-	require.Empty(t, ids)
+	require.Empty(t, domain)
 }
 
-func TestResolveDrainIdentifiers_CaseInsensitive(t *testing.T) {
-	ids, matched := resolveDrainIdentifiers(drainTestEndpoints(), "SpaceBelt.XYZ")
+func TestResolveDrainDomain_CaseInsensitive(t *testing.T) {
+	domain, matched := resolveDrainDomain(drainTestEndpoints(), "SpaceBelt.XYZ")
+	require.Equal(t, "spacebelt.xyz", domain)
 	require.Equal(t, 2, matched)
-	require.Contains(t, ids, "pokt1aaa")
 }
 
 func TestRegistrableDomain(t *testing.T) {

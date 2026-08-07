@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -332,7 +331,11 @@ const (
 	// tracking. Bounding it here means the worst case of "set a drain, got distracted" is
 	// self-healing: paired with the TTL on the shared drains key, there is no way to bench
 	// an operator permanently through this endpoint. Re-issue to extend.
-	maxDrainDuration = 2 * time.Hour
+	//
+	// 5h covers a working session without re-issuing. It is deliberately still bounded: a
+	// ban meant to outlive a shift belongs in config, where it is reviewable and survives a
+	// restart, rather than in an admin call nobody can see after the fact.
+	maxDrainDuration = 5 * time.Hour
 )
 
 // handleReputationDrain handles POST /admin/reputation/drain/{serviceId}
@@ -422,15 +425,20 @@ func (r *router) handleReputationDrain(w http.ResponseWriter, req *http.Request)
 		return
 	}
 
-	identifiers, matchedEndpoints := resolveDrainIdentifiers(details, target)
+	// Normalize whatever was typed — eTLD+1, hostname, or full URL — to the registrable
+	// domain the drain is keyed on, and report how many live endpoints it names so a typo
+	// is visible rather than silently benching nothing.
+	domain, matchedEndpoints := resolveDrainDomain(details, target)
+	if domain == "" {
+		domain = registrableDomain(strings.ToLower(strings.TrimSpace(target)))
+	}
 
 	result := r.reputationAdmin.DrainDomain(req.Context(), reputation.DrainRequest{
-		ServiceID:   protocol.ServiceID(serviceID),
-		Identifiers: identifiers,
-		Label:       target,
-		Duration:    duration,
-		RPCType:     query.Get("rpc_type"),
-		DryRun:      query.Get("dry_run") == "true",
+		ServiceID: protocol.ServiceID(serviceID),
+		Domain:    domain,
+		Duration:  duration,
+		RPCType:   query.Get("rpc_type"),
+		DryRun:    query.Get("dry_run") == "true",
 	})
 	result.MatchedEndpoints = matchedEndpoints
 
@@ -449,14 +457,14 @@ func (r *router) handleReputationDrain(w http.ResponseWriter, req *http.Request)
 // belong to the requested service, and it means the drain does not silently bench nothing
 // when a service's granularity is not what the caller assumed — which is exactly how the
 // supplier-address-keyed services defeated an eTLD+1-only filter.
-func resolveDrainIdentifiers(details []protocol.EndpointDetails, target string) ([]string, int) {
+func resolveDrainDomain(details []protocol.EndpointDetails, target string) (string, int) {
 	target = strings.ToLower(strings.TrimSpace(target))
 	// Accept a full URL as the target by reducing it to its host.
 	if u, err := url.Parse(target); err == nil && u.Host != "" {
 		target = strings.ToLower(u.Hostname())
 	}
 
-	set := make(map[string]struct{})
+	domain := ""
 	matched := 0
 	for _, d := range details {
 		host := ""
@@ -466,23 +474,17 @@ func resolveDrainIdentifiers(details []protocol.EndpointDetails, target string) 
 		if host == "" {
 			continue
 		}
-		if host != target && registrableDomain(host) != target {
+		reg := registrableDomain(host)
+		// Accept either an exact hostname or the operator domain, but always bench the
+		// OPERATOR: a drain that covered one hostname would be defeated the moment the
+		// session rotated in a sibling machine at the same operator.
+		if host != target && reg != target {
 			continue
 		}
+		domain = reg
 		matched++
-		for _, id := range []string{d.Address, d.SupplierAddress, d.URL, host, registrableDomain(host)} {
-			if id != "" {
-				set[id] = struct{}{}
-			}
-		}
 	}
-
-	out := make([]string, 0, len(set))
-	for id := range set {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out, matched
+	return domain, matched
 }
 
 // registrableDomain returns the last two labels of a host ("rm-01.eu.example.com" →

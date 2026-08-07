@@ -554,6 +554,30 @@ func (r *RedisStorage) drainsHashKey() string {
 	return r.keyPrefix + "__drains__"
 }
 
+// drainField encodes a DrainKey as a hash field: "serviceID|domain|rpcType".
+//
+// Pipe-delimited because none of the three components can contain one — a service ID and an
+// eTLD+1 are both restricted character sets, and rpcType is a fixed vocabulary. Using ":"
+// (as endpoint keys do) would be ambiguous against URLs, which is what forced the endpoint
+// key parser into its first-colon/last-colon dance.
+func drainField(key reputation.DrainKey) string {
+	return string(key.ServiceID) + "|" + key.Domain + "|" + key.RPCType
+}
+
+// parseDrainField is the inverse of drainField. An empty rpcType (drain covering every RPC
+// type) round-trips as a trailing empty segment.
+func parseDrainField(field string) (reputation.DrainKey, bool) {
+	parts := strings.Split(field, "|")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+		return reputation.DrainKey{}, false
+	}
+	return reputation.DrainKey{
+		ServiceID: protocol.ServiceID(parts[0]),
+		Domain:    parts[1],
+		RPCType:   parts[2],
+	}, true
+}
+
 // drainsHashTTLMargin is how long the drains hash outlives its longest drain. The margin
 // exists so the key is never reaped while a drain is still meant to be in force, with
 // room for clock skew between replicas.
@@ -568,8 +592,8 @@ const drainsHashTTLMargin = 10 * time.Minute
 //
 // GT semantics: the TTL is only ever EXTENDED, never shortened, so writing a short drain
 // cannot cut short a longer one already recorded in the same hash.
-func (r *RedisStorage) SetDrain(ctx context.Context, key reputation.EndpointKey, until time.Time) error {
-	if err := r.client.HSet(ctx, r.drainsHashKey(), key.String(), until.UTC().Format(time.RFC3339)).Err(); err != nil {
+func (r *RedisStorage) SetDrain(ctx context.Context, key reputation.DrainKey, until time.Time) error {
+	if err := r.client.HSet(ctx, r.drainsHashKey(), drainField(key), until.UTC().Format(time.RFC3339)).Err(); err != nil {
 		return fmt.Errorf("failed to set drain in Redis: %w", err)
 	}
 
@@ -583,8 +607,8 @@ func (r *RedisStorage) SetDrain(ctx context.Context, key reputation.EndpointKey,
 }
 
 // DeleteDrain lifts an admin drain across the fleet.
-func (r *RedisStorage) DeleteDrain(ctx context.Context, key reputation.EndpointKey) error {
-	if err := r.client.HDel(ctx, r.drainsHashKey(), key.String()).Err(); err != nil {
+func (r *RedisStorage) DeleteDrain(ctx context.Context, key reputation.DrainKey) error {
+	if err := r.client.HDel(ctx, r.drainsHashKey(), drainField(key)).Err(); err != nil {
 		return fmt.Errorf("failed to delete drain from Redis: %w", err)
 	}
 	return nil
@@ -595,14 +619,14 @@ func (r *RedisStorage) DeleteDrain(ctx context.Context, key reputation.EndpointK
 // Expired fields are also deleted opportunistically. Redis cannot TTL individual hash
 // fields, so without this the hash would accumulate every drain ever applied — and a
 // forgotten drain must not become a permanent bench if a replica ever misreads the clock.
-func (r *RedisStorage) ListDrains(ctx context.Context) (map[reputation.EndpointKey]time.Time, error) {
+func (r *RedisStorage) ListDrains(ctx context.Context) (map[reputation.DrainKey]time.Time, error) {
 	raw, err := r.client.HGetAll(ctx, r.drainsHashKey()).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read drains from Redis: %w", err)
 	}
 
 	now := time.Now()
-	drains := make(map[reputation.EndpointKey]time.Time, len(raw))
+	drains := make(map[reputation.DrainKey]time.Time, len(raw))
 	var expired []string
 
 	for field, val := range raw {
@@ -617,7 +641,7 @@ func (r *RedisStorage) ListDrains(ctx context.Context) (map[reputation.EndpointK
 			expired = append(expired, field)
 			continue
 		}
-		key, ok := r.parseKey(r.keyPrefix + field)
+		key, ok := parseDrainField(field)
 		if !ok {
 			expired = append(expired, field)
 			continue

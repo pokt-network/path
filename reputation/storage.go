@@ -81,15 +81,15 @@ type Storage interface {
 	// Storing them here (rather than only in pod memory) is what makes one admin call apply
 	// fleet-wide: every replica picks the drain up on its next refresh, instead of the
 	// operator having to hit all N pods.
-	SetDrain(ctx context.Context, key EndpointKey, until time.Time) error
+	SetDrain(ctx context.Context, key DrainKey, until time.Time) error
 
 	// DeleteDrain lifts an admin drain. Removing it from shared storage is what propagates
 	// a release to the other replicas.
-	DeleteDrain(ctx context.Context, key EndpointKey) error
+	DeleteDrain(ctx context.Context, key DrainKey) error
 
 	// ListDrains returns every live admin drain. Expired entries are filtered out by the
 	// implementation, so callers can treat the result as currently-in-force.
-	ListDrains(ctx context.Context) (map[EndpointKey]time.Time, error)
+	ListDrains(ctx context.Context) (map[DrainKey]time.Time, error)
 
 	Close() error
 }

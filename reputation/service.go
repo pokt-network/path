@@ -51,10 +51,11 @@ type service struct {
 	// (ArchivalExpiresAt) is still checked at read time in GetArchivalEndpoints.
 	archivalIndex map[protocol.ServiceID]map[EndpointKey]struct{}
 
-	// drainedKeys records the cooldown expiry that an admin drain wrote for a key, so a
-	// later release can lift ONLY what the drain benched and leave a genuinely earned
-	// cooldown in place. Guarded by mu. See DrainDomain.
-	drainedKeys map[EndpointKey]time.Time
+	// drainedDomains holds admin drains as PREDICATES — (service, domain, rpc_type) →
+	// expiry — rather than as resolved endpoint keys. Sessions rotate their supplier set
+	// every rollover, so a bench resolved to concrete keys goes stale within ~20 minutes
+	// while still appearing active. Guarded by mu. See DrainDomain.
+	drainedDomains map[DrainKey]time.Time
 
 	// Async write handling
 	writeCh   chan writeRequest
@@ -288,9 +289,6 @@ func (s *service) GetScore(ctx context.Context, key EndpointKey) (Score, error) 
 
 	s.mu.RLock()
 	score, exists := s.cache[key]
-	if exists {
-		score = s.drainOverlayLocked(key, score)
-	}
 	s.mu.RUnlock()
 
 	if !exists {
@@ -379,7 +377,7 @@ func (s *service) GetScores(ctx context.Context, keys []EndpointKey) (map[Endpoi
 	result := make(map[EndpointKey]Score, len(keys))
 	for _, key := range keys {
 		if score, exists := s.cache[key]; exists {
-			result[key] = s.drainOverlayLocked(key, score)
+			result[key] = score
 		}
 	}
 
@@ -452,11 +450,6 @@ func (s *service) FilterByScore(ctx context.Context, keys []EndpointKey, minThre
 	keyScores := make([]keyScore, len(keys))
 	for i, key := range keys {
 		score, exists := s.cache[key]
-		if exists {
-			// Overlay the admin drain BEFORE the recovery check: a drained endpoint must
-			// not be recovered out of its bench by the same pass that reads it.
-			score = s.drainOverlayLocked(key, score)
-		}
 		keyScores[i] = keyScore{
 			key:          key,
 			score:        score,
@@ -837,27 +830,6 @@ func (s *service) refreshFromStorage(ctx context.Context) error {
 
 // refreshDrains replaces the local admin-drain set with the one in shared storage.
 //
-// REPLACE, not merge: a release issued on another replica shows up as the drain being
-// absent from storage, and merging would keep benching it here forever. Shared storage is
-// the authority, which is what makes one admin call apply — and one release lift — across
-// the whole fleet.
-//
-// A storage failure leaves the existing local set untouched rather than clearing it: losing
-// Redis should not silently un-bench everything mid-incident.
-func (s *service) refreshDrains(ctx context.Context) {
-	drains, err := s.storage.ListDrains(ctx)
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn().Err(err).Msg("failed to refresh admin drains; keeping the local set")
-		}
-		return
-	}
-
-	s.mu.Lock()
-	s.drainedKeys = drains
-	s.mu.Unlock()
-}
-
 // SetArchivalStatus marks an endpoint as archival-capable with an expiry time.
 // This is called by health checks when an endpoint passes archival validation.
 // The status is shared across all replicas via Redis storage.

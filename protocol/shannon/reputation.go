@@ -2,12 +2,14 @@ package shannon
 
 import (
 	"context"
+	"strings"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
 )
@@ -89,6 +91,53 @@ func (p *Protocol) filterByReputation(
 			// Fall back to WebSocket-only filtering rather than dropping every endpoint.
 			logger.Warn().Err(err).Msg("Failed to get json_rpc scores for websocket floor, filtering on websocket score only")
 			httpScores = nil
+		}
+	}
+
+	// Admin drains are evaluated against the endpoint's LIVE URL, not against a reputation
+	// key, and that is deliberate. EndpointAddr is `supplierAddr-url` and the supplier set
+	// rotates every session, so a bench resolved to concrete keys goes stale at the next
+	// rollover — which is exactly how the first version of this silently stopped working
+	// while still reporting endpoints benched. Matching on the URL means an endpoint rotated
+	// into the session at a drained operator is benched the moment it appears.
+	//
+	// Applied BEFORE the reputation checks below so a drain does not depend on scores
+	// existing: an unscored endpoint at a drained operator must still be excluded.
+	drainedEndpoints := 0
+	if p.reputationService != nil {
+		rpcTypeStr := strings.ToLower(rpcType.String())
+		for i := 0; i < len(cached); i++ {
+			ak := cached[i]
+			// The pre-selected endpoint keeps its usual escape hatch: dropping it here would
+			// fail the request outright rather than route it elsewhere.
+			if ak.addr == requestedEndpointAddr {
+				continue
+			}
+			epURL := ak.ep.GetURL(rpcType)
+			domain, domainErr := shannonmetrics.ExtractDomainOrHost(epURL)
+			if domainErr != nil {
+				continue
+			}
+			if !p.reputationService.IsDomainDrained(serviceID, domain, rpcTypeStr) {
+				continue
+			}
+			delete(endpoints, ak.addr)
+			drainedEndpoints++
+		}
+	}
+	if drainedEndpoints > 0 {
+		logger.Warn().
+			Int("drained_endpoints", drainedEndpoints).
+			Int("remaining", len(endpoints)).
+			Msg("⚠️ excluded endpoints benched by an admin drain")
+	}
+	// A drain must never empty the pool — that would be an outage rather than a
+	// redistribution. Restoring is safe because the drain is an operator preference, not a
+	// correctness constraint.
+	if len(endpoints) == 0 {
+		logger.Warn().Msg("⚠️ admin drain would empty the endpoint pool — restoring drained endpoints")
+		for _, ak := range cached {
+			endpoints[ak.addr] = ak.ep
 		}
 	}
 
