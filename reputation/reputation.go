@@ -387,6 +387,15 @@ type ReputationService interface {
 	// Used for administrative purposes or testing.
 	ResetScore(ctx context.Context, key EndpointKey) error
 
+	// GetScoreRaw returns the score WITHOUT the admin-drain overlay — what the endpoint
+	// earned. Selection must use GetScore (overlaid); reporting should use this, so a
+	// metric can distinguish "we benched them" from "they are failing".
+	GetScoreRaw(ctx context.Context, key EndpointKey) (Score, error)
+
+	// IsDrained reports whether an endpoint is benched by an admin drain rather than by a
+	// cooldown it earned.
+	IsDrained(ctx context.Context, key EndpointKey) bool
+
 	// DrainDomain temporarily benches every scored endpoint of one operator (eTLD+1)
 	// for a service by writing a cooldown expiry, without altering reputation itself.
 	// Administrative / experimental: it makes "what happens when this operator is not

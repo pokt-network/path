@@ -475,7 +475,23 @@ func RecordCircuitBreakerEvent(serviceID, domain, reasonCategory, event string) 
 var EndpointsInCooldown = promauto.NewGaugeVec(
 	prometheus.GaugeOpts{
 		Name: MetricPrefix + "endpoints_in_cooldown",
-		Help: "Number of endpoints currently in strike cooldown (Score.CooldownUntil in the future). Published every 10s. Cooldown is independent from score-below-threshold — an endpoint can be cooldown'd even with a high score after critical strikes.",
+		Help: "Number of endpoints in a cooldown they EARNED (Score.CooldownUntil in the future). Excludes endpoints benched by an admin drain — see path_endpoints_drained. Published every 10s. Cooldown is independent from score-below-threshold — an endpoint can be cooldown'd even with a high score after critical strikes.",
+	},
+	[]string{LabelDomain, LabelRPCType, LabelServiceID},
+)
+
+// EndpointsDrained counts endpoints benched by an admin drain rather than by anything they
+// did.
+//
+// Deliberately a SEPARATE series from path_endpoints_in_cooldown. A drain removes an
+// operator's traffic exactly the way a cooldown does, so folding the two together makes a
+// deliberate bench indistinguishable from a quality incident on every dashboard — and a
+// drain exists to OBSERVE an operator, so contaminating the signal defeats its purpose.
+// Nobody should be paged over a drain we applied ourselves.
+var EndpointsDrained = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: MetricPrefix + "endpoints_drained",
+		Help: "Number of endpoints currently benched by an admin drain (POST /admin/reputation/drain). Not a fault: these were removed from selection deliberately and the bench expires on its own. Published every 10s.",
 	},
 	[]string{LabelDomain, LabelRPCType, LabelServiceID},
 )

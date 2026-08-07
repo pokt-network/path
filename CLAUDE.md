@@ -374,6 +374,13 @@ If the storage write fails the drain still applies locally and the response carr
 is partial is the failure mode worth shouting about. Conversely a storage *outage* never
 clears in-force drains; losing Redis mid-incident must not silently un-bench everyone.
 
+**A drain is never reported as a fault.** `path_endpoints_in_cooldown` counts only cooldowns
+an endpoint **earned** — it reads the un-overlaid score. Drains get their own gauge,
+`path_endpoints_drained{domain, rpc_type, service_id}`. Folding the two together would make
+every drain read as a quality incident on the dashboards the drain exists to let you read,
+and would eventually page someone over a bench we applied ourselves. Selection excludes both;
+only reporting distinguishes them.
+
 **It cannot be forgotten.** `duration` is capped at **2h** (rejected, not clamped — silently
 shortening a drain is worse than saying no), the shared key carries a TTL past its longest
 drain, and expired entries are filtered on read and reaped. There is no way to bench an

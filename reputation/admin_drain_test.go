@@ -442,3 +442,42 @@ func TestDrainDomain_UnaffectedByScoreRecovery(t *testing.T) {
 	svc.mu.RUnlock()
 	require.True(t, raw.CooldownUntil.IsZero(), "recovery must not pick up the overlay either")
 }
+
+// Reporting must be able to tell "we benched them" from "they are failing". The gauge
+// path_endpoints_in_cooldown reads GetScoreRaw and so must NOT see a drain; the drain is
+// reported on its own series via IsDrained. Folding the two together would make every
+// experiment look like a quality incident on the dashboards the experiment exists to read.
+func TestDrainDomain_SeparatesEarnedCooldownFromAdminDrain(t *testing.T) {
+	svc, _, ctx := drainTestService(t)
+
+	drained := seedScored(t, svc, ctx, "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+	earned := seedScored(t, svc, ctx, "https://rm-02.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+
+	svc.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 20 * time.Minute,
+	})
+
+	// Give the other endpoint a cooldown it actually earned.
+	svc.mu.Lock()
+	sc := svc.cache[earned]
+	sc.CooldownUntil = time.Now().Add(30 * time.Minute)
+	svc.setScoreLocked(earned, sc)
+	svc.mu.Unlock()
+
+	// What the FAULT metric sees (GetScoreRaw): only the earned cooldown.
+	drainedRaw, err := svc.GetScoreRaw(ctx, drained)
+	require.NoError(t, err)
+	require.False(t, drainedRaw.IsInCooldown(), "a drain must not appear as an earned cooldown")
+
+	earnedRaw, err := svc.GetScoreRaw(ctx, earned)
+	require.NoError(t, err)
+	require.True(t, earnedRaw.IsInCooldown(), "a real cooldown must still be reported")
+
+	// What the DRAIN metric sees (IsDrained): only the drain.
+	require.True(t, svc.IsDrained(ctx, drained))
+	require.False(t, svc.IsDrained(ctx, earned), "an earned cooldown is not a drain")
+
+	// Selection, meanwhile, must exclude BOTH.
+	require.True(t, isBenched(t, svc, ctx, drained))
+	require.True(t, isBenched(t, svc, ctx, earned))
+}

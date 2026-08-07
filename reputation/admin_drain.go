@@ -221,6 +221,37 @@ func (s *service) DrainDomain(ctx context.Context, req DrainRequest) DrainResult
 	return result
 }
 
+// GetScoreRaw returns an endpoint's score WITHOUT the admin-drain overlay — what the
+// endpoint earned, ignoring anything an operator benched by hand.
+//
+// Selection must use GetScore/GetScores (overlaid), or a drain would not bench anything.
+// Reporting is the opposite: a metric that cannot tell "we benched them" from "they are
+// failing" will eventually have someone paging an operator over a drain we applied
+// ourselves. path_endpoints_in_cooldown uses this; path_endpoints_drained counts the rest.
+func (s *service) GetScoreRaw(ctx context.Context, key EndpointKey) (Score, error) {
+	if !s.config.Enabled {
+		return Score{Value: s.GetInitialScoreForService(key.ServiceID)}, nil
+	}
+
+	s.mu.RLock()
+	score, exists := s.cache[key]
+	s.mu.RUnlock()
+
+	if !exists {
+		return Score{}, ErrNotFound
+	}
+	return score, nil
+}
+
+// IsDrained reports whether an endpoint is currently benched by an admin drain, as opposed
+// to being in a cooldown it earned. Lets reporting separate the two.
+func (s *service) IsDrained(ctx context.Context, key EndpointKey) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	until, ok := s.drainedKeys[key]
+	return ok && time.Now().Before(until)
+}
+
 // drainOverlayLocked re-applies an active admin drain's cooldown on top of a score read
 // from the cache. The caller MUST hold s.mu (read or write).
 //

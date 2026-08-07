@@ -63,7 +63,14 @@ type LeaderboardDataProvider interface {
 	// GetCooldownCountData returns per-(domain, service_id, rpc_type) counts of
 	// endpoints currently in strike cooldown. Optional: implementations may return
 	// nil if cooldown tracking is not supported.
+	//
+	// Must count only EARNED cooldowns. Endpoints benched by an admin drain belong in
+	// GetDrainedCountData, or a deliberate bench reads as a fault on every dashboard.
 	GetCooldownCountData(ctx context.Context) ([]CooldownCountEntry, error)
+
+	// GetDrainedCountData returns per-(domain, service_id, rpc_type) counts of endpoints
+	// benched by an admin drain. Optional: implementations may return nil.
+	GetDrainedCountData(ctx context.Context) ([]CooldownCountEntry, error)
 }
 
 // LeaderboardPublisher publishes endpoint leaderboard metrics every 10 seconds
@@ -215,6 +222,23 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 			EndpointsInCooldown.WithLabelValues(entry.Domain, entry.RPCType, entry.ServiceID).Set(float64(entry.Count))
 		}
 		lp.logger.Debug().Int("entries", len(cooldownCounts)).Msg("Published cooldown counts")
+	}
+
+	// Publish admin-drain counts on their own series, for the same reset reason: a drain
+	// that expires must read as zero rather than sticking at its last value.
+	drainedCounts, err := lp.provider.GetDrainedCountData(ctx)
+	if err != nil {
+		lp.logger.Warn().Err(err).Msg("Failed to get drained count data")
+		return
+	}
+
+	EndpointsDrained.Reset()
+
+	if len(drainedCounts) > 0 {
+		for _, entry := range drainedCounts {
+			EndpointsDrained.WithLabelValues(entry.Domain, entry.RPCType, entry.ServiceID).Set(float64(entry.Count))
+		}
+		lp.logger.Warn().Int("entries", len(drainedCounts)).Msg("⚠️ endpoints are benched by an admin drain")
 	}
 }
 
