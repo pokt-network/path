@@ -27,6 +27,10 @@ type MemoryStorage struct {
 	endpointBlocks  map[string]map[protocol.EndpointAddr]uint64 // serviceID -> endpointAddr -> block height
 	ttl             time.Duration
 	closed          bool
+
+	// drains holds admin drains keyed by operator predicate. Deliberately separate from
+	// scores — see Storage.SetDrain for why a bench cannot live on the score.
+	drains map[reputation.DrainKey]time.Time
 }
 
 // scoreEntry holds a score with its expiration time.
@@ -336,4 +340,53 @@ func (m *MemoryStorage) GetEndpointBlockHeights(ctx context.Context, serviceID p
 		result[k] = v
 	}
 	return result, nil
+}
+
+// ---------- Admin drains ----------
+
+// SetDrain records an admin drain. Kept separate from scores for the same reason as the
+// Redis implementation: a bench carried on Score.CooldownUntil is erased by the next
+// storage refresh.
+func (m *MemoryStorage) SetDrain(_ context.Context, key reputation.DrainKey, until time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return reputation.ErrStorageClosed
+	}
+	if m.drains == nil {
+		m.drains = make(map[reputation.DrainKey]time.Time)
+	}
+	m.drains[key] = until
+	return nil
+}
+
+// DeleteDrain lifts an admin drain.
+func (m *MemoryStorage) DeleteDrain(_ context.Context, key reputation.DrainKey) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return reputation.ErrStorageClosed
+	}
+	delete(m.drains, key)
+	return nil
+}
+
+// ListDrains returns live drains, dropping (and reaping) expired entries.
+func (m *MemoryStorage) ListDrains(_ context.Context) (map[reputation.DrainKey]time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, reputation.ErrStorageClosed
+	}
+
+	now := time.Now()
+	out := make(map[reputation.DrainKey]time.Time, len(m.drains))
+	for key, until := range m.drains {
+		if !now.Before(until) {
+			delete(m.drains, key)
+			continue
+		}
+		out[key] = until
+	}
+	return out, nil
 }

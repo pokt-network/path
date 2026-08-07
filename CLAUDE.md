@@ -160,9 +160,10 @@ curl -X POST http://localhost:3069/v1 \
   - Skip **all** reputation-derived filtering — both the score-threshold/cooldown filter and
     tiered (highest-tier-only) selection. A score-0, fully-cooled-down supplier is reachable.
   - Still apply RPC type filtering (only endpoints supporting the requested RPC type)
-  - Still apply the config `blocked_suppliers` list, the endpoint policy (`require_https` /
-    `require_domain`), and the supplier blacklist (signature/validation failures). None of these
-    are reputation, and the header does not override them.
+  - Still apply the config `blocked_suppliers` list, the `blocked_domains` list (the nuclear
+    domain ban), the endpoint policy (`require_https` / `require_domain`), and the supplier
+    blacklist (signature/validation failures). None of these are reputation, and the header
+    does not override them.
   - Log filtered supplier list and endpoint counts
 - If none of the specified suppliers are available in the current session, the request will fail
 - Header takes precedence over load testing configuration (if any)
@@ -292,10 +293,215 @@ router_config:
 PATH_WEBSOCKET_IDLE_TIMEOUT=45m   # pod restart instead of a config-map edit
 ```
 
+**Reputation Drain** (`POST /admin/reputation/drain/{serviceId}`)
+
+Temporarily benches every **scored** endpoint of one operator (eTLD+1) for a service by
+writing a cooldown expiry onto its score. Selection already excludes endpoints in cooldown
+regardless of score, so this reuses a filter every selection path is guaranteed to consult
+rather than adding a second exclusion some path could miss.
+
+Answers "where would this traffic go if operator X were unavailable" without waiting for X
+to fail.
+
+**Tumble is not a substitute.** A tumble re-dials but leaves every operator eligible, so the
+connection can land straight back where it started. Measured on gnosis: **8 consecutive
+tumbles failed to move a ~500 frames/s subscription** off the two operators already carrying
+it, because each rebind could reselect them. Drain first, *then* tumble — the rebind then has
+nowhere else to go.
+
+```bash
+# what would be benched (always do this first — the response lists domains_seen, so a typo
+# reads as "matched 0, and here is what actually exists" rather than a silent no-op)
+curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=op-beta.example&rpc_type=websocket&dry_run=true"
+
+# bench for 20m, websocket only — the operator's json_rpc / rest traffic is untouched
+curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=op-beta.example&rpc_type=websocket&duration=20m"
+
+# then move the live connections that are already bound
+curl -X POST "http://localhost:13069/admin/websocket/tumble/gnosis"
+
+# release early
+curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=op-beta.example&rpc_type=websocket&duration=0"
+```
+
+Query parameters: `domain=<eTLD+1|hostname|url>` (**required**, `url=` is an alias — a drain
+with no target would bench the whole service, which is never what anyone meant to type) ·
+`duration=<go duration>` (default `15m`; `0` releases) · `rpc_type=<websocket|json_rpc|rest|…>`
+(default all) · `dry_run=true`.
+
+**Target by URL/domain, never by node id.** The handler resolves the target against live
+endpoint details into *every* identifier a reputation key could carry — full endpoint address,
+supplier address, URL, hostname, eTLD+1 — because key granularity is per-service config. The
+same operator is a hostname on one service and a `pokt1…` supplier address on another. An
+eTLD+1-only filter returns `matched: 0` on a supplier-keyed service while looking like it
+worked; check `identifiers_resolved` and `matched_endpoints` in the response to tell "target
+names nothing" apart from "names endpoints that carry no score yet".
+
+**The bench is an overlay, not a score write.** It lives in `drainedKeys` and is applied when
+scores are read. This is load-bearing: an earlier version wrote `CooldownUntil` onto the Score,
+and `refreshFromStorage` — which overwrites the local cache from Redis unconditionally —
+erased every drain within a refresh cycle while the endpoint still reported `drained=N`.
+**Anything that must outlive a storage refresh cannot live on the score.** Same trap as the
+circuit breaker's `refreshFromRedis`, approached from the other direction.
+
+**The gate is `GetScores` → `IsInCooldown()`** in `protocol/shannon/reputation.go`, not
+`FilterByScore` — that one only compares `Value` against the threshold and ignores cooldown
+entirely. A test asserting on `Score.CooldownUntil` proves nothing about whether selection
+will honour a drain; assert through `GetScores`.
+
+**Not a penalty.** `Value`, `CriticalStrikes` and `RecentCriticalRate` are left untouched, so
+the quality signal stays readable *while* the drain is in effect — which matters, because
+reading it is usually the entire point of draining. A drain that rewrote the score would
+destroy the measurement it exists to enable.
+
+**Release is deliberately narrow:** it lifts only cooldowns the drain itself wrote and that
+nothing has overwritten since. A cooldown earned for real while the drain was up survives —
+otherwise "undo my experiment" would silently un-bench a legitimately failing endpoint.
+
+**Unscored endpoints are benched too.** This was once a real gap — the bench lived on the
+score, so an endpoint reputation had never observed read as "initial score, not in cooldown"
+and stayed selectable. The predicate rewrite closed it: the drain filter matches the
+endpoint's **live URL** and runs *before* `GetScores` is consulted, so an endpoint carrying no
+score at all is still excluded. The response's `unscored_warning` is retained as a diagnostic
+but no longer marks an incomplete drain.
+
+**A drain applies at the pace of rebinds, not instantly.** Endpoints leave the selectable set
+immediately, but a *bound* WebSocket connection only moves at its own next rebind — rollover,
+stall or `session_expired`. Measured 2026-08-07: gnosis 42 connections → 0 in ~19 min and bsc
+26 → 0 in ~11 min, on rollover alone with no tumble. Budget for that mid-incident.
+
+**Fleet-wide: ONE call, not one per pod.** Unlike the other admin endpoints, drains are
+written to shared storage (a dedicated `__drains__` hash, **never** the score) and every
+replica adopts them on its next refresh. Storage is authoritative and the refresh *replaces*
+the local set, so a release propagates too — merging would leave a released drain benched
+forever on whichever pod did not issue it.
+
+If the storage write fails the drain still applies locally and the response carries
+`propagation_error` plus a warning saying **THIS POD ONLY** — a partial drain nobody realises
+is partial is the failure mode worth shouting about. Conversely a storage *outage* never
+clears in-force drains; losing Redis mid-incident must not silently un-bench everyone.
+
+**A drain is never reported as a fault.** `path_endpoints_in_cooldown` counts only cooldowns
+an endpoint **earned** — it reads the un-overlaid score. Drains get their own gauge,
+`path_endpoints_drained{domain, rpc_type, service_id}`. Folding the two together would make
+every drain read as a quality incident on the dashboards the drain exists to let you read,
+and would eventually page someone over a bench we applied ourselves. Selection excludes both;
+only reporting distinguishes them.
+
+**It cannot be forgotten.** `duration` is capped at **5h** (rejected, not clamped — silently
+shortening a drain is worse than saying no), the shared key carries a TTL past its longest
+drain, and expired entries are filtered on read and reaped. There is no way to bench an
+operator indefinitely through this endpoint. Re-issue to extend.
+
+**Domain Blacklist (`blocked_domains`) — the nuclear ban**
+
+Permanently bans an operator domain from serving specific RPC types on **ALL services**,
+where a drain is temporary (5h cap), per-service, and yields when it would empty the pool.
+
+```yaml
+gateway_config:
+  blocked_domains:
+    - domain: example.xyz          # eTLD+1 (matches every host under it) or exact hostname
+      rpc_types: [websocket]       # omit = every RPC type
+```
+```bash
+PATH_BLOCKED_DOMAINS=example.xyz:websocket,other.example   # pod restart, no config edit
+# entry = domain[:type1|type2]; env UNIONS with config — it can widen a ban, never narrow one
+```
+
+Semantics, all deliberate:
+- Covers **every** path that hands out endpoints: primary selection (HTTP + WebSocket, which
+  also covers retry/hedge/batch and WS rebind — they draw from the filtered pool), **fallback
+  endpoints** (which bypass every session-endpoint filter and needed explicit coverage), and
+  **health checks** (paid relays — a nuclear ban stops the probes too).
+- **`Target-Suppliers` cannot override it** (unlike drains, which that header bypasses — the
+  documented gap). The filter runs before the allowlist, next to `blocked_suppliers`.
+- **No preferred-endpoint exemption** (drain bug 4's shape) and matching is on the **live
+  URL**, so it survives session rollovers by construction (drain bug 2's shape).
+- **It can empty the pool.** A drain yields as a preference; a ban that yields when the banned
+  operator is all that remains is not a ban. The request fails instead.
+- A malformed entry (typo'd rpc_type, empty domain) **refuses to boot** rather than silently
+  narrowing the ban.
+- Live WS connections: a ban change requires a restart (config or env), and the restart closes
+  every connection with a clean handshake; reconnects cannot re-select the banned domain. No
+  separate force-close step exists or is needed.
+- Known limitation: health-check suppression is exact for all-type and websocket bans; a ban
+  covering only a subset of the HTTP-carried types (json_rpc/rest/comet_bft) leaves the
+  endpoint's other HTTP probes running (the executor keys HTTP checks on endpoint address,
+  not per-type URL).
+
+Metrics: `path_blocked_domains_configured{domain, rpc_type}` (1 per entry at startup —
+"is the ban loaded on this pod", readable at any LOG_LEVEL) and
+`path_endpoints_domain_blocked_total{domain, rpc_type, service_id}` (counted per selection
+pass — the honest "is it actually engaging" signal). Configured-but-never-engaging is a red
+flag: verify before trusting, four drain bugs reported benched while serving.
+
+Tests: `protocol/shannon/domain_blocklist_test.go` asserts through the production callers
+(`getSessionsUniqueEndpoints`, `getUniqueEndpoints`, `GetEndpointsForHealthCheck`), and every
+call site was revert-checked (filter removed → tests fail).
+
 **Circuit Breaker — when to use:**
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved
 - Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis
+
+## WebSocket Frames Are Reward-Eligible Relays
+
+**Every endpoint→client WebSocket frame is signed by the relay miner and mined as a
+reward-eligible relay**, paired with the *most recent* request. poktroll
+`pkg/relayer/proxy/websockets/bridge.go`:
+
+> Each message (inbound or outbound) is treated as a reward-eligible relay. For example, with
+> eth_subscribe, both the initial subscription request and each received event would be
+> eligible for rewards. […] Currently, the RelayMiner is paid for each incoming and outgoing
+> message transmitted.
+
+PATH validates that signature in `validateEndpointWebsocketMessage` → `ValidateRelayResponse`
+(`protocol/shannon/websocket_context.go`).
+
+**The asymmetry:** HTTP is 1 client request = 1 relay, client-driven. A WS subscription is 1
+signed request = **unbounded** relays, and the push rate is chosen by **the supplier being
+paid**. PATH signs the anchoring subscribe with its *own* application key, so the gateway's app
+stake funds it. The only brake is `relayMeter.IsOverServicing(...)` — the application's
+per-session allowance — and it engages on almost nothing. Measured 2026-08-07:
+`path_supplier_exhausted_total` fires on **bsc alone** and nowhere else on the fleet, bursting
+0 → ~11/s over ~4h with long zero troughs between. An earlier note recording it as 0 fleetwide
+was a snapshot that landed in a trough — read this counter over a range, never with an instant
+query. On every other service the brake is effectively dormant.
+
+Consequence: a per-domain frames/s number is closer to a **settlement-volume** meter than a
+demand meter. Do not reason about it as load on the supplier.
+
+### `path_websocket_connection_frame_rate` — the distribution, not the sum
+
+Histogram `{service_id, domain}`, every live connection observed every 15s, buckets
+`0.1 … 2500`. Emitted from the same `sampleRates` pass that feeds the tumble ranking, so the
+two can never disagree.
+
+**Why it exists:** `path_websocket_messages_total` is a per-domain SUM, and a sum cannot tell
+*one firehose plus a hundred idle sockets* apart from *a hundred ordinary subscribers*. Those
+have opposite explanations and the difference is not academic — measured fleetwide, one
+operator held **16.9% of WS connections and earned 66.1% of WS relays** (3.9× over-index),
+while on gnosis **2 connections out of ~70 carried ~97% of frames**. A handful of connections
+can produce that entire fleetwide number without the operator doing anything.
+
+```promql
+histogram_quantile(0.5,  sum by (le, domain) (rate(path_websocket_connection_frame_rate_bucket{service_id="gnosis"}[10m])))
+histogram_quantile(0.99, sum by (le, domain) (rate(path_websocket_connection_frame_rate_bucket{service_id="gnosis"}[10m])))
+```
+
+**Read it as:** p50 ≈ 0 with p99 in the hundreds → a few firehoses landed there, a placement
+artifact, nobody is doing anything. p50 materially above other operators → systematic across
+that operator's whole connection population.
+
+**Idle connections are observed at 0 deliberately.** Dropping them would leave the quantiles
+describing only the connections that carry traffic — exactly the population the metric exists
+to be measured *against*.
+
+**Trap:** clients do not choose their operator; selection assigns it. So which operator a
+high-volume subscriber lands on is effectively a random draw, and any per-operator *average*
+conflates "inflates every stream" with "the big streams landed here". Only the distribution —
+or a same-client-different-operator comparison via a drain — separates them.
 
 ## Endpoint Selection — Registration-Weighted, Capped per Operator
 
@@ -373,6 +579,46 @@ Recorded on **every** band pick, so `outcome="reshaped"` over the total is the r
 **Cannot starve a retry:** the cap reweights the band, it never filters it. The set of endpoints a retry can reach is bit-for-bit what it was before, at any cap value.
 
 **What to watch after enabling:** `path_supplier_exhausted_total` for the **thin** operators the excess lands on, not the capped one — a solo-registration backend gains share while still holding one supplier's per-session allowance. Same failure mode as the backend-URL dedup, and self-correcting. Retry success rate — `path_relays_total{request_type="retry"}` split by `status_code` — must not fall; roughly 60% of retries already fail, so that pool is marginal to begin with.
+
+## Testing Changes That Affect Routing
+
+Three separate bugs shipped in the admin-drain feature, all with passing tests, all the same
+mistake: **the test asserted on something the author wrote, not on the value the production
+caller receives.** Each reported success in production while excluding nothing.
+
+1. The bench was written onto `Score.CooldownUntil` — `refreshFromStorage` overwrites the
+   cache from Redis unconditionally and erased it within a refresh cycle. Test asserted
+   "`CooldownUntil` is set", which was true, briefly.
+2. The bench resolved to a fixed set of `EndpointKey`s. `EndpointAddr` embeds the supplier
+   address and sessions rotate their supplier set, so it went stale every rollover (~20 min).
+   Every test used a static cache, so nothing rotated.
+3. The filter deleted from the `endpoints` map passed in, while the function builds its result
+   by walking `cached`. Nothing was ever excluded; the Warn log never fired.
+
+**Use the selection harness** (`protocol/shannon/selection_harness_test.go`). It answers the
+only question that matters — *does selection still return this endpoint?* — in one call:
+
+```go
+s := newSelectionScenario(t, "gnosis", opBetaA, opAlphaA, opGammaA)
+s.Drain("op-beta.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA)
+s.RotateSuppliers(1)                     // simulates a session rollover
+s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA)
+```
+
+Three rules, all cheap:
+
+- **Assert on the production caller's return value**, never on a helper, a cached field, or a
+  gauge. Scores, drain maps, `path_endpoints_drained` and `/ready` have each reported a bench
+  that selection did not honour.
+- **Before committing a bug fix, revert the fix and confirm the test fails.** Done twice
+  during this work: caught nothing the first time, caught the real bug the third.
+- **Two observables disagreeing about the same state is a bug** — stop and find it. When
+  `path_endpoints_drained` said 60 benched while `/ready` said 0 excluded, that contradiction
+  was the bug announcing itself and it was rationalised away twice.
+
+Anything keyed on `EndpointAddr` must be tested across `RotateSuppliers`. That key embeds a
+supplier address, and supplier sets rotate every session.
 
 ## Testing Strategy
 

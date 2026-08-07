@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/reputation"
 )
 
 // ServiceReadinessReporter provides readiness information for services.
@@ -315,6 +318,184 @@ func (r *router) handleChainStateClear(w http.ResponseWriter, req *http.Request)
 		"service_id": serviceID,
 		"message":    "chain state cleared (perceived block height reset, in-memory + Redis)",
 	})
+}
+
+const (
+	// defaultDrainDuration is long enough to collect a clean rate window and short enough
+	// that a forgotten drain lifts itself well inside a shift.
+	defaultDrainDuration = 15 * time.Minute
+
+	// maxDrainDuration is the hard ceiling on a single drain.
+	//
+	// A drain removes an operator's traffic, so an unbounded one is an outage nobody is
+	// tracking. Bounding it here means the worst case of "set a drain, got distracted" is
+	// self-healing: paired with the TTL on the shared drains key, there is no way to bench
+	// an operator permanently through this endpoint. Re-issue to extend.
+	//
+	// 5h covers a working session without re-issuing. It is deliberately still bounded: a
+	// ban meant to outlive a shift belongs in config, where it is reviewable and survives a
+	// restart, rather than in an admin call nobody can see after the fact.
+	maxDrainDuration = 5 * time.Hour
+)
+
+// handleReputationDrain handles POST /admin/reputation/drain/{serviceId}
+//
+// Temporarily benches every scored endpoint belonging to one operator (eTLD+1) for the
+// service, by writing a cooldown expiry onto its score. Selection already excludes
+// endpoints in cooldown regardless of score, so this reuses a filter every selection path
+// is guaranteed to consult.
+//
+// Why this exists: questions of the form "where would this traffic go if operator X were
+// not available" are otherwise only answerable by waiting for X to fail. Tumbling a
+// websocket connection is not a substitute — a tumble re-dials but leaves every operator
+// eligible, so the connection can and does land straight back where it started.
+//
+// This is NOT a penalty. Value, CriticalStrikes and RecentCriticalRate are left alone, so
+// the quality signal stays readable while the drain is in effect — which matters, because
+// reading it is usually the entire point of draining.
+//
+// Per-pod in-memory state like the other admin endpoints; issue it to each pod.
+//
+// Query parameters:
+//
+//	domain=<eTLD+1>   operator to bench (REQUIRED)
+//	duration=<dur>    how long, Go duration (default 15m). 0 releases this pod's drain.
+//	rpc_type=<type>   narrow to one protocol (websocket, json_rpc, …); default all
+//	dry_run=true      report what would be benched without writing
+//
+// A drain expires on its own. It does not survive a pod restart.
+func (r *router) handleReputationDrain(w http.ResponseWriter, req *http.Request) {
+	if r.reputationAdmin == nil {
+		http.Error(w, `{"error":"reputation admin not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	serviceID := strings.TrimPrefix(req.URL.Path, "/admin/reputation/drain/")
+	if serviceID == "" {
+		http.Error(w, `{"error":"service ID required: POST /admin/reputation/drain/{serviceId}"}`, http.StatusBadRequest)
+		return
+	}
+
+	query := req.URL.Query()
+
+	// Required rather than defaulted: a drain with no target would bench the whole
+	// service, which is never what anyone meant to type.
+	target := query.Get("domain")
+	if target == "" {
+		target = query.Get("url")
+	}
+	if target == "" {
+		http.Error(w, `{"error":"target required: ?domain=<eTLD+1|hostname|url>"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Default 15m — long enough to collect a clean rate window, short enough that a
+	// forgotten drain heals itself well inside a shift.
+	duration := defaultDrainDuration
+	if raw := query.Get("duration"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed < 0 {
+			http.Error(w, `{"error":"duration must be a non-negative Go duration (e.g. 15m); 0 releases"}`, http.StatusBadRequest)
+			return
+		}
+		// Rejected rather than clamped: silently shortening a drain an operator believed
+		// they had set for days is worse than telling them the ceiling. Nobody should be
+		// able to bench an operator indefinitely by mistyping a duration.
+		if parsed > maxDrainDuration {
+			http.Error(w, fmt.Sprintf(`{"error":"duration exceeds the %s maximum; a drain must expire without anyone remembering to lift it"}`, maxDrainDuration), http.StatusBadRequest)
+			return
+		}
+		duration = parsed
+	}
+
+	// Resolve the human-facing target (an operator domain, hostname, or URL) into the
+	// concrete identifiers a reputation key can carry. This MUST happen here rather than
+	// inside the reputation service: key granularity is per-service config — endpoint
+	// address, URL, domain, or supplier address — so the same operator is a hostname on
+	// one service and a pokt1… supplier address on another, and only the protocol layer
+	// holds the supplier→URL mapping that bridges them.
+	reporter, ok := r.readinessReporter()
+	if !ok {
+		http.Error(w, `{"error":"endpoint details unavailable; cannot resolve target"}`, http.StatusServiceUnavailable)
+		return
+	}
+	details, err := reporter.GetServiceEndpointDetails(protocol.ServiceID(serviceID))
+	if err != nil {
+		http.Error(w, `{"error":"failed to list endpoints for service"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Normalize whatever was typed — eTLD+1, hostname, or full URL — to the registrable
+	// domain the drain is keyed on, and report how many live endpoints it names so a typo
+	// is visible rather than silently benching nothing.
+	domain, matchedEndpoints := resolveDrainDomain(details, target)
+	if domain == "" {
+		domain = registrableDomain(strings.ToLower(strings.TrimSpace(target)))
+	}
+
+	result := r.reputationAdmin.DrainDomain(req.Context(), reputation.DrainRequest{
+		ServiceID: protocol.ServiceID(serviceID),
+		Domain:    domain,
+		Duration:  duration,
+		RPCType:   query.Get("rpc_type"),
+		DryRun:    query.Get("dry_run") == "true",
+	})
+	result.MatchedEndpoints = matchedEndpoints
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// resolveDrainIdentifiers maps a human-facing target — an eTLD+1, a hostname, or a full
+// URL — onto every reputation-key identifier the matching endpoints could be keyed under,
+// and reports how many endpoints matched.
+//
+// Every granularity is emitted for each matching endpoint (full address, supplier address,
+// URL, hostname, eTLD+1) rather than trying to detect which one the service uses. Emitting
+// a superset is safe because matching is exact string equality against keys that already
+// belong to the requested service, and it means the drain does not silently bench nothing
+// when a service's granularity is not what the caller assumed — which is exactly how the
+// supplier-address-keyed services defeated an eTLD+1-only filter.
+func resolveDrainDomain(details []protocol.EndpointDetails, target string) (string, int) {
+	target = strings.ToLower(strings.TrimSpace(target))
+	// Accept a full URL as the target by reducing it to its host.
+	if u, err := url.Parse(target); err == nil && u.Host != "" {
+		target = strings.ToLower(u.Hostname())
+	}
+
+	domain := ""
+	matched := 0
+	for _, d := range details {
+		host := ""
+		if u, err := url.Parse(d.URL); err == nil {
+			host = strings.ToLower(u.Hostname())
+		}
+		if host == "" {
+			continue
+		}
+		reg := registrableDomain(host)
+		// Accept either an exact hostname or the operator domain, but always bench the
+		// OPERATOR: a drain that covered one hostname would be defeated the moment the
+		// session rotated in a sibling machine at the same operator.
+		if host != target && reg != target {
+			continue
+		}
+		domain = reg
+		matched++
+	}
+	return domain, matched
+}
+
+// registrableDomain returns the last two labels of a host ("rm-01.eu.example.com" →
+// "example.com"). Deliberately the same naive rule the metrics layer uses for the `domain`
+// label, so an operator identified from a dashboard resolves to the same thing here.
+func registrableDomain(host string) string {
+	parts := strings.Split(host, ".")
+	if len(parts) < 2 {
+		return host
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
 }
 
 // handleWebsocketTumble handles POST /admin/websocket/tumble/{serviceId}

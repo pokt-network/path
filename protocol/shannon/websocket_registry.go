@@ -4,8 +4,10 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/pokt-network/path/metrics"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/websockets"
 )
@@ -166,17 +168,45 @@ func (r *websocketConnRegistry) startRateSampler(ctx context.Context) {
 	}()
 }
 
-// sampleRates refreshes every live connection's frames/sec.
+// sampleRates refreshes every live connection's frames/sec, and publishes each connection's
+// rate as a histogram observation.
+//
+// The per-connection observation is the point: path_websocket_messages_total is a per-domain
+// SUM, and a sum cannot tell "one firehose among a hundred idle sockets" apart from "a
+// hundred ordinary subscribers". Emitting here rather than from a separate ticker reuses the
+// pass that already computes the rate, so the distribution can never disagree with the
+// ranking a tumble is spent on.
+//
+// Observations are collected under the lock but recorded after releasing it: a Prometheus
+// histogram takes its own internal lock, and nesting that inside the registry mutex would put
+// an unrelated subsystem on the critical path of every admin tumble and rebind.
 func (r *websocketConnRegistry) sampleRates(now time.Time) {
 	if r == nil {
 		return
 	}
+
+	type rateSample struct {
+		domain    string
+		serviceID string
+		rate      float64
+	}
+	var samples []rateSample
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, svc := range r.conns {
+	for serviceID, svc := range r.conns {
 		for _, entry := range svc {
 			entry.sample(now)
+			samples = append(samples, rateSample{
+				domain:    entry.domain,
+				serviceID: string(serviceID),
+				rate:      entry.rate,
+			})
 		}
+	}
+	r.mu.Unlock()
+
+	for _, s := range samples {
+		metrics.RecordWebsocketConnectionFrameRate(s.domain, s.serviceID, s.rate)
 	}
 }
 
@@ -228,6 +258,67 @@ func (r *websocketConnRegistry) deregister(serviceID protocol.ServiceID, wrc *we
 	if len(svc) == 0 {
 		delete(r.conns, serviceID)
 	}
+}
+
+// shutdownAll closes every live bridge on this pod with a proper close handshake and
+// returns how many finished before ctx expired.
+//
+// Exists because http.Server.Shutdown explicitly does NOT close hijacked connections, and
+// every websocket is hijacked — so without this the process exits, every socket dies with
+// the TCP connection, and both peers report an abnormal closure. Fleetwide that made every
+// rollout emit a burst of 1006s across all services in the same second: the client cannot
+// tell a deploy from a crash, and the endpoint operator sees a fault they did not cause.
+func (r *websocketConnRegistry) shutdownAll(ctx context.Context, reason string) int {
+	if r == nil {
+		return 0
+	}
+
+	// Snapshot under the lock and release it BEFORE closing anything. bridge.Close runs
+	// shutdown(), which calls AttachBridge(nil) → deregister → r.mu.Lock(). Closing while
+	// holding even the read lock self-deadlocks. tumble() gets away with holding it only
+	// because Tumble() is a non-blocking channel send; Close() is synchronous.
+	r.mu.RLock()
+	controllers := make([]websockets.BridgeController, 0, len(r.conns))
+	for _, svc := range r.conns {
+		for _, entry := range svc {
+			controllers = append(controllers, entry.controller)
+		}
+	}
+	r.mu.RUnlock()
+
+	if len(controllers) == 0 {
+		return 0
+	}
+
+	// Concurrently, because each close writes a frame to both peers under a one-second
+	// deadline apiece. Serially that is seconds per connection, which on a busy replica
+	// overruns the pod's termination grace period and gets the process SIGKILLed — the
+	// exact abrupt teardown this is here to avoid.
+	var closed atomic.Int64
+	var wg sync.WaitGroup
+	for _, c := range controllers {
+		wg.Add(1)
+		go func(c websockets.BridgeController) {
+			defer wg.Done()
+			c.Close(reason)
+			closed.Add(1)
+		}(c)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// Report what actually completed rather than what was attempted: a shutdown that
+		// timed out having closed half the connections must not read as a clean sweep.
+	}
+
+	return int(closed.Load())
 }
 
 // updateBinding re-points an entry at the endpoint the connection just rebound onto, so

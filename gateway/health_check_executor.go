@@ -902,7 +902,7 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	// Over-servicing rejections — same no-penalty rule as the request path.
 	// Without this, every health-check probe to an exhausted supplier records a
 	// MajorError signal and pins their reputation at 0 even after the request
-	// path has stopped penalizing them. Production canary observed easy2stake's
+	// path has stopped penalizing them. Production canary observed operator-zeta's
 	// BSC supplier set stuck at score=0 with success-only request-path signals
 	// because the health-check executor was draining them in parallel.
 	if heuristic.IsOverServicedError(checkErr.Error()) {
@@ -1245,8 +1245,21 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 	}
 
 	// Heuristic analysis - detect bad gateway, empty responses, and other error patterns
-	// This runs BEFORE QoS validation to catch issues the basic validation might miss
-	heuristicResult := heuristic.Analyze(responseBody, httpStatusCode, servicePayload.EffectiveRPCType(), "")
+	// This runs BEFORE QoS validation to catch issues the basic validation might miss.
+	//
+	// The method must be threaded through here exactly as the other four call sites do it
+	// (protocol/shannon/context.go, gateway/hedge.go, http_request_context_handle_request.go).
+	// This call passed a hardcoded "" - so even with JSONRPCMethod populated on the payload,
+	// every method-aware rule was blind at this site, and this is the site that decides the
+	// health check's outcome. A CometBFT `health` response
+	// ({"jsonrpc":"2.0","id":1,"result":{}}) is flagged jsonrpc_empty_object_result at
+	// confidence 0.95 unless the method is known, which maps to SignalMajorError below.
+	jsonrpcMethod := servicePayload.JSONRPCMethod
+	if jsonrpcMethod == "" {
+		// REST checks carry no JSON-RPC method; path-aware rules key off Path instead.
+		jsonrpcMethod = servicePayload.Path
+	}
+	heuristicResult := heuristic.Analyze(responseBody, httpStatusCode, servicePayload.EffectiveRPCType(), jsonrpcMethod)
 	if heuristicResult.ShouldRetry {
 		heuristicErr := fmt.Errorf("heuristic detected error: %s - %s", heuristicResult.Reason, heuristicResult.Details)
 		e.logger.Debug().
@@ -1628,12 +1641,25 @@ func (e *HealthCheckExecutor) buildServicePayload(check HealthCheckConfig) proto
 		rpcType = sharedtypes.RPCType_UNKNOWN_RPC
 	}
 
+	// JSONRPCMethod drives the method-aware heuristic checks. User traffic gets it
+	// from QoS parsing; a health check never goes through QoS, so without this it
+	// stayed empty and the heuristic fell back to Path — which for a JSON-RPC check
+	// is "/", matching no method at all.
+	//
+	// That broke the CometBFT carve-out in analyzeJSONRPC: `health` legitimately
+	// answers {"jsonrpc":"2.0","id":1,"result":{}}, and the empty-object rule is
+	// skipped only when rpcType is COMET_BFT or isCometBFTMethod(method) holds.
+	// Cosmos services declare the check as type json_rpc, so neither guard fired and
+	// every healthy node was scored jsonrpc_empty_object_result → retry + minor_error.
+	// Measured 2026-08-06: 16 cosmos services failing this check 100%, ~19% of all
+	// failing health-check signals fleet-wide.
 	return protocol.Payload{
-		Method:  check.Method,
-		Path:    check.Path,
-		Data:    check.Body,
-		Headers: headers,
-		RPCType: rpcType, // Set from aligned health check type
+		Method:        check.Method,
+		Path:          check.Path,
+		Data:          check.Body,
+		Headers:       headers,
+		RPCType:       rpcType, // Set from aligned health check type
+		JSONRPCMethod: extractJSONRPCMethod([]byte(check.Body)),
 	}
 }
 

@@ -2,12 +2,14 @@ package shannon
 
 import (
 	"context"
+	"strings"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/gateway"
 	"github.com/pokt-network/path/metrics"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/path/reputation"
 )
@@ -89,6 +91,67 @@ func (p *Protocol) filterByReputation(
 			// Fall back to WebSocket-only filtering rather than dropping every endpoint.
 			logger.Warn().Err(err).Msg("Failed to get json_rpc scores for websocket floor, filtering on websocket score only")
 			httpScores = nil
+		}
+	}
+
+	// Admin drains are evaluated against the endpoint's LIVE URL, not against a reputation
+	// key, and that is deliberate. EndpointAddr is `supplierAddr-url` and the supplier set
+	// rotates every session, so a bench resolved to concrete keys goes stale at the next
+	// rollover — which is exactly how the first version of this silently stopped working
+	// while still reporting endpoints benched. Matching on the URL means an endpoint rotated
+	// into the session at a drained operator is benched the moment it appears.
+	//
+	// Applied BEFORE the reputation checks below so a drain does not depend on scores
+	// existing: an unscored endpoint at a drained operator must still be excluded.
+	// Filter `cached` itself, NOT the incoming `endpoints` map: everything below builds the
+	// returned set by walking `cached`, so deleting from `endpoints` has no effect on the
+	// result. An earlier version did exactly that and the ban was completely inert in
+	// production while reporting success.
+	if p.reputationService != nil {
+		rpcTypeStr := strings.ToLower(rpcType.String())
+		kept := cached[:0:0]
+		drained := 0
+		// NO exemption for requestedEndpointAddr here, deliberately — every other filter in
+		// this function grants one, and granting it to drains defeated them entirely.
+		//
+		// A websocket rebind passes the endpoint it is ALREADY bound to as preferredAddr
+		// (ReconnectEndpoint in websocket_context.go), and a connection re-selects at every
+		// session rollover. So the exemption fired on precisely the connections a drain
+		// exists to move: each rollover re-picked the drained endpoint because it was
+		// "preferred". Measured in production 2026-08-07 — drain applied fleet-wide, every
+		// connection tumbled, path_endpoints_drained reporting 170 benched, and four
+		// minutes later the drained operator still served 73% of the service's frames.
+		//
+		// Sticky placement is what a drain overrides; it cannot also be what protects an
+		// endpoint from one. The pool-empty branch below is the real safety net, and it is
+		// sufficient: an endpoint is only kept when dropping it would leave nothing.
+		for _, ak := range cached {
+			if domain, domainErr := shannonmetrics.ExtractDomainOrHost(ak.ep.GetURL(rpcType)); domainErr == nil &&
+				p.reputationService.IsDomainDrained(serviceID, domain, rpcTypeStr) {
+				drained++
+				continue
+			}
+			kept = append(kept, ak)
+		}
+
+		switch {
+		case drained == 0:
+			// nothing benched for this service/rpc_type
+
+		case len(kept) > 0:
+			logger.Warn().
+				Int("drained_endpoints", drained).
+				Int("remaining", len(kept)).
+				Msg("⚠️ excluded endpoints benched by an admin drain")
+			cached = kept
+
+		default:
+			// A drain must never empty the pool — that would be an outage rather than a
+			// redistribution. A ban is an operator preference, not a correctness
+			// constraint, so it yields rather than severing the service.
+			logger.Warn().
+				Int("drained_endpoints", drained).
+				Msg("⚠️ admin drain would empty the endpoint pool — keeping drained endpoints as last resort")
 		}
 	}
 

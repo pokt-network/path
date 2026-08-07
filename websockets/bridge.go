@@ -148,6 +148,12 @@ type BridgeController interface {
 	// goroutine. Returns false when the bridge cannot tumble (rebind disabled) or a
 	// tumble is already queued for it.
 	Tumble() bool
+
+	// Close tears the bridge down with a proper close handshake on both sides and
+	// blocks until the frames have been written (or their short deadlines expire).
+	// Safe to call from any goroutine and idempotent — the underlying shutdown is
+	// sync.Once guarded, so racing with a self-initiated shutdown is harmless.
+	Close(reason string)
 }
 
 // BridgeAttacher is an optional interface an EndpointReconnector may implement to
@@ -171,6 +177,15 @@ func (b *bridge) Tumble() bool {
 		// A tumble is already queued; a second rebind would be redundant.
 		return false
 	}
+}
+
+// Close implements BridgeController.
+//
+// Routed through the same shutdown() every other teardown uses, so both peers get the
+// close-frame write, the registry deregistration and the observation-channel close in the
+// established order. reason is carried into the close frame's text.
+func (b *bridge) Close(reason string) {
+	b.shutdown(fmt.Errorf("%w: %s", ErrBridgeGatewayShuttingDown, reason))
 }
 
 // handleAdminTumble performs an operator-requested rebind onto a different supplier.
@@ -664,19 +679,31 @@ func (b *bridge) shutdown(err error) {
 		// see a malformed frame.
 		closeCode, errMsg := b.determineCloseCodeAndMessage(err)
 		closeCode = sanitizeCloseCode(closeCode)
-		closeMsg := websocket.FormatCloseMessage(closeCode, errMsg)
+		clientCloseMsg := websocket.FormatCloseMessage(closeCode, errMsg)
+
+		// The two peers do NOT get the same code. PATH sits in the middle —
+		//
+		//   external client <--(PATH is the server)-- PATH --(PATH is the client)--> relay miner
+		//
+		// — so a code that is correct facing one direction can be nonsense facing the
+		// other. See endpointCloseCode.
+		endpointCode := endpointCloseCode(closeCode)
+		endpointCloseMsg := clientCloseMsg
+		if endpointCode != closeCode {
+			endpointCloseMsg = websocket.FormatCloseMessage(endpointCode, errMsg)
+		}
 
 		// Write close messages with timeout to prevent hanging on broken connections
 		closeTimeout := time.Now().Add(1 * time.Second)
 
 		if b.clientConn != nil {
-			if err := b.clientConn.WriteControl(websocket.CloseMessage, closeMsg, closeTimeout); err != nil {
+			if err := b.clientConn.WriteControl(websocket.CloseMessage, clientCloseMsg, closeTimeout); err != nil {
 				b.logger.Warn().Err(err).Msg("⚠️ could not write close message to client connection")
 			}
 			b.clientConn.Close()
 		}
 		if b.endpointConn != nil {
-			if err := b.endpointConn.WriteControl(websocket.CloseMessage, closeMsg, closeTimeout); err != nil {
+			if err := b.endpointConn.WriteControl(websocket.CloseMessage, endpointCloseMsg, closeTimeout); err != nil {
 				b.logger.Warn().Err(err).Msg("⚠️ could not write close message to endpoint connection")
 			}
 			b.endpointConn.Close()
@@ -693,6 +720,33 @@ func (b *bridge) shutdown(err error) {
 			close(b.messageObservationsChan)
 		}
 	})
+}
+
+// endpointCloseCode adapts a client-facing close code for the UPSTREAM direction.
+//
+// PATH is the server to the external client but the CLIENT to the relay miner, and RFC
+// 6455 §7.4.1 defines 1011/1012/1013 as things a SERVER tells a client: "internal server
+// error", "service restarting, reconnect", "try again later". Sent upstream they invert
+// the roles — "service restarting, please reconnect" addressed to the relay miner asks it
+// to reconnect to us, which is not something it does, and "internal server error" reports
+// our fault as though the endpoint had one. Neither is what happened.
+//
+// 1001 Going Away is defined for both directions ("a server going down OR a browser
+// having navigated away") and describes it exactly: the peer that dialed you is leaving.
+//
+// Everything else passes through unchanged — 1000 means the same thing in both
+// directions, and application codes (3000-4999, e.g. the relay miner's own 4000 at
+// session expiry) are propagated deliberately.
+//
+// gorilla accepts 1012 on read, so this is not about a protocol error; it is about the
+// operator on the other end being told something true.
+func endpointCloseCode(clientCode int) int {
+	switch clientCode {
+	case websocket.CloseInternalServerErr, websocket.CloseServiceRestart, websocket.CloseTryAgainLater:
+		return websocket.CloseGoingAway
+	default:
+		return clientCode
+	}
 }
 
 // sanitizeCloseCode maps RFC 6455 §7.4.1 reserved status codes — which are for
@@ -756,6 +810,13 @@ func (b *bridge) determineCloseCodeAndMessage(err error) (int, string) {
 
 	// Check for specific error types using errors.Is for proper error chain handling
 	switch {
+	case errors.Is(err, ErrBridgeGatewayShuttingDown):
+		// A deploy, not a fault. 1012 is the code that exists for exactly this and tells
+		// the client to come back — which it should, onto a replica that is not
+		// terminating. Distinguishing it from a crash is the entire point: a rollout
+		// previously reached both peers as 1006.
+		return websocket.CloseServiceRestart, "gateway shutting down, please reconnect"
+
 	case errors.Is(err, ErrBridgeContextCanceled):
 		// Expected shutdown - encourage reconnection
 		return websocket.CloseServiceRestart, "service restarting, please reconnect"

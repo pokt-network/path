@@ -4,7 +4,10 @@ import (
 	"strings"
 
 	"github.com/pokt-network/poktroll/pkg/polylog"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
+	"github.com/pokt-network/path/metrics"
+	shannonmetrics "github.com/pokt-network/path/metrics/protocol/shannon"
 	"github.com/pokt-network/path/protocol"
 )
 
@@ -45,6 +48,58 @@ func removeBlockedSuppliers(
 				Str("endpoint", string(addr)).
 				Msg("Skipping config-blocked supplier")
 		}
+	}
+	return removed
+}
+
+// removeBlockedDomains deletes endpoints whose URL is at a domain the gateway operator
+// has banned for this RPC type (blocked_domains config / PATH_BLOCKED_DOMAINS) and counts
+// each removal on path_endpoints_domain_blocked_total. Returns the number removed.
+//
+// Deliberately NO exemption for a requested/preferred endpoint and NO pool-empty safety
+// net. The drain grants neither either (the preferred-endpoint exemption is what defeated
+// it — every WebSocket rebind prefers the endpoint it is already bound to), and this
+// blocklist is stricter than a drain: a ban that yields when the banned operator is all
+// that remains is not a ban. If the pool empties, the request fails rather than being
+// served by an operator the config says must never serve it.
+//
+// Matching is on the endpoint's live URL, never on EndpointAddr — supplier sets rotate
+// every session, so an addr-keyed ban silently lifts at the next rollover (drain bug 2).
+func removeBlockedDomains(
+	endpoints map[protocol.EndpointAddr]endpoint,
+	blocklist *domainBlocklist,
+	rpcType sharedtypes.RPCType,
+	serviceID protocol.ServiceID,
+	logger polylog.Logger,
+) int {
+	if blocklist == nil || len(endpoints) == 0 {
+		return 0
+	}
+
+	rpcTypeLabel := strings.ToLower(rpcType.String())
+	removed := 0
+	for addr, ep := range endpoints {
+		epURL := ep.GetURL(rpcType)
+		if epURL == "" {
+			epURL = ep.PublicURL()
+		}
+		if !blocklist.IsBlocked(epURL, rpcType) {
+			continue
+		}
+
+		delete(endpoints, addr)
+		removed++
+
+		domain := "unknown"
+		if d, err := shannonmetrics.ExtractDomainOrHost(epURL); err == nil {
+			domain = d
+		}
+		metrics.EndpointsDomainBlockedTotal.WithLabelValues(domain, rpcTypeLabel, string(serviceID)).Inc()
+
+		logger.Debug().
+			Str("domain", domain).
+			Str("endpoint", string(addr)).
+			Msg("Skipping endpoint at operator-blocked domain")
 	}
 	return removed
 }

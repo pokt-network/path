@@ -51,6 +51,12 @@ type service struct {
 	// (ArchivalExpiresAt) is still checked at read time in GetArchivalEndpoints.
 	archivalIndex map[protocol.ServiceID]map[EndpointKey]struct{}
 
+	// drainedDomains holds admin drains as PREDICATES — (service, domain, rpc_type) →
+	// expiry — rather than as resolved endpoint keys. Sessions rotate their supplier set
+	// every rollover, so a bench resolved to concrete keys goes stale within ~20 minutes
+	// while still appearing active. Guarded by mu. See DrainDomain.
+	drainedDomains map[DrainKey]time.Time
+
 	// Async write handling
 	writeCh   chan writeRequest
 	stopCh    chan struct{}
@@ -817,9 +823,13 @@ func (s *service) refreshFromStorage(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
+	s.refreshDrains(ctx)
+
 	return nil
 }
 
+// refreshDrains replaces the local admin-drain set with the one in shared storage.
+//
 // SetArchivalStatus marks an endpoint as archival-capable with an expiry time.
 // This is called by health checks when an endpoint passes archival validation.
 // The status is shared across all replicas via Redis storage.

@@ -475,9 +475,54 @@ func RecordCircuitBreakerEvent(serviceID, domain, reasonCategory, event string) 
 var EndpointsInCooldown = promauto.NewGaugeVec(
 	prometheus.GaugeOpts{
 		Name: MetricPrefix + "endpoints_in_cooldown",
-		Help: "Number of endpoints currently in strike cooldown (Score.CooldownUntil in the future). Published every 10s. Cooldown is independent from score-below-threshold — an endpoint can be cooldown'd even with a high score after critical strikes.",
+		Help: "Number of endpoints in a cooldown they EARNED (Score.CooldownUntil in the future). Excludes endpoints benched by an admin drain — see path_endpoints_drained. Published every 10s. Cooldown is independent from score-below-threshold — an endpoint can be cooldown'd even with a high score after critical strikes.",
 	},
 	[]string{LabelDomain, LabelRPCType, LabelServiceID},
+)
+
+// EndpointsDrained counts endpoints benched by an admin drain rather than by anything they
+// did.
+//
+// Deliberately a SEPARATE series from path_endpoints_in_cooldown. A drain removes an
+// operator's traffic exactly the way a cooldown does, so folding the two together makes a
+// deliberate bench indistinguishable from a quality incident on every dashboard — and a
+// drain exists to OBSERVE an operator, so contaminating the signal defeats its purpose.
+// Nobody should be paged over a drain we applied ourselves.
+var EndpointsDrained = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: MetricPrefix + "endpoints_drained",
+		Help: "Number of endpoints currently benched by an admin drain (POST /admin/reputation/drain). Not a fault: these were removed from selection deliberately and the bench expires on its own. Published every 10s.",
+	},
+	[]string{LabelDomain, LabelRPCType, LabelServiceID},
+)
+
+// EndpointsDomainBlockedTotal counts endpoints removed from selection by the
+// gateway-operator domain blocklist (blocked_domains config / PATH_BLOCKED_DOMAINS).
+//
+// Counted per selection pass, so the RATE tracks how often the ban is actually engaging
+// — the honest signal, after four drain bugs whose gauges reported benched endpoints
+// selection kept serving. Zero while path_blocked_domains_configured is nonzero means no
+// banned endpoint appeared in any session, OR the ban is not engaging — investigate
+// before trusting it.
+var EndpointsDomainBlockedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "endpoints_domain_blocked_total",
+		Help: "Endpoints removed from a selection pass by the gateway-operator domain blocklist (blocked_domains / PATH_BLOCKED_DOMAINS). Deliberate config-driven bans, not faults.",
+	},
+	[]string{LabelDomain, LabelRPCType, LabelServiceID},
+)
+
+// BlockedDomainsConfigured reports the (domain, rpc_type) entries the domain blocklist
+// booted with — set once at startup, 1 per entry, rpc_type="all" for all-type bans.
+// Exists because LOG_LEVEL=error hides the startup log, and "is the ban even loaded on
+// this pod" must be answerable from Prometheus. Compare with
+// path_endpoints_domain_blocked_total: configured but never engaging is a red flag.
+var BlockedDomainsConfigured = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: MetricPrefix + "blocked_domains_configured",
+		Help: "1 for each (domain, rpc_type) entry in the gateway-operator domain blocklist on this pod (rpc_type=\"all\" = every type). Set at startup.",
+	},
+	[]string{LabelDomain, LabelRPCType},
 )
 
 // =============================================================================
@@ -1195,6 +1240,36 @@ var WebsocketMessagesTotal = promauto.NewCounterVec(
 	[]string{LabelDomain, LabelServiceID, "direction", LabelReputationSignal},
 )
 
+// WebsocketConnectionFrameRate observes EVERY live connection's endpoint→client frames/sec
+// on each sampler pass, bucketed per service and operator.
+//
+// Why a histogram when path_websocket_messages_total already exists: that counter is a per
+// domain SUM, and a sum cannot distinguish "one firehose plus a hundred idle sockets" from
+// "a hundred ordinary subscribers". Those two have completely different explanations —
+// the first is where a high-volume client happened to land, the second is a property of
+// the operator — and per-operator earnings differ by ~4x fleetwide on exactly that
+// ambiguity. Only the distribution separates them.
+//
+// Both frame directions are reward-eligible under the relay miner (each endpoint→client
+// push is signed and mined paired with the most recent request), so this is closer to a
+// settlement-volume distribution than a traffic one.
+//
+// Idle connections are observed at 0 deliberately. Dropping them would leave the p50
+// describing only the connections that carry traffic, which is precisely the population
+// the metric exists to size against everything else.
+//
+// Buckets span one frame per ten seconds (a newHeads subscription on a slow chain) to
+// thousands per second (a logs/pendingTransactions firehose), with resolution concentrated
+// in 1..500 where the interesting separation lives.
+var WebsocketConnectionFrameRate = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    MetricPrefix + "websocket_connection_frame_rate",
+		Help:    "Per-connection endpoint→client frames/sec, sampled periodically, by domain and service_id. Reveals the DISTRIBUTION that path_websocket_messages_total sums away.",
+		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500},
+	},
+	[]string{LabelDomain, LabelServiceID},
+)
+
 // WebsocketRebindTotal counts websocket session-rebind episodes by outcome.
 // EXPERIMENTAL / canary observability for the session-rebind feature
 // (PATH_WEBSOCKET_SESSION_REBIND). result is one of the WSRebind* labels above:
@@ -1635,6 +1710,13 @@ func RecordWebsocketConnectionFailed(domain, serviceID string) {
 // direction should be WSDirectionClientToEndpoint or WSDirectionEndpointToClient
 func RecordWebsocketMessage(domain, serviceID, direction, reputationSignal string) {
 	WebsocketMessagesTotal.WithLabelValues(domain, serviceID, direction, reputationSignal).Inc()
+}
+
+// RecordWebsocketConnectionFrameRate observes one live connection's current frames/sec.
+// Called once per connection per sampler pass, including for connections currently at
+// zero — see WebsocketConnectionFrameRate for why the zeros are load-bearing.
+func RecordWebsocketConnectionFrameRate(domain, serviceID string, framesPerSec float64) {
+	WebsocketConnectionFrameRate.WithLabelValues(domain, serviceID).Observe(framesPerSec)
 }
 
 // RecordWebsocketRebind records a websocket session-rebind episode outcome and, on

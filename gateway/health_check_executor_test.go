@@ -12,7 +12,9 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/stretchr/testify/require"
 
+	protocolobservations "github.com/pokt-network/path/observation/protocol"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/heuristic"
 	"github.com/pokt-network/path/reputation"
 )
 
@@ -247,7 +249,7 @@ func TestConfigMergingSyncAllowance(t *testing.T) {
 
 // mockQoSServiceWithSyncAllowance is a minimal mock that tracks SetSyncAllowance calls.
 type mockQoSServiceWithSyncAllowance struct {
-	QoSService // embed interface — only SetSyncAllowance is used
+	QoSService    // embed interface — only SetSyncAllowance is used
 	syncAllowance uint64
 	called        bool
 }
@@ -579,7 +581,7 @@ func (m *recordedSignalReputationSvc) RecordedSignals() []reputation.Signal {
 // TestRecordCheckResult_OverServicedSkipsPenalty pins the invariant that the
 // health-check executor must not penalize a supplier when the relay-miner has
 // signaled the application's per-session stake budget is exhausted. Without
-// this skip the executor was draining easy2stake's BSC supplier set to score=0
+// this skip the executor was draining operator-zeta's BSC supplier set to score=0
 // in production despite the request-path no-penalty fix.
 func TestRecordCheckResult_OverServicedSkipsPenalty(t *testing.T) {
 	cases := []struct {
@@ -822,4 +824,214 @@ func TestFanOutcomeToSibling_OverServicedNotPenalized(t *testing.T) {
 
 	require.Empty(t, rep.RecordedSignals(),
 		"fanned over-serviced failures must not penalize the sibling")
+}
+
+// TestBuildServicePayload_JSONRPCMethod pins that the health check payload carries the
+// JSON-RPC method from its body.
+//
+// Regression: the field was never set, so protocol/shannon/context.go fell back to
+// payload.Path ("/") when calling the heuristic. That defeated the CometBFT carve-out
+// in analyzeJSONRPC — `health` returns {"jsonrpc":"2.0","id":1,"result":{}}, which the
+// empty-object rule flags unless rpcType is COMET_BFT or the method is recognized as
+// CometBFT. Cosmos services declare the check as type json_rpc, so every healthy node
+// was retried and penalized minor_error on every cycle.
+func TestBuildServicePayload_JSONRPCMethod(t *testing.T) {
+	e := &HealthCheckExecutor{logger: polyzero.NewLogger()}
+
+	tests := []struct {
+		name       string
+		check      HealthCheckConfig
+		wantMethod string
+	}{
+		{
+			name: "cometbft health over json_rpc carries the method",
+			check: HealthCheckConfig{
+				Name:   "health",
+				Type:   "json_rpc",
+				Method: "POST",
+				Path:   "/",
+				Body:   `{"jsonrpc":"2.0","id":1,"method":"health"}`,
+			},
+			wantMethod: "health",
+		},
+		{
+			name: "evm method carries through",
+			check: HealthCheckConfig{
+				Name:   "eth_blockNumber",
+				Type:   "json_rpc",
+				Method: "POST",
+				Path:   "/",
+				Body:   `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`,
+			},
+			wantMethod: "eth_blockNumber",
+		},
+		{
+			name: "rest check has no json-rpc method",
+			check: HealthCheckConfig{
+				Name:   "syncing",
+				Type:   "rest",
+				Method: "GET",
+				Path:   "/cosmos/base/tendermint/v1beta1/syncing",
+			},
+			wantMethod: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := e.buildServicePayload(tt.check)
+			require.Equal(t, tt.wantMethod, payload.JSONRPCMethod)
+			// Path must stay intact: REST path-aware validation still depends on it.
+			require.Equal(t, tt.check.Path, payload.Path)
+		})
+	}
+}
+
+// TestCometBFTHealthResponseNotFlaggedByHeuristic is the end-to-end assertion behind the
+// fix: with the method populated, a healthy CometBFT `health` response must survive the
+// heuristic that previously flagged it.
+//
+// BOTH heuristic sites are asserted. The response passes through them in order, and
+// either one alone fails the check:
+//
+//	site 1 - protocol/shannon/context.go, after the relay returns
+//	site 2 - health_check_executor.go, which decides the check's outcome
+//
+// Fixing only site 1 changes nothing observable: the response simply reaches site 2 and
+// is rejected there on the same rule, moving the metric from status_code="error" to
+// status_code="200" while cosmos `health` stays at 100% failure.
+func TestCometBFTHealthResponseNotFlaggedByHeuristic(t *testing.T) {
+	e := &HealthCheckExecutor{logger: polyzero.NewLogger()}
+	payload := e.buildServicePayload(HealthCheckConfig{
+		Name:   "health",
+		Type:   "json_rpc",
+		Method: "POST",
+		Path:   "/",
+		Body:   `{"jsonrpc":"2.0","id":1,"method":"health"}`,
+	})
+
+	// The correct CometBFT answer from a healthy node.
+	healthyResponse := []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+
+	// Both sites resolve the method the same way: payload method, Path as fallback.
+	jsonrpcMethod := payload.JSONRPCMethod
+	if jsonrpcMethod == "" {
+		jsonrpcMethod = payload.Path
+	}
+	require.Equal(t, "health", jsonrpcMethod, "method must survive payload construction")
+
+	t.Run("site 1: protocol layer", func(t *testing.T) {
+		result := heuristic.Analyze(healthyResponse, http.StatusOK, payload.RPCType, jsonrpcMethod)
+		require.False(t, result.ShouldRetry,
+			"healthy CometBFT health response must not be flagged (got %q: %s)", result.Reason, result.Details)
+	})
+
+	t.Run("site 2: health check executor", func(t *testing.T) {
+		// EffectiveRPCType, matching the executor's own call.
+		result := heuristic.Analyze(healthyResponse, http.StatusOK, payload.EffectiveRPCType(), jsonrpcMethod)
+		require.False(t, result.ShouldRetry,
+			"healthy CometBFT health response must not be flagged (got %q: %s)", result.Reason, result.Details)
+	})
+}
+
+// healthCheckProtocolCtx returns a canned backend response to the health check relay.
+type healthCheckProtocolCtx struct {
+	body       string
+	statusCode int
+}
+
+func (m *healthCheckProtocolCtx) HandleServiceRequest([]protocol.Payload) ([]protocol.Response, error) {
+	return []protocol.Response{{
+		Bytes:          []byte(m.body),
+		HTTPStatusCode: m.statusCode,
+		EndpointAddr:   "pokt1a-https://a.example.com",
+	}}, nil
+}
+
+func (m *healthCheckProtocolCtx) SetParentContext(context.Context) {}
+func (m *healthCheckProtocolCtx) MarkAsHedge()                     {}
+func (m *healthCheckProtocolCtx) MarkAsRetry()                     {}
+func (m *healthCheckProtocolCtx) MarkAsHealthCheck()               {}
+func (m *healthCheckProtocolCtx) GetObservations() protocolobservations.Observations {
+	return protocolobservations.Observations{}
+}
+
+// healthCheckProtocol hands the executor the canned context above.
+type healthCheckProtocol struct {
+	mockProtocolForRetry
+	protocolCtx *healthCheckProtocolCtx
+}
+
+func (m *healthCheckProtocol) BuildHTTPRequestContextForEndpoint(
+	_ context.Context,
+	_ protocol.ServiceID,
+	_ protocol.EndpointAddr,
+	_ sharedtypes.RPCType,
+	_ *http.Request,
+	_ bool,
+) (ProtocolRequestContext, protocolobservations.Observations, error) {
+	return m.protocolCtx, protocolobservations.Observations{}, nil
+}
+
+// TestExecuteCheckViaProtocol_CometBFTHealthPasses drives the real executor path, which is
+// what makes this a regression test rather than a restatement of the heuristic's rules.
+//
+// The executor runs its OWN heuristic.Analyze after the relay returns. That call passed a
+// hardcoded "", so populating JSONRPCMethod on the payload alone left cosmos `health` at
+// 100% failure - the response cleared the protocol-layer check and was then rejected here.
+func TestExecuteCheckViaProtocol_CometBFTHealthPasses(t *testing.T) {
+	tests := []struct {
+		name      string
+		check     HealthCheckConfig
+		body      string
+		wantError bool
+	}{
+		{
+			name: "healthy cometbft health response passes",
+			check: HealthCheckConfig{
+				Name: "health", Type: "json_rpc", Method: "POST", Path: "/",
+				Body:               `{"jsonrpc":"2.0","id":1,"method":"health"}`,
+				ExpectedStatusCode: 200,
+			},
+			body:      `{"jsonrpc":"2.0","id":1,"result":{}}`,
+			wantError: false,
+		},
+		{
+			// The rule must still bite where it was meant to: an EVM method has no
+			// business returning an empty object.
+			name: "evm empty object result is still rejected",
+			check: HealthCheckConfig{
+				Name: "eth_blockNumber", Type: "json_rpc", Method: "POST", Path: "/",
+				Body:               `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`,
+				ExpectedStatusCode: 200,
+			},
+			body:      `{"jsonrpc":"2.0","id":1,"result":{}}`,
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := &HealthCheckExecutor{
+				logger:   polyzero.NewLogger(),
+				protocol: &healthCheckProtocol{protocolCtx: &healthCheckProtocolCtx{body: tt.body, statusCode: 200}},
+			}
+
+			_, err := e.ExecuteCheckViaProtocol(
+				context.Background(),
+				protocol.ServiceID("pocket"),
+				protocol.EndpointAddr("pokt1a-https://a.example.com"),
+				tt.check,
+				0,   // syncAllowance: sync check disabled
+				nil, // capture
+			)
+
+			if tt.wantError {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "jsonrpc_empty_object_result")
+				return
+			}
+			require.NoError(t, err, "healthy CometBFT health response must pass the executor's own heuristic")
+		})
+	}
 }

@@ -540,3 +540,120 @@ func (s *RedisStorage) GetEndpointBlockHeights(ctx context.Context, serviceID pr
 
 	return heights, nil
 }
+
+// ---------- Admin drains ----------
+
+// drainsHashKey is the single Redis hash holding every live admin drain, mapping an
+// EndpointKey string to an RFC3339 expiry.
+//
+// A hash rather than one Redis key per drain: the refresh loop reads the whole set on
+// every tick, so this is one HGETALL instead of a SCAN, and it cannot be picked up by the
+// score-keyspace SCAN in List() — that pattern's parseKey rejects this name (no colons),
+// so drains and scores stay strictly separate.
+func (r *RedisStorage) drainsHashKey() string {
+	return r.keyPrefix + "__drains__"
+}
+
+// drainField encodes a DrainKey as a hash field: "serviceID|domain|rpcType".
+//
+// Pipe-delimited because none of the three components can contain one — a service ID and an
+// eTLD+1 are both restricted character sets, and rpcType is a fixed vocabulary. Using ":"
+// (as endpoint keys do) would be ambiguous against URLs, which is what forced the endpoint
+// key parser into its first-colon/last-colon dance.
+func drainField(key reputation.DrainKey) string {
+	return string(key.ServiceID) + "|" + key.Domain + "|" + key.RPCType
+}
+
+// parseDrainField is the inverse of drainField. An empty rpcType (drain covering every RPC
+// type) round-trips as a trailing empty segment.
+func parseDrainField(field string) (reputation.DrainKey, bool) {
+	parts := strings.Split(field, "|")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+		return reputation.DrainKey{}, false
+	}
+	return reputation.DrainKey{
+		ServiceID: protocol.ServiceID(parts[0]),
+		Domain:    parts[1],
+		RPCType:   parts[2],
+	}, true
+}
+
+// drainsHashTTLMargin is how long the drains hash outlives its longest drain. The margin
+// exists so the key is never reaped while a drain is still meant to be in force, with
+// room for clock skew between replicas.
+const drainsHashTTLMargin = 10 * time.Minute
+
+// SetDrain records an admin drain in shared storage so every replica applies it.
+//
+// A TTL is set on the hash itself as a backstop: per-field expiry in ListDrains is what
+// actually lifts a drain, but if that logic ever failed, an operator benched by a forgotten
+// call would stay benched indefinitely. With the TTL the worst case is self-healing —
+// nobody has to remember to unlock anyone.
+//
+// GT semantics: the TTL is only ever EXTENDED, never shortened, so writing a short drain
+// cannot cut short a longer one already recorded in the same hash.
+func (r *RedisStorage) SetDrain(ctx context.Context, key reputation.DrainKey, until time.Time) error {
+	if err := r.client.HSet(ctx, r.drainsHashKey(), drainField(key), until.UTC().Format(time.RFC3339)).Err(); err != nil {
+		return fmt.Errorf("failed to set drain in Redis: %w", err)
+	}
+
+	ttl := time.Until(until) + drainsHashTTLMargin
+	if ttl > 0 {
+		// Best effort: a missing TTL only costs the backstop, and ListDrains still filters
+		// expired fields, so this must not fail the write.
+		_ = r.client.ExpireGT(ctx, r.drainsHashKey(), ttl).Err()
+	}
+	return nil
+}
+
+// DeleteDrain lifts an admin drain across the fleet.
+func (r *RedisStorage) DeleteDrain(ctx context.Context, key reputation.DrainKey) error {
+	if err := r.client.HDel(ctx, r.drainsHashKey(), drainField(key)).Err(); err != nil {
+		return fmt.Errorf("failed to delete drain from Redis: %w", err)
+	}
+	return nil
+}
+
+// ListDrains returns the live drains, dropping expired entries.
+//
+// Expired fields are also deleted opportunistically. Redis cannot TTL individual hash
+// fields, so without this the hash would accumulate every drain ever applied — and a
+// forgotten drain must not become a permanent bench if a replica ever misreads the clock.
+func (r *RedisStorage) ListDrains(ctx context.Context) (map[reputation.DrainKey]time.Time, error) {
+	raw, err := r.client.HGetAll(ctx, r.drainsHashKey()).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read drains from Redis: %w", err)
+	}
+
+	now := time.Now()
+	drains := make(map[reputation.DrainKey]time.Time, len(raw))
+	var expired []string
+
+	for field, val := range raw {
+		until, parseErr := time.Parse(time.RFC3339, val)
+		if parseErr != nil {
+			// An unparseable entry can never expire on its own; drop it rather than let it
+			// sit in the hash forever.
+			expired = append(expired, field)
+			continue
+		}
+		if !now.Before(until) {
+			expired = append(expired, field)
+			continue
+		}
+		key, ok := parseDrainField(field)
+		if !ok {
+			expired = append(expired, field)
+			continue
+		}
+		drains[key] = until
+	}
+
+	if len(expired) > 0 {
+		// Best effort: a failed cleanup only leaves dead fields that ListDrains already
+		// filters, so it must not fail the read.
+		_ = r.client.HDel(ctx, r.drainsHashKey(), expired...).Err()
+	}
+
+	return drains, nil
+}

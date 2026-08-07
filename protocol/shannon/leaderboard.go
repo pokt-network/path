@@ -2,6 +2,7 @@ package shannon
 
 import (
 	"context"
+	"strings"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
@@ -415,14 +416,44 @@ func (p *Protocol) GetSupplierScoreData(ctx context.Context) ([]metrics.Supplier
 // This metric exposes that state so dashboards can answer "how many endpoints
 // does this domain currently have locked out?" without needing /ready introspection.
 func (p *Protocol) GetCooldownCountData(ctx context.Context) ([]metrics.CooldownCountEntry, error) {
-	logger := p.logger.With("method", "GetCooldownCountData")
+	// Counts only cooldowns the endpoint EARNED. Drains are reported separately by
+	// GetDrainedCountData so a bench we applied on purpose never reads as a fault.
+	return p.countBenchedEndpoints(ctx, "GetCooldownCountData",
+		func(_ reputation.EndpointKey, score reputation.Score, _ string, _ sharedtypes.RPCType) bool {
+			return score.IsInCooldown()
+		})
+}
+
+// GetDrainedCountData implements the metrics.LeaderboardDataProvider interface, reporting
+// endpoints removed from selection by POST /admin/reputation/drain.
+//
+// Separate from the cooldown count because the two mean opposite things operationally: a
+// cooldown is the endpoint's fault and warrants attention, a drain is ours and warrants
+// none. A drain is also usually applied in order to OBSERVE an operator, so publishing it
+// as a cooldown would corrupt the very signal it exists to produce.
+func (p *Protocol) GetDrainedCountData(ctx context.Context) ([]metrics.CooldownCountEntry, error) {
+	return p.countBenchedEndpoints(ctx, "GetDrainedCountData",
+		func(key reputation.EndpointKey, _ reputation.Score, domain string, rpcType sharedtypes.RPCType) bool {
+			return p.reputationService.IsDomainDrained(key.ServiceID, domain, strings.ToLower(rpcType.String()))
+		})
+}
+
+// countBenchedEndpoints walks the active sessions and counts, per (domain, service,
+// rpc_type), the endpoints matching include. Shared by the cooldown and drain counters so
+// the two can never diverge in how they enumerate endpoints — only in what they select.
+func (p *Protocol) countBenchedEndpoints(
+	ctx context.Context,
+	method string,
+	include func(reputation.EndpointKey, reputation.Score, string, sharedtypes.RPCType) bool,
+) ([]metrics.CooldownCountEntry, error) {
+	logger := p.logger.With("method", method)
 
 	if p.unifiedServicesConfig == nil {
-		logger.Debug().Msg("No unified services config available, returning empty cooldown counts")
+		logger.Debug().Msg("No unified services config available, returning empty counts")
 		return nil, nil
 	}
 	if p.reputationService == nil {
-		logger.Debug().Msg("Reputation service not enabled, returning empty cooldown counts")
+		logger.Debug().Msg("Reputation service not enabled, returning empty counts")
 		return nil, nil
 	}
 
@@ -450,22 +481,26 @@ func (p *Protocol) GetCooldownCountData(ctx context.Context) ([]metrics.Cooldown
 			}
 
 			for endpointAddr, ep := range endpoints {
-				keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
-				key := keyBuilder.BuildKey(serviceID, endpointAddr, actualRPCType)
-				score, scoreErr := p.reputationService.GetScore(ctx, key)
-				if scoreErr != nil {
-					// No score recorded → can't be in cooldown. Skip silently.
-					continue
-				}
-				if !score.IsInCooldown() {
-					continue
-				}
-
 				endpointURL := ep.GetURL(actualRPCType)
 				domain, domainErr := shannonmetrics.ExtractDomainOrHost(endpointURL)
 				if domainErr != nil {
 					domain = shannonmetrics.ErrDomain
 				}
+
+				// Resolved before the include check because a drain is matched on DOMAIN,
+				// not on a reputation key — an unscored endpoint at a drained operator is
+				// still benched, so it must still be counted.
+				keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
+				key := keyBuilder.BuildKey(serviceID, endpointAddr, actualRPCType)
+				// A drain never writes to the Score, so this reports only cooldowns the
+				// endpoint EARNED. Drains are counted separately by GetDrainedCountData,
+				// keeping a deliberate bench from reading as a quality incident.
+				score, _ := p.reputationService.GetScore(ctx, key)
+
+				if !include(key, score, domain, actualRPCType) {
+					continue
+				}
+
 				k := groupKey{
 					Domain:    domain,
 					ServiceID: string(serviceID),
@@ -486,7 +521,7 @@ func (p *Protocol) GetCooldownCountData(ctx context.Context) ([]metrics.Cooldown
 		})
 	}
 
-	logger.Debug().Int("total_entries", len(entries)).Msg("Built cooldown count data")
+	logger.Debug().Int("total_entries", len(entries)).Msg("Built benched-endpoint count data")
 	return entries, nil
 }
 

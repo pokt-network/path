@@ -43,6 +43,16 @@ func (m *mockReputationService) ResetScore(ctx context.Context, key reputation.E
 	return nil
 }
 
+// Admin drains are exercised through protocol/shannon's selection harness, which asserts
+// on what selection actually returns. These stubs only keep the interface satisfied.
+func (m *mockReputationService) IsDomainDrained(serviceID protocol.ServiceID, domain, rpcType string) bool {
+	return false
+}
+
+func (m *mockReputationService) DrainDomain(ctx context.Context, req reputation.DrainRequest) reputation.DrainResult {
+	return reputation.DrainResult{}
+}
+
 func (m *mockReputationService) KeyBuilderForService(serviceID protocol.ServiceID) reputation.KeyBuilder {
 	return reputation.NewKeyBuilder("domain")
 }

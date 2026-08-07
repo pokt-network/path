@@ -54,6 +54,16 @@ var (
 	// ErrEndpointStalled/ErrEndpointTumbled which must land elsewhere.
 	ErrEndpointSessionExpired = errors.New("endpoint session expired: bound session ended without the supplier disconnecting")
 
+	// ErrBridgeGatewayShuttingDown indicates the gateway process is terminating and is
+	// closing this bridge deliberately, rather than the connection failing.
+	//
+	// Without it the process simply exits and every live websocket dies with the TCP
+	// socket and no close handshake, which both peers report as an abnormal closure
+	// (1006) — the client cannot tell a deploy from a crash, and the endpoint logs a
+	// fault it did not cause. http.Server.Shutdown does not help: it explicitly does not
+	// close hijacked connections, and every websocket is hijacked.
+	ErrBridgeGatewayShuttingDown = errors.New("gateway shutting down")
+
 	// ErrBridgeIdleTimeout indicates the client has held the connection open without ever
 	// establishing a subscription and without sending a frame for idleConnectionThreshold.
 	//

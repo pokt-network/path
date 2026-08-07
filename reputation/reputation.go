@@ -43,6 +43,37 @@ func NewEndpointKey(serviceID protocol.ServiceID, endpointAddr protocol.Endpoint
 	}
 }
 
+// ParseEndpointKeyString is the inverse of EndpointKey.String().
+//
+// EndpointAddr may itself contain colons (URLs carry "https://" and often a port), so the
+// serviceID is taken up to the FIRST colon and the rpcType from after the LAST — anything
+// between is the address, colons and all. Splitting naively on ":" corrupts every URL-keyed
+// endpoint.
+func ParseEndpointKeyString(s string) (EndpointKey, bool) {
+	lastColon := strings.LastIndex(s, ":")
+	if lastColon <= 0 {
+		return EndpointKey{}, false
+	}
+	rpcTypeStr := s[lastColon+1:]
+
+	rest := s[:lastColon]
+	firstColon := strings.Index(rest, ":")
+	if firstColon <= 0 {
+		return EndpointKey{}, false
+	}
+	serviceID := rest[:firstColon]
+	endpointAddr := rest[firstColon+1:]
+	if endpointAddr == "" {
+		return EndpointKey{}, false
+	}
+
+	return NewEndpointKey(
+		protocol.ServiceID(serviceID),
+		protocol.EndpointAddr(endpointAddr),
+		sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(rpcTypeStr)]),
+	), true
+}
+
 // String returns a string representation of the endpoint key.
 // Format: "serviceID:endpointAddr:rpcType"
 // Example: "eth:pokt1abc-https://node.example.com:json_rpc"
@@ -355,6 +386,18 @@ type ReputationService interface {
 	// ResetScore resets an endpoint's score to the initial value.
 	// Used for administrative purposes or testing.
 	ResetScore(ctx context.Context, key EndpointKey) error
+
+	// IsDomainDrained reports whether an operator (eTLD+1) is benched by an admin drain for
+	// this service and RPC type. Consulted by selection against the endpoint's LIVE URL, so
+	// the bench survives session rotation. Scores are never modified by a drain, so the
+	// quality signal stays readable while one is in force.
+	IsDomainDrained(serviceID protocol.ServiceID, domain, rpcType string) bool
+
+	// DrainDomain temporarily benches every scored endpoint of one operator (eTLD+1)
+	// for a service by writing a cooldown expiry, without altering reputation itself.
+	// Administrative / experimental: it makes "what happens when this operator is not
+	// available" answerable without waiting for the operator to actually fail.
+	DrainDomain(ctx context.Context, req DrainRequest) DrainResult
 
 	// KeyBuilderForService returns the KeyBuilder for the given service.
 	// Uses service-specific config if available, otherwise falls back to global default.

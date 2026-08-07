@@ -159,6 +159,35 @@ func ConnectWebsocketEndpoint(
 	return conn, nil
 }
 
+// closeHandshakeTimeout bounds how long a close frame may take to write. Every caller of
+// CloseEndpointConn is on a teardown path where the peer may already be gone, so being
+// polite must never block; one second is far past a healthy write and far short of
+// anything a caller would notice.
+const closeHandshakeTimeout = time.Second
+
+// CloseEndpointConn closes an endpoint websocket connection with a proper close handshake
+// rather than dropping the TCP socket underneath it.
+//
+// A bare conn.Close() sends no close frame, so the endpoint's read fails mid-frame and it
+// reports the peer as having vanished: geth logs `websocket: close 1006 (abnormal
+// closure): unexpected EOF`, Nethermind `An exception caused the WebSocket to enter the
+// Aborted state (Failed: 0)`. Those are OUR teardowns being reported as the endpoint's
+// fault, and the volume is not incidental — the websocket health-check probe dials,
+// measures and closes ~89 times a second fleetwide, so every operator running websocket
+// endpoints sees a continuous stream of abnormal closures caused entirely by PATH.
+//
+// Best effort by construction: the write is unchecked and deadline-bounded because a
+// teardown often begins BECAUSE the peer already went away, and there is nothing useful
+// to do about a close frame that cannot be delivered.
+func CloseEndpointConn(conn *websocket.Conn, code int, reason string) {
+	if conn == nil {
+		return
+	}
+	closeMsg := websocket.FormatCloseMessage(code, reason)
+	_ = conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(closeHandshakeTimeout))
+	_ = conn.Close()
+}
+
 // newConnection creates a new websocket connection wrapper.
 //
 // ctx stops the connection's read/ping loops (its Done channel). onDisconnect is

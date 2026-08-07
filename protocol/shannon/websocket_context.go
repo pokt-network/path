@@ -358,7 +358,11 @@ func (p *Protocol) CheckWebsocketConnection(
 		logger.Debug().Err(err).Msg("❌ Failed to connect to websocket endpoint")
 		return nil, getWebsocketConnectionErrorObservation(logger, serviceID, selectedEndpoint, err)
 	}
-	defer conn.Close()
+	// Close with a handshake, not a bare socket drop. This probe runs ~89 times a second
+	// fleetwide, and a bare Close() makes every one of them surface in the endpoint's log
+	// as an abnormal closure (1006 / "Aborted state") attributed to the endpoint. 1000
+	// Normal Closure is accurate: the probe got what it came for and is leaving.
+	defer websockets.CloseEndpointConn(conn, gorillaws.CloseNormalClosure, "health check complete")
 
 	// Handshake-only probe: connecting was the whole test.
 	//
