@@ -320,9 +320,7 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		// Best effort with a short deadline: the endpoint may already be gone (a rollover
 		// often starts BECAUSE it closed on us), and a rebind must not stall waiting to be
 		// polite to a socket that is not there.
-		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "rebinding to a new session")
-		_ = b.endpointConn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(time.Second))
-		b.endpointConn.Close()
+		CloseEndpointConn(b.endpointConn.Conn, websocket.CloseNormalClosure, "rebinding to a new session")
 		b.endpointConn = nil
 	}
 
@@ -340,14 +338,16 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 	if replayErr != nil {
 		// Replay-frame construction failed (e.g. re-signing error). The new connection
 		// is unusable without restored subscriptions; close the client to reconnect.
-		newConn.Close()
+		// The endpoint did nothing wrong — the failure is ours — so it gets a clean 1000
+		// rather than a dropped socket it would log as an abnormal closure.
+		CloseEndpointConn(newConn, websocket.CloseNormalClosure, "subscription replay failed")
 		b.logger.Error().Err(replayErr).Msg("❌ [WS-REBIND] failed to build subscription replay frames — closing client")
 		b.reconnector.OnReconnectOutcome(false, 0, ReconnectStageReplay)
 		b.shutdown(fmt.Errorf("%w: subscription replay failed: %w", ErrBridgeEndpointUnavailable, replayErr))
 		return
 	}
 	if err := writeReplayFrames(newConn, replayFrames); err != nil {
-		newConn.Close()
+		CloseEndpointConn(newConn, websocket.CloseNormalClosure, "subscription replay failed")
 		b.logger.Error().Err(err).Msg("❌ [WS-REBIND] failed to replay subscriptions onto new endpoint — closing client")
 		b.reconnector.OnReconnectOutcome(false, 0, ReconnectStageReplay)
 		b.shutdown(fmt.Errorf("%w: subscription replay write failed: %w", ErrBridgeEndpointUnavailable, err))
