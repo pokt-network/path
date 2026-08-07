@@ -1468,3 +1468,79 @@ func TestReputationWebSocketRecording_RPCType(t *testing.T) {
 
 	t.Log("Verified: WebSocket observations use WEBSOCKET RPC type in reputation keys")
 }
+
+// THE REGRESSION TEST for the admin drain.
+//
+// The drain block originally deleted from the `endpoints` map passed in, but this function
+// builds its result by walking `cached` — so the deletions had no effect on what it returned
+// and the ban was completely inert in production while the API reported success and the
+// gauge reported endpoints benched. Asserting on the RETURNED map is the only thing that
+// catches that; every unit test I had written up to then asserted on helpers instead.
+func Test_filterByReputation_ExcludesDrainedOperator(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	config := reputation.Config{Enabled: true, InitialScore: 80, MinThreshold: 30, StorageType: "memory"}
+	config.HydrateDefaults()
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	p := &Protocol{logger: logger, reputationService: svc}
+	serviceID := protocol.ServiceID("gnosis")
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"https://f019.spacebelt.xyz": &mockEndpoint{addr: "https://f019.spacebelt.xyz"},
+		"https://r001.rpcgate.xyz":   &mockEndpoint{addr: "https://r001.rpcgate.xyz"},
+		"https://n1.kalorius.tech":   &mockEndpoint{addr: "https://n1.kalorius.tech"},
+	}
+
+	// Nothing benched yet: every endpoint survives.
+	require.Len(t, p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, ""), 3)
+
+	svc.DrainDomain(ctx, reputation.DrainRequest{
+		ServiceID: serviceID, Domain: "spacebelt.xyz", RPCType: "websocket", Duration: time.Hour,
+	})
+
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, "")
+	require.NotContains(t, filtered, protocol.EndpointAddr("https://f019.spacebelt.xyz"),
+		"a drained operator must be absent from the RETURNED set, not merely from a map nobody reads")
+	require.Contains(t, filtered, protocol.EndpointAddr("https://r001.rpcgate.xyz"))
+	require.Contains(t, filtered, protocol.EndpointAddr("https://n1.kalorius.tech"))
+
+	// A drain is scoped to its rpc_type: the same operator still serves HTTP.
+	httpFiltered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
+	require.Contains(t, httpFiltered, protocol.EndpointAddr("https://f019.spacebelt.xyz"))
+}
+
+// Banning every operator must not sever the service. A drain is an operator preference, not
+// a correctness constraint, so it yields rather than returning an empty pool.
+func Test_filterByReputation_DrainNeverEmptiesPool(t *testing.T) {
+	ctx := context.Background()
+	logger := polyzero.NewLogger()
+
+	config := reputation.Config{Enabled: true, InitialScore: 80, MinThreshold: 30, StorageType: "memory"}
+	config.HydrateDefaults()
+	store := reputationstorage.NewMemoryStorage(config.RecoveryTimeout)
+	svc := reputation.NewService(config, store)
+	require.NoError(t, svc.Start(ctx))
+	defer func() { _ = svc.Stop() }()
+
+	p := &Protocol{logger: logger, reputationService: svc}
+	serviceID := protocol.ServiceID("gnosis")
+
+	endpoints := map[protocol.EndpointAddr]endpoint{
+		"https://f019.spacebelt.xyz": &mockEndpoint{addr: "https://f019.spacebelt.xyz"},
+		"https://r001.rpcgate.xyz":   &mockEndpoint{addr: "https://r001.rpcgate.xyz"},
+	}
+
+	for _, d := range []string{"spacebelt.xyz", "rpcgate.xyz"} {
+		svc.DrainDomain(ctx, reputation.DrainRequest{
+			ServiceID: serviceID, Domain: d, RPCType: "websocket", Duration: time.Hour,
+		})
+	}
+
+	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, "")
+	require.Len(t, filtered, 2, "draining every operator must yield rather than empty the pool")
+}

@@ -103,41 +103,45 @@ func (p *Protocol) filterByReputation(
 	//
 	// Applied BEFORE the reputation checks below so a drain does not depend on scores
 	// existing: an unscored endpoint at a drained operator must still be excluded.
-	drainedEndpoints := 0
+	// Filter `cached` itself, NOT the incoming `endpoints` map: everything below builds the
+	// returned set by walking `cached`, so deleting from `endpoints` has no effect on the
+	// result. An earlier version did exactly that and the ban was completely inert in
+	// production while reporting success.
 	if p.reputationService != nil {
 		rpcTypeStr := strings.ToLower(rpcType.String())
-		for i := 0; i < len(cached); i++ {
-			ak := cached[i]
+		kept := cached[:0:0]
+		drained := 0
+		for _, ak := range cached {
 			// The pre-selected endpoint keeps its usual escape hatch: dropping it here would
 			// fail the request outright rather than route it elsewhere.
-			if ak.addr == requestedEndpointAddr {
-				continue
+			if ak.addr != requestedEndpointAddr {
+				if domain, domainErr := shannonmetrics.ExtractDomainOrHost(ak.ep.GetURL(rpcType)); domainErr == nil &&
+					p.reputationService.IsDomainDrained(serviceID, domain, rpcTypeStr) {
+					drained++
+					continue
+				}
 			}
-			epURL := ak.ep.GetURL(rpcType)
-			domain, domainErr := shannonmetrics.ExtractDomainOrHost(epURL)
-			if domainErr != nil {
-				continue
-			}
-			if !p.reputationService.IsDomainDrained(serviceID, domain, rpcTypeStr) {
-				continue
-			}
-			delete(endpoints, ak.addr)
-			drainedEndpoints++
+			kept = append(kept, ak)
 		}
-	}
-	if drainedEndpoints > 0 {
-		logger.Warn().
-			Int("drained_endpoints", drainedEndpoints).
-			Int("remaining", len(endpoints)).
-			Msg("⚠️ excluded endpoints benched by an admin drain")
-	}
-	// A drain must never empty the pool — that would be an outage rather than a
-	// redistribution. Restoring is safe because the drain is an operator preference, not a
-	// correctness constraint.
-	if len(endpoints) == 0 {
-		logger.Warn().Msg("⚠️ admin drain would empty the endpoint pool — restoring drained endpoints")
-		for _, ak := range cached {
-			endpoints[ak.addr] = ak.ep
+
+		switch {
+		case drained == 0:
+			// nothing benched for this service/rpc_type
+
+		case len(kept) > 0:
+			logger.Warn().
+				Int("drained_endpoints", drained).
+				Int("remaining", len(kept)).
+				Msg("⚠️ excluded endpoints benched by an admin drain")
+			cached = kept
+
+		default:
+			// A drain must never empty the pool — that would be an outage rather than a
+			// redistribution. A ban is an operator preference, not a correctness
+			// constraint, so it yields rather than severing the service.
+			logger.Warn().
+				Int("drained_endpoints", drained).
+				Msg("⚠️ admin drain would empty the endpoint pool — keeping drained endpoints as last resort")
 		}
 	}
 
