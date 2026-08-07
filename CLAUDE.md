@@ -358,11 +358,17 @@ destroy the measurement it exists to enable.
 nothing has overwritten since. A cooldown earned for real while the drain was up survives —
 otherwise "undo my experiment" would silently un-bench a legitimately failing endpoint.
 
-**Known limit — a drain is not airtight.** The cooldown lives on the score, so an endpoint the
-reputation service has never observed is treated by selection as "initial score, not in
-cooldown" and stays selectable. The response carries `unscored_warning` rather than letting a
-partial drain read as complete. On a service with health checks running everything is scored,
-so it is usually complete.
+**Unscored endpoints are benched too.** This was once a real gap — the bench lived on the
+score, so an endpoint reputation had never observed read as "initial score, not in cooldown"
+and stayed selectable. The predicate rewrite closed it: the drain filter matches the
+endpoint's **live URL** and runs *before* `GetScores` is consulted, so an endpoint carrying no
+score at all is still excluded. The response's `unscored_warning` is retained as a diagnostic
+but no longer marks an incomplete drain.
+
+**A drain applies at the pace of rebinds, not instantly.** Endpoints leave the selectable set
+immediately, but a *bound* WebSocket connection only moves at its own next rebind — rollover,
+stall or `session_expired`. Measured 2026-08-07: gnosis 42 connections → 0 in ~19 min and bsc
+26 → 0 in ~11 min, on rollover alone with no tumble. Budget for that mid-incident.
 
 **Fleet-wide: ONE call, not one per pod.** Unlike the other admin endpoints, drains are
 written to shared storage (a dedicated `__drains__` hash, **never** the score) and every
@@ -457,8 +463,11 @@ PATH validates that signature in `validateEndpointWebsocketMessage` → `Validat
 signed request = **unbounded** relays, and the push rate is chosen by **the supplier being
 paid**. PATH signs the anchoring subscribe with its *own* application key, so the gateway's app
 stake funds it. The only brake is `relayMeter.IsOverServicing(...)` — the application's
-per-session allowance — and `path_supplier_exhausted_total` was **0 fleetwide** when checked,
-so that brake is dormant.
+per-session allowance — and it engages on almost nothing. Measured 2026-08-07:
+`path_supplier_exhausted_total` fires on **bsc alone** and nowhere else on the fleet, bursting
+0 → ~11/s over ~4h with long zero troughs between. An earlier note recording it as 0 fleetwide
+was a snapshot that landed in a trough — read this counter over a range, never with an instant
+query. On every other service the brake is effectively dormant.
 
 Consequence: a per-domain frames/s number is closer to a **settlement-volume** meter than a
 demand meter. Do not reason about it as load on the supplier.
