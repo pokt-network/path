@@ -307,6 +307,21 @@ func (b *bridge) handleEndpointDown(down endpointDisconnect) {
 		b.endpointCancel()
 	}
 	if b.endpointConn != nil {
+		// Close the WebSocket properly rather than dropping the TCP socket. A bare Close()
+		// looks to the endpoint like the peer vanished mid-read, and rebinds fire on EVERY
+		// session rollover — so this filled operator logs continuously across the fleet:
+		// geth reported `websocket: bad close code 1006`, Nethermind `An exception caused
+		// the WebSocket to enter the Aborted state (Failed: 0)`.
+		//
+		// Normal shutdown already does this (see bridge.go); only the rebind path skipped
+		// it, which is why the noise looked constant rather than occasional. 1000 Normal
+		// Closure is correct: a rebind is an orderly move, not a fault on the endpoint's
+		// part, and telling them otherwise misattributes our routing decision as their error.
+		// Best effort with a short deadline: the endpoint may already be gone (a rollover
+		// often starts BECAUSE it closed on us), and a rebind must not stall waiting to be
+		// polite to a socket that is not there.
+		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "rebinding to a new session")
+		_ = b.endpointConn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(time.Second))
 		b.endpointConn.Close()
 		b.endpointConn = nil
 	}
