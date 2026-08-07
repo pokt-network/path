@@ -251,22 +251,22 @@ func rpcTypeName(rpcType sharedtypes.RPCType) string {
 // =============================================================================
 
 const (
-	spacebeltA = "https://f019.spacebelt.xyz"
-	spacebeltB = "https://f026.spacebelt.xyz"
-	rpcgateA   = "https://r001.rpcgate.xyz"
-	kaloriusA  = "https://n1.kalorius.tech"
+	opBetaA = "https://f019.op-beta.example"
+	opBetaB = "https://f026.op-beta.example"
+	opAlphaA   = "https://r001.op-alpha.example"
+	opGammaA  = "https://n1.op-gamma.example"
 )
 
 // BUG 3 — the filter mutated a map its result was not built from, so nothing was excluded
 // while the API and the gauge both reported the operator benched.
 func TestSelection_DrainRemovesOperatorFromTheReturnedSet(t *testing.T) {
-	s := newSelectionScenario(t, "gnosis", spacebeltA, spacebeltB, rpcgateA, kaloriusA)
+	s := newSelectionScenario(t, "gnosis", opBetaA, opBetaB, opAlphaA, opGammaA)
 
-	s.AssertServes(sharedtypes.RPCType_WEBSOCKET, spacebeltA, spacebeltB, rpcgateA, kaloriusA)
+	s.AssertServes(sharedtypes.RPCType_WEBSOCKET, opBetaA, opBetaB, opAlphaA, opGammaA)
 
-	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
-	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA, spacebeltB)
-	s.AssertSelectable(sharedtypes.RPCType_WEBSOCKET, rpcgateA, kaloriusA)
+	s.Drain("op-beta.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA, opBetaB)
+	s.AssertSelectable(sharedtypes.RPCType_WEBSOCKET, opAlphaA, opGammaA)
 }
 
 // BUG 4 — the drain exempted requestedEndpointAddr, and every websocket path supplies one.
@@ -283,92 +283,92 @@ func TestSelection_DrainRemovesOperatorFromTheReturnedSet(t *testing.T) {
 // The three earlier drain tests all passed because Survivors() hardcodes "" — the one call
 // shape the websocket path never uses.
 func TestSelection_DrainAppliesEvenToThePreferredEndpoint(t *testing.T) {
-	s := newSelectionScenario(t, "gnosis", spacebeltA, spacebeltB, rpcgateA, kaloriusA)
+	s := newSelectionScenario(t, "gnosis", opBetaA, opBetaB, opAlphaA, opGammaA)
 
-	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+	s.Drain("op-beta.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
 
-	// A rebind on a connection currently bound to spacebeltA prefers spacebeltA.
-	s.AssertExcludedPreferring(sharedtypes.RPCType_WEBSOCKET, spacebeltA, spacebeltA, spacebeltB)
+	// A rebind on a connection currently bound to opBetaA prefers opBetaA.
+	s.AssertExcludedPreferring(sharedtypes.RPCType_WEBSOCKET, opBetaA, opBetaA, opBetaB)
 
 	// ...and still has somewhere to go.
-	got := s.SurvivorsPreferring(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
-	require.Contains(t, got, rpcgateA)
-	require.Contains(t, got, kaloriusA)
+	got := s.SurvivorsPreferring(sharedtypes.RPCType_WEBSOCKET, opBetaA)
+	require.Contains(t, got, opAlphaA)
+	require.Contains(t, got, opGammaA)
 }
 
 // The pool-empty guard is what keeps the above from being an outage: when the preferred
 // endpoint is the ONLY thing left, yielding is correct — a bench is an operator preference,
 // not a correctness constraint.
 func TestSelection_PreferredEndpointSurvivesWhenItIsAllThatRemains(t *testing.T) {
-	s := newSelectionScenario(t, "gnosis", spacebeltA)
+	s := newSelectionScenario(t, "gnosis", opBetaA)
 
-	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+	s.Drain("op-beta.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
 
-	require.Equal(t, []string{spacebeltA},
-		s.SurvivorsPreferring(sharedtypes.RPCType_WEBSOCKET, spacebeltA),
+	require.Equal(t, []string{opBetaA},
+		s.SurvivorsPreferring(sharedtypes.RPCType_WEBSOCKET, opBetaA),
 		"a drain must never empty the pool, even against the preferred endpoint")
 }
 
 // BUG 2 — the bench was a snapshot of EndpointKeys, so a session rollover silently lifted it.
 func TestSelection_DrainSurvivesSupplierRotation(t *testing.T) {
-	s := newSelectionScenario(t, "gnosis", spacebeltA, rpcgateA, kaloriusA)
+	s := newSelectionScenario(t, "gnosis", opBetaA, opAlphaA, opGammaA)
 
-	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
-	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+	s.Drain("op-beta.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA)
 
 	// Session N+1: same backends, entirely new supplier addresses.
 	s.RotateSuppliers(1)
-	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA)
 
 	s.RotateSuppliers(2)
-	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA)
 }
 
 // A ban is scoped to one protocol: banning WebSocket must not take the operator's HTTP
 // traffic with it.
 func TestSelection_DrainIsScopedToRPCType(t *testing.T) {
-	s := newSelectionScenario(t, "gnosis", spacebeltA, kaloriusA)
+	s := newSelectionScenario(t, "gnosis", opBetaA, opGammaA)
 
-	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
-	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
-	s.AssertSelectable(sharedtypes.RPCType_JSON_RPC, spacebeltA)
+	s.Drain("op-beta.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA)
+	s.AssertSelectable(sharedtypes.RPCType_JSON_RPC, opBetaA)
 }
 
 func TestSelection_ReleaseRestoresSelectability(t *testing.T) {
-	s := newSelectionScenario(t, "gnosis", spacebeltA, kaloriusA)
+	s := newSelectionScenario(t, "gnosis", opBetaA, opGammaA)
 
-	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
-	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+	s.Drain("op-beta.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+	s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA)
 
-	s.Release("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
-	s.AssertSelectable(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+	s.Release("op-beta.example", sharedtypes.RPCType_WEBSOCKET)
+	s.AssertSelectable(sharedtypes.RPCType_WEBSOCKET, opBetaA)
 }
 
 // Banning every operator must yield rather than sever the service: a ban is an operator
 // preference, not a correctness constraint.
 func TestSelection_DrainNeverEmptiesThePool(t *testing.T) {
-	s := newSelectionScenario(t, "gnosis", spacebeltA, rpcgateA)
+	s := newSelectionScenario(t, "gnosis", opBetaA, opAlphaA)
 
-	s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
-	s.Drain("rpcgate.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+	s.Drain("op-beta.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+	s.Drain("op-alpha.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
 
-	s.AssertServes(sharedtypes.RPCType_WEBSOCKET, spacebeltA, rpcgateA)
+	s.AssertServes(sharedtypes.RPCType_WEBSOCKET, opBetaA, opAlphaA)
 }
 
 // An earned cooldown and an admin bench must both remove an endpoint from selection, and a
 // release must lift only the bench — the two are independent by construction, and operators
 // rely on that when reading dashboards during an experiment.
 func TestSelection_EarnedCooldownAndAdminBenchAreIndependent(t *testing.T) {
-	s := newSelectionScenario(t, "gnosis", spacebeltA, rpcgateA, kaloriusA)
+	s := newSelectionScenario(t, "gnosis", opBetaA, opAlphaA, opGammaA)
 
-	s.DriveIntoCooldown(rpcgateA, sharedtypes.RPCType_JSON_RPC)
-	s.Drain("spacebelt.xyz", sharedtypes.RPCType_JSON_RPC, time.Hour)
+	s.DriveIntoCooldown(opAlphaA, sharedtypes.RPCType_JSON_RPC)
+	s.Drain("op-beta.example", sharedtypes.RPCType_JSON_RPC, time.Hour)
 
-	s.AssertExcluded(sharedtypes.RPCType_JSON_RPC, spacebeltA, rpcgateA)
-	s.AssertSelectable(sharedtypes.RPCType_JSON_RPC, kaloriusA)
+	s.AssertExcluded(sharedtypes.RPCType_JSON_RPC, opBetaA, opAlphaA)
+	s.AssertSelectable(sharedtypes.RPCType_JSON_RPC, opGammaA)
 
 	// Lifting the bench must not rescue the endpoint that earned its cooldown.
-	s.Release("spacebelt.xyz", sharedtypes.RPCType_JSON_RPC)
-	s.AssertSelectable(sharedtypes.RPCType_JSON_RPC, spacebeltA)
-	s.AssertExcluded(sharedtypes.RPCType_JSON_RPC, rpcgateA)
+	s.Release("op-beta.example", sharedtypes.RPCType_JSON_RPC)
+	s.AssertSelectable(sharedtypes.RPCType_JSON_RPC, opBetaA)
+	s.AssertExcluded(sharedtypes.RPCType_JSON_RPC, opAlphaA)
 }

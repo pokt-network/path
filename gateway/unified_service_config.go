@@ -125,8 +125,8 @@ type EndpointPolicyConfig struct {
 // websocket bans; a ban covering only a subset of the HTTP-carried types (json_rpc,
 // rest, comet_bft) still lets the endpoint's other HTTP health checks probe it.
 type BlockedDomainConfig struct {
-	// Domain is an eTLD+1 ("rpcgate.xyz", matching every host under it) or an exact
-	// hostname ("s019.rpcgate.xyz", matching only that host). Case-insensitive.
+	// Domain is an eTLD+1 ("op-alpha.example", matching every host under it) or an exact
+	// hostname ("s019.op-alpha.example", matching only that host). Case-insensitive.
 	Domain string `yaml:"domain"`
 
 	// RPCTypes lists the banned RPC types ("websocket", "json_rpc", "rest",

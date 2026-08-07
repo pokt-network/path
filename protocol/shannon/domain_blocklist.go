@@ -18,7 +18,7 @@ import (
 // Entries are comma-separated: "domain" bans every RPC type, "domain:type1|type2" bans
 // only those types. Example:
 //
-//	PATH_BLOCKED_DOMAINS=rpcgate.xyz:websocket,spacebelt.xyz:websocket,evil.example
+//	PATH_BLOCKED_DOMAINS=op-alpha.example:websocket,op-beta.example:websocket,evil.example
 //
 // Env entries are UNIONED with the blocked_domains config list — the env var can widen
 // a ban but never narrow one.
@@ -45,8 +45,8 @@ const maxDomainDecisionCacheEntries = 1 << 16 // 65536
 //
 // A nil *domainBlocklist is valid and blocks nothing; all methods are nil-safe.
 type domainBlocklist struct {
-	// blocked maps a lowercase domain — either an eTLD+1 ("rpcgate.xyz") or an exact
-	// hostname ("s019.rpcgate.xyz") — to the set of banned RPC types.
+	// blocked maps a lowercase domain — either an eTLD+1 ("op-alpha.example") or an exact
+	// hostname ("s019.op-alpha.example") — to the set of banned RPC types.
 	// A nil set bans every RPC type.
 	blocked map[string]map[sharedtypes.RPCType]struct{}
 

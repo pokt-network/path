@@ -1135,9 +1135,9 @@ func TestReputation_KeyGranularityPerDomain(t *testing.T) {
 
 	serviceID := protocol.ServiceID("eth")
 
-	// Multiple endpoints from DIFFERENT suppliers but SAME hosting domain (nodefleet.net)
-	endpoint1Addr := protocol.EndpointAddr("pokt1supplier1-https://rm-01.eu.nodefleet.net")
-	endpoint2Addr := protocol.EndpointAddr("pokt1supplier2-https://rm-02.us.nodefleet.net")
+	// Multiple endpoints from DIFFERENT suppliers but SAME hosting domain (op-delta.example)
+	endpoint1Addr := protocol.EndpointAddr("pokt1supplier1-https://rm-01.eu.op-delta.example")
+	endpoint2Addr := protocol.EndpointAddr("pokt1supplier2-https://rm-02.us.op-delta.example")
 	// One endpoint from a DIFFERENT domain
 	endpoint3Addr := protocol.EndpointAddr("pokt1supplier3-https://relay.pokt.network")
 
@@ -1150,7 +1150,7 @@ func TestReputation_KeyGranularityPerDomain(t *testing.T) {
 	key2 := keyBuilder.BuildKey(serviceID, endpoint2Addr, sharedtypes.RPCType_JSON_RPC)
 	key3 := keyBuilder.BuildKey(serviceID, endpoint3Addr, sharedtypes.RPCType_JSON_RPC)
 
-	// Verify keys 1 and 2 are the same (same domain: nodefleet.net)
+	// Verify keys 1 and 2 are the same (same domain: op-delta.example)
 	require.Equal(t, key1, key2, "Endpoints from same domain should have same key")
 	require.NotEqual(t, key1, key3, "Endpoints from different domains should have different keys")
 
@@ -1491,27 +1491,27 @@ func Test_filterByReputation_ExcludesDrainedOperator(t *testing.T) {
 	serviceID := protocol.ServiceID("gnosis")
 
 	endpoints := map[protocol.EndpointAddr]endpoint{
-		"https://f019.spacebelt.xyz": &mockEndpoint{addr: "https://f019.spacebelt.xyz"},
-		"https://r001.rpcgate.xyz":   &mockEndpoint{addr: "https://r001.rpcgate.xyz"},
-		"https://n1.kalorius.tech":   &mockEndpoint{addr: "https://n1.kalorius.tech"},
+		"https://f019.op-beta.example": &mockEndpoint{addr: "https://f019.op-beta.example"},
+		"https://r001.op-alpha.example":   &mockEndpoint{addr: "https://r001.op-alpha.example"},
+		"https://n1.op-gamma.example":   &mockEndpoint{addr: "https://n1.op-gamma.example"},
 	}
 
 	// Nothing benched yet: every endpoint survives.
 	require.Len(t, p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, ""), 3)
 
 	svc.DrainDomain(ctx, reputation.DrainRequest{
-		ServiceID: serviceID, Domain: "spacebelt.xyz", RPCType: "websocket", Duration: time.Hour,
+		ServiceID: serviceID, Domain: "op-beta.example", RPCType: "websocket", Duration: time.Hour,
 	})
 
 	filtered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_WEBSOCKET, logger, "")
-	require.NotContains(t, filtered, protocol.EndpointAddr("https://f019.spacebelt.xyz"),
+	require.NotContains(t, filtered, protocol.EndpointAddr("https://f019.op-beta.example"),
 		"a drained operator must be absent from the RETURNED set, not merely from a map nobody reads")
-	require.Contains(t, filtered, protocol.EndpointAddr("https://r001.rpcgate.xyz"))
-	require.Contains(t, filtered, protocol.EndpointAddr("https://n1.kalorius.tech"))
+	require.Contains(t, filtered, protocol.EndpointAddr("https://r001.op-alpha.example"))
+	require.Contains(t, filtered, protocol.EndpointAddr("https://n1.op-gamma.example"))
 
 	// A drain is scoped to its rpc_type: the same operator still serves HTTP.
 	httpFiltered := p.filterByReputation(ctx, serviceID, endpoints, sharedtypes.RPCType_JSON_RPC, logger, "")
-	require.Contains(t, httpFiltered, protocol.EndpointAddr("https://f019.spacebelt.xyz"))
+	require.Contains(t, httpFiltered, protocol.EndpointAddr("https://f019.op-beta.example"))
 }
 
 // Banning every operator must not sever the service. A drain is an operator preference, not
@@ -1531,11 +1531,11 @@ func Test_filterByReputation_DrainNeverEmptiesPool(t *testing.T) {
 	serviceID := protocol.ServiceID("gnosis")
 
 	endpoints := map[protocol.EndpointAddr]endpoint{
-		"https://f019.spacebelt.xyz": &mockEndpoint{addr: "https://f019.spacebelt.xyz"},
-		"https://r001.rpcgate.xyz":   &mockEndpoint{addr: "https://r001.rpcgate.xyz"},
+		"https://f019.op-beta.example": &mockEndpoint{addr: "https://f019.op-beta.example"},
+		"https://r001.op-alpha.example":   &mockEndpoint{addr: "https://r001.op-alpha.example"},
 	}
 
-	for _, d := range []string{"spacebelt.xyz", "rpcgate.xyz"} {
+	for _, d := range []string{"op-beta.example", "op-alpha.example"} {
 		svc.DrainDomain(ctx, reputation.DrainRequest{
 			ServiceID: serviceID, Domain: d, RPCType: "websocket", Duration: time.Hour,
 		})

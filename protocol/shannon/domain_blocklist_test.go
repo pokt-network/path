@@ -37,37 +37,37 @@ func compileBlocklist(t *testing.T, entries ...gateway.BlockedDomainConfig) *dom
 
 func TestDomainBlocklist_MatchesETLDPlusOneAndExactHost(t *testing.T) {
 	bl := compileBlocklist(t,
-		gateway.BlockedDomainConfig{Domain: "rpcgate.xyz"},
-		gateway.BlockedDomainConfig{Domain: "n1.kalorius.tech"},
+		gateway.BlockedDomainConfig{Domain: "op-alpha.example"},
+		gateway.BlockedDomainConfig{Domain: "n1.op-gamma.example"},
 	)
 
 	// eTLD+1 entry matches every host under it.
-	require.True(t, bl.IsBlocked("https://s019.rpcgate.xyz", sharedtypes.RPCType_JSON_RPC))
-	require.True(t, bl.IsBlocked("wss://other.rpcgate.xyz/ws", sharedtypes.RPCType_WEBSOCKET))
+	require.True(t, bl.IsBlocked("https://s019.op-alpha.example", sharedtypes.RPCType_JSON_RPC))
+	require.True(t, bl.IsBlocked("wss://other.op-alpha.example/ws", sharedtypes.RPCType_WEBSOCKET))
 
 	// Exact-hostname entry matches only that host.
-	require.True(t, bl.IsBlocked("https://n1.kalorius.tech", sharedtypes.RPCType_JSON_RPC))
-	require.False(t, bl.IsBlocked("https://n2.kalorius.tech", sharedtypes.RPCType_JSON_RPC),
+	require.True(t, bl.IsBlocked("https://n1.op-gamma.example", sharedtypes.RPCType_JSON_RPC))
+	require.False(t, bl.IsBlocked("https://n2.op-gamma.example", sharedtypes.RPCType_JSON_RPC),
 		"an exact-hostname entry must not ban the operator's other hosts")
 
-	require.False(t, bl.IsBlocked("https://f019.spacebelt.xyz", sharedtypes.RPCType_JSON_RPC))
+	require.False(t, bl.IsBlocked("https://f019.op-beta.example", sharedtypes.RPCType_JSON_RPC))
 }
 
 func TestDomainBlocklist_RPCTypeScoping(t *testing.T) {
 	bl := compileBlocklist(t,
-		gateway.BlockedDomainConfig{Domain: "spacebelt.xyz", RPCTypes: []string{"websocket"}},
-		gateway.BlockedDomainConfig{Domain: "rpcgate.xyz"}, // all types
+		gateway.BlockedDomainConfig{Domain: "op-beta.example", RPCTypes: []string{"websocket"}},
+		gateway.BlockedDomainConfig{Domain: "op-alpha.example"}, // all types
 	)
 
-	require.True(t, bl.IsBlocked("wss://f019.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET))
-	require.False(t, bl.IsBlocked("https://f019.spacebelt.xyz", sharedtypes.RPCType_JSON_RPC),
+	require.True(t, bl.IsBlocked("wss://f019.op-beta.example", sharedtypes.RPCType_WEBSOCKET))
+	require.False(t, bl.IsBlocked("https://f019.op-beta.example", sharedtypes.RPCType_JSON_RPC),
 		"a websocket-only ban must not take the operator's HTTP traffic with it")
 
 	for _, rpcType := range []sharedtypes.RPCType{
 		sharedtypes.RPCType_JSON_RPC, sharedtypes.RPCType_WEBSOCKET,
 		sharedtypes.RPCType_REST, sharedtypes.RPCType_COMET_BFT,
 	} {
-		require.True(t, bl.IsBlocked("https://s019.rpcgate.xyz", rpcType),
+		require.True(t, bl.IsBlocked("https://s019.op-alpha.example", rpcType),
 			"an entry with no rpc_types must ban every type (got through on %s)", rpcType)
 	}
 }
@@ -75,20 +75,20 @@ func TestDomainBlocklist_RPCTypeScoping(t *testing.T) {
 func TestDomainBlocklist_AllTypesEntryAbsorbsNarrowerOne(t *testing.T) {
 	// Order must not matter: (ws-only, all) and (all, ws-only) both mean "everything".
 	for _, entries := range [][]gateway.BlockedDomainConfig{
-		{{Domain: "rpcgate.xyz", RPCTypes: []string{"websocket"}}, {Domain: "rpcgate.xyz"}},
-		{{Domain: "rpcgate.xyz"}, {Domain: "rpcgate.xyz", RPCTypes: []string{"websocket"}}},
+		{{Domain: "op-alpha.example", RPCTypes: []string{"websocket"}}, {Domain: "op-alpha.example"}},
+		{{Domain: "op-alpha.example"}, {Domain: "op-alpha.example", RPCTypes: []string{"websocket"}}},
 	} {
 		bl := compileBlocklist(t, entries...)
-		require.True(t, bl.IsBlocked("https://s019.rpcgate.xyz", sharedtypes.RPCType_JSON_RPC),
+		require.True(t, bl.IsBlocked("https://s019.op-alpha.example", sharedtypes.RPCType_JSON_RPC),
 			"a narrower entry must never un-ban a type the all-types entry covers")
 	}
 }
 
 func TestDomainBlocklist_EnvParsing(t *testing.T) {
-	entries := parseBlockedDomainsEnv(" rpcgate.xyz:websocket , spacebelt.xyz:websocket|json_rpc ,evil.example,, ")
+	entries := parseBlockedDomainsEnv(" op-alpha.example:websocket , op-beta.example:websocket|json_rpc ,evil.example,, ")
 	require.Equal(t, []gateway.BlockedDomainConfig{
-		{Domain: "rpcgate.xyz", RPCTypes: []string{"websocket"}},
-		{Domain: "spacebelt.xyz", RPCTypes: []string{"websocket", "json_rpc"}},
+		{Domain: "op-alpha.example", RPCTypes: []string{"websocket"}},
+		{Domain: "op-beta.example", RPCTypes: []string{"websocket", "json_rpc"}},
 		{Domain: "evil.example"},
 	}, entries)
 
@@ -98,7 +98,7 @@ func TestDomainBlocklist_EnvParsing(t *testing.T) {
 
 func TestDomainBlocklist_RejectsBadConfig(t *testing.T) {
 	_, err := newDomainBlocklist([]gateway.BlockedDomainConfig{
-		{Domain: "rpcgate.xyz", RPCTypes: []string{"websockets"}}, // typo
+		{Domain: "op-alpha.example", RPCTypes: []string{"websockets"}}, // typo
 	})
 	require.Error(t, err, "an unknown rpc_type must refuse to boot, not silently narrow the ban")
 
@@ -108,7 +108,7 @@ func TestDomainBlocklist_RejectsBadConfig(t *testing.T) {
 
 func TestDomainBlocklist_NilBlocksNothing(t *testing.T) {
 	var bl *domainBlocklist
-	require.False(t, bl.IsBlocked("https://s019.rpcgate.xyz", sharedtypes.RPCType_JSON_RPC))
+	require.False(t, bl.IsBlocked("https://s019.op-alpha.example", sharedtypes.RPCType_JSON_RPC))
 
 	empty, err := newDomainBlocklist(nil)
 	require.NoError(t, err)
@@ -214,23 +214,23 @@ func (s *blocklistScenario) survivors(
 
 func TestSelection_DomainBlocklistRemovesBannedOperator(t *testing.T) {
 	s := newBlocklistScenario(t, "gnosis",
-		[]gateway.BlockedDomainConfig{{Domain: "spacebelt.xyz", RPCTypes: []string{"websocket"}}},
-		spacebeltA, spacebeltB, rpcgateA, kaloriusA)
+		[]gateway.BlockedDomainConfig{{Domain: "op-beta.example", RPCTypes: []string{"websocket"}}},
+		opBetaA, opBetaB, opAlphaA, opGammaA)
 
 	got := s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, "")
-	require.NotContains(t, got, spacebeltA)
-	require.NotContains(t, got, spacebeltB)
-	require.Contains(t, got, rpcgateA)
-	require.Contains(t, got, kaloriusA)
+	require.NotContains(t, got, opBetaA)
+	require.NotContains(t, got, opBetaB)
+	require.Contains(t, got, opAlphaA)
+	require.Contains(t, got, opGammaA)
 }
 
 func TestSelection_DomainBlocklistScopedToRPCType(t *testing.T) {
 	s := newBlocklistScenario(t, "gnosis",
-		[]gateway.BlockedDomainConfig{{Domain: "spacebelt.xyz", RPCTypes: []string{"websocket"}}},
-		spacebeltA, kaloriusA)
+		[]gateway.BlockedDomainConfig{{Domain: "op-beta.example", RPCTypes: []string{"websocket"}}},
+		opBetaA, opGammaA)
 
-	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, ""), spacebeltA)
-	require.Contains(t, s.survivors(sharedtypes.RPCType_JSON_RPC, true, nil, ""), spacebeltA,
+	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, ""), opBetaA)
+	require.Contains(t, s.survivors(sharedtypes.RPCType_JSON_RPC, true, nil, ""), opBetaA,
 		"a websocket ban must not take the operator's HTTP traffic with it")
 }
 
@@ -239,11 +239,11 @@ func TestSelection_DomainBlocklistScopedToRPCType(t *testing.T) {
 // blocked_suppliers, so a banned operator is unreachable even when explicitly pinned.
 func TestSelection_DomainBlocklistIgnoresTargetSuppliers(t *testing.T) {
 	s := newBlocklistScenario(t, "gnosis",
-		[]gateway.BlockedDomainConfig{{Domain: "spacebelt.xyz", RPCTypes: []string{"websocket"}}},
-		spacebeltA, kaloriusA)
+		[]gateway.BlockedDomainConfig{{Domain: "op-beta.example", RPCTypes: []string{"websocket"}}},
+		opBetaA, opGammaA)
 
-	got := s.survivors(sharedtypes.RPCType_WEBSOCKET, true, []string{s.supplierOf[spacebeltA]}, "")
-	require.NotContains(t, got, spacebeltA,
+	got := s.survivors(sharedtypes.RPCType_WEBSOCKET, true, []string{s.supplierOf[opBetaA]}, "")
+	require.NotContains(t, got, opBetaA,
 		"Target-Suppliers must not resurrect a banned operator — this ban is nuclear")
 }
 
@@ -253,13 +253,13 @@ func TestSelection_DomainBlocklistIgnoresTargetSuppliers(t *testing.T) {
 // pins that the full production path cannot re-pick a banned endpoint either.
 func TestSelection_DomainBlocklistAppliesEvenToPreferredEndpoint(t *testing.T) {
 	s := newBlocklistScenario(t, "gnosis",
-		[]gateway.BlockedDomainConfig{{Domain: "spacebelt.xyz", RPCTypes: []string{"websocket"}}},
-		spacebeltA, spacebeltB, rpcgateA, kaloriusA)
+		[]gateway.BlockedDomainConfig{{Domain: "op-beta.example", RPCTypes: []string{"websocket"}}},
+		opBetaA, opBetaB, opAlphaA, opGammaA)
 
-	got := s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, spacebeltA)
-	require.NotContains(t, got, spacebeltA)
-	require.NotContains(t, got, spacebeltB)
-	require.Contains(t, got, rpcgateA)
+	got := s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, opBetaA)
+	require.NotContains(t, got, opBetaA)
+	require.NotContains(t, got, opBetaB)
+	require.Contains(t, got, opAlphaA)
 }
 
 // Drain bug 2's shape: state keyed on EndpointAddr silently lifts at the next rollover,
@@ -267,16 +267,16 @@ func TestSelection_DomainBlocklistAppliesEvenToPreferredEndpoint(t *testing.T) {
 // live URL, so it must survive any number of rotations.
 func TestSelection_DomainBlocklistSurvivesSupplierRotation(t *testing.T) {
 	s := newBlocklistScenario(t, "gnosis",
-		[]gateway.BlockedDomainConfig{{Domain: "spacebelt.xyz", RPCTypes: []string{"websocket"}}},
-		spacebeltA, rpcgateA, kaloriusA)
+		[]gateway.BlockedDomainConfig{{Domain: "op-beta.example", RPCTypes: []string{"websocket"}}},
+		opBetaA, opAlphaA, opGammaA)
 
-	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, ""), spacebeltA)
+	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, ""), opBetaA)
 
 	s.RotateSuppliers(1)
-	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, ""), spacebeltA)
+	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, ""), opBetaA)
 
 	s.RotateSuppliers(2)
-	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, ""), spacebeltA)
+	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, true, nil, ""), opBetaA)
 }
 
 // Health checks and leaderboard gathering call with filterByReputation=false, which
@@ -284,10 +284,10 @@ func TestSelection_DomainBlocklistSurvivesSupplierRotation(t *testing.T) {
 // blocklist must NOT be among the things that flag turns off.
 func TestSelection_DomainBlocklistAppliesToReputationFreeCalls(t *testing.T) {
 	s := newBlocklistScenario(t, "gnosis",
-		[]gateway.BlockedDomainConfig{{Domain: "spacebelt.xyz", RPCTypes: []string{"websocket"}}},
-		spacebeltA, kaloriusA)
+		[]gateway.BlockedDomainConfig{{Domain: "op-beta.example", RPCTypes: []string{"websocket"}}},
+		opBetaA, opGammaA)
 
-	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, false, nil, ""), spacebeltA,
+	require.NotContains(t, s.survivors(sharedtypes.RPCType_WEBSOCKET, false, nil, ""), opBetaA,
 		"filterByReputation=false must not bypass the domain blocklist")
 }
 
@@ -296,8 +296,8 @@ func TestSelection_DomainBlocklistAppliesToReputationFreeCalls(t *testing.T) {
 // says must never serve it is worse than failing the request.
 func TestSelection_DomainBlocklistCanEmptyThePool(t *testing.T) {
 	s := newBlocklistScenario(t, "gnosis",
-		[]gateway.BlockedDomainConfig{{Domain: "spacebelt.xyz"}},
-		spacebeltA, spacebeltB)
+		[]gateway.BlockedDomainConfig{{Domain: "op-beta.example"}},
+		opBetaA, opBetaB)
 
 	require.Empty(t, s.survivors(sharedtypes.RPCType_JSON_RPC, true, nil, ""),
 		"a nuclear ban must hold even when the banned operator is all that remains")
@@ -312,12 +312,12 @@ func TestGetUniqueEndpoints_DomainBlocklistCoversFallbackEndpoints(t *testing.T)
 	p := &Protocol{
 		logger: polyzero.NewLogger(),
 		blockedDomains: compileBlocklist(t,
-			gateway.BlockedDomainConfig{Domain: "spacebelt.xyz"}),
+			gateway.BlockedDomainConfig{Domain: "op-beta.example"}),
 		serviceFallbackMap: map[protocol.ServiceID]serviceFallback{
 			"gnosis": {
 				Endpoints: map[protocol.EndpointAddr]endpoint{
-					"fb-spacebelt": &harnessEndpoint{supplier: "fallback", url: spacebeltA},
-					"fb-kalorius":  &harnessEndpoint{supplier: "fallback", url: kaloriusA},
+					"fb-operator-beta": &harnessEndpoint{supplier: "fallback", url: opBetaA},
+					"fb-operator-gamma":  &harnessEndpoint{supplier: "fallback", url: opGammaA},
 				},
 				SendAllTraffic: true,
 			},
@@ -332,8 +332,8 @@ func TestGetUniqueEndpoints_DomainBlocklistCoversFallbackEndpoints(t *testing.T)
 	for _, ep := range got {
 		urls = append(urls, ep.GetURL(sharedtypes.RPCType_JSON_RPC))
 	}
-	require.NotContains(t, urls, spacebeltA, "send-all-traffic fallback must still honor the ban")
-	require.Contains(t, urls, kaloriusA)
+	require.NotContains(t, urls, opBetaA, "send-all-traffic fallback must still honor the ban")
+	require.Contains(t, urls, opGammaA)
 
 	// The shared config map must not have been mutated by the filter.
 	require.Len(t, p.serviceFallbackMap["gnosis"].Endpoints, 2,
@@ -344,11 +344,11 @@ func TestGetUniqueEndpoints_BannedFallbackCannotRescueEmptyPool(t *testing.T) {
 	p := &Protocol{
 		logger: polyzero.NewLogger(),
 		blockedDomains: compileBlocklist(t,
-			gateway.BlockedDomainConfig{Domain: "spacebelt.xyz"}),
+			gateway.BlockedDomainConfig{Domain: "op-beta.example"}),
 		serviceFallbackMap: map[protocol.ServiceID]serviceFallback{
 			"gnosis": {
 				Endpoints: map[protocol.EndpointAddr]endpoint{
-					"fb-spacebelt": &harnessEndpoint{supplier: "fallback", url: spacebeltA},
+					"fb-operator-beta": &harnessEndpoint{supplier: "fallback", url: opBetaA},
 				},
 			},
 		},
@@ -401,7 +401,7 @@ func TestNewProtocol_WiresDomainBlocklistFromConfigAndEnv(t *testing.T) {
 	// And the constructed instance must actually EXCLUDE through real selection — the
 	// field being set is necessary but not sufficient.
 	eps := make(map[protocol.EndpointAddr]endpoint)
-	for i, u := range []string{"wss://a.envonly.example", kaloriusA} {
+	for i, u := range []string{"wss://a.envonly.example", opGammaA} {
 		ep := &harnessEndpoint{supplier: supplierAddrForIndex(i, 0), url: u}
 		eps[ep.Addr()] = ep
 	}
@@ -421,7 +421,7 @@ func TestNewProtocol_WiresDomainBlocklistFromConfigAndEnv(t *testing.T) {
 	}
 	require.NotContains(t, urls, "wss://a.envonly.example",
 		"a ban present only in the env var must exclude through the constructed Protocol")
-	require.Contains(t, urls, kaloriusA)
+	require.Contains(t, urls, opGammaA)
 }
 
 func TestNewProtocol_RefusesToBootOnMalformedEnvBan(t *testing.T) {
@@ -486,7 +486,7 @@ func newHealthCheckBlocklistProtocol(t *testing.T, entries ...gateway.BlockedDom
 	}
 
 	eps := make(map[protocol.EndpointAddr]endpoint)
-	for i, u := range []string{spacebeltA, kaloriusA} {
+	for i, u := range []string{opBetaA, opGammaA} {
 		ep := &harnessEndpoint{supplier: supplierAddrForIndex(i, 0), url: u}
 		eps[ep.Addr()] = ep
 	}
@@ -498,14 +498,14 @@ func newHealthCheckBlocklistProtocol(t *testing.T, entries ...gateway.BlockedDom
 // just the user traffic.
 func TestGetEndpointsForHealthCheck_AllTypeBanExcludesEndpoint(t *testing.T) {
 	p := newHealthCheckBlocklistProtocol(t,
-		gateway.BlockedDomainConfig{Domain: "spacebelt.xyz"})
+		gateway.BlockedDomainConfig{Domain: "op-beta.example"})
 
 	infos, err := p.GetEndpointsForHealthCheck()("gnosis")
 	require.NoError(t, err)
 	require.NotEmpty(t, infos, "the unbanned endpoint must still be probed")
 
 	for _, info := range infos {
-		require.NotContains(t, string(info.Addr), "spacebelt.xyz",
+		require.NotContains(t, string(info.Addr), "op-beta.example",
 			"a fully banned endpoint must receive no health-check probes at all")
 	}
 }
@@ -514,24 +514,24 @@ func TestGetEndpointsForHealthCheck_AllTypeBanExcludesEndpoint(t *testing.T) {
 // websocket probe on WebSocketURL != "" — while HTTP probes continue.
 func TestGetEndpointsForHealthCheck_WebsocketBanBlanksWebSocketURL(t *testing.T) {
 	p := newHealthCheckBlocklistProtocol(t,
-		gateway.BlockedDomainConfig{Domain: "spacebelt.xyz", RPCTypes: []string{"websocket"}})
+		gateway.BlockedDomainConfig{Domain: "op-beta.example", RPCTypes: []string{"websocket"}})
 
 	infos, err := p.GetEndpointsForHealthCheck()("gnosis")
 	require.NoError(t, err)
 
-	var sawSpacebelt, sawKalorius bool
+	var sawOpBeta, sawOpGamma bool
 	for _, info := range infos {
 		switch info.HTTPURL {
-		case spacebeltA:
-			sawSpacebelt = true
+		case opBetaA:
+			sawOpBeta = true
 			require.Empty(t, info.WebSocketURL,
 				"a websocket ban must strip the WebSocket probe URL")
-		case kaloriusA:
-			sawKalorius = true
+		case opGammaA:
+			sawOpGamma = true
 			require.NotEmpty(t, info.WebSocketURL,
 				"the unbanned endpoint must keep its WebSocket probe")
 		}
 	}
-	require.True(t, sawSpacebelt, "a websocket-only ban must not remove the endpoint's HTTP probes")
-	require.True(t, sawKalorius)
+	require.True(t, sawOpBeta, "a websocket-only ban must not remove the endpoint's HTTP probes")
+	require.True(t, sawOpGamma)
 }

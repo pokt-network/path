@@ -902,7 +902,7 @@ func (e *HealthCheckExecutor) recordCheckResult(
 	// Over-servicing rejections — same no-penalty rule as the request path.
 	// Without this, every health-check probe to an exhausted supplier records a
 	// MajorError signal and pins their reputation at 0 even after the request
-	// path has stopped penalizing them. Production canary observed easy2stake's
+	// path has stopped penalizing them. Production canary observed operator-zeta's
 	// BSC supplier set stuck at score=0 with success-only request-path signals
 	// because the health-check executor was draining them in parallel.
 	if heuristic.IsOverServicedError(checkErr.Error()) {

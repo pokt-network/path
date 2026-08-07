@@ -40,20 +40,20 @@ func TestDrain_SurvivesSessionRotation(t *testing.T) {
 	svc, _, ctx := drainTestService(t)
 
 	svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket", Duration: 45 * time.Minute,
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket", Duration: 45 * time.Minute,
 	})
 
 	// Session N: these supplier addresses are in session now.
-	require.True(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"))
+	require.True(t, svc.IsDomainDrained("gnosis", "op-beta.example", "websocket"))
 
 	// Session N+1: entirely different supplier addresses front the same operator. The drain
 	// is keyed on the operator, so it must still bite — this is what broke in production.
-	require.True(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"),
+	require.True(t, svc.IsDomainDrained("gnosis", "op-beta.example", "websocket"),
 		"a drain must not depend on which supplier addresses are in session")
 
 	// A hostname at the same operator resolves to the same registrable domain upstream, so
 	// a machine rotated in mid-drain is covered too.
-	require.True(t, svc.IsDomainDrained("gnosis", "SPACEBELT.XYZ", "websocket"),
+	require.True(t, svc.IsDomainDrained("gnosis", "OP-BETA.EXAMPLE", "websocket"),
 		"matching must be case-insensitive")
 }
 
@@ -61,15 +61,15 @@ func TestDrain_ScopedToServiceAndRPCType(t *testing.T) {
 	svc, _, ctx := drainTestService(t)
 
 	svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket", Duration: 45 * time.Minute,
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket", Duration: 45 * time.Minute,
 	})
 
-	require.True(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"))
-	require.False(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "json_rpc"),
+	require.True(t, svc.IsDomainDrained("gnosis", "op-beta.example", "websocket"))
+	require.False(t, svc.IsDomainDrained("gnosis", "op-beta.example", "json_rpc"),
 		"draining websocket must leave the operator's HTTP traffic alone")
-	require.False(t, svc.IsDomainDrained("bsc", "spacebelt.xyz", "websocket"),
+	require.False(t, svc.IsDomainDrained("bsc", "op-beta.example", "websocket"),
 		"a drain must not leak across services")
-	require.False(t, svc.IsDomainDrained("gnosis", "kalorius.tech", "websocket"),
+	require.False(t, svc.IsDomainDrained("gnosis", "op-gamma.example", "websocket"),
 		"a drain must not leak across operators")
 }
 
@@ -78,35 +78,35 @@ func TestDrain_EmptyRPCTypeCoversAll(t *testing.T) {
 	svc, _, ctx := drainTestService(t)
 
 	svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", Duration: 45 * time.Minute,
+		ServiceID: "gnosis", Domain: "op-beta.example", Duration: 45 * time.Minute,
 	})
 
-	require.True(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"))
-	require.True(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "json_rpc"))
-	require.True(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "rest"))
+	require.True(t, svc.IsDomainDrained("gnosis", "op-beta.example", "websocket"))
+	require.True(t, svc.IsDomainDrained("gnosis", "op-beta.example", "json_rpc"))
+	require.True(t, svc.IsDomainDrained("gnosis", "op-beta.example", "rest"))
 }
 
 func TestDrain_ReleaseAndExpiry(t *testing.T) {
 	svc, _, ctx := drainTestService(t)
 
 	svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket", Duration: 45 * time.Minute,
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket", Duration: 45 * time.Minute,
 	})
-	require.True(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"))
+	require.True(t, svc.IsDomainDrained("gnosis", "op-beta.example", "websocket"))
 
 	res := svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket", Duration: 0,
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket", Duration: 0,
 	})
 	require.True(t, res.Released)
-	require.False(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"))
+	require.False(t, svc.IsDomainDrained("gnosis", "op-beta.example", "websocket"))
 
 	// A forgotten drain must lift itself — nobody should have to remember to unban anyone.
 	svc.mu.Lock()
 	svc.drainedDomains = map[DrainKey]time.Time{
-		{ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket"}: time.Now().Add(-time.Second),
+		{ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket"}: time.Now().Add(-time.Second),
 	}
 	svc.mu.Unlock()
-	require.False(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"),
+	require.False(t, svc.IsDomainDrained("gnosis", "op-beta.example", "websocket"),
 		"an expired drain must not still bench")
 }
 
@@ -115,13 +115,13 @@ func TestDrain_ReleaseAndExpiry(t *testing.T) {
 func TestDrain_DoesNotTouchScores(t *testing.T) {
 	svc, _, ctx := drainTestService(t)
 
-	key := NewEndpointKey("gnosis", "pokt1abc-https://rm-01.spacebelt.xyz", 0)
+	key := NewEndpointKey("gnosis", "pokt1abc-https://rm-01.op-beta.example", 0)
 	require.NoError(t, svc.RecordSignal(ctx, key, NewSuccessSignal(10*time.Millisecond)))
 	before, err := svc.GetScore(ctx, key)
 	require.NoError(t, err)
 
 	svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket", Duration: 45 * time.Minute,
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket", Duration: 45 * time.Minute,
 	})
 
 	after, err := svc.GetScore(ctx, key)
@@ -151,21 +151,21 @@ func TestDrain_PropagatesToOtherReplicas(t *testing.T) {
 	t.Cleanup(func() { _ = podB.Stop() })
 
 	podA.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket", Duration: 45 * time.Minute,
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket", Duration: 45 * time.Minute,
 	})
-	require.True(t, podA.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"))
-	require.False(t, podB.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"), "pod B has not refreshed yet")
+	require.True(t, podA.IsDomainDrained("gnosis", "op-beta.example", "websocket"))
+	require.False(t, podB.IsDomainDrained("gnosis", "op-beta.example", "websocket"), "pod B has not refreshed yet")
 
 	podB.refreshDrains(ctx)
-	require.True(t, podB.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"),
+	require.True(t, podB.IsDomainDrained("gnosis", "op-beta.example", "websocket"),
 		"one admin call must bench every replica")
 
 	// And a release must lift it everywhere, or un-banning would need N calls again.
 	podA.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket", Duration: 0,
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket", Duration: 0,
 	})
 	podB.refreshDrains(ctx)
-	require.False(t, podB.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"))
+	require.False(t, podB.IsDomainDrained("gnosis", "op-beta.example", "websocket"))
 }
 
 // Losing storage mid-incident must not silently un-ban everyone.
@@ -180,12 +180,12 @@ func TestDrain_StorageFailureKeepsLocalDrains(t *testing.T) {
 	t.Cleanup(func() { _ = pod.Stop() })
 
 	pod.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket", Duration: 45 * time.Minute,
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket", Duration: 45 * time.Minute,
 	})
 	_ = shared.Close()
 
 	pod.refreshDrains(ctx)
-	require.True(t, pod.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"),
+	require.True(t, pod.IsDomainDrained("gnosis", "op-beta.example", "websocket"),
 		"a storage outage must not clear in-force drains")
 }
 
@@ -201,21 +201,21 @@ func TestDrain_ReportsPropagationFailure(t *testing.T) {
 
 	_ = shared.Close()
 	res := pod.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket", Duration: 45 * time.Minute,
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket", Duration: 45 * time.Minute,
 	})
 	require.NotEmpty(t, res.PropagationError)
-	require.True(t, pod.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"), "the local bench still applies")
+	require.True(t, pod.IsDomainDrained("gnosis", "op-beta.example", "websocket"), "the local bench still applies")
 }
 
 func TestDrain_DryRunChangesNothing(t *testing.T) {
 	svc, _, ctx := drainTestService(t)
 
 	res := svc.DrainDomain(ctx, DrainRequest{
-		ServiceID: "gnosis", Domain: "spacebelt.xyz", RPCType: "websocket",
+		ServiceID: "gnosis", Domain: "op-beta.example", RPCType: "websocket",
 		Duration: 45 * time.Minute, DryRun: true,
 	})
 	require.True(t, res.DryRun)
-	require.False(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"),
+	require.False(t, svc.IsDomainDrained("gnosis", "op-beta.example", "websocket"),
 		"a dry run must bench nothing")
 }
 
@@ -224,6 +224,6 @@ func TestDrain_EmptyDomainBenchesNothing(t *testing.T) {
 	svc, _, ctx := drainTestService(t)
 
 	svc.DrainDomain(ctx, DrainRequest{ServiceID: "gnosis", Duration: 45 * time.Minute})
-	require.False(t, svc.IsDomainDrained("gnosis", "spacebelt.xyz", "websocket"))
+	require.False(t, svc.IsDomainDrained("gnosis", "op-beta.example", "websocket"))
 	require.False(t, svc.IsDomainDrained("gnosis", "", "websocket"))
 }

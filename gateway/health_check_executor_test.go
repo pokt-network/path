@@ -581,7 +581,7 @@ func (m *recordedSignalReputationSvc) RecordedSignals() []reputation.Signal {
 // TestRecordCheckResult_OverServicedSkipsPenalty pins the invariant that the
 // health-check executor must not penalize a supplier when the relay-miner has
 // signaled the application's per-session stake budget is exhausted. Without
-// this skip the executor was draining easy2stake's BSC supplier set to score=0
+// this skip the executor was draining operator-zeta's BSC supplier set to score=0
 // in production despite the request-path no-penalty fix.
 func TestRecordCheckResult_OverServicedSkipsPenalty(t *testing.T) {
 	cases := []struct {

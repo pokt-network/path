@@ -312,16 +312,16 @@ nowhere else to go.
 ```bash
 # what would be benched (always do this first — the response lists domains_seen, so a typo
 # reads as "matched 0, and here is what actually exists" rather than a silent no-op)
-curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=spacebelt.xyz&rpc_type=websocket&dry_run=true"
+curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=op-beta.example&rpc_type=websocket&dry_run=true"
 
 # bench for 20m, websocket only — the operator's json_rpc / rest traffic is untouched
-curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=spacebelt.xyz&rpc_type=websocket&duration=20m"
+curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=op-beta.example&rpc_type=websocket&duration=20m"
 
 # then move the live connections that are already bound
 curl -X POST "http://localhost:13069/admin/websocket/tumble/gnosis"
 
 # release early
-curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=spacebelt.xyz&rpc_type=websocket&duration=0"
+curl -X POST "http://localhost:13069/admin/reputation/drain/gnosis?domain=op-beta.example&rpc_type=websocket&duration=0"
 ```
 
 Query parameters: `domain=<eTLD+1|hostname|url>` (**required**, `url=` is an alias — a drain
@@ -599,11 +599,11 @@ caller receives.** Each reported success in production while excluding nothing.
 only question that matters — *does selection still return this endpoint?* — in one call:
 
 ```go
-s := newSelectionScenario(t, "gnosis", spacebeltA, rpcgateA, kaloriusA)
-s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
-s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+s := newSelectionScenario(t, "gnosis", opBetaA, opAlphaA, opGammaA)
+s.Drain("op-beta.example", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA)
 s.RotateSuppliers(1)                     // simulates a session rollover
-s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, opBetaA)
 ```
 
 Three rules, all cheap:
