@@ -10,6 +10,7 @@ import (
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
+	sdk "github.com/pokt-network/shannon-sdk"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/path/gateway"
@@ -358,6 +359,77 @@ func TestGetUniqueEndpoints_BannedFallbackCannotRescueEmptyPool(t *testing.T) {
 	_, _, err := p.getUniqueEndpoints(
 		context.Background(), "gnosis", nil, true, sharedtypes.RPCType_JSON_RPC, nil, "")
 	require.Error(t, err)
+}
+
+// --- production caller: NewProtocol (the wiring itself) -------------------------------
+
+// Every scenario above hand-builds Protocol{blockedDomains: ...}, which leaves the one
+// step none of them can see: does NewProtocol actually compile the config + env into the
+// field selection reads? Deleting the constructor wiring would keep every other test
+// green while shipping an inert ban — the exact shape of all four drain bugs.
+
+type constructorFullNode struct{ FullNode }
+
+func (f *constructorFullNode) GetAccountClient() *sdk.AccountClient { return &sdk.AccountClient{} }
+
+// Any valid secp256k1 scalar works; this key exists only so newSigner constructs.
+const constructorTestKeyHex = "0000000000000000000000000000000000000000000000000000000000000001"
+
+func newProtocolViaConstructor(t *testing.T) (*Protocol, error) {
+	t.Helper()
+	// Keep the constructor goroutine-free: no throughput sampler, no reputation service.
+	t.Setenv("PATH_WEBSOCKET_SESSION_REBIND", "false")
+	return NewProtocol(context.Background(), polyzero.NewLogger(), GatewayConfig{
+		GatewayAddress:       "pokt1gateway",
+		GatewayPrivateKeyHex: constructorTestKeyHex,
+		BlockedDomains: []gateway.BlockedDomainConfig{
+			{Domain: "cfgonly.example", RPCTypes: []string{"json_rpc"}},
+		},
+	}, &constructorFullNode{})
+}
+
+func TestNewProtocol_WiresDomainBlocklistFromConfigAndEnv(t *testing.T) {
+	t.Setenv(envBlockedDomains, "envonly.example:websocket")
+
+	p, err := newProtocolViaConstructor(t)
+	require.NoError(t, err)
+
+	// Both sources must reach the compiled blocklist (env is a union with config).
+	require.True(t, p.blockedDomains.IsBlocked("https://a.cfgonly.example", sharedtypes.RPCType_JSON_RPC))
+	require.True(t, p.blockedDomains.IsBlocked("wss://a.envonly.example", sharedtypes.RPCType_WEBSOCKET))
+
+	// And the constructed instance must actually EXCLUDE through real selection — the
+	// field being set is necessary but not sufficient.
+	eps := make(map[protocol.EndpointAddr]endpoint)
+	for i, u := range []string{"wss://a.envonly.example", kaloriusA} {
+		ep := &harnessEndpoint{supplier: supplierAddrForIndex(i, 0), url: u}
+		eps[ep.Addr()] = ep
+	}
+	p.sessionEndpointsCache.Store("session-ctor", eps)
+	session := sessiontypes.Session{
+		SessionId:   "session-ctor",
+		Header:      &sessiontypes.SessionHeader{SessionId: "session-ctor", ServiceId: "gnosis"},
+		Application: &apptypes.Application{Address: "pokt1app"},
+	}
+	got, _, err := p.getSessionsUniqueEndpoints(
+		context.Background(), "gnosis", []sessiontypes.Session{session},
+		true, sharedtypes.RPCType_WEBSOCKET, nil, "")
+	require.NoError(t, err)
+	urls := make([]string, 0, len(got))
+	for _, ep := range got {
+		urls = append(urls, ep.GetURL(sharedtypes.RPCType_WEBSOCKET))
+	}
+	require.NotContains(t, urls, "wss://a.envonly.example",
+		"a ban present only in the env var must exclude through the constructed Protocol")
+	require.Contains(t, urls, kaloriusA)
+}
+
+func TestNewProtocol_RefusesToBootOnMalformedEnvBan(t *testing.T) {
+	t.Setenv(envBlockedDomains, "envonly.example:websockets") // typo'd rpc type
+
+	_, err := newProtocolViaConstructor(t)
+	require.Error(t, err,
+		"a malformed nuclear ban must refuse to boot, not silently drop the entry")
 }
 
 // --- production caller: GetEndpointsForHealthCheck ------------------------------------
