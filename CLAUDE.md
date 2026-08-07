@@ -523,6 +523,46 @@ Recorded on **every** band pick, so `outcome="reshaped"` over the total is the r
 
 **What to watch after enabling:** `path_supplier_exhausted_total` for the **thin** operators the excess lands on, not the capped one — a solo-registration backend gains share while still holding one supplier's per-session allowance. Same failure mode as the backend-URL dedup, and self-correcting. Retry success rate — `path_relays_total{request_type="retry"}` split by `status_code` — must not fall; roughly 60% of retries already fail, so that pool is marginal to begin with.
 
+## Testing Changes That Affect Routing
+
+Three separate bugs shipped in the admin-drain feature, all with passing tests, all the same
+mistake: **the test asserted on something the author wrote, not on the value the production
+caller receives.** Each reported success in production while excluding nothing.
+
+1. The bench was written onto `Score.CooldownUntil` — `refreshFromStorage` overwrites the
+   cache from Redis unconditionally and erased it within a refresh cycle. Test asserted
+   "`CooldownUntil` is set", which was true, briefly.
+2. The bench resolved to a fixed set of `EndpointKey`s. `EndpointAddr` embeds the supplier
+   address and sessions rotate their supplier set, so it went stale every rollover (~20 min).
+   Every test used a static cache, so nothing rotated.
+3. The filter deleted from the `endpoints` map passed in, while the function builds its result
+   by walking `cached`. Nothing was ever excluded; the Warn log never fired.
+
+**Use the selection harness** (`protocol/shannon/selection_harness_test.go`). It answers the
+only question that matters — *does selection still return this endpoint?* — in one call:
+
+```go
+s := newSelectionScenario(t, "gnosis", spacebeltA, rpcgateA, kaloriusA)
+s.Drain("spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET, time.Hour)
+s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+s.RotateSuppliers(1)                     // simulates a session rollover
+s.AssertExcluded(sharedtypes.RPCType_WEBSOCKET, spacebeltA)
+```
+
+Three rules, all cheap:
+
+- **Assert on the production caller's return value**, never on a helper, a cached field, or a
+  gauge. Scores, drain maps, `path_endpoints_drained` and `/ready` have each reported a bench
+  that selection did not honour.
+- **Before committing a bug fix, revert the fix and confirm the test fails.** Done twice
+  during this work: caught nothing the first time, caught the real bug the third.
+- **Two observables disagreeing about the same state is a bug** — stop and find it. When
+  `path_endpoints_drained` said 60 benched while `/ready` said 0 excluded, that contradiction
+  was the bug announcing itself and it was rationalised away twice.
+
+Anything keyed on `EndpointAddr` must be tested across `RotateSuppliers`. That key embeds a
+supplier address, and supplier sets rotate every session.
+
 ## Testing Strategy
 
 - **Unit Tests** - Standard Go tests with `-short` flag
