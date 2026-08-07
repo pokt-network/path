@@ -830,7 +830,32 @@ func (s *service) refreshFromStorage(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
+	s.refreshDrains(ctx)
+
 	return nil
+}
+
+// refreshDrains replaces the local admin-drain set with the one in shared storage.
+//
+// REPLACE, not merge: a release issued on another replica shows up as the drain being
+// absent from storage, and merging would keep benching it here forever. Shared storage is
+// the authority, which is what makes one admin call apply — and one release lift — across
+// the whole fleet.
+//
+// A storage failure leaves the existing local set untouched rather than clearing it: losing
+// Redis should not silently un-bench everything mid-incident.
+func (s *service) refreshDrains(ctx context.Context) {
+	drains, err := s.storage.ListDrains(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn().Err(err).Msg("failed to refresh admin drains; keeping the local set")
+		}
+		return
+	}
+
+	s.mu.Lock()
+	s.drainedKeys = drains
+	s.mu.Unlock()
 }
 
 // SetArchivalStatus marks an endpoint as archival-capable with an expiry time.

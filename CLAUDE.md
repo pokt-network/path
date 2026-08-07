@@ -363,8 +363,21 @@ cooldown" and stays selectable. The response carries `unscored_warning` rather t
 partial drain read as complete. On a service with health checks running everything is scored,
 so it is usually complete.
 
-Per-pod in-memory state like the other admin endpoints — issue it to **each pod**. Expires on
-its own; does not survive a restart.
+**Fleet-wide: ONE call, not one per pod.** Unlike the other admin endpoints, drains are
+written to shared storage (a dedicated `__drains__` hash, **never** the score) and every
+replica adopts them on its next refresh. Storage is authoritative and the refresh *replaces*
+the local set, so a release propagates too — merging would leave a released drain benched
+forever on whichever pod did not issue it.
+
+If the storage write fails the drain still applies locally and the response carries
+`propagation_error` plus a warning saying **THIS POD ONLY** — a partial drain nobody realises
+is partial is the failure mode worth shouting about. Conversely a storage *outage* never
+clears in-force drains; losing Redis mid-incident must not silently un-bench everyone.
+
+**It cannot be forgotten.** `duration` is capped at **2h** (rejected, not clamped — silently
+shortening a drain is worse than saying no), the shared key carries a TTL past its longest
+drain, and expired entries are filtered on read and reaped. There is no way to bench an
+operator indefinitely through this endpoint. Re-issue to extend.
 
 **Circuit Breaker — when to use:**
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts

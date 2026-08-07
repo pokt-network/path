@@ -43,6 +43,37 @@ func NewEndpointKey(serviceID protocol.ServiceID, endpointAddr protocol.Endpoint
 	}
 }
 
+// ParseEndpointKeyString is the inverse of EndpointKey.String().
+//
+// EndpointAddr may itself contain colons (URLs carry "https://" and often a port), so the
+// serviceID is taken up to the FIRST colon and the rpcType from after the LAST — anything
+// between is the address, colons and all. Splitting naively on ":" corrupts every URL-keyed
+// endpoint.
+func ParseEndpointKeyString(s string) (EndpointKey, bool) {
+	lastColon := strings.LastIndex(s, ":")
+	if lastColon <= 0 {
+		return EndpointKey{}, false
+	}
+	rpcTypeStr := s[lastColon+1:]
+
+	rest := s[:lastColon]
+	firstColon := strings.Index(rest, ":")
+	if firstColon <= 0 {
+		return EndpointKey{}, false
+	}
+	serviceID := rest[:firstColon]
+	endpointAddr := rest[firstColon+1:]
+	if endpointAddr == "" {
+		return EndpointKey{}, false
+	}
+
+	return NewEndpointKey(
+		protocol.ServiceID(serviceID),
+		protocol.EndpointAddr(endpointAddr),
+		sharedtypes.RPCType(sharedtypes.RPCType_value[strings.ToUpper(rpcTypeStr)]),
+	), true
+}
+
 // String returns a string representation of the endpoint key.
 // Format: "serviceID:endpointAddr:rpcType"
 // Example: "eth:pokt1abc-https://node.example.com:json_rpc"

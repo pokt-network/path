@@ -19,6 +19,7 @@ type mockStorage struct {
 	mu              sync.RWMutex
 	scores          map[string]Score
 	perceivedBlocks map[string]uint64
+	drains          map[string]time.Time
 	closed          bool
 }
 
@@ -26,7 +27,48 @@ func newMockStorage() *mockStorage {
 	return &mockStorage{
 		scores:          make(map[string]Score),
 		perceivedBlocks: make(map[string]uint64),
+		drains:          make(map[string]time.Time),
 	}
+}
+
+func (m *mockStorage) SetDrain(_ context.Context, key EndpointKey, until time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrStorageClosed
+	}
+	m.drains[key.String()] = until
+	return nil
+}
+
+func (m *mockStorage) DeleteDrain(_ context.Context, key EndpointKey) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrStorageClosed
+	}
+	delete(m.drains, key.String())
+	return nil
+}
+
+func (m *mockStorage) ListDrains(_ context.Context) (map[EndpointKey]time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, ErrStorageClosed
+	}
+	now := time.Now()
+	out := make(map[EndpointKey]time.Time, len(m.drains))
+	for encoded, until := range m.drains {
+		if !now.Before(until) {
+			delete(m.drains, encoded)
+			continue
+		}
+		if key, ok := ParseEndpointKeyString(encoded); ok {
+			out[key] = until
+		}
+	}
+	return out, nil
 }
 
 func (m *mockStorage) Get(_ context.Context, key EndpointKey) (Score, error) {

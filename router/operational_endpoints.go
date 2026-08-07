@@ -321,6 +321,20 @@ func (r *router) handleChainStateClear(w http.ResponseWriter, req *http.Request)
 	})
 }
 
+const (
+	// defaultDrainDuration is long enough to collect a clean rate window and short enough
+	// that a forgotten drain lifts itself well inside a shift.
+	defaultDrainDuration = 15 * time.Minute
+
+	// maxDrainDuration is the hard ceiling on a single drain.
+	//
+	// A drain removes an operator's traffic, so an unbounded one is an outage nobody is
+	// tracking. Bounding it here means the worst case of "set a drain, got distracted" is
+	// self-healing: paired with the TTL on the shared drains key, there is no way to bench
+	// an operator permanently through this endpoint. Re-issue to extend.
+	maxDrainDuration = 2 * time.Hour
+)
+
 // handleReputationDrain handles POST /admin/reputation/drain/{serviceId}
 //
 // Temporarily benches every scored endpoint belonging to one operator (eTLD+1) for the
@@ -374,11 +388,18 @@ func (r *router) handleReputationDrain(w http.ResponseWriter, req *http.Request)
 
 	// Default 15m — long enough to collect a clean rate window, short enough that a
 	// forgotten drain heals itself well inside a shift.
-	duration := 15 * time.Minute
+	duration := defaultDrainDuration
 	if raw := query.Get("duration"); raw != "" {
 		parsed, err := time.ParseDuration(raw)
 		if err != nil || parsed < 0 {
 			http.Error(w, `{"error":"duration must be a non-negative Go duration (e.g. 15m); 0 releases"}`, http.StatusBadRequest)
+			return
+		}
+		// Rejected rather than clamped: silently shortening a drain an operator believed
+		// they had set for days is worse than telling them the ceiling. Nobody should be
+		// able to bench an operator indefinitely by mistyping a duration.
+		if parsed > maxDrainDuration {
+			http.Error(w, fmt.Sprintf(`{"error":"duration exceeds the %s maximum; a drain must expire without anyone remembering to lift it"}`, maxDrainDuration), http.StatusBadRequest)
 			return
 		}
 		duration = parsed

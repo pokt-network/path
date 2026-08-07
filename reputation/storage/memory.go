@@ -27,6 +27,10 @@ type MemoryStorage struct {
 	endpointBlocks  map[string]map[protocol.EndpointAddr]uint64 // serviceID -> endpointAddr -> block height
 	ttl             time.Duration
 	closed          bool
+
+	// drains holds admin drains keyed by EndpointKey.String(). Deliberately separate from
+	// scores — see Storage.SetDrain for why a bench cannot live on the score.
+	drains map[string]time.Time
 }
 
 // scoreEntry holds a score with its expiration time.
@@ -336,4 +340,58 @@ func (m *MemoryStorage) GetEndpointBlockHeights(ctx context.Context, serviceID p
 		result[k] = v
 	}
 	return result, nil
+}
+
+// ---------- Admin drains ----------
+
+// SetDrain records an admin drain. Kept separate from scores for the same reason as the
+// Redis implementation: a bench carried on Score.CooldownUntil is erased by the next
+// storage refresh.
+func (m *MemoryStorage) SetDrain(_ context.Context, key reputation.EndpointKey, until time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return reputation.ErrStorageClosed
+	}
+	if m.drains == nil {
+		m.drains = make(map[string]time.Time)
+	}
+	m.drains[key.String()] = until
+	return nil
+}
+
+// DeleteDrain lifts an admin drain.
+func (m *MemoryStorage) DeleteDrain(_ context.Context, key reputation.EndpointKey) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return reputation.ErrStorageClosed
+	}
+	delete(m.drains, key.String())
+	return nil
+}
+
+// ListDrains returns live drains, dropping (and reaping) expired entries.
+func (m *MemoryStorage) ListDrains(_ context.Context) (map[reputation.EndpointKey]time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, reputation.ErrStorageClosed
+	}
+
+	now := time.Now()
+	out := make(map[reputation.EndpointKey]time.Time, len(m.drains))
+	for encoded, until := range m.drains {
+		if !now.Before(until) {
+			delete(m.drains, encoded)
+			continue
+		}
+		key, ok := reputation.ParseEndpointKeyString(encoded)
+		if !ok {
+			delete(m.drains, encoded)
+			continue
+		}
+		out[key] = until
+	}
+	return out, nil
 }

@@ -215,3 +215,153 @@ func TestDrainDomain_EmptyIdentifiersBenchNothing(t *testing.T) {
 	require.NotEmpty(t, res.Warning)
 	require.False(t, isBenched(t, svc, ctx, key))
 }
+
+// ---------- Fleet-wide propagation ----------
+
+// The point of shared storage: one admin call must bench the endpoint on EVERY replica.
+// Before this, a drain was pod-local, so an operator had to hit all N pods — and in
+// practice got a partial drain without realising it was partial.
+func TestDrainDomain_PropagatesToOtherReplicas(t *testing.T) {
+	ctx := context.Background()
+	shared := newMockStorage()
+	t.Cleanup(func() { _ = shared.Close() })
+
+	cfg := Config{Enabled: true, InitialScore: 100, MinThreshold: 30}
+	cfg.HydrateDefaults()
+
+	podA := NewService(cfg, shared).(*service)
+	require.NoError(t, podA.Start(ctx))
+	t.Cleanup(func() { _ = podA.Stop() })
+
+	podB := NewService(cfg, shared).(*service)
+	require.NoError(t, podB.Start(ctx))
+	t.Cleanup(func() { _ = podB.Stop() })
+
+	key := NewEndpointKey("gnosis", "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+	require.NoError(t, podA.RecordSignal(ctx, key, NewSuccessSignal(time.Millisecond)))
+	require.NoError(t, podB.RecordSignal(ctx, key, NewSuccessSignal(time.Millisecond)))
+
+	// Drain on pod A only.
+	res := podA.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 20 * time.Minute,
+	})
+	require.Equal(t, 1, res.Drained)
+	require.Empty(t, res.PropagationError)
+
+	require.True(t, isBenched(t, podA, ctx, key), "the pod that issued the drain must bench")
+	require.False(t, isBenched(t, podB, ctx, key), "pod B has not refreshed yet")
+
+	// Pod B picks it up on its next refresh, with no admin call of its own.
+	podB.refreshDrains(ctx)
+	require.True(t, isBenched(t, podB, ctx, key), "one admin call must bench every replica")
+}
+
+// A release must propagate too, or lifting a fleet-wide drain would need N calls again —
+// and a replica that merged instead of replacing would bench forever.
+func TestDrainDomain_ReleasePropagatesToOtherReplicas(t *testing.T) {
+	ctx := context.Background()
+	shared := newMockStorage()
+	t.Cleanup(func() { _ = shared.Close() })
+
+	cfg := Config{Enabled: true, InitialScore: 100, MinThreshold: 30}
+	cfg.HydrateDefaults()
+
+	podA := NewService(cfg, shared).(*service)
+	require.NoError(t, podA.Start(ctx))
+	t.Cleanup(func() { _ = podA.Stop() })
+	podB := NewService(cfg, shared).(*service)
+	require.NoError(t, podB.Start(ctx))
+	t.Cleanup(func() { _ = podB.Stop() })
+
+	key := NewEndpointKey("gnosis", "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+	require.NoError(t, podA.RecordSignal(ctx, key, NewSuccessSignal(time.Millisecond)))
+	require.NoError(t, podB.RecordSignal(ctx, key, NewSuccessSignal(time.Millisecond)))
+
+	podA.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 20 * time.Minute,
+	})
+	podB.refreshDrains(ctx)
+	require.True(t, isBenched(t, podB, ctx, key))
+
+	// Release on pod A.
+	podA.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 0,
+	})
+
+	podB.refreshDrains(ctx)
+	require.False(t, isBenched(t, podB, ctx, key), "a release must lift the bench on every replica")
+}
+
+// A forgotten drain must lift itself. Nobody should have to remember to unlock anyone.
+func TestDrainDomain_ExpiredDrainIsNotPropagated(t *testing.T) {
+	ctx := context.Background()
+	shared := newMockStorage()
+	t.Cleanup(func() { _ = shared.Close() })
+
+	cfg := Config{Enabled: true, InitialScore: 100, MinThreshold: 30}
+	cfg.HydrateDefaults()
+	pod := NewService(cfg, shared).(*service)
+	require.NoError(t, pod.Start(ctx))
+	t.Cleanup(func() { _ = pod.Stop() })
+
+	key := NewEndpointKey("gnosis", "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+	require.NoError(t, pod.RecordSignal(ctx, key, NewSuccessSignal(time.Millisecond)))
+	require.NoError(t, shared.SetDrain(ctx, key, time.Now().Add(-time.Minute)))
+
+	pod.refreshDrains(ctx)
+	require.False(t, isBenched(t, pod, ctx, key), "an expired drain must never be applied")
+
+	drains, err := shared.ListDrains(ctx)
+	require.NoError(t, err)
+	require.Empty(t, drains, "expired drains must be reaped from shared storage")
+}
+
+// Losing storage mid-incident must not silently un-bench everything.
+func TestDrainDomain_StorageFailureKeepsLocalDrains(t *testing.T) {
+	ctx := context.Background()
+	shared := newMockStorage()
+
+	cfg := Config{Enabled: true, InitialScore: 100, MinThreshold: 30}
+	cfg.HydrateDefaults()
+	pod := NewService(cfg, shared).(*service)
+	require.NoError(t, pod.Start(ctx))
+	t.Cleanup(func() { _ = pod.Stop() })
+
+	key := NewEndpointKey("gnosis", "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+	require.NoError(t, pod.RecordSignal(ctx, key, NewSuccessSignal(time.Millisecond)))
+	pod.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 20 * time.Minute,
+	})
+	require.True(t, isBenched(t, pod, ctx, key))
+
+	_ = shared.Close() // storage now errors
+
+	pod.refreshDrains(ctx)
+	require.True(t, isBenched(t, pod, ctx, key),
+		"a storage outage must not clear in-force drains")
+}
+
+// When storage is unreachable at drain time the operator must be told the bench is
+// pod-local, rather than being left to assume it went fleet-wide.
+func TestDrainDomain_ReportsPropagationFailure(t *testing.T) {
+	ctx := context.Background()
+	shared := newMockStorage()
+
+	cfg := Config{Enabled: true, InitialScore: 100, MinThreshold: 30}
+	cfg.HydrateDefaults()
+	pod := NewService(cfg, shared).(*service)
+	require.NoError(t, pod.Start(ctx))
+	t.Cleanup(func() { _ = pod.Stop() })
+
+	key := NewEndpointKey("gnosis", "https://rm-01.spacebelt.xyz", sharedtypes.RPCType_WEBSOCKET)
+	require.NoError(t, pod.RecordSignal(ctx, key, NewSuccessSignal(time.Millisecond)))
+	_ = shared.Close()
+
+	res := pod.DrainDomain(ctx, DrainRequest{
+		ServiceID: "gnosis", Identifiers: []string{"https://rm-01.spacebelt.xyz"}, Duration: 20 * time.Minute,
+	})
+	require.Equal(t, 1, res.Drained)
+	require.NotEmpty(t, res.PropagationError)
+	require.Contains(t, res.Warning, "THIS POD ONLY")
+	require.True(t, isBenched(t, pod, ctx, key), "the local bench still applies")
+}

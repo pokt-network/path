@@ -66,6 +66,10 @@ type DrainResult struct {
 	// Warning is set when the result needs reading with care.
 	Warning string `json:"warning,omitempty"`
 
+	// PropagationError is set when the drain could not be written to shared storage, which
+	// means it applied to THIS POD ONLY.
+	PropagationError string `json:"propagation_error,omitempty"`
+
 	DryRun bool `json:"dry_run"`
 }
 
@@ -121,6 +125,11 @@ func (s *service) DrainDomain(ctx context.Context, req DrainRequest) DrainResult
 	until := now.Add(req.Duration)
 	releasing := req.Duration <= 0
 
+	// Keys mutated locally, replayed to shared storage after the lock is released — a
+	// storage round trip per key must not be held under the reputation mutex, which every
+	// request path contends on.
+	var touched []EndpointKey
+
 	s.mu.Lock()
 	// Drop expired entries so the map cannot grow without bound across many drains.
 	for k, exp := range s.drainedKeys {
@@ -148,6 +157,7 @@ func (s *service) DrainDomain(ctx context.Context, req DrainRequest) DrainResult
 			result.Released++
 			if !req.DryRun {
 				delete(s.drainedKeys, key)
+				touched = append(touched, key)
 			}
 			continue
 		}
@@ -160,9 +170,32 @@ func (s *service) DrainDomain(ctx context.Context, req DrainRequest) DrainResult
 			s.drainedKeys = make(map[EndpointKey]time.Time)
 		}
 		s.drainedKeys[key] = until
+		touched = append(touched, key)
 		result.Drained++
 	}
 	s.mu.Unlock()
+
+	// Propagate to shared storage so ONE admin call applies fleet-wide. Without this a
+	// drain is pod-local, and an operator has to hit every replica to bench anything —
+	// which in practice means a partial drain nobody realises is partial.
+	//
+	// Applied after the local mutation so this pod is correct even if storage is down; the
+	// result then says so rather than implying a fleet-wide bench that did not happen.
+	if !req.DryRun && len(touched) > 0 {
+		for _, key := range touched {
+			var err error
+			if releasing {
+				err = s.storage.DeleteDrain(ctx, key)
+			} else {
+				err = s.storage.SetDrain(ctx, key, until)
+			}
+			if err != nil {
+				result.PropagationError = err.Error()
+				result.Warning = "drain applied to THIS POD ONLY: shared storage write failed, other replicas are unaffected"
+				break
+			}
+		}
+	}
 
 	if !releasing && !req.DryRun && result.Drained > 0 {
 		result.DrainedUntil = until.UTC().Format(time.RFC3339)

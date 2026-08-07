@@ -3,6 +3,7 @@ package reputation
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/pokt-network/path/protocol"
 )
@@ -70,6 +71,26 @@ type Storage interface {
 	RemoveEndpointBlockHeights(ctx context.Context, serviceID protocol.ServiceID, addrs []protocol.EndpointAddr) error
 
 	// Close releases any resources held by the storage.
+	// SetDrain records an admin drain: this endpoint is benched until the given time.
+	//
+	// Drains are stored SEPARATELY from scores, and that separation is the whole point.
+	// An earlier version carried the bench on Score.CooldownUntil, where refreshFromStorage
+	// — which overwrites the local cache from storage unconditionally — erased it within a
+	// refresh cycle. Anything that must outlive a storage refresh cannot live on the score.
+	//
+	// Storing them here (rather than only in pod memory) is what makes one admin call apply
+	// fleet-wide: every replica picks the drain up on its next refresh, instead of the
+	// operator having to hit all N pods.
+	SetDrain(ctx context.Context, key EndpointKey, until time.Time) error
+
+	// DeleteDrain lifts an admin drain. Removing it from shared storage is what propagates
+	// a release to the other replicas.
+	DeleteDrain(ctx context.Context, key EndpointKey) error
+
+	// ListDrains returns every live admin drain. Expired entries are filtered out by the
+	// implementation, so callers can treat the result as currently-in-force.
+	ListDrains(ctx context.Context) (map[EndpointKey]time.Time, error)
+
 	Close() error
 }
 
