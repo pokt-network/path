@@ -142,6 +142,11 @@ type Protocol struct {
 	// endpointPolicy holds operator-level security policies for endpoint selection.
 	endpointPolicy gateway.EndpointPolicyConfig
 
+	// blockedDomains is the gateway-operator (domain, rpc_type) blocklist — the nuclear
+	// ban, applied to every path that hands out endpoints (selection, fallback, health
+	// checks) across ALL services. nil when nothing is banned. See domain_blocklist.go.
+	blockedDomains *domainBlocklist
+
 	// supplierBlacklist tracks suppliers with validation/signature errors.
 	// These suppliers are temporarily excluded from selection to prevent
 	// penalizing domain reputation for individual supplier issues.
@@ -310,6 +315,26 @@ func NewProtocol(
 				"Recommended: Start with max_parallel_endpoints=1 and test thoroughly before increasing.")
 	}
 
+	// Compile the gateway-operator domain blocklist: config entries plus any
+	// PATH_BLOCKED_DOMAINS env additions (union — env widens, never narrows).
+	// A malformed entry refuses to boot: silently dropping a nuclear ban is worse.
+	blockedDomainEntries := append(
+		append([]gateway.BlockedDomainConfig(nil), config.BlockedDomains...),
+		parseBlockedDomainsEnv(os.Getenv(envBlockedDomains))...,
+	)
+	blockedDomains, err := newDomainBlocklist(blockedDomainEntries)
+	if err != nil {
+		return nil, fmt.Errorf("invalid domain blocklist (blocked_domains config / %s env): %w", envBlockedDomains, err)
+	}
+	for _, entry := range blockedDomains.configuredEntries() {
+		// Warn so the ban is visible at LOG_LEVEL=warn; the gauge covers LOG_LEVEL=error.
+		shannonLogger.Warn().
+			Str("domain", entry[0]).
+			Str("rpc_type", entry[1]).
+			Msg("🚫 domain blocklist entry active — endpoints at this domain are banned on ALL services")
+		metrics.BlockedDomainsConfigured.WithLabelValues(entry[0], entry[1]).Set(1)
+	}
+
 	protocolInstance := &Protocol{
 		logger: shannonLogger,
 
@@ -350,6 +375,9 @@ func NewProtocol(
 
 		// endpointPolicy holds operator-level endpoint security policies
 		endpointPolicy: config.EndpointPolicy,
+
+		// blockedDomains is the compiled (domain, rpc_type) nuclear ban list
+		blockedDomains: blockedDomains,
 
 		// supplierBlacklist tracks suppliers with validation/signature errors
 		supplierBlacklist: newSupplierBlacklist(),
@@ -1007,6 +1035,20 @@ func (p *Protocol) getUniqueEndpoints(
 	// Get fallback configuration for the service ID.
 	fallbackEndpoints, shouldSendAllTrafficToFallback := p.getServiceFallbackEndpoints(serviceID)
 
+	// The domain blocklist covers fallback endpoints too — both return paths below hand
+	// them out raw, bypassing every session-endpoint filter, and a nuclear ban with a
+	// fallback-shaped hole is not nuclear. Clone first: getServiceFallbackEndpoints
+	// returns the shared config-owned map, which must not be mutated.
+	if p.blockedDomains != nil && len(fallbackEndpoints) > 0 {
+		fallbackEndpoints = maps.Clone(fallbackEndpoints)
+		if blockedCount := removeBlockedDomains(fallbackEndpoints, p.blockedDomains, rpcType, serviceID, logger); blockedCount > 0 {
+			logger.Warn().
+				Int("blocked", blockedCount).
+				Int("remaining", len(fallbackEndpoints)).
+				Msg("🚫 Filtered out fallback endpoints at operator-blocked domains")
+		}
+	}
+
 	// If the service is configured to send all traffic to fallback endpoints,
 	// return only the fallback endpoints and skip session endpoint logic.
 	if shouldSendAllTrafficToFallback && len(fallbackEndpoints) > 0 {
@@ -1219,6 +1261,20 @@ func (p *Protocol) getSessionsUniqueEndpoints(
 				Int("blocked", blockedCount).
 				Int("remaining", len(qualifiedEndpoints)).
 				Msg("Filtered out config-blocked suppliers")
+		}
+
+		// GATEWAY-OPERATOR DOMAIN BLOCKLIST (the nuclear ban)
+		// Permanently exclude endpoints at domains banned for this RPC type, on every
+		// service. Applied before the allowlist so Target-Suppliers cannot override it,
+		// and with no preferred-endpoint exemption so a WebSocket rebind cannot re-pick
+		// a banned endpoint it is already bound to. Uses actualRPCType: after an RPC-type
+		// fallback the surviving endpoints serve the fallback type, and their URL for the
+		// originally requested type may not exist.
+		if blockedCount := removeBlockedDomains(qualifiedEndpoints, p.blockedDomains, actualRPCType, serviceID, logger); blockedCount > 0 {
+			logger.Warn().
+				Int("blocked", blockedCount).
+				Int("remaining", len(qualifiedEndpoints)).
+				Msg("🚫 Filtered out endpoints at operator-blocked domains")
 		}
 
 		// ENDPOINT POLICY FILTERING
@@ -1674,23 +1730,17 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 				continue
 			}
 
-			// Filter endpoints by RPC type support
+			// Filter endpoints by RPC type support, honoring the domain blocklist:
+			// a banned (domain, rpc_type) must receive no probes — health checks are
+			// paid relays, and "block HC too" is the point of a nuclear ban.
 			for addr, ep := range sessionEndpoints {
-				supportsAnyType := false
-				for rpcType := range healthCheckRPCTypes {
-					url := ep.GetURL(rpcType)
-					if url != "" {
-						supportsAnyType = true
-						break
-					}
-				}
-
-				if supportsAnyType {
+				supportsHTTP, supportsWS := p.healthCheckTypeSupport(ep, healthCheckRPCTypes)
+				if supportsHTTP || supportsWS {
 					allEndpoints[addr] = ep
 				} else {
 					logger.Debug().
 						Str("endpoint", string(addr)).
-						Msg("Skipping endpoint - does not support any health check RPC types")
+						Msg("Skipping endpoint - does not support any health check RPC types (or all are operator-blocked)")
 				}
 			}
 		}
@@ -1698,16 +1748,8 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 		// Also include fallback endpoints if configured, filtered by RPC type
 		fallbackEndpoints, _ := p.getServiceFallbackEndpoints(serviceID)
 		for addr, ep := range fallbackEndpoints {
-			supportsAnyType := false
-			for rpcType := range healthCheckRPCTypes {
-				url := ep.GetURL(rpcType)
-				if url != "" {
-					supportsAnyType = true
-					break
-				}
-			}
-
-			if supportsAnyType {
+			supportsHTTP, supportsWS := p.healthCheckTypeSupport(ep, healthCheckRPCTypes)
+			if supportsHTTP || supportsWS {
 				allEndpoints[addr] = ep
 			}
 		}
@@ -1725,8 +1767,11 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 				HTTPURL: ep.PublicURL(),
 			}
 
-			// Get WebSocket URL if available
-			if wsURL, err := ep.WebsocketURL(); err == nil {
+			// Get WebSocket URL if available. A blank WebSocketURL is how the health
+			// check executor decides an endpoint gets no WebSocket probe (it gates on
+			// WebSocketURL != ""), so a websocket domain ban is enforced by omission here.
+			if wsURL, err := ep.WebsocketURL(); err == nil &&
+				!p.blockedDomains.IsBlocked(wsURL, sharedtypes.RPCType_WEBSOCKET) {
 				info.WebSocketURL = wsURL
 			}
 
@@ -1745,6 +1790,33 @@ func (p *Protocol) GetEndpointsForHealthCheck() func(protocol.ServiceID) ([]gate
 
 		return result, nil
 	}
+}
+
+// healthCheckTypeSupport reports which transport a health-check probe may use against
+// this endpoint: supportsHTTP when at least one HTTP-carried health-check RPC type
+// (json_rpc, rest, comet_bft) has a URL and is not operator-blocked for its domain,
+// supportsWS likewise for websocket. Neither true = the endpoint gets no probes at all.
+//
+// Known limitation (documented on gateway.BlockedDomainConfig): the executor runs all
+// HTTP-carried checks against one endpoint address, so a ban covering only SOME of an
+// endpoint's HTTP types cannot suppress just those checks — the endpoint keeps its HTTP
+// probes as long as any HTTP type survives. All-type and websocket bans are exact.
+func (p *Protocol) healthCheckTypeSupport(
+	ep endpoint,
+	healthCheckRPCTypes map[sharedtypes.RPCType]struct{},
+) (supportsHTTP, supportsWS bool) {
+	for rpcType := range healthCheckRPCTypes {
+		url := ep.GetURL(rpcType)
+		if url == "" || p.blockedDomains.IsBlocked(url, rpcType) {
+			continue
+		}
+		if rpcType == sharedtypes.RPCType_WEBSOCKET {
+			supportsWS = true
+		} else {
+			supportsHTTP = true
+		}
+	}
+	return supportsHTTP, supportsWS
 }
 
 // getHealthCheckRPCTypes extracts the RPC types used in health checks for a service.

@@ -114,6 +114,26 @@ type EndpointPolicyConfig struct {
 	RequireDomain bool `yaml:"require_domain,omitempty"`
 }
 
+// BlockedDomainConfig is one entry of the gateway-operator domain blocklist — the
+// nuclear ban. Every endpoint whose URL is at Domain (exact hostname or eTLD+1 match)
+// is permanently excluded from serving the listed RPC types on EVERY service: primary
+// selection, retry/hedge, WebSocket (initial bind and rebind), fallback endpoints, and
+// health checks. Nothing overrides it — not Target-Suppliers, not a preferred/bound
+// endpoint — and unlike an admin drain it does not yield when it would empty the pool.
+//
+// Known limitation: health-check suppression is exact for all-type bans and for
+// websocket bans; a ban covering only a subset of the HTTP-carried types (json_rpc,
+// rest, comet_bft) still lets the endpoint's other HTTP health checks probe it.
+type BlockedDomainConfig struct {
+	// Domain is an eTLD+1 ("rpcgate.xyz", matching every host under it) or an exact
+	// hostname ("s019.rpcgate.xyz", matching only that host). Case-insensitive.
+	Domain string `yaml:"domain"`
+
+	// RPCTypes lists the banned RPC types ("websocket", "json_rpc", "rest",
+	// "comet_bft", "grpc"). Empty means every RPC type.
+	RPCTypes []string `yaml:"rpc_types,omitempty"`
+}
+
 // ServiceReputationConfig holds per-service reputation configuration.
 type ServiceReputationConfig struct {
 	Enabled         *bool          `yaml:"enabled,omitempty"`

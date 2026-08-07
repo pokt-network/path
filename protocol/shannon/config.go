@@ -108,6 +108,12 @@ type (
 		// Allows gateway operators to enforce HTTPS-only, domain-only, etc.
 		EndpointPolicy gateway.EndpointPolicyConfig `yaml:"endpoint_policy,omitempty"`
 
+		// BlockedDomains permanently bans operator domains from serving specific RPC types
+		// on ALL services — the nuclear ban. See gateway.BlockedDomainConfig for semantics.
+		// The PATH_BLOCKED_DOMAINS env var appends entries at pod-restart speed
+		// (union — env can widen a ban, never narrow one).
+		BlockedDomains []gateway.BlockedDomainConfig `yaml:"blocked_domains,omitempty"`
+
 		// UnifiedServices is the unified YAML-driven service configuration.
 		// This consolidates all per-service settings (type, rpc_types, fallback, health_checks)
 		// into a single structure with defaults and per-service overrides.

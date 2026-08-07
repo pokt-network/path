@@ -160,9 +160,10 @@ curl -X POST http://localhost:3069/v1 \
   - Skip **all** reputation-derived filtering — both the score-threshold/cooldown filter and
     tiered (highest-tier-only) selection. A score-0, fully-cooled-down supplier is reachable.
   - Still apply RPC type filtering (only endpoints supporting the requested RPC type)
-  - Still apply the config `blocked_suppliers` list, the endpoint policy (`require_https` /
-    `require_domain`), and the supplier blacklist (signature/validation failures). None of these
-    are reputation, and the header does not override them.
+  - Still apply the config `blocked_suppliers` list, the `blocked_domains` list (the nuclear
+    domain ban), the endpoint policy (`require_https` / `require_domain`), and the supplier
+    blacklist (signature/validation failures). None of these are reputation, and the header
+    does not override them.
   - Log filtered supplier list and endpoint counts
 - If none of the specified suppliers are available in the current session, the request will fail
 - Header takes precedence over load testing configuration (if any)
@@ -385,6 +386,53 @@ only reporting distinguishes them.
 shortening a drain is worse than saying no), the shared key carries a TTL past its longest
 drain, and expired entries are filtered on read and reaped. There is no way to bench an
 operator indefinitely through this endpoint. Re-issue to extend.
+
+**Domain Blacklist (`blocked_domains`) — the nuclear ban**
+
+Permanently bans an operator domain from serving specific RPC types on **ALL services**,
+where a drain is temporary (5h cap), per-service, and yields when it would empty the pool.
+
+```yaml
+gateway_config:
+  blocked_domains:
+    - domain: example.xyz          # eTLD+1 (matches every host under it) or exact hostname
+      rpc_types: [websocket]       # omit = every RPC type
+```
+```bash
+PATH_BLOCKED_DOMAINS=example.xyz:websocket,other.example   # pod restart, no config edit
+# entry = domain[:type1|type2]; env UNIONS with config — it can widen a ban, never narrow one
+```
+
+Semantics, all deliberate:
+- Covers **every** path that hands out endpoints: primary selection (HTTP + WebSocket, which
+  also covers retry/hedge/batch and WS rebind — they draw from the filtered pool), **fallback
+  endpoints** (which bypass every session-endpoint filter and needed explicit coverage), and
+  **health checks** (paid relays — a nuclear ban stops the probes too).
+- **`Target-Suppliers` cannot override it** (unlike drains, which that header bypasses — the
+  documented gap). The filter runs before the allowlist, next to `blocked_suppliers`.
+- **No preferred-endpoint exemption** (drain bug 4's shape) and matching is on the **live
+  URL**, so it survives session rollovers by construction (drain bug 2's shape).
+- **It can empty the pool.** A drain yields as a preference; a ban that yields when the banned
+  operator is all that remains is not a ban. The request fails instead.
+- A malformed entry (typo'd rpc_type, empty domain) **refuses to boot** rather than silently
+  narrowing the ban.
+- Live WS connections: a ban change requires a restart (config or env), and the restart closes
+  every connection with a clean handshake; reconnects cannot re-select the banned domain. No
+  separate force-close step exists or is needed.
+- Known limitation: health-check suppression is exact for all-type and websocket bans; a ban
+  covering only a subset of the HTTP-carried types (json_rpc/rest/comet_bft) leaves the
+  endpoint's other HTTP probes running (the executor keys HTTP checks on endpoint address,
+  not per-type URL).
+
+Metrics: `path_blocked_domains_configured{domain, rpc_type}` (1 per entry at startup —
+"is the ban loaded on this pod", readable at any LOG_LEVEL) and
+`path_endpoints_domain_blocked_total{domain, rpc_type, service_id}` (counted per selection
+pass — the honest "is it actually engaging" signal). Configured-but-never-engaging is a red
+flag: verify before trusting, four drain bugs reported benched while serving.
+
+Tests: `protocol/shannon/domain_blocklist_test.go` asserts through the production callers
+(`getSessionsUniqueEndpoints`, `getUniqueEndpoints`, `GetEndpointsForHealthCheck`), and every
+call site was revert-checked (filter removed → tests fail).
 
 **Circuit Breaker — when to use:**
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts

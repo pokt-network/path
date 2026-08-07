@@ -496,6 +496,35 @@ var EndpointsDrained = promauto.NewGaugeVec(
 	[]string{LabelDomain, LabelRPCType, LabelServiceID},
 )
 
+// EndpointsDomainBlockedTotal counts endpoints removed from selection by the
+// gateway-operator domain blocklist (blocked_domains config / PATH_BLOCKED_DOMAINS).
+//
+// Counted per selection pass, so the RATE tracks how often the ban is actually engaging
+// — the honest signal, after four drain bugs whose gauges reported benched endpoints
+// selection kept serving. Zero while path_blocked_domains_configured is nonzero means no
+// banned endpoint appeared in any session, OR the ban is not engaging — investigate
+// before trusting it.
+var EndpointsDomainBlockedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "endpoints_domain_blocked_total",
+		Help: "Endpoints removed from a selection pass by the gateway-operator domain blocklist (blocked_domains / PATH_BLOCKED_DOMAINS). Deliberate config-driven bans, not faults.",
+	},
+	[]string{LabelDomain, LabelRPCType, LabelServiceID},
+)
+
+// BlockedDomainsConfigured reports the (domain, rpc_type) entries the domain blocklist
+// booted with — set once at startup, 1 per entry, rpc_type="all" for all-type bans.
+// Exists because LOG_LEVEL=error hides the startup log, and "is the ban even loaded on
+// this pod" must be answerable from Prometheus. Compare with
+// path_endpoints_domain_blocked_total: configured but never engaging is a red flag.
+var BlockedDomainsConfigured = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: MetricPrefix + "blocked_domains_configured",
+		Help: "1 for each (domain, rpc_type) entry in the gateway-operator domain blocklist on this pod (rpc_type=\"all\" = every type). Set at startup.",
+	},
+	[]string{LabelDomain, LabelRPCType},
+)
+
 // =============================================================================
 // Supplier Blacklist Events (Counter)
 // Labels: domain, supplier, service_id, reason
