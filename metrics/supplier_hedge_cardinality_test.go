@@ -7,45 +7,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Test_supplierSignalSeverity locks the 8-signal-type → 3-severity-class
-// collapse that bounds supplier_signal_total cardinality. The exact strings are
-// the reputation.SignalType wire values (metrics cannot import reputation —
-// import cycle — so they are asserted literally here as the contract).
-func Test_supplierSignalSeverity(t *testing.T) {
-	cases := map[string]string{
-		"success":            SupplierSeverityOK,
-		"recovery_success":   SupplierSeverityOK,
-		"slow_response":      SupplierSeveritySlow,
-		"very_slow_response": SupplierSeveritySlow,
-		"minor_error":        SupplierSeverityError,
-		"major_error":        SupplierSeverityError,
-		"critical_error":     SupplierSeverityError,
-		"fatal_error":        SupplierSeverityError,
-		// Unknown / newly-added types must fall through to error, never leak a
-		// new label value (keeps cardinality bounded + surfaces the omission).
-		"some_future_signal": SupplierSeverityError,
-		"":                   SupplierSeverityError,
-	}
-	for in, want := range cases {
-		require.Equalf(t, want, supplierSignalSeverity(in), "signal %q", in)
-	}
-
-	// Only three severity values may ever be emitted.
-	seen := map[string]struct{}{}
-	for in := range cases {
-		seen[supplierSignalSeverity(in)] = struct{}{}
-	}
-	require.LessOrEqual(t, len(seen), 3, "severity label must have at most 3 values")
-}
-
-// Test_RecordSupplierSignal_EmptySupplierDropped guards the empty-supplier skip
-// (per-domain reputation keys carry no supplier).
-func Test_RecordSupplierSignal_EmptySupplierDropped(t *testing.T) {
-	before := testutil.CollectAndCount(SupplierSignalTotal)
-	RecordSupplierSignal("", "eth", "success")
-	require.Equal(t, before, testutil.CollectAndCount(SupplierSignalTotal),
-		"empty supplier must not create a series")
-}
+// Tests for the de-labeling of the per-supplier metric family.
+//
+// Two metrics that lived here — path_supplier_signal_total and
+// path_supplier_reputation_score — were removed entirely on 2026-08-12, along
+// with their severity-collapse and empty-supplier tests. Both were GUARDED and
+// both HONORED their guard while remaining among the largest series sources in
+// the gateway job, because a guard caps the live registry and not the number of
+// distinct series Prometheus retains. See DefaultSeriesLimit for the measurements
+// and Test_SupplierLabelIsGone below for the property that replaced them.
 
 // Test_RecordHealthCheck_CollapsesSuppliers locks the de-labeling of
 // path_health_check_status_total. The metric carried a `supplier` label with no
@@ -71,29 +41,148 @@ func Test_RecordHealthCheck_CollapsesSuppliers(t *testing.T) {
 	RecordHealthCheck(domain, "", rpcType, serviceID, checkName, SignalOK)
 
 	require.Equal(t, before+3, testutil.ToFloat64(series),
-		"all suppliers behind one domain must land on the same series")
+		"all suppliers behind one domain must collapse onto the same series")
+}
+
+// Test_RecordSupplierBlacklist_CollapsesSuppliers locks the `supplier` label drop
+// on path_supplier_blacklist_total. The address is still accepted (and still
+// logged at the call site); it must not reach a label.
+func Test_RecordSupplierBlacklist_CollapsesSuppliers(t *testing.T) {
+	const (
+		domain    = "blacklist-delabel.example"
+		serviceID = "eth"
+		reason    = BlacklistReasonSignatureError
+	)
+
+	// Arity assertion: 3 labels, no `supplier`.
+	series := SupplierBlacklistTotal.WithLabelValues(domain, serviceID, reason)
+	before := testutil.ToFloat64(series)
+
+	RecordSupplierBlacklist(domain, "pokt1blacklistone", serviceID, reason)
+	RecordSupplierBlacklist(domain, "pokt1blacklisttwo", serviceID, reason)
+
+	require.Equal(t, before+2, testutil.ToFloat64(series),
+		"two suppliers on one domain must collapse onto the same series")
+}
+
+// Test_RecordQoSFilterRejection_KeysOnDomain locks the supplier→domain re-key.
+//
+// This metric fires ~9,500/s fleet-wide and, with a supplier label, had the worst
+// churn of any gateway metric: 1,271 series live in a 10-minute window against
+// 24,708 distinct minted over one pod's 7.7h life (19.4×).
+func Test_RecordQoSFilterRejection_KeysOnDomain(t *testing.T) {
+	const (
+		domain    = "qosfilter-rekey.example"
+		serviceID = "eth"
+		reason    = QoSFilterReasonBlockHeightLag
+	)
+
+	// Arity assertion: (domain, service_id, reason).
+	series := QoSFilterRejectionTotal.WithLabelValues(domain, serviceID, reason)
+	before := testutil.ToFloat64(series)
+
+	RecordQoSFilterRejection(domain, serviceID, reason)
+	RecordQoSFilterRejection(domain, serviceID, reason)
+	require.Equal(t, before+2, testutil.ToFloat64(series))
+
+	// Empty target is skipped rather than recorded as DomainUnknown: the empty
+	// check MUST run before SanitizeDomainLabel, which maps "" to DomainUnknown
+	// and would turn "no endpoint context" into a real series.
+	unknown := QoSFilterRejectionTotal.WithLabelValues(DomainUnknown, serviceID, reason)
+	unknownBefore := testutil.ToFloat64(unknown)
+	RecordQoSFilterRejection("", serviceID, reason)
+	require.Equal(t, unknownBefore, testutil.ToFloat64(unknown),
+		"empty domain must be skipped, not collapsed onto DomainUnknown")
+
+	// A supplier address reaching this metric collapses to the sentinel instead of
+	// expanding ~1:1 with the supplier set — the failure this re-key exists to
+	// prevent, in case a caller passes an EndpointAddr instead of a domain.
+	sentinel := QoSFilterRejectionTotal.WithLabelValues(DomainSupplierAddr, serviceID, reason)
+	sentinelBefore := testutil.ToFloat64(sentinel)
+	RecordQoSFilterRejection("pokt1qosfilterleakedaddress", serviceID, reason)
+	require.Equal(t, sentinelBefore+1, testutil.ToFloat64(sentinel),
+		"a leaked supplier address must land on the supplier_addr sentinel")
 }
 
 // Test_RecordHedgeSupplierOutcome_Split guards the histogram→(counter+role
-// histogram) split: the role latency histogram is always recorded, but the
-// per-supplier counter is skipped when supplier is empty.
+// histogram) split, and the supplier→domain re-key of the counter: the role
+// latency histogram is always recorded, but the per-operator counter is skipped
+// when the domain is unknown.
 func Test_RecordHedgeSupplierOutcome_Split(t *testing.T) {
-	// Empty supplier: role histogram still observes, per-supplier counter does not.
+	// Unknown domain: role histogram still observes, per-operator counter does not.
 	histBefore := testutil.CollectAndCount(HedgeRoleLatency)
 	RecordHedgeSupplierOutcome("", HedgeRoleWinner, 0.12)
-	require.Greater(t, testutil.CollectAndCount(HedgeRoleLatency), histBefore-1,
-		"role latency histogram must record even without a supplier")
+	require.GreaterOrEqual(t, testutil.CollectAndCount(HedgeRoleLatency), histBefore,
+		"role latency histogram must record even without a domain")
 
-	// Known supplier: per-supplier counter increments for the right role.
-	const supplier = "pokt1testsupplierhedge"
-	winBefore := testutil.ToFloat64(HedgeSupplierOutcomeTotal.WithLabelValues(supplier, HedgeRoleWinner))
-	RecordHedgeSupplierOutcome(supplier, HedgeRoleWinner, 0.2)
-	winAfter := testutil.ToFloat64(HedgeSupplierOutcomeTotal.WithLabelValues(supplier, HedgeRoleWinner))
-	require.Equal(t, winBefore+1, winAfter, "winner count must increment for known supplier")
+	// Known operator: per-operator counter increments for the right role.
+	const domain = "hedge-outcome.example"
+	winBefore := testutil.ToFloat64(HedgeSupplierOutcomeTotal.WithLabelValues(domain, HedgeRoleWinner))
+	RecordHedgeSupplierOutcome(domain, HedgeRoleWinner, 0.2)
+	require.Equal(t, winBefore+1,
+		testutil.ToFloat64(HedgeSupplierOutcomeTotal.WithLabelValues(domain, HedgeRoleWinner)),
+		"winner count must increment for a known operator")
 
 	// Loser role is a distinct series.
-	loseBefore := testutil.ToFloat64(HedgeSupplierOutcomeTotal.WithLabelValues(supplier, HedgeRoleLoser))
-	RecordHedgeSupplierOutcome(supplier, HedgeRoleLoser, 0.5)
+	loseBefore := testutil.ToFloat64(HedgeSupplierOutcomeTotal.WithLabelValues(domain, HedgeRoleLoser))
+	RecordHedgeSupplierOutcome(domain, HedgeRoleLoser, 0.5)
 	require.Equal(t, loseBefore+1,
-		testutil.ToFloat64(HedgeSupplierOutcomeTotal.WithLabelValues(supplier, HedgeRoleLoser)))
+		testutil.ToFloat64(HedgeSupplierOutcomeTotal.WithLabelValues(domain, HedgeRoleLoser)))
+
+	// Two suppliers of the same operator must collapse, which is the whole point
+	// of the re-key: a raw supplier address hits the sentinel, not its own series.
+	sentinelBefore := testutil.ToFloat64(
+		HedgeSupplierOutcomeTotal.WithLabelValues(DomainSupplierAddr, HedgeRoleWinner))
+	RecordHedgeSupplierOutcome("pokt1hedgeleakedaddressone", HedgeRoleWinner, 0.3)
+	RecordHedgeSupplierOutcome("pokt1hedgeleakedaddresstwo", HedgeRoleWinner, 0.3)
+	require.Equal(t, sentinelBefore+2,
+		testutil.ToFloat64(HedgeSupplierOutcomeTotal.WithLabelValues(DomainSupplierAddr, HedgeRoleWinner)),
+		"leaked supplier addresses must collapse onto one sentinel series")
+}
+
+// Test_DomainFromEndpointAddr covers the EndpointAddr → operator-domain helper
+// that the re-keyed call sites depend on.
+//
+// It returns "" rather than DomainUnknown on failure BY DESIGN: the Record*
+// helpers check for empty before sanitizing, so returning a sentinel here would
+// defeat their skip and mint a series for every context-less call.
+func Test_DomainFromEndpointAddr(t *testing.T) {
+	cases := []struct {
+		name string
+		addr string
+		want string
+	}{
+		{
+			name: "supplier-url form yields eTLD+1",
+			addr: "pokt1abc-https://relayminer.shannon-mainnet.eu.example.net",
+			want: "example.net",
+		},
+		{
+			name: "subdomains collapse onto one operator",
+			addr: "pokt1def-https://other.host.example.net:8443",
+			want: "example.net",
+		},
+		{
+			name: "no dash separator yields empty, not a sentinel",
+			addr: "pokt1abcnoseparator",
+			want: "",
+		},
+		{
+			name: "empty input yields empty",
+			addr: "",
+			want: "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			require.Equal(t, c.want, DomainFromEndpointAddr(c.addr))
+		})
+	}
+
+	// Two suppliers behind the same operator must resolve to one domain — the
+	// property that turns a chain-sized label into an operator-sized one.
+	a := DomainFromEndpointAddr("pokt1one-https://a.example.net")
+	b := DomainFromEndpointAddr("pokt1two-https://b.example.net")
+	require.Equal(t, a, b, "different suppliers on one operator must share a domain")
+	require.NotEmpty(t, a)
 }

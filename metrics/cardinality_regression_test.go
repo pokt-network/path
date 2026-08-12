@@ -1,10 +1,13 @@
 package metrics
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
@@ -153,4 +156,200 @@ func Test_RPCTypeFallback_SupplierLabelDropped(t *testing.T) {
 
 	require.Empty(t, collectLabelValues(t, RPCTypeFallbackTotal, LabelSupplier),
 		"supplier is still being emitted as a label")
+}
+
+// =============================================================================
+// Follow-up round: F5 (histogram label multiplication) and F6 (label-set churn),
+// reported 2026-08-12 22:40Z after 7.6h on the F1/F2/F3 fix.
+//
+// The first round bounded label VALUE SETS. This round bounds two things a
+// sanitizer and a guard both miss:
+//   F5 — a label on a HISTOGRAM costs ~12 series per tuple, so a 20× label pair
+//        multiplies 12× harder there than on the counter beside it.
+//   F6 — a guard caps the LIVE registry; it cannot cap the number of distinct
+//        series Prometheus retains when a label's value set rotates over time.
+// =============================================================================
+
+// Test_RelayLatency_HistogramLabelsAreTopologyBounded is the F5 regression.
+//
+// path_relay_latency_seconds_bucket was 341,840 series fleet-wide, 31.6% of the
+// entire gateway job and the largest single source of ongoing growth. Its labels
+// were domain(13) × rpc_type(3) × service_id(61) × request_type(4) ×
+// status_code(5) × reputation_signal(4). The last two contribute nothing that is
+// queried from the histogram and multiply it 20× — at ~12 series per tuple.
+//
+// This asserts through RecordRelay, not on the metric declaration: the histogram
+// must not gain a series when only status_code or reputation_signal varies, while
+// the counter beside it must.
+func Test_RelayLatency_HistogramLabelsAreTopologyBounded(t *testing.T) {
+	RelaysTotal.Reset()
+	RelayLatency.Reset()
+
+	const (
+		domain    = "relay-latency-labels.example"
+		rpcType   = "json_rpc"
+		serviceID = "eth"
+	)
+
+	// Same topology tuple, every combination of the two dropped labels.
+	for _, statusCode := range []string{"2xx", "4xx", "5xx"} {
+		for _, signal := range []string{SignalOK, "minor_error", "major_error", "critical_error"} {
+			RecordRelay(domain, rpcType, serviceID, statusCode, signal, RelayTypeNormal, 0.1)
+		}
+	}
+
+	require.Equal(t, 1, testutil.CollectAndCount(RelayLatency),
+		"histogram must hold ONE tuple: status_code and reputation_signal must not reach it")
+	require.Equal(t, 12, testutil.CollectAndCount(RelaysTotal),
+		"the counter must keep the full outcome taxonomy (3 status_code × 4 reputation_signal)")
+
+	// The labels the histogram DOES keep must still separate series, or the fix
+	// would have flattened the metric into uselessness rather than narrowing it.
+	RecordRelay(domain, "websocket", serviceID, "2xx", SignalOK, RelayTypeNormal, 0.1)
+	RecordRelay(domain, rpcType, serviceID, "2xx", SignalOK, RelayTypeHedge, 0.1)
+	RecordRelay("other-operator.example", rpcType, serviceID, "2xx", SignalOK, RelayTypeNormal, 0.1)
+	RecordRelay(domain, rpcType, "poly", "2xx", SignalOK, RelayTypeNormal, 0.1)
+	require.Equal(t, 5, testutil.CollectAndCount(RelayLatency),
+		"domain, rpc_type, service_id and request_type must each still separate series")
+
+	// Arity assertion: passing the counter's 6 labels to the histogram would panic.
+	require.Empty(t, collectLabelValues(t, RelayLatency, LabelStatusCode))
+	require.Empty(t, collectLabelValues(t, RelayLatency, LabelReputationSignal))
+}
+
+// Test_SupplierLabelIsGone is the F6 regression, and the only test here that is a
+// property of the whole package rather than of one metric.
+//
+// Six metrics carried a raw `supplier` label: 303,309 series in a 10-minute
+// window. The supplier set is ~5,200 on chain and grows with the NETWORK, not
+// with our traffic, and it rotates every session — so these metrics minted
+// multiples of their live count in distinct series every day (measured on one
+// pod over 7.7h: supplier_reputation_score 16.5×, qos_filter_rejection 19.4×,
+// supplier_signal 9.3×, against a 1.0× control).
+//
+// A cardinality guard cannot fix that. Two of the six were guarded, honored their
+// caps, and were still among the largest series sources in the job.
+//
+// ⭐ Each metric is populated THROUGH ITS PRODUCTION Record* HELPER first, then
+// the registry is walked. That order is load-bearing and was got wrong once here:
+// Gather() reports the labels of CHILD SERIES, so a vec with no children reports
+// no labels at all. A registry walk on its own passes whatever the label set is —
+// the revert check (restore `supplier` on both re-keyed metrics, expect a
+// failure) came back green, which is the same class of mistake as asserting on a
+// helper's return value instead of the caller's.
+//
+// The walk is kept as a second net over everything else the suite has populated,
+// so a NEW metric that both carries a supplier label and gets exercised anywhere
+// in this package fails too.
+//
+// The exemptions are the metrics where the supplier IS the subject — a specific
+// account you have to name to act on it — rather than a way of naming an
+// operator. PNF's ask draws exactly this line: aggregate to domain where the
+// metric is an AGGREGATE SIGNAL. All three are also tiny in practice, which is
+// the corroborating evidence rather than the reason.
+func Test_SupplierLabelIsGone(t *testing.T) {
+	allowed := map[string]struct{}{
+		// 313 series fleet-wide. The allowance it reports is per (supplier,
+		// session) — aggregating to domain would destroy the quantity.
+		MetricPrefix + "supplier_exhausted_total": {},
+		// 0 series in production. Fires when a supplier ACCOUNT has never signed a
+		// transaction, so the address is the actionable payload; our dashboard
+		// queries it `by(supplier)` for precisely that reason.
+		MetricPrefix + "supplier_nil_pubkey_total": {},
+		// 0 series in production. Same shape: names the account whose cached pubkey
+		// was invalidated or recovered.
+		MetricPrefix + "supplier_pubkey_cache_events_total": {},
+	}
+
+	// Populate every metric that used to carry `supplier`, via the production
+	// helper, so the registry walk below actually has children to inspect. A
+	// supplier address is passed wherever the helper still accepts one: if it ever
+	// reaches a label again, the walk sees it.
+	const leakedSupplier = "pokt1supplierlabelregression"
+	RecordSupplierBlacklist("supplier-label-gone.example", leakedSupplier, "eth", BlacklistReasonSignatureError)
+	RecordQoSFilterRejection("supplier-label-gone.example", "eth", QoSFilterReasonBlockHeightLag)
+	RecordHedgeSupplierOutcome("supplier-label-gone.example", HedgeRoleWinner, 0.1)
+	RecordHealthCheck("supplier-label-gone.example", leakedSupplier, "json_rpc", "eth", "block_height", SignalOK)
+	RecordRPCTypeFallback("supplier-label-gone.example", leakedSupplier, "eth", "COMET_BFT", "JSON_RPC")
+	RecordRelay("supplier-label-gone.example", "json_rpc", "eth", "2xx", SignalOK, RelayTypeNormal, 0.1)
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+
+	var offenders []string
+	populated := map[string]struct{}{}
+	for _, fam := range families {
+		name := fam.GetName()
+		if !strings.HasPrefix(name, MetricPrefix) {
+			continue
+		}
+		if len(fam.GetMetric()) > 0 {
+			populated[name] = struct{}{}
+		}
+		if _, ok := allowed[name]; ok {
+			continue
+		}
+		for _, m := range fam.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == LabelSupplier {
+					offenders = append(offenders, name)
+				}
+			}
+		}
+	}
+
+	require.Empty(t, offenders,
+		"these metrics carry a raw `supplier` label; aggregate to `domain` or serve the "+
+			"per-supplier question from /ready/<service>?detailed=true")
+
+	// Guard the guard: if a helper above stops emitting, the walk silently stops
+	// covering that metric and this test decays into asserting nothing.
+	for _, name := range []string{
+		MetricPrefix + "supplier_blacklist_total",
+		MetricPrefix + "qos_filter_rejection_total",
+		MetricPrefix + "hedge_supplier_outcome_total",
+		MetricPrefix + "health_check_status_total",
+		MetricPrefix + "rpc_type_fallback_total",
+		MetricPrefix + "relays_total",
+	} {
+		require.Containsf(t, populated, name,
+			"%s was not populated, so the label walk did not actually inspect it", name)
+	}
+}
+
+// Test_RemovedSupplierMetricsStayRemoved pins the two deletions.
+//
+// Both were guarded AND honored their guard AND were still enormous, which is the
+// counter-intuitive part worth a test: someone reading only the guard code would
+// reasonably conclude they were safe to re-add.
+//
+// Detected by REGISTRATION COLLISION, not by walking Gather(). Gather() reports
+// only families that have at least one child series, so a re-added vec that no
+// test happens to populate would be invisible to a registry walk — the metric
+// would be back, minting series in production, with this test green. Registering
+// a same-named collector answers "is this name taken" regardless of children.
+func Test_RemovedSupplierMetricsStayRemoved(t *testing.T) {
+	removed := []string{
+		MetricPrefix + "supplier_reputation_score", // 4,510 live vs 74,639 distinct/7.7h/pod
+		MetricPrefix + "supplier_signal_total",     // 6,523 live vs 60,674 distinct/7.7h/pod
+	}
+
+	for _, name := range removed {
+		probe := prometheus.NewCounter(prometheus.CounterOpts{
+			Name: name,
+			Help: "registration probe",
+		})
+		err := prometheus.DefaultRegisterer.Register(probe)
+
+		var already prometheus.AlreadyRegisteredError
+		require.Falsef(t, errors.As(err, &already),
+			"%s is registered again; it was removed for unbounded label-set churn (a guard "+
+				"cannot bound it — see DefaultSeriesLimit). Per-operator reading is "+
+				"path_reputation_mean_score; per-supplier is /ready/<service>?detailed=true", name)
+		require.NoErrorf(t, err, "unexpected error probing %s", name)
+
+		// Leave the registry as found, or the probe itself becomes a phantom metric
+		// for every later test in this package.
+		prometheus.DefaultRegisterer.Unregister(probe)
+	}
 }

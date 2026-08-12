@@ -534,17 +534,24 @@ var BlockedDomainsConfigured = promauto.NewGaugeVec(
 
 // =============================================================================
 // Supplier Blacklist Events (Counter)
-// Labels: domain, supplier, service_id, reason
+// Labels: domain, service_id, reason
 // Value: count
 // Purpose: Track suppliers blacklisted for validation/signature errors
+//
+// No `supplier` label: the supplier set is ~5,200 on chain and grows with the
+// network, not with our traffic, so a raw supplier label makes this metric scale
+// with chain growth (9,410 series fleet-wide, measured 2026-08-12, for a metric
+// whose only dashboard consumer aggregates by service_id and reason). A
+// blacklisting is acted on per operator anyway, and the specific address is in
+// the WARN log at the call site.
 // =============================================================================
 
 var SupplierBlacklistTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "supplier_blacklist_total",
-		Help: "Suppliers blacklisted by domain, supplier address, service_id, and reason.",
+		Help: "Suppliers blacklisted by domain, service_id, and reason. No supplier label: it scaled with the on-chain supplier set rather than with traffic; the blacklisted address is in the log line.",
 	},
-	[]string{LabelDomain, LabelSupplier, LabelServiceID, "reason"},
+	[]string{LabelDomain, LabelServiceID, "reason"},
 )
 
 // Blacklist reason constants
@@ -595,7 +602,9 @@ const (
 
 // =============================================================================
 // RPC Type Fallback (Counter)
-// Labels: domain, supplier, service_id, requested_rpc_type, fallback_rpc_type
+// Labels: domain, service_id, requested_rpc_type, fallback_rpc_type
+// (`supplier` was dropped in the 2026-08-12 F3 fix: 3,289 values against the
+// metric's own 9 domains × 12 service_ids, ~all of its 201,068 series.)
 // Purpose: Track when suppliers don't support the requested RPC type and fallback is used
 // =============================================================================
 
@@ -653,11 +662,21 @@ func RecordSupplierExhausted(supplier, serviceID string) {
 
 // =============================================================================
 // QoS Filter Rejections (Counter)
-// Labels: supplier, service_id, reason
-// Purpose: Per-supplier visibility into why QoS dropped an endpoint pre-relay.
-// These rejections are silent today — operators can't tell whether their
+// Labels: domain, service_id, reason
+// Purpose: Per-operator visibility into why QoS dropped an endpoint pre-relay.
+// These rejections are otherwise silent — operators can't tell whether their
 // endpoint was filtered for being block-behind, missing chain_id, lacking
 // archival capability, etc.
+//
+// Keyed on domain (eTLD+1), not supplier. This metric fires ~9,500/s fleet-wide,
+// and with a raw supplier label it had the WORST churn of any gateway metric:
+// 1,271 series live in a 10-minute window against 24,708 distinct series minted
+// over 7.7h on a single pod (19.4×), because rejections are sporadic per
+// supplier while the supplier set rotates every session. A cardinality guard
+// cannot bound that — it caps the live registry, and re-admitting an evicted
+// tuple produces the same series, so the number of distinct series Prometheus
+// must store is identical with or without eviction. Only fewer label VALUES
+// bound it, and the routing decision this metric informs is made per operator.
 // =============================================================================
 
 const (
@@ -673,40 +692,60 @@ const (
 var QoSFilterRejectionTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "qos_filter_rejection_total",
-		Help: "QoS filter rejections by supplier, service_id, and reason. Reasons: block_height_lag, block_height_unknown, chain_id_mismatch, archival_required, invalid_response, empty_response, capability_limitation.",
+		Help: "QoS filter rejections by domain (eTLD+1), service_id, and reason. Reasons: block_height_lag, block_height_unknown, chain_id_mismatch, archival_required, invalid_response, empty_response, capability_limitation.",
 	},
-	[]string{LabelSupplier, LabelServiceID, "reason"},
+	[]string{LabelDomain, LabelServiceID, "reason"},
 )
 
-// RecordQoSFilterRejection counts a per-supplier QoS filter rejection.
-// Skipped when supplier is empty (e.g., missing endpoint context) or when
-// the cardinality guard has tripped for this metric.
-func RecordQoSFilterRejection(supplier, serviceID, reason string) {
-	if supplier == "" {
+// RecordQoSFilterRejection counts a per-operator QoS filter rejection.
+// Skipped when domain is empty (e.g., missing endpoint context) or when the
+// cardinality guard has tripped for this metric.
+//
+// The empty check runs BEFORE SanitizeDomainLabel deliberately:
+// SanitizeDomainLabel("") returns DomainUnknown, which would turn "no endpoint
+// context" into a real series and silently defeat the skip.
+func RecordQoSFilterRejection(domain, serviceID, reason string) {
+	if domain == "" {
 		return
 	}
-	if !qosFilterRejectionGuard.allow(supplier, serviceID, reason) {
+	domain = SanitizeDomainLabel(domain)
+	if !qosFilterRejectionGuard.allow(domain, serviceID, reason) {
 		return
 	}
-	QoSFilterRejectionTotal.WithLabelValues(supplier, serviceID, reason).Inc()
+	QoSFilterRejectionTotal.WithLabelValues(domain, serviceID, reason).Inc()
 }
 
 // =============================================================================
-// Per-supplier reputation observability (Gauge + Counter)
-// Labels: supplier, service_id (+ signal_type on counter)
-// Purpose: Give operators of relay miners a metric-level view of why PATH is
-// or isn't routing to them. Supplier already implies domain — no domain label.
-// Signals are emitted from reputation/service.go::RecordSignal, so any QoS
-// code that produces a Signal automatically feeds this counter.
+// REMOVED: path_supplier_reputation_score (gauge, labels supplier/service_id/rpc_type)
+//
+// Removed 2026-08-12. It was the single worst churn source in the gateway: 4,510
+// series live in a 10-minute window against 74,639 distinct series minted over
+// 7.7h on ONE pod (16.5×), ~232K series/pod/day, every one retained for the full
+// 6-day Prometheus window. The churn was structural — the publisher Reset()s the
+// whole gauge every snapshot cycle (correctly: a supplier that rotates out of a
+// session must not stick at its last score via the 5-minute staleness window),
+// so the live set is only ever the current sessions' suppliers while the
+// cumulative set grows toward the whole chain.
+//
+// No cardinality guard could have bounded it. A guard caps the LIVE registry,
+// and re-admitting an evicted tuple recreates the same label set — so the count
+// of distinct series Prometheus must store is identical with or without
+// eviction. Only fewer label values bound that, and `supplier` scales with chain
+// growth rather than with our traffic.
+//
+// Nothing consumed it: zero references across our dashboards, zero Prometheus
+// rules. Both readings it supported already exist and are cheaper:
+//   - per operator: path_reputation_mean_score{domain, service_id, rpc_type},
+//     403 series/pod, 1.0× churn (also Reset() per cycle, but bounded by the
+//     operator set instead of the supplier set).
+//   - per supplier, live and exact: GET /ready/<service>?detailed=true, which
+//     returns score, strikes, latency, tier and cooldown per endpoint. That is
+//     the right shape for a per-supplier question — a point lookup, not 74K
+//     retained timeseries.
+//
+// Re-introducing a per-supplier metric means re-introducing that churn. Serve
+// the question from the API instead.
 // =============================================================================
-
-var SupplierReputationScore = promauto.NewGaugeVec(
-	prometheus.GaugeOpts{
-		Name: MetricPrefix + "supplier_reputation_score",
-		Help: "Per-supplier reputation score (0-100) by supplier, service_id, and rpc_type. Snapshotted every 10s. The rpc_type split keeps a supplier's websocket score from colliding with its json_rpc score (they are tracked and acted on separately).",
-	},
-	[]string{LabelSupplier, LabelServiceID, LabelRPCType},
-)
 
 // Reasons an endpoint is dropped by the reputation filter, used as the `reason`
 // label on ReputationDisqualifiedTotal.
@@ -1056,48 +1095,43 @@ func RecordReputationPoolCollapseGuard(serviceID, rpcType string) {
 	ReputationPoolCollapseGuardTotal.WithLabelValues(serviceID, rpcType).Inc()
 }
 
-// Severity classes for supplier_signal_total. The reputation layer emits 8
-// distinct signal-type strings; carrying all 8 as a label multiplies this
-// counter's cardinality 8× on top of the (supplier × service_id) base — the
-// base already accumulates toward the full network supplier set as sessions
-// rotate, so the extra 8× is what pushes the metric into the 25K guard within
-// ~15 min of pod start. Collapsing to 3 severity classes cuts the fan to 3×
-// while preserving the only distinction this per-supplier view needs: is the
-// supplier working, degraded-but-serving, or failing. Full error taxonomy
-// (5xx vs timeout vs config) remains available per-domain on relays_total
-// (status_code + reputation_signal).
-const (
-	SupplierSeverityOK    = "ok"    // success, recovery_success
-	SupplierSeveritySlow  = "slow"  // slow_response, very_slow_response
-	SupplierSeverityError = "error" // minor/major/critical/fatal error
-)
-
-var SupplierSignalTotal = promauto.NewCounterVec(
-	prometheus.CounterOpts{
-		Name: MetricPrefix + "supplier_signal_total",
-		Help: "Reputation signals emitted by supplier and service_id, collapsed to a severity class (ok/slow/error). Full error taxonomy is available per-domain on relays_total.",
-	},
-	[]string{LabelSupplier, LabelServiceID, LabelSeverity},
-)
-
-// supplierSignalSeverity collapses a reputation signal-type string (the 8
-// reputation.SignalType wire values) into one of three severity classes.
-// Unknown/new signal types fall through to "error" so a mis-added type shows
-// up loudly rather than silently vanishing, and cardinality stays bounded.
-func supplierSignalSeverity(signalType string) string {
-	switch signalType {
-	case "success", "recovery_success":
-		return SupplierSeverityOK
-	case "slow_response", "very_slow_response":
-		return SupplierSeveritySlow
-	default: // minor_error, major_error, critical_error, fatal_error, unknown
-		return SupplierSeverityError
-	}
-}
+// =============================================================================
+// REMOVED: path_supplier_signal_total (counter, labels supplier/service_id/severity)
+//
+// Removed 2026-08-12. Its cardinality had already been cut once — the 8
+// reputation signal types were collapsed to 3 severity classes to stop it
+// tripping the 25K guard within ~15 min of pod start. That fixed the multiplier
+// and left the base, which was the actual problem: the (supplier × service_id)
+// base accumulates toward the whole network's supplier set as sessions rotate.
+//
+// Measured on one mainnet pod: 6,523 series live in a 10-minute window against
+// 60,674 distinct series minted over 7.7h (9.3×), 79,617 series fleet-wide. It
+// was one of the two largest sources of series in the entire gateway job while
+// simultaneously sitting at ~26% of its own guard cap — the guard bounds the live
+// registry, not the number of distinct series Prometheus retains, and eviction
+// does not change that count at all (a re-admitted tuple is the same label set).
+//
+// Nothing consumed it: zero references across our dashboards, zero Prometheus
+// rules. Everything it reported is already available, domain-keyed and 1.0×
+// churn, on metrics we keep:
+//   - path_relays_total{domain, rpc_type, service_id, status_code,
+//     reputation_signal, request_type} — the FULL 8-value signal taxonomy, not
+//     the 3-class collapse, and it covers health-check and probation traffic via
+//     request_type.
+//   - path_health_check_status_total{domain, ..., reputation_signal} for the
+//     health-check path specifically.
+//   - /ready/<service>?detailed=true for a live per-supplier point lookup.
+//
+// The severity collapse (ok/slow/error) went with it; nothing else used those
+// constants. If a per-supplier counter is ever needed again, note that no guard
+// setting makes it cheap — the cost is the label's value set, and that one grows
+// with the chain.
+// =============================================================================
 
 // =============================================================================
 // Relays (Counter + Histogram)
-// Labels: domain, rpc_type, service_id, status_code, reputation_signal, request_type
+// Labels (counter):   domain, rpc_type, service_id, status_code, reputation_signal, request_type
+// Labels (histogram): domain, rpc_type, service_id, request_type
 // Purpose: Track ALL outgoing relays from PATH to supplier endpoints
 // Includes: normal user requests, health checks, probation traffic
 // =============================================================================
@@ -1136,13 +1170,41 @@ var RelaysTotal = promauto.NewCounterVec(
 	[]string{LabelDomain, LabelRPCType, LabelServiceID, LabelStatusCode, LabelReputationSignal, "request_type"},
 )
 
+// RelayLatency deliberately carries FEWER labels than RelaysTotal: it omits
+// status_code and reputation_signal.
+//
+// A histogram costs ~12 series per label tuple (10 `le` buckets plus _sum and
+// _count), so every label on it multiplies 12× what the same label costs on the
+// counter beside it. status_code (5 values) × reputation_signal (4) is a 20×
+// multiplier on the most expensive metric in the gateway: measured 2026-08-12,
+// path_relay_latency_seconds_bucket was 341,840 series fleet-wide, 31.6% of the
+// entire gateway job, and was the single largest source of ongoing series
+// growth.
+//
+// The remaining labels are bounded by service topology rather than by request
+// outcome. Measured on one mainnet pod: the live (domain, service_id, rpc_type)
+// universe is 403 combinations, so this histogram's tuple ceiling is 403 ×
+// len(request_type) ≈ 1,600 → ~19K series. With status_code and
+// reputation_signal it was 403 × 4 × 20 = 32,240 tuples → ~322K series/pod, and
+// it was still climbing toward that at 7.6h of pod age (2,226 → 2,732 tuples
+// over 6h).
+//
+// Nothing consumed the dropped labels HERE. Every dashboard query against this
+// histogram aggregates to at most (domain, service_id, rpc_type, le) and uses
+// request_type only as a selector; no Prometheus rule references it at all. The
+// full outcome taxonomy remains on RelaysTotal, which carries all six labels at
+// 1 series per tuple — join on (domain, rpc_type, service_id, request_type) to
+// correlate a latency shift with the status codes behind it.
+//
+// If a per-status latency split is ever genuinely needed, add a SEPARATE
+// narrow-labelled histogram rather than restoring these labels here.
 var RelayLatency = promauto.NewHistogramVec(
 	prometheus.HistogramOpts{
 		Name:    MetricPrefix + "relay_latency_seconds",
-		Help:    "Outgoing relay latency in seconds by domain, rpc_type, service_id, status_code, reputation_signal, and request_type.",
+		Help:    "Outgoing relay latency in seconds by domain, rpc_type, service_id, and request_type. No status_code/reputation_signal labels: on a histogram each label costs ~12 series per tuple, and that pair multiplied this metric 20× to 31.6% of all gateway series. The outcome taxonomy is on relays_total (same labels plus status_code and reputation_signal, 1 series per tuple).",
 		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
 	},
-	[]string{LabelDomain, LabelRPCType, LabelServiceID, LabelStatusCode, LabelReputationSignal, "request_type"},
+	[]string{LabelDomain, LabelRPCType, LabelServiceID, "request_type"},
 )
 
 // =============================================================================
@@ -1459,21 +1521,27 @@ var HedgeWinningLatency = promauto.NewHistogramVec(
 )
 
 // =============================================================================
-// Hedge per-supplier outcome (Counter) + role latency (Histogram)
+// Hedge per-operator outcome (Counter) + role latency (Histogram)
 // Purpose: Answers "am I losing races, and by how much?".
 //
-// Split into two metrics to bound cardinality. The per-supplier signal is a
+// Split into two metrics to bound cardinality. The per-operator signal is a
 // win-rate — a ratio of counts — which needs no buckets, so it lives on a plain
-// COUNTER (supplier × role = 2 series/supplier, ~10K series network-wide,
-// well under the 25K guard → complete, not first-seen-biased). The "by how
-// much" is a latency distribution that does NOT need per-supplier resolution,
-// so it lives on a HISTOGRAM keyed by role only (~2×12 series total).
+// COUNTER (domain × role = 2 series/operator, ~26 series/pod). The "by how much"
+// is a latency distribution that does NOT need per-operator resolution, so it
+// lives on a HISTOGRAM keyed by role only (~2×12 series total).
 //
 // This replaces the earlier single per-supplier HistogramVec, which multiplied
 // ~8K supplier×role tuples by ~12 bucket series each = the largest single
 // metric family in the gateway (~585K series, ~39% of all gateway cardinality;
 // with service_id it was 945K — audit 2026-04-28). Win-rate = winner /
 // (winner + loser) on the counter; loser-vs-winner latency gap on the histogram.
+//
+// Keyed on domain rather than supplier since 2026-08-12: even as a bare counter,
+// supplier × role was 49,231 series fleet-wide and 1.8× churn (4,306 live vs
+// 7,840 distinct over 7.7h on one pod), because the supplier set rotates every
+// session and scales with the chain rather than with our traffic. Hedge is an
+// operator-level question — "did routing to a different operator help" — so the
+// eTLD+1 is the granularity that answers it.
 // =============================================================================
 
 const (
@@ -1481,23 +1549,24 @@ const (
 	HedgeRoleLoser  = "loser"
 )
 
-// HedgeSupplierOutcomeTotal is the per-supplier win/loss counter. Bounded and
-// complete: supplier × {winner,loser} stays well under the guard cap.
+// HedgeSupplierOutcomeTotal is the per-operator win/loss counter. Bounded by the
+// live operator set (13 domains measured 2026-08-12), not by the chain's
+// supplier set.
 var HedgeSupplierOutcomeTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "hedge_supplier_outcome_total",
-		Help: "Per-supplier hedge race outcomes. role=winner|loser. Win-rate = winner/(winner+loser).",
+		Help: "Per-operator (eTLD+1) hedge race outcomes. role=winner|loser. Win-rate = winner/(winner+loser).",
 	},
-	[]string{LabelSupplier, "role"},
+	[]string{LabelDomain, "role"},
 )
 
 // HedgeRoleLatency is the hedge outcome latency distribution by role, aggregated
-// across all suppliers (no supplier label → tiny, fixed cardinality). Pairs
-// with HedgeSupplierOutcomeTotal for the per-supplier win-rate.
+// across all operators (no domain label → tiny, fixed cardinality). Pairs with
+// HedgeSupplierOutcomeTotal for the per-operator win-rate.
 var HedgeRoleLatency = promauto.NewHistogramVec(
 	prometheus.HistogramOpts{
 		Name:    MetricPrefix + "hedge_role_latency_seconds",
-		Help:    "Hedge race outcome latency by role (winner|loser), aggregated across suppliers. Pairs with hedge_supplier_outcome_total for per-supplier win-rate.",
+		Help:    "Hedge race outcome latency by role (winner|loser), aggregated across operators. Pairs with hedge_supplier_outcome_total for per-operator win-rate.",
 		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
 	},
 	[]string{"role"},
@@ -1519,21 +1588,25 @@ func RecordHedgeLatencySavings(rpcType, serviceID string, savingsSeconds float64
 
 // RecordHedgeSupplierOutcome records a hedge race outcome. role must be
 // HedgeRoleWinner or HedgeRoleLoser. The latency distribution is recorded per
-// role (no supplier label, always). The per-supplier win/loss count is recorded
-// only when supplier is known and the cardinality guard admits it.
-func RecordHedgeSupplierOutcome(supplier, role string, latencySeconds float64) {
+// role (no domain label, always). The per-operator win/loss count is recorded
+// only when domain is known and the cardinality guard admits it.
+//
+// Empty check before SanitizeDomainLabel: the sanitizer maps "" to
+// DomainUnknown, which would turn "no endpoint context" into a real series.
+func RecordHedgeSupplierOutcome(domain, role string, latencySeconds float64) {
 	// Role-only latency distribution: fixed, tiny cardinality — always recorded.
 	HedgeRoleLatency.WithLabelValues(role).Observe(latencySeconds)
 
-	// Per-supplier win/loss counter: 2 series/supplier, still guarded as a
-	// backstop against a supplier-address label leak.
-	if supplier == "" {
+	// Per-operator win/loss counter: 2 series/operator, still guarded as a
+	// backstop against a domain label leak.
+	if domain == "" {
 		return
 	}
-	if !hedgeSupplierGuard.allow(supplier, role) {
+	domain = SanitizeDomainLabel(domain)
+	if !hedgeSupplierGuard.allow(domain, role) {
 		return
 	}
-	HedgeSupplierOutcomeTotal.WithLabelValues(supplier, role).Inc()
+	HedgeSupplierOutcomeTotal.WithLabelValues(domain, role).Inc()
 }
 
 // RecordBatchSize records a batch request with latency.
@@ -1598,9 +1671,15 @@ func RecordProbationEvent(domain, rpcType, serviceID, event string) {
 
 // RecordSupplierBlacklist records a supplier being blacklisted with the specific reason
 // reason should be one of the BlacklistReason* constants
-func RecordSupplierBlacklist(domain, supplier, serviceID, reason string) {
+//
+// supplier is accepted and ignored: it is no longer a label (see
+// SupplierBlacklistTotal). The parameter is kept so call sites keep passing the
+// address they already have, making a future re-introduction a one-line change
+// rather than a hunt through callers — same pattern as RecordHealthCheck and
+// RecordRPCTypeFallback.
+func RecordSupplierBlacklist(domain, _ /* supplier */, serviceID, reason string) {
 	domain = SanitizeDomainLabel(domain)
-	SupplierBlacklistTotal.WithLabelValues(domain, supplier, serviceID, reason).Inc()
+	SupplierBlacklistTotal.WithLabelValues(domain, serviceID, reason).Inc()
 }
 
 // RecordSupplierNilPubkey records when a supplier is found with a nil public key.
@@ -1644,23 +1723,9 @@ func SetMeanScore(domain, serviceID, rpcType string, score float64) {
 	ReputationMeanScore.WithLabelValues(domain, serviceID, rpcType).Set(score)
 }
 
-// SetSupplierReputationScore sets the per-(supplier, service_id, rpc_type) reputation gauge.
-// Skipped silently when supplier is empty (e.g., per-domain reputation key)
-// or when the cardinality guard has tripped for this metric.
-//
-// The guard is keyed on all three labels, matching the gauge exactly. It used to
-// key on (supplier, service_id) only, which let one admitted slot create one
-// series per rpc_type — so the guard's tuple count under-reported the series it
-// was capping, and eviction could not delete the series it reclaimed.
-func SetSupplierReputationScore(supplier, serviceID, rpcType string, score float64) {
-	if supplier == "" {
-		return
-	}
-	if !supplierReputationGuard.allow(supplier, serviceID, rpcType) {
-		return
-	}
-	SupplierReputationScore.WithLabelValues(supplier, serviceID, rpcType).Set(score)
-}
+// SetSupplierReputationScore was removed with path_supplier_reputation_score.
+// See the REMOVED block above SetMeanScore's metric for why, and use
+// /ready/<service>?detailed=true for per-supplier scores.
 
 // RecordReputationDisqualified increments the reputation-filter disqualification
 // counter for one dropped endpoint. reason is one of the
@@ -1676,29 +1741,22 @@ func RecordHedgeSelfOperatorAvoided(serviceID string) {
 	HedgeSelfOperatorAvoidedTotal.WithLabelValues(serviceID).Inc()
 }
 
-// RecordSupplierSignal increments the per-supplier signal counter, collapsing
-// the reputation signal type to a severity class (ok/slow/error) to bound
-// cardinality. Skipped silently when supplier is empty (e.g., per-domain
-// reputation key) or when the cardinality guard has tripped for this metric.
-func RecordSupplierSignal(supplier, serviceID, signalType string) {
-	if supplier == "" {
-		return
-	}
-	severity := supplierSignalSeverity(signalType)
-	if !supplierSignalGuard.allow(supplier, serviceID, severity) {
-		return
-	}
-	SupplierSignalTotal.WithLabelValues(supplier, serviceID, severity).Inc()
-}
+// RecordSupplierSignal was removed with path_supplier_signal_total. The
+// domain-keyed replacement is path_relays_total's reputation_signal label, which
+// carries the full taxonomy rather than the 3-class collapse. See the REMOVED
+// block where the metric was declared.
 
 // RecordRelay records an outgoing relay to a supplier endpoint with latency
 // relayType should be one of: RelayTypeNormal, RelayTypeHealthCheck, RelayTypeProbation
 // statusCode should be the HTTP status code category (2xx, 4xx, 5xx, etc.)
 // reputationSignal should be the signal recorded (ok, minor_error, major_error, etc.)
+//
+// statusCode and reputationSignal land on the counter only — see RelayLatency for
+// why the histogram carries a narrower label set.
 func RecordRelay(domain, rpcType, serviceID, statusCode, reputationSignal, relayType string, latencySeconds float64) {
 	domain = SanitizeDomainLabel(domain)
 	RelaysTotal.WithLabelValues(domain, rpcType, serviceID, statusCode, reputationSignal, relayType).Inc()
-	RelayLatency.WithLabelValues(domain, rpcType, serviceID, statusCode, reputationSignal, relayType).Observe(latencySeconds)
+	RelayLatency.WithLabelValues(domain, rpcType, serviceID, relayType).Observe(latencySeconds)
 }
 
 // WebSocket Connection Metrics Helpers

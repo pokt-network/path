@@ -32,16 +32,6 @@ type MeanScoreEntry struct {
 	MeanScore float64 // Average score across all endpoints for this combination
 }
 
-// SupplierScoreEntry represents the per-(supplier, service_id, rpc_type) reputation score.
-// One value per triple — a supplier serving multiple RPC types (e.g. json_rpc + websocket)
-// gets one entry per type, since reputation is tracked and acted on per rpc_type.
-type SupplierScoreEntry struct {
-	Supplier  string
-	ServiceID string
-	RPCType   string
-	Score     float64
-}
-
 // CooldownCountEntry represents per-domain count of endpoints currently in strike
 // cooldown for a given service / rpc_type.
 type CooldownCountEntry struct {
@@ -55,11 +45,14 @@ type CooldownCountEntry struct {
 type LeaderboardDataProvider interface {
 	// GetEndpointLeaderboardData returns all endpoint entries grouped by the required dimensions
 	GetEndpointLeaderboardData(ctx context.Context) ([]EndpointLeaderboardEntry, error)
-	// GetMeanScoreData returns mean reputation scores per domain/service/rpc_type
+	// GetMeanScoreData returns mean reputation scores per domain/service/rpc_type.
+	//
+	// Per-OPERATOR, deliberately. A GetSupplierScoreData sibling existed until
+	// 2026-08-12 and was removed with path_supplier_reputation_score: keyed on the
+	// supplier address, it minted ~232K distinct Prometheus series per pod per day
+	// while nothing queried it. Per-supplier scores are served on demand by
+	// GET /ready/<service>?detailed=true instead.
 	GetMeanScoreData(ctx context.Context) ([]MeanScoreEntry, error)
-	// GetSupplierScoreData returns per-(supplier, service_id) reputation scores.
-	// Optional: implementations may return nil if per-supplier scoring is not supported.
-	GetSupplierScoreData(ctx context.Context) ([]SupplierScoreEntry, error)
 	// GetCooldownCountData returns per-(domain, service_id, rpc_type) counts of
 	// endpoints currently in strike cooldown. Optional: implementations may return
 	// nil if cooldown tracking is not supported.
@@ -188,23 +181,14 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 		}
 	}
 
-	// Publish per-(supplier, service_id) reputation scores. Reset between
-	// snapshots — suppliers may rotate out of sessions and stale series
-	// would persist forever otherwise.
-	supplierScores, err := lp.provider.GetSupplierScoreData(ctx)
-	if err != nil {
-		lp.logger.Warn().Err(err).Msg("Failed to get supplier score data")
-		return
-	}
-
-	SupplierReputationScore.Reset()
-
-	if len(supplierScores) > 0 {
-		for _, entry := range supplierScores {
-			SetSupplierReputationScore(entry.Supplier, entry.ServiceID, entry.RPCType, entry.Score)
-		}
-		lp.logger.Debug().Int("entries", len(supplierScores)).Msg("Published supplier scores")
-	}
+	// A per-(supplier, service_id, rpc_type) score gauge was published here until
+	// 2026-08-12. Its Reset() — needed so a supplier rotating out of a session did
+	// not stick at its last score via Prometheus' 5-minute staleness window — is
+	// exactly what made it the worst churn source in the gateway: the live set was
+	// only ever the current sessions' suppliers while the cumulative set grew
+	// toward the whole chain (4,510 live vs 74,639 distinct over 7.7h on one pod).
+	// Removed; use path_reputation_mean_score above for the per-operator reading
+	// and /ready/<service>?detailed=true for a per-supplier one.
 
 	// Publish per-domain endpoint cooldown counts. Reset between snapshots so a
 	// domain that drops to zero cooldown'd endpoints actually shows zero (instead

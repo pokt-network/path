@@ -580,6 +580,73 @@ Recorded on **every** band pick, so `outcome="reshaped"` over the total is the r
 
 **What to watch after enabling:** `path_supplier_exhausted_total` for the **thin** operators the excess lands on, not the capped one — a solo-registration backend gains share while still holding one supplier's per-session allowance. Same failure mode as the backend-URL dedup, and self-correcting. Retry success rate — `path_relays_total{request_type="retry"}` split by `status_code` — must not fall; roughly 60% of retries already fail, so that pool is marginal to begin with.
 
+## Adding a Prometheus Label — What Actually Bounds Cardinality
+
+Two rounds of a production cardinality incident (2026-08-12) converged on one rule:
+**only a label's VALUE SET bounds it.** Neither a sanitizer nor a guard does, and each fails
+in a way that looks like success.
+
+- A **sanitizer** bounds a value's *shape*, never the *set*. `SanitizeMethodLabel` was already
+  wired when 5,000 route-shaped probe paths sailed through it.
+- A **cardinality guard** bounds the **live registry**, never the number of distinct series
+  Prometheus retains. `path_supplier_signal_total` sat at ~26% of its 25K cap and was still one
+  of the two largest series sources in the whole job — 6,523 tuples live in a 10-minute window
+  against **60,674 distinct over one pod's 7.7h life**. Eviction is not the cause and removing
+  it would not help: re-admitting an evicted tuple recreates the *same label set*, hence the
+  same series with a gap, never a new one. Eviction only decides whether the cost also lands on
+  pod heap.
+
+Tiers, in the order to reach for them:
+
+| label source | example | verdict |
+|---|---|---|
+| our config | `service_id`, `rpc_type`, `reason`, `role`, status class | safe — fixed at deploy |
+| operator set | `domain` (eTLD+1) | safe — 15 values fleet-wide, grows only when an operator joins |
+| **the chain** | `supplier` | **never safe at any cap** — ~5,200 addresses, grows with the network, rotates every session |
+| the client | `method`, REST path | guard-only, and only because the cap converts unbounded minting into a bounded cost plus a WARN |
+
+**A label on a histogram costs ~12× what it costs on the counter beside it** (one series per
+bucket plus `_sum`/`_count`). `path_relay_latency_seconds_bucket` was 31.6% of all gateway
+series because it carried `status_code` × `reputation_signal` — a 20× pair that no dashboard
+ever queried *from the histogram*. Put the outcome taxonomy on the counter; keep the histogram
+on topology labels only.
+
+**`supplier` is gone from every aggregate metric.** Per-supplier questions are served by
+`GET /ready/<service>?detailed=true` — a point lookup, not 74K retained timeseries. Three
+metrics keep it deliberately (`supplier_exhausted_total`, `supplier_nil_pubkey_total`,
+`supplier_pubkey_cache_events_total`): there the address is the actionable payload, not a way
+of naming an operator. `Test_SupplierLabelIsGone` enforces the rest.
+
+Churn diagnostic — run it whenever a metric looks cheap but the TSDB disagrees:
+
+```promql
+count(count_over_time(<metric>{pod="<pod>"}[10m]))   # live
+count(count_over_time(<metric>{pod="<pod>"}[8h]))    # distinct over 8h
+```
+
+Above ~1.5× means the label set rotates and the metric costs multiples of its instant count.
+`path_relay_latency_seconds_bucket` at 1.0× is the control.
+
+**Testing traps specific to metrics** (same family as the routing ones below):
+
+- `Gather()` reports the labels of **child series**, so a vec with no children reports no
+  labels at all. A registry-walk test passes on a revert that re-adds the label. **Populate
+  through the production `Record*` helper first**, then walk — and assert the population
+  happened, or the test decays into asserting nothing.
+- Detect a **removed** metric by registration collision (`Register` a same-named probe and
+  expect no `AlreadyRegisteredError`), not by walking `Gather()` — a re-added vec that nothing
+  populates is invisible to a walk.
+- A `supplier`→`domain` re-key **compiles silently** when the call site keeps passing the
+  address: both are strings and the label *name* is right. Assert on the label **value** from
+  the production caller — a bech32 address sanitizes to the `supplier_addr` sentinel, which is
+  the tell. `qos/evm/qos_filter_rejection_label_test.go` and
+  `gateway/hedge_outcome_label_test.go` do this; both were revert-checked.
+
+**Never `labeldrop` these on the Prometheus side.** Collapsing thousands of series onto one
+label set produces `duplicate sample for timestamp`, which fails the **whole scrape** —
+`up=0`, every gateway metric lost, not a partial blinding. The collision-free stopgap is
+`action: drop` on `__name__` for a specific metric.
+
 ## Testing Changes That Affect Routing
 
 Three separate bugs shipped in the admin-drain feature, all with passing tests, all the same

@@ -313,99 +313,16 @@ func (p *Protocol) GetMeanScoreData(ctx context.Context) ([]metrics.MeanScoreEnt
 	return entries, nil
 }
 
-// GetSupplierScoreData implements the metrics.LeaderboardDataProvider interface.
-// It returns the mean reputation score per (supplier, service_id, rpc_type) triple,
-// averaging per-endpoint scores when the supplier has multiple endpoints of the same
-// rpc_type.
+// GetSupplierScoreData was removed with path_supplier_reputation_score
+// (2026-08-12). It walked every service's active sessions, expanded every unique
+// endpoint and did a reputation GetScore per endpoint, every 10 seconds, purely
+// to feed a gauge that nothing queried and that minted ~232K distinct Prometheus
+// series per pod per day. Per-supplier scores are served on demand by
+// GET /ready/<service>?detailed=true, which reads the same reputation state
+// without a periodic fleet-wide walk.
 //
-// Cardinality note: bounded by active suppliers × active services × rpc_types (a
-// supplier typically serves 1-3 rpc types). The rpc_type split is deliberate: a
-// supplier's websocket reputation is tracked and disqualified separately from its
-// json_rpc reputation, and averaging the two together hid genuinely-broken websocket
-// endpoints behind a healthy json_rpc score.
-func (p *Protocol) GetSupplierScoreData(ctx context.Context) ([]metrics.SupplierScoreEntry, error) {
-	logger := p.logger.With("method", "GetSupplierScoreData")
-
-	if p.unifiedServicesConfig == nil {
-		logger.Debug().Msg("No unified services config available, returning empty supplier scores")
-		return nil, nil
-	}
-
-	if p.reputationService == nil {
-		logger.Debug().Msg("Reputation service not enabled, returning empty supplier scores")
-		return nil, nil
-	}
-
-	type supplierKey struct {
-		Supplier  string
-		ServiceID string
-		RPCType   string
-	}
-	type aggregator struct {
-		Total float64
-		Count int
-	}
-	aggregates := make(map[supplierKey]*aggregator)
-
-	for _, serviceConfig := range p.unifiedServicesConfig.Services {
-		serviceID := serviceConfig.ID
-
-		activeSessions, err := p.getCentralizedGatewayModeActiveSessions(ctx, serviceID, false)
-		if err != nil || len(activeSessions) == 0 {
-			continue
-		}
-
-		rpcTypesToQuery := p.getServiceRPCTypesForLeaderboard(serviceID)
-
-		for _, rpcType := range rpcTypesToQuery {
-			endpoints, actualRPCType, err := p.getUniqueEndpoints(ctx, serviceID, activeSessions, false, rpcType, nil, "")
-			if err != nil {
-				continue
-			}
-
-			for endpointAddr := range endpoints {
-				supplier, err := endpointAddr.GetAddress()
-				if err != nil || supplier == "" {
-					continue
-				}
-
-				keyBuilder := p.reputationService.KeyBuilderForService(serviceID)
-				key := keyBuilder.BuildKey(serviceID, endpointAddr, actualRPCType)
-				score, scoreErr := p.reputationService.GetScore(ctx, key)
-				if scoreErr != nil {
-					score = reputation.Score{Value: p.reputationService.GetInitialScoreForService(serviceID)}
-				}
-
-				aggKey := supplierKey{
-					Supplier:  supplier,
-					ServiceID: string(serviceID),
-					RPCType:   metrics.NormalizeRPCType(actualRPCType.String()),
-				}
-				if aggregates[aggKey] == nil {
-					aggregates[aggKey] = &aggregator{}
-				}
-				aggregates[aggKey].Total += score.Value
-				aggregates[aggKey].Count++
-			}
-		}
-	}
-
-	entries := make([]metrics.SupplierScoreEntry, 0, len(aggregates))
-	for k, agg := range aggregates {
-		if agg.Count == 0 {
-			continue
-		}
-		entries = append(entries, metrics.SupplierScoreEntry{
-			Supplier:  k.Supplier,
-			ServiceID: k.ServiceID,
-			RPCType:   k.RPCType,
-			Score:     agg.Total / float64(agg.Count),
-		})
-	}
-
-	logger.Debug().Int("total_entries", len(entries)).Msg("Built supplier score data")
-	return entries, nil
-}
+// The per-operator equivalent is still published: see GetMeanScoreData above,
+// which feeds path_reputation_mean_score{domain, service_id, rpc_type}.
 
 // GetCooldownCountData implements the metrics.LeaderboardDataProvider interface.
 // It returns per-(domain, service_id, rpc_type) counts of endpoints currently in
