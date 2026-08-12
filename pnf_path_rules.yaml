@@ -450,7 +450,12 @@
   # Block time: ~6s | Source: chainspect.app, moonscan.io
   # Formula: 300s / 6s = 50 blocks for 5 minutes
   sync_allowance: 50
-  check_interval: 10s
+  # 30s, not 10s: health checks were 78% of this service's total relays
+  # (29.4 HC/s against 8.1 user relays/s, measured 2026-08-07). A 10s detection
+  # window buys nothing at that traffic level. Per-check rate is ~98/interval_seconds,
+  # independent of endpoint count, so interval is a real lever (per-service scheduling
+  # landed 2026-08-03; before that a service could only lower the global floor).
+  check_interval: 30s
   enabled: true
   checks:
     - name: eth_blockNumber
@@ -474,19 +479,14 @@
       expected_response_contains: '0x504"'
       timeout: 5s
       reputation_signal: critical_error
-    # Archival check - block 677,000
-    # Address: 0xf89d7b9c864f589bbf53a82105107622b35eaa40 (from E2E tests)
-    # Block: 0xa5488 (677,000)
-    - name: moonbeam_archival
-      type: json_rpc
-      method: POST
-      path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xf89d7b9c864f589bbf53a82105107622b35eaa40","0xa5488"]}'
-      expected_status_code: 200
-      expected_response_contains: "0x109855c3ae698000"
-      timeout: 10s
-      archival: true
-      reputation_signal: minor_error
+    # REMOVED 2026-08-07: moonbeam_archival returned minor_error on 100% of runs
+    # (9.80/s minor_error against 0.00/s ok). The expected balance was verified
+    # CORRECT against rpc.api.moonbeam.network (block 0xa5488 -> 0x109855c3ae698000),
+    # so this was real archival-supply absence, not a stale rule value.
+    # A penalty applied uniformly to every endpoint distorts no ranking and alerts
+    # nobody, so it spent a third of this service's health-check budget for zero
+    # signal. Re-add (address 0xf89d7b9c864f589bbf53a82105107622b35eaa40, block
+    # 0xa5488) if archival supply appears.
     # WebSocket data-path check. Deliberately sends a request rather than only
     # opening the socket: a supplier can complete the handshake, answer pings, and
     # still deliver nothing, so connect-only would score it healthy.
@@ -507,7 +507,10 @@
   # Block time: ~6s | Source: moonscan.io (same as Moonbeam)
   # Formula: 300s / 6s = 50 blocks for 5 minutes
   sync_allowance: 50
-  check_interval: 10s
+  # 30s, not 10s: health checks were 71% of this service's total relays
+  # (19.6 HC/s against 8.1 user relays/s, measured 2026-08-07). See moonbeam for the
+  # rate model — per-check rate is ~98/interval_seconds, flat in endpoint count.
+  check_interval: 30s
   enabled: true
   checks:
     - name: eth_blockNumber
@@ -608,7 +611,10 @@
   # Block time: ~5s | Source: celoscan.io, celo docs
   # Formula: 300s / 5s = 60 blocks for 5 minutes
   sync_allowance: 60
-  check_interval: 10s
+  # 30s, not 10s: health checks were 87% of this service's total relays — the worst
+  # ratio on the fleet (22.9 HC/s against 3.3 user relays/s, measured 2026-08-07).
+  # See moonbeam for the rate model.
+  check_interval: 30s
   enabled: true
   checks:
     - name: eth_blockNumber
@@ -632,19 +638,14 @@
       expected_response_contains: '0xa4ec"'
       timeout: 5s
       reputation_signal: critical_error
-    # Archival check - block 20,000,000
-    # Address: 0xf89d7b9c864f589bbF53a82105107622B35EaA40 (from E2E tests)
-    # Block: 0x1312d00 (20,000,000)
-    - name: celo_archival
-      type: json_rpc
-      method: POST
-      path: /
-      body: '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xf89d7b9c864f589bbF53a82105107622B35EaA40","0x1312d00"]}'
-      expected_status_code: 200
-      expected_response_contains: "0x9a1201de9ff1d6718714"
-      timeout: 10s
-      archival: true
-      reputation_signal: minor_error
+    # REMOVED 2026-08-07: celo_archival returned minor_error on 100% of runs
+    # (9.80/s minor_error against 0.00/s ok). The expected balance was verified
+    # CORRECT against forno.celo.org (block 0x1312d00 -> 0x9a1201de9ff1d6718714),
+    # so this was real archival-supply absence, not a stale rule value. Same shape as
+    # moonbeam_archival above. Contrast gnosis_archival (66% fail / 34% ok) and
+    # eth_archival (14% fail) — those discriminate between endpoints and are kept.
+    # Re-add (address 0xf89d7b9c864f589bbF53a82105107622B35EaA40, block 0x1312d00)
+    # if archival supply appears.
 
 - service_id: fantom
   # Block time: ~1s | Source: ftmscan.com (legacy chain, migrating to Sonic)

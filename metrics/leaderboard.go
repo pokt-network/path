@@ -161,7 +161,7 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 			// Publish each entry
 			for _, entry := range entries {
 				ReputationEndpointLeaderboard.WithLabelValues(
-					entry.Domain,
+					SanitizeDomainLabel(entry.Domain),
 					entry.RPCType,
 					entry.ServiceID,
 					fmt.Sprintf("%d", entry.TierThreshold),
@@ -219,7 +219,7 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 
 	if len(cooldownCounts) > 0 {
 		for _, entry := range cooldownCounts {
-			EndpointsInCooldown.WithLabelValues(entry.Domain, entry.RPCType, entry.ServiceID).Set(float64(entry.Count))
+			EndpointsInCooldown.WithLabelValues(SanitizeDomainLabel(entry.Domain), entry.RPCType, entry.ServiceID).Set(float64(entry.Count))
 		}
 		lp.logger.Debug().Int("entries", len(cooldownCounts)).Msg("Published cooldown counts")
 	}
@@ -236,7 +236,7 @@ func (lp *LeaderboardPublisher) publishLeaderboard(ctx context.Context) {
 
 	if len(drainedCounts) > 0 {
 		for _, entry := range drainedCounts {
-			EndpointsDrained.WithLabelValues(entry.Domain, entry.RPCType, entry.ServiceID).Set(float64(entry.Count))
+			EndpointsDrained.WithLabelValues(SanitizeDomainLabel(entry.Domain), entry.RPCType, entry.ServiceID).Set(float64(entry.Count))
 		}
 		lp.logger.Warn().Int("entries", len(drainedCounts)).Msg("⚠️ endpoints are benched by an admin drain")
 	}
