@@ -387,6 +387,7 @@ func SetCircuitBreakerState(serviceID, domain string, broken bool) {
 	if domain == "" {
 		return
 	}
+	domain = SanitizeDomainLabel(domain)
 	v := 0.0
 	if broken {
 		v = 1.0
@@ -450,11 +451,17 @@ var DomainCircuitBreakerEventsTotal = promauto.NewCounterVec(
 // RecordCircuitBreakerEvent increments the per-(service, domain, reason, event)
 // counter. Skipped silently when domain is empty.
 func RecordCircuitBreakerEvent(serviceID, domain, reasonCategory, event string) {
+	// Sanitize AFTER the empty check: SanitizeDomainLabel maps "" to
+	// DomainUnknown, which would defeat the documented skip.
 	if domain == "" {
 		return
 	}
+	domain = SanitizeDomainLabel(domain)
 	if reasonCategory == "" {
 		reasonCategory = CircuitBreakReasonUnknown
+	}
+	if !circuitBreakerEventsGuard.allow(serviceID, domain, reasonCategory, event) {
+		return
 	}
 	DomainCircuitBreakerEventsTotal.WithLabelValues(serviceID, domain, reasonCategory, event).Inc()
 }
@@ -597,7 +604,7 @@ var RPCTypeFallbackTotal = promauto.NewCounterVec(
 		Name: MetricPrefix + "rpc_type_fallback_total",
 		Help: "Count of RPC type fallbacks when supplier doesn't support requested RPC type.",
 	},
-	[]string{LabelDomain, LabelSupplier, LabelServiceID, "requested_rpc_type", "fallback_rpc_type"},
+	[]string{LabelDomain, LabelServiceID, "requested_rpc_type", "fallback_rpc_type"},
 )
 
 // =============================================================================
@@ -909,10 +916,15 @@ var SelectionPoolOperators = promauto.NewHistogramVec(
 func RecordSelectionPool(serviceID, selectionPath string, operatorCounts map[string]int, poolSize int, selectedOperator string) {
 	SelectionPoolSize.WithLabelValues(serviceID, selectionPath).Observe(float64(poolSize))
 	SelectionPoolOperators.WithLabelValues(serviceID, selectionPath).Observe(float64(len(operatorCounts)))
+	// operatorKey() derives these from ExtractDomainOrHost, which returns a bare
+	// bech32 supplier address verbatim for a dotless host — so `operator` is
+	// exposed to the same leak that made `domain` 90.5% supplier addresses.
+	// These two are counters with no Reset(), so an unsanitized value here is
+	// retained for the pod's lifetime.
 	for op := range operatorCounts {
-		SelectionCandidateTotal.WithLabelValues(serviceID, op, selectionPath).Inc()
+		SelectionCandidateTotal.WithLabelValues(serviceID, SanitizeDomainLabel(op), selectionPath).Inc()
 	}
-	SelectionSelectedTotal.WithLabelValues(serviceID, selectedOperator, selectionPath).Inc()
+	SelectionSelectedTotal.WithLabelValues(serviceID, SanitizeDomainLabel(selectedOperator), selectionPath).Inc()
 }
 
 // Selector paths for LabelSelectionPath.
@@ -1344,6 +1356,7 @@ var WebsocketEndpointStallTotal = promauto.NewCounterVec(
 // one backend collapse onto the same (domain, …) series, which is what every
 // consumer of this metric already aggregates to.
 func RecordHealthCheck(domain, _, rpcType, serviceID, healthCheckName, reputationSignal string) {
+	domain = SanitizeDomainLabel(domain)
 	if !healthCheckStatusGuard.allow(domain, rpcType, serviceID, healthCheckName, reputationSignal) {
 		return
 	}
@@ -1357,22 +1370,31 @@ func RecordHealthCheckDeduped(serviceID string) {
 
 // RecordObservation records an observation pipeline event
 func RecordObservation(domain, rpcType, serviceID, networkType, method, reputationSignal string) {
+	domain = SanitizeDomainLabel(domain)
+	// `method` is attacker-controlled; this guard is the hard bound on it. See
+	// observationPipelineGuard.
+	if !observationPipelineGuard.allow(domain, rpcType, serviceID, networkType, method, reputationSignal) {
+		return
+	}
 	ObservationPipeline.WithLabelValues(domain, rpcType, serviceID, networkType, method, reputationSignal).Inc()
 }
 
 // RecordLatencyReputation records a latency categorization
 func RecordLatencyReputation(domain, rpcType, serviceID, latencySignal string) {
+	domain = SanitizeDomainLabel(domain)
 	LatencyReputation.WithLabelValues(domain, rpcType, serviceID, latencySignal).Inc()
 }
 
 // RecordRequest records a request with status code and latency
 func RecordRequest(domain, rpcType, serviceID, statusCode string, latencySeconds float64) {
+	domain = SanitizeDomainLabel(domain)
 	RequestsTotal.WithLabelValues(domain, rpcType, serviceID, statusCode).Inc()
 	RequestLatency.WithLabelValues(domain, rpcType, serviceID, statusCode).Observe(latencySeconds)
 }
 
 // RecordRetryDistribution records why a retry happened
 func RecordRetryDistribution(domain, rpcType, serviceID, reason string) {
+	domain = SanitizeDomainLabel(domain)
 	RetriesDistribution.WithLabelValues(domain, rpcType, serviceID, reason).Inc()
 }
 
@@ -1567,12 +1589,17 @@ func RecordRequestSize(rpcType, serviceID string, bytesReceived, bytesSent int64
 
 // RecordProbationEvent records a probation event (entered, exited, or routed)
 func RecordProbationEvent(domain, rpcType, serviceID, event string) {
+	domain = SanitizeDomainLabel(domain)
+	if !probationEventsGuard.allow(domain, rpcType, serviceID, event) {
+		return
+	}
 	ProbationEventsTotal.WithLabelValues(domain, rpcType, serviceID, event).Inc()
 }
 
 // RecordSupplierBlacklist records a supplier being blacklisted with the specific reason
 // reason should be one of the BlacklistReason* constants
 func RecordSupplierBlacklist(domain, supplier, serviceID, reason string) {
+	domain = SanitizeDomainLabel(domain)
 	SupplierBlacklistTotal.WithLabelValues(domain, supplier, serviceID, reason).Inc()
 }
 
@@ -1595,13 +1622,25 @@ func RecordSupplierPubkeyRecovered(supplier string) {
 }
 
 // RecordRPCTypeFallback records when a supplier doesn't support the requested RPC type
-// and a fallback RPC type is used instead
-func RecordRPCTypeFallback(domain, supplier, serviceID, requestedRPCType, fallbackRPCType string) {
-	RPCTypeFallbackTotal.WithLabelValues(domain, supplier, serviceID, requestedRPCType, fallbackRPCType).Inc()
+// and a fallback RPC type is used instead.
+//
+// The second argument is the supplier address. It is accepted and ignored: the
+// signature is kept so callers need no change, but the value is deliberately NOT
+// used as a label. It carried 3,289 distinct values against the metric's own 9
+// domains × 12 service_ids, doing essentially all of the 201,068-series
+// multiplication this counter reached in production. Per-supplier attribution
+// belongs in traces or logs, not a Prometheus label.
+func RecordRPCTypeFallback(domain, _, serviceID, requestedRPCType, fallbackRPCType string) {
+	domain = SanitizeDomainLabel(domain)
+	if !rpcTypeFallbackGuard.allow(domain, serviceID, requestedRPCType, fallbackRPCType) {
+		return
+	}
+	RPCTypeFallbackTotal.WithLabelValues(domain, serviceID, requestedRPCType, fallbackRPCType).Inc()
 }
 
 // SetMeanScore sets the mean reputation score for a domain/service/rpc_type combination
 func SetMeanScore(domain, serviceID, rpcType string, score float64) {
+	domain = SanitizeDomainLabel(domain)
 	ReputationMeanScore.WithLabelValues(domain, serviceID, rpcType).Set(score)
 }
 
@@ -1657,6 +1696,7 @@ func RecordSupplierSignal(supplier, serviceID, signalType string) {
 // statusCode should be the HTTP status code category (2xx, 4xx, 5xx, etc.)
 // reputationSignal should be the signal recorded (ok, minor_error, major_error, etc.)
 func RecordRelay(domain, rpcType, serviceID, statusCode, reputationSignal, relayType string, latencySeconds float64) {
+	domain = SanitizeDomainLabel(domain)
 	RelaysTotal.WithLabelValues(domain, rpcType, serviceID, statusCode, reputationSignal, relayType).Inc()
 	RelayLatency.WithLabelValues(domain, rpcType, serviceID, statusCode, reputationSignal, relayType).Observe(latencySeconds)
 }
@@ -1666,6 +1706,7 @@ func RecordRelay(domain, rpcType, serviceID, statusCode, reputationSignal, relay
 // RecordWebsocketConnectionEstablished records a successful WebSocket connection establishment
 // and increments the active connection count
 func RecordWebsocketConnectionEstablished(domain, serviceID string) {
+	domain = SanitizeDomainLabel(domain)
 	WebsocketConnectionsActive.WithLabelValues(domain, serviceID).Inc()
 	WebsocketConnectionEventsTotal.WithLabelValues(domain, serviceID, WSEventEstablished).Inc()
 }
@@ -1673,6 +1714,7 @@ func RecordWebsocketConnectionEstablished(domain, serviceID string) {
 // RecordWebsocketConnectionClosed records a WebSocket connection closure
 // and decrements the active connection count, recording the duration
 func RecordWebsocketConnectionClosed(domain, serviceID string, durationSeconds float64) {
+	domain = SanitizeDomainLabel(domain)
 	WebsocketConnectionsActive.WithLabelValues(domain, serviceID).Dec()
 	WebsocketConnectionEventsTotal.WithLabelValues(domain, serviceID, WSEventClosed).Inc()
 	WebsocketConnectionDuration.WithLabelValues(domain, serviceID).Observe(durationSeconds)
@@ -1698,17 +1740,20 @@ func MoveWebsocketConnection(oldDomain, newDomain, serviceID string) {
 // event="closed" / duration observation still comes from RecordWebsocketConnectionClosed on
 // the shared close path; this only labels WHY.
 func RecordWebsocketIdleReaped(domain, serviceID string) {
+	domain = SanitizeDomainLabel(domain)
 	WebsocketIdleReapedTotal.WithLabelValues(domain, serviceID).Inc()
 }
 
 // RecordWebsocketConnectionFailed records a WebSocket connection failure
 func RecordWebsocketConnectionFailed(domain, serviceID string) {
+	domain = SanitizeDomainLabel(domain)
 	WebsocketConnectionEventsTotal.WithLabelValues(domain, serviceID, WSEventFailed).Inc()
 }
 
 // RecordWebsocketMessage records a WebSocket message
 // direction should be WSDirectionClientToEndpoint or WSDirectionEndpointToClient
 func RecordWebsocketMessage(domain, serviceID, direction, reputationSignal string) {
+	domain = SanitizeDomainLabel(domain)
 	WebsocketMessagesTotal.WithLabelValues(domain, serviceID, direction, reputationSignal).Inc()
 }
 
@@ -1716,6 +1761,7 @@ func RecordWebsocketMessage(domain, serviceID, direction, reputationSignal strin
 // Called once per connection per sampler pass, including for connections currently at
 // zero — see WebsocketConnectionFrameRate for why the zeros are load-bearing.
 func RecordWebsocketConnectionFrameRate(domain, serviceID string, framesPerSec float64) {
+	domain = SanitizeDomainLabel(domain)
 	WebsocketConnectionFrameRate.WithLabelValues(domain, serviceID).Observe(framesPerSec)
 }
 
@@ -1724,6 +1770,7 @@ func RecordWebsocketConnectionFrameRate(domain, serviceID string, framesPerSec f
 // for the session-rebind feature. result should be one of the WSRebind* labels; trigger
 // one of the WSRebindTrigger* labels (what initiated the rebind).
 func RecordWebsocketRebind(domain, serviceID, result, trigger string, replayedSubscriptions int) {
+	domain = SanitizeDomainLabel(domain)
 	WebsocketRebindTotal.WithLabelValues(domain, serviceID, result, trigger).Inc()
 	if replayedSubscriptions > 0 {
 		WebsocketSubscriptionsReplayedTotal.WithLabelValues(domain, serviceID).Add(float64(replayedSubscriptions))
@@ -1733,6 +1780,7 @@ func RecordWebsocketRebind(domain, serviceID, result, trigger string, replayedSu
 // RecordWebsocketEndpointStall records a staleness-watchdog firing. gaveUp distinguishes a
 // forced rebind (false) from giving up and closing the client (true).
 func RecordWebsocketEndpointStall(domain, serviceID string, gaveUp bool) {
+	domain = SanitizeDomainLabel(domain)
 	result := WSStallRebind
 	if gaveUp {
 		result = WSStallGaveUp

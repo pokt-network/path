@@ -155,11 +155,49 @@ func normalizeRESTPath(p string) string {
 		if seg == "" {
 			continue
 		}
-		if isDynamicSegment(seg) {
+		if isDynamicSegment(seg) || !isRouteShapedSegment(seg) {
 			parts[i] = ":var"
 		}
 	}
+	if len(parts) > maxRESTPathSegments {
+		parts = append(parts[:maxRESTPathSegments], "...")
+	}
 	return strings.Join(parts, "/")
+}
+
+// maxRESTPathSegments bounds path depth. A deeply nested path is either a
+// traversal probe or a route we do not serve; either way its depth carries no
+// signal worth a distinct series.
+const maxRESTPathSegments = 12
+
+// isRouteShapedSegment reports whether a path segment could plausibly be a
+// route component: unreserved URL characters only (RFC 3986 §2.3 plus `~`).
+//
+// This is the SHAPE half of bounding the `method` label, and on its own it is
+// NOT sufficient — `/aaa`, `/aab`, … are all route-shaped and still unbounded,
+// which is why observationPipelineGuard is the actual cap (verified by
+// Test_ObservationPipeline_AttackerMethodsAreBounded, where 5,000 route-shaped
+// probe paths survive this function untouched).
+//
+// What it does buy: the hostile values PNF found live in the TSDB
+// (`/\r\n\r\nSet-Cookie: …`, `/${13337*31337}`, `/+CSCOE+/logon.html`,
+// `/%2e%2e%2f…`) never reach a label at all, so they cannot appear in
+// dashboards, alert annotations, or anything downstream that renders a label
+// value. Character sanitization alone was the 2026-06-15 fix's mistake —
+// it is worth having, it is just not the bound.
+func isRouteShapedSegment(seg string) bool {
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '_' || c == '-' || c == '.' || c == '~':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // isDynamicSegment reports whether a path segment looks like a request-specific

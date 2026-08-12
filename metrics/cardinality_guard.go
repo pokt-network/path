@@ -166,6 +166,10 @@ func packageGuards() []*cardinalityGuard {
 		hedgeSupplierGuard,
 		qosFilterRejectionGuard,
 		healthCheckStatusGuard,
+		probationEventsGuard,
+		observationPipelineGuard,
+		circuitBreakerEventsGuard,
+		rpcTypeFallbackGuard,
 	}
 }
 
@@ -410,22 +414,22 @@ func hashLabelValues(labelValues []string) uint64 {
 // delete precisely the series it reclaims (see DefaultSeriesLimit).
 var (
 	supplierSignalGuard = newCardinalityGuard("supplier_signal_total", defaultSeriesLimit).
-		withEviction(defaultGuardIdleWindow, func(lv []string) {
+				withEviction(defaultGuardIdleWindow, func(lv []string) {
 			SupplierSignalTotal.DeleteLabelValues(lv...)
 		})
 
 	supplierReputationGuard = newCardinalityGuard("supplier_reputation_score", defaultSeriesLimit).
-		withEviction(defaultGuardIdleWindow, func(lv []string) {
+				withEviction(defaultGuardIdleWindow, func(lv []string) {
 			SupplierReputationScore.DeleteLabelValues(lv...)
 		})
 
 	hedgeSupplierGuard = newCardinalityGuard("hedge_supplier_latency_seconds", defaultSeriesLimit).
-		withEviction(defaultGuardIdleWindow, func(lv []string) {
+				withEviction(defaultGuardIdleWindow, func(lv []string) {
 			HedgeSupplierOutcomeTotal.DeleteLabelValues(lv...)
 		})
 
 	qosFilterRejectionGuard = newCardinalityGuard("qos_filter_rejection_total", defaultSeriesLimit).
-		withEviction(defaultGuardIdleWindow, func(lv []string) {
+				withEviction(defaultGuardIdleWindow, func(lv []string) {
 			QoSFilterRejectionTotal.DeleteLabelValues(lv...)
 		})
 
@@ -437,7 +441,53 @@ var (
 	// `domain` values) cannot reproduce the 200K+ series this metric carried in
 	// production while completely unguarded.
 	healthCheckStatusGuard = newCardinalityGuard("health_check_status_total", defaultSeriesLimit).
-		withEviction(defaultGuardIdleWindow, func(lv []string) {
+				withEviction(defaultGuardIdleWindow, func(lv []string) {
 			HealthCheckStatus.DeleteLabelValues(lv...)
+		})
+
+	// Guards added after the 2026-08-12 cardinality regression, in which these
+	// four metrics contributed ~3.0M series (63% of PNF's entire TSDB) and took
+	// Prometheus to 89% of its memory ceiling. All four shipped unguarded.
+	//
+	// Two distinct label-source defects fed them, both fixed separately
+	// (SanitizeDomainLabel, SanitizeMethodLabel). These guards exist so that
+	// neither fix is load-bearing: a future label source that leaks unbounded
+	// values costs a capped number of series and a WARN, not a monitoring
+	// outage. That is the actual lesson of the regression — the sanitizers are
+	// hygiene, the guard is the bound.
+
+	// probationEventsGuard — 2,354,499 series in production (92× growth, 27% of
+	// the TSDB) because `domain` carried raw supplier addresses. Realistic tuple
+	// count post-fix is domain × rpc_type × service_id × event, far under cap.
+	probationEventsGuard = newCardinalityGuard("probation_events_total", defaultSeriesLimit).
+				withEviction(defaultGuardIdleWindow, func(lv []string) {
+			ProbationEventsTotal.DeleteLabelValues(lv...)
+		})
+
+	// observationPipelineGuard — the ONLY hard bound on the `method` label, and
+	// the only one of these four guards that is load-bearing rather than a
+	// backstop. `method` is attacker-controlled: it carries the JSON-RPC method
+	// name or the REST URL path, so any unauthenticated client can mint a fresh
+	// series per request by varying it. SanitizeMethodLabel normalizes the
+	// SHAPE of a value but cannot bound the SET — `/aaa`, `/aab`, … all survive
+	// as legitimate-looking static route segments. Only this cap converts a
+	// remote resource-exhaustion vector into a bounded cost plus a WARN.
+	observationPipelineGuard = newCardinalityGuard("observation_pipeline_total", defaultSeriesLimit).
+					withEviction(defaultGuardIdleWindow, func(lv []string) {
+			ObservationPipeline.DeleteLabelValues(lv...)
+		})
+
+	// circuitBreakerEventsGuard — 233,269 series (49× growth).
+	circuitBreakerEventsGuard = newCardinalityGuard("circuit_breaker_events_total", defaultSeriesLimit).
+					withEviction(defaultGuardIdleWindow, func(lv []string) {
+			DomainCircuitBreakerEventsTotal.DeleteLabelValues(lv...)
+		})
+
+	// rpcTypeFallbackGuard — backstop only. The real fix was dropping the
+	// `supplier` label (3,289 values doing essentially all of the metric's
+	// 201,068-series multiplication against 9 domains × 12 service_ids).
+	rpcTypeFallbackGuard = newCardinalityGuard("rpc_type_fallback_total", defaultSeriesLimit).
+				withEviction(defaultGuardIdleWindow, func(lv []string) {
+			RPCTypeFallbackTotal.DeleteLabelValues(lv...)
 		})
 )
