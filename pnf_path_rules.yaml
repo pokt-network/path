@@ -905,7 +905,17 @@
   # Block time: ~4s | Source: evm-sidechain.xrpl.org explorer
   # Formula: 300s / 4s = 75 blocks for 5 minutes
   sync_allowance: 75
-  check_interval: 10s
+  # 30s, not 10s: websocket checks are the one check type NOT covered by backend-URL
+  # dedup (runEndpointChecks runs siblings with runWS=true so each is probed directly),
+  # so an operator holding N registrations behind ONE node URL takes N connect/close
+  # cycles per interval against the same socket server, per environment. Reported
+  # 2026-08-14 by an operator whose node logged our probe's own close reason
+  # ("health check complete", close 1000 Normal) as a flood — ethermint's websocket
+  # server logs every disconnect at Error level regardless of close code, so a clean
+  # probe still reads as an error on their side.
+  # Interval is the only lever available from config; the structural fix is extending
+  # backend-URL dedup to websocket probes whose siblings share an identical WS URL.
+  check_interval: 30s
   enabled: true
   checks:
     - name: eth_blockNumber
@@ -943,8 +953,6 @@
       archival: true
       reputation_signal: minor_error
 
-# Hyperliquid is an EVM chain (not Cosmos)
-# KNOWN ISSUE: eth_call ignores block number parameter - always returns latest block context
     # WebSocket data-path check. Deliberately sends a request rather than only
     # opening the socket: a supplier can complete the handshake, answer pings, and
     # still deliver nothing, so connect-only would score it healthy.
@@ -961,6 +969,8 @@
       timeout: 10s
       reputation_signal: major_error
 
+# Hyperliquid is an EVM chain (not Cosmos)
+# KNOWN ISSUE: eth_call ignores block number parameter - always returns latest block context
 - service_id: hyperliquid
   # Block time: ~1s | Source: hyperliquid docs, block explorer
   # Formula: 300s / 1s = 300 blocks for 5 minutes
@@ -1976,7 +1986,9 @@
   # Block time: ~4s | Source: Same as XRPL EVM mainnet
   # Formula: 300s / 4s = 75 blocks for 5 minutes
   sync_allowance: 75
-  check_interval: 15s
+  # 30s, not 15s: same websocket probe noise as xrplevm mainnet — see that service for
+  # the dedup gap this works around. Both were reported in the same operator thread.
+  check_interval: 30s
   enabled: true
   checks:
     - name: eth_blockNumber
@@ -2477,12 +2489,60 @@
 - service_id: kava
   # Block time: ~6s | Source: mintscan.io/kava, kava.io docs
   # Formula: 300s / 6s = 50 blocks for 5 minutes
+  #
+  # Kava is a dual chain: Cosmos SDK (comet_bft + rest) AND EVM (json_rpc), served by the
+  # same node on different ports. The `type` field is NOT cosmetic here - it selects which
+  # of the endpoint's per-rpc-type URLs the check is relayed to.
+  #
+  # FIXED 2026-08-14: `health` and `status` are CometBFT methods but were declared
+  # `type: json_rpc`, so every one was delivered to the endpoint's EVM JSON-RPC URL, which
+  # answered {"error":{"code":-32601,"message":"the method health does not exist/is not
+  # available"}}. `status` carries critical_error, so kava's json_rpc mean score sat at
+  # ~10.1 while rest read 85.7 - a rule bug, not an operator fault. Reported with the
+  # node-side capture showing the EVM port receiving `health`/`status`.
+  #
+  # comet_bft read 100 for the opposite reason: no check in this file was typed comet_bft,
+  # so that rpc type was never exercised. 100 means "never penalized", not "healthy".
+  #
+  # Verified against public Kava infrastructure 2026-08-14:
+  #   evm.kava.io       eth_chainId -> 0x8ae (2222); eth_blockNumber -> 22100394
+  #   rpc.data.kava.io  status.sync_info.latest_block_height -> 22100395
+  # EVM height tracks CometBFT height 1:1 (off by one block), so the single perceived
+  # height per service is valid for both sync checks.
   sync_allowance: 50
   check_interval: 30s
   enabled: true
   checks:
-    - name: health
+    # --- EVM side (json_rpc) ---
+    - name: eth_blockNumber
       type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      expected_status_code: 200
+      timeout: 5s
+      reputation_signal: critical_error
+      sync_check: true
+    - name: eth_chainId
+      type: json_rpc
+      method: POST
+      path: /
+      body: '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+      expected_status_code: 200
+      # Chain-ID assertion: guards against a supplier serving a DIFFERENT chain
+      # under this service ID (see tron/Base incident). Trailing quote anchors the
+      # match so a short id like 0x1 cannot substring-match 0x1388 etc.
+      expected_response_contains: '0x8ae"'
+      timeout: 5s
+      reputation_signal: critical_error
+    # --- Cosmos side (comet_bft) ---
+    # major_error, not critical: comet_bft has never been measured on any service in this
+    # file, so its scores are all "never penalized" rather than proven. Opening at critical
+    # (-50, triggers cooldown) on an unexercised rpc type risks mass cooldowns for a rule
+    # defect rather than an endpoint one. Escalate once the false-positive rate is known -
+    # same staging as the websocket checks above.
+    - name: health
+      type: comet_bft
       method: POST
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"health"}'
@@ -2490,15 +2550,16 @@
       timeout: 5s
       reputation_signal: minor_error
     - name: status
-      type: json_rpc
+      type: comet_bft
       method: POST
       path: /
       body: '{"jsonrpc":"2.0","id":1,"method":"status"}'
       expected_status_code: 200
       expected_response_contains: '"node_info"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
       sync_check: true
+    # --- Cosmos side (rest) ---
     - name: syncing
       type: rest
       method: GET
