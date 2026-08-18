@@ -118,9 +118,17 @@ func (s *ServiceState) ValidateEndpoint(endpointAddr protocol.EndpointAddr, endp
 		// Split the reason so "we have never observed this endpoint" is distinguishable from
 		// "this endpoint answered badly" — the two call for opposite responses, and lumping
 		// them together is what made the pre-fix exclusions unreadable.
+		// One reason per distinct cause. The first version of this mapping folded
+		// errNoGetHealthObs and errNoGetEpochInfoObs into a single block_height_unknown
+		// bucket, which meant telling them apart required inferring from the ABSENCE of a
+		// sibling series — the diagnosis that actually mattered rested on a negative.
 		reason := metrics.QoSFilterReasonInvalidResponse
 		switch {
-		case errors.Is(err, errNoGetHealthObs), errors.Is(err, errNoGetEpochInfoObs):
+		case errors.Is(err, errNoGetHealthObs):
+			reason = metrics.QoSFilterReasonHealthUnknown
+		case errors.Is(err, errInvalidGetHealthObs):
+			reason = metrics.QoSFilterReasonUnhealthy
+		case errors.Is(err, errNoGetEpochInfoObs), errors.Is(err, errInvalidGetEpochInfoHeightZeroObs):
 			reason = metrics.QoSFilterReasonBlockHeightUnknown
 		case errors.Is(err, errRecentJSONRPCValidationError):
 			reason = metrics.QoSFilterReasonInvalidResponse
@@ -129,9 +137,19 @@ func (s *ServiceState) ValidateEndpoint(endpointAddr protocol.EndpointAddr, endp
 		return err
 	}
 
-	if endpoint.Epoch < perceivedEpoch {
-		recordRejection(metrics.QoSFilterReasonBlockHeightLag)
-		return fmt.Errorf("solana endpoint epoch is less than chain perceived epoch: %d < %d", endpoint.Epoch, perceivedEpoch)
+	// Epoch comparison, skipped when either side is unobserved.
+	//
+	// Epoch 0 means "never observed" — the health-check path supplies a block height but no
+	// epoch — and rejecting on it would bench endpoints for a field nothing routinely writes.
+	//
+	// One epoch of tolerance because this is the same max-versus-strict shape as the block
+	// height check: perceivedEpoch is raised by whichever endpoint reports first, and at a
+	// rollover every other endpoint is briefly an epoch behind through no fault of its own.
+	// Solana epochs last ~2.5 days, so this costs almost nothing and removes a cliff that
+	// would otherwise empty the pool for a few seconds every couple of days.
+	if endpoint.Epoch > 0 && perceivedEpoch > 0 && endpoint.Epoch+1 < perceivedEpoch {
+		recordRejection(metrics.QoSFilterReasonEpochLag)
+		return fmt.Errorf("solana endpoint epoch is more than one epoch behind chain perceived epoch: %d < %d", endpoint.Epoch, perceivedEpoch)
 	}
 
 	// An endpoint may trail the perceived height by up to the sync allowance.

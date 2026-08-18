@@ -71,7 +71,25 @@ func (e *SolanaDataExtractor) ExtractBlockHeight(request []byte, response []byte
 		return blockHeight.Int(), nil
 	}
 
-	return 0, fmt.Errorf("could not extract block height: getEpochInfo result missing numeric blockHeight field")
+	// getBlockHeight answers with a bare numeric result rather than an object.
+	//
+	// Gated on the request method, which is what separates this from the absoluteSlot fallback
+	// the comment above forbids: that one guessed at a field inside a getEpochInfo result and
+	// guessed the slot; this one reads the documented return value of a method whose entire
+	// purpose is to report block height. Accepting a bare number from ANY response would
+	// re-open the poisoning hole, since getSlot answers with a bare number too.
+	//
+	// This shape was previously unparseable, and getBlockHeight is one of the two probes
+	// solana's health checks actually run — so health checks contributed no block height at
+	// all, and every endpoint whose observations came only from health checks was rejected as
+	// never-observed.
+	if isMethod(request, methodGetBlockHeight) {
+		if result := gjson.GetBytes(response, "result"); result.Exists() && result.Type == gjson.Number {
+			return result.Int(), nil
+		}
+	}
+
+	return 0, fmt.Errorf("could not extract block height: no numeric blockHeight in getEpochInfo result and not a %q response", methodGetBlockHeight)
 }
 
 // ExtractChainID extracts the cluster identifier from a Solana response.
@@ -134,6 +152,17 @@ func (e *SolanaDataExtractor) ExtractChainID(request []byte, response []byte) (s
 //   - false if endpoint is healthy (not syncing)
 //   - Error if sync status cannot be determined
 func (e *SolanaDataExtractor) IsSyncing(request []byte, response []byte) (bool, error) {
+	// Only a getHealth response carries sync status.
+	//
+	// This gate is load-bearing in two directions. Without it every response was run through
+	// the "result == ok" test below, so a getBlockHeight response — whose result is a number —
+	// was reported as SYNCING. And with SyncCheckPerformed now derived from whether this
+	// returns an error, an ungated version would claim a health observation for responses that
+	// contain none, which is worse than having no observation at all.
+	if !isMethod(request, methodGetHealth) {
+		return false, fmt.Errorf("request is not a %q request: sync status not derivable", methodGetHealth)
+	}
+
 	// If getHealth returns an error, the node is unhealthy (possibly syncing)
 	errorResult := gjson.GetBytes(response, "error")
 	if errorResult.Exists() && errorResult.Type != gjson.Null {
@@ -250,4 +279,13 @@ func (e *SolanaDataExtractor) IsValidResponse(request []byte, response []byte) (
 	}
 
 	return true, nil
+}
+
+// isMethod reports whether the JSON-RPC request body names the given method.
+//
+// The rest of this extractor identifies responses by shape alone, which works when the shapes
+// are distinctive and fails when they are not — "ok" versus a bare number being the case that
+// bit us. Where the method matters, read it.
+func isMethod(request []byte, method jsonrpc.Method) bool {
+	return gjson.GetBytes(request, "method").String() == string(method)
 }

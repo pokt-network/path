@@ -9,6 +9,10 @@ const (
 	// Reference: https://docs.solana.com/developing/clients/jsonrpc-api#getepochinfo
 	methodGetEpochInfo = jsonrpc.Method("getEpochInfo")
 
+	// methodGetBlockHeight is the JSON-RPC method for getting the block height directly.
+	// Its result is a bare number, unlike getEpochInfo's object — see ExtractBlockHeight.
+	methodGetBlockHeight = jsonrpc.Method("getBlockHeight")
+
 	// methodGetHealth is the JSON-RPC method for checking the health of the node.
 	// Reference: https://docs.solana.com/developing/clients/jsonrpc-api#gethealth
 	methodGetHealth = jsonrpc.Method("getHealth")

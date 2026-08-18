@@ -147,40 +147,62 @@ func TestSolanaDataExtractor_ExtractChainID(t *testing.T) {
 func TestSolanaDataExtractor_IsSyncing(t *testing.T) {
 	extractor := NewSolanaDataExtractor()
 
+	const getHealthReq = `{"jsonrpc":"2.0","id":1,"method":"getHealth"}`
+
 	tests := []struct {
 		name         string
+		request      string
 		response     string
 		expectedSync bool
 		expectError  bool
 	}{
 		{
 			name:         "healthy node (not syncing)",
+			request:      getHealthReq,
 			response:     `{"jsonrpc":"2.0","id":1,"result":"ok"}`,
 			expectedSync: false,
 			expectError:  false,
 		},
 		{
 			name:         "node behind (syncing)",
+			request:      getHealthReq,
 			response:     `{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Node is behind by 42 slots"}}`,
 			expectedSync: true,
 			expectError:  false,
 		},
 		{
 			name:         "unhealthy node",
+			request:      getHealthReq,
 			response:     `{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Node is unhealthy"}}`,
 			expectedSync: true,
 			expectError:  false,
 		},
 		{
 			name:        "other error",
+			request:     getHealthReq,
 			response:    `{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid params"}}`,
+			expectError: true,
+		},
+		{
+			// The bug the method gate closes. getBlockHeight's result is a bare number, so
+			// the "result == ok" test reported every block-height response as SYNCING — and
+			// getBlockHeight is one of the two probes solana's health checks actually run.
+			name:        "getBlockHeight response is not a sync signal",
+			request:     `{"jsonrpc":"2.0","id":1,"method":"getBlockHeight"}`,
+			response:    `{"jsonrpc":"2.0","id":1,"result":418160000}`,
+			expectError: true,
+		},
+		{
+			name:        "no request body: sync status is not derivable",
+			request:     "",
+			response:    `{"jsonrpc":"2.0","id":1,"result":"ok"}`,
 			expectError: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isSyncing, err := extractor.IsSyncing(nil, []byte(tt.response))
+			isSyncing, err := extractor.IsSyncing([]byte(tt.request), []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {

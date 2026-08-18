@@ -687,12 +687,24 @@ const (
 	QoSFilterReasonInvalidResponse    = "invalid_response"
 	QoSFilterReasonEmptyResponse      = "empty_response"
 	QoSFilterReasonCapabilityLimited  = "capability_limitation"
+	// QoSFilterReasonHealthUnknown: the endpoint has no health-probe observation at all.
+	// Distinct from Unhealthy — "never asked" and "answered badly" call for opposite
+	// responses, and a shared bucket makes them indistinguishable without inferring from the
+	// absence of a sibling series.
+	QoSFilterReasonHealthUnknown = "health_unknown"
+	// QoSFilterReasonUnhealthy: the endpoint answered a health probe with a not-OK result.
+	QoSFilterReasonUnhealthy = "unhealthy"
+	// QoSFilterReasonEpochLag: the endpoint is more than the allowed number of epochs behind
+	// the perceived chain epoch. Solana-specific; separate from block_height_lag because the
+	// two have different time constants (~2.5 days versus ~400ms) and conflating them would
+	// make an epoch-rollover blip look like ordinary sync lag.
+	QoSFilterReasonEpochLag = "epoch_lag"
 )
 
 var QoSFilterRejectionTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: MetricPrefix + "qos_filter_rejection_total",
-		Help: "QoS filter rejections by domain (eTLD+1), service_id, and reason. Reasons: block_height_lag, block_height_unknown, chain_id_mismatch, archival_required, invalid_response, empty_response, capability_limitation.",
+		Help: "QoS filter rejections by domain (eTLD+1), service_id, and reason. Reasons: block_height_lag, block_height_unknown, chain_id_mismatch, archival_required, invalid_response, empty_response, capability_limitation, health_unknown, unhealthy, epoch_lag.",
 	},
 	[]string{LabelDomain, LabelServiceID, "reason"},
 )

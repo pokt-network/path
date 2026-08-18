@@ -10,6 +10,11 @@ import (
 // Expected value of the `result` field to a `getHealth` request.
 const resultGetHealthOK = "ok"
 
+// resultGetHealthSyncing is recorded when a getHealth probe reports the node is behind or
+// unhealthy. Any value other than resultGetHealthOK fails validateBasic; this one names the
+// reason instead of leaving the field empty, which would read as "never observed".
+const resultGetHealthSyncing = "syncing"
+
 const (
 	// TODO_TECHDEBT(@adshmh): Add sanctions mechanism for dishonest endpoints (e.g., using public RPCs).
 	// The sanctions store will apply to all QoS packages via PR #253 (JUDGE framework).
@@ -74,8 +79,15 @@ func (e endpoint) validateBasic() error {
 	case e.BlockHeight == 0:
 		return errInvalidGetEpochInfoHeightZeroObs
 
-	case e.Epoch == 0:
-		return errInvalidGetEpochInfoEpochZeroObs
+	// Epoch 0 is deliberately NOT fatal: it means "not observed", not "wrong".
+	//
+	// The only source of a real epoch is a getEpochInfo response from user traffic — the
+	// health-check path builds a SolanaGetEpochInfoResponse carrying just a block height, so
+	// its Epoch is 0 by construction. Treating that as invalid would re-create the trap this
+	// file's health-observation fix just closed: an endpoint kept out of selection for a field
+	// nothing routinely supplies, and therefore never given the traffic that would supply it.
+	//
+	// ValidateEndpoint skips the epoch comparison when Epoch is 0 for the same reason.
 
 	default:
 		return nil
