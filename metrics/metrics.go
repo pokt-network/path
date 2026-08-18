@@ -1893,6 +1893,17 @@ func GetLatencySignalWithThresholds(latencyMs float64, thresholds *LatencyThresh
 }
 
 // GetStatusCodeCategory returns the status code as a string, grouping 4xx and 5xx
+// Status categories shared by path_requests_total and path_relays_total.
+//
+// StatusCategoryError covers relays that never produced an HTTP status at all — timeouts,
+// refused/reset connections, unreachable hosts, signature and payload validation failures.
+// It is deliberately NOT folded into 5xx: a backend that answers 500 is reachable and
+// answering, and one that never answers is not. The two call for different responses.
+const (
+	StatusCategorySuccess = "200"
+	StatusCategoryError   = "error"
+)
+
 func GetStatusCodeCategory(statusCode int) string {
 	switch {
 	case statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices:

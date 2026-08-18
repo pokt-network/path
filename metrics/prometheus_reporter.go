@@ -100,29 +100,51 @@ func (pmr *PrometheusMetricsReporter) processEndpointObservation(serviceID strin
 		latencyMs = float64(responseTime.AsTime().Sub(queryTime.AsTime()).Milliseconds())
 	}
 
-	// Get status code (returns 0 if not set, treat as 200 for success)
+	// Check if error was explicitly set (nil means no error, not UNSPECIFIED)
+	// This is important because UNSPECIFIED when explicitly set means "unknown error",
+	// while nil means "success with no error"
+	hasError := endpointObs.ErrorType != nil
+	errorType := endpointObs.GetErrorType()
+
+	// Backend HTTP status, 0 when the relay never got one.
 	statusCode := int(endpointObs.GetEndpointBackendServiceHttpResponseStatusCode())
-	if statusCode == 0 {
-		statusCode = 200 // Default success
-	}
 
 	// Determine RPC type from QoS observations
 	rpcType := pmr.getRPCTypeFromQoS(qosObs)
 
 	// Metric 5: Request count and latency
-	statusCodeStr := GetStatusCodeCategory(statusCode)
+	//
+	// A status of 0 means the backend never returned an HTTP response. That is TWO
+	// different outcomes and they must not share a label:
+	//
+	//   - no error set    -> the relay succeeded and the status simply was not recorded.
+	//   - error set       -> the relay failed BEFORE any HTTP status existed: a timeout,
+	//                        a refused/reset connection, an unreachable host, a signature
+	//                        or payload validation failure.
+	//
+	// This previously defaulted both to 200, so every transport failure was counted as a
+	// success against the very endpoint that failed. Measured on solana 2026-08-18: an
+	// operator producing 242 relay errors/s (5s timeouts, path_relay_latency P95 7.6s)
+	// reported 0/s non-200 here and read as ~95% successful, while an operator returning
+	// honest HTTP error codes at 50ms read as ~43%. The panel ranked them backwards, and
+	// any alert keyed on this metric was blind to exactly the failure mode that matters
+	// most — an endpoint that accepts the connection and then never answers.
+	//
+	// StatusCategoryError matches the vocabulary path_relays_total already uses for the
+	// same outcome, so the two metrics can be compared without a translation table.
+	statusCodeStr := StatusCategoryError
+	switch {
+	case statusCode != 0:
+		statusCodeStr = GetStatusCodeCategory(statusCode)
+	case !hasError:
+		statusCodeStr = StatusCategorySuccess
+	}
 	latencySeconds := latencyMs / 1000.0
 	RecordRequest(domain, rpcType, serviceID, statusCodeStr, latencySeconds)
 
 	// Metric 4: Latency reputation
 	latencySignal := GetLatencySignal(latencyMs)
 	RecordLatencyReputation(domain, rpcType, serviceID, latencySignal)
-
-	// Check if error was explicitly set (nil means no error, not UNSPECIFIED)
-	// This is important because UNSPECIFIED when explicitly set means "unknown error",
-	// while nil means "success with no error"
-	hasError := endpointObs.ErrorType != nil
-	errorType := endpointObs.GetErrorType()
 
 	// Metric 3: Observation pipeline - determine signal from error type
 	reputationSignal := pmr.getReputationSignalFromEndpoint(hasError, errorType, latencyMs)

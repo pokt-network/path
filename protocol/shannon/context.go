@@ -1302,8 +1302,9 @@ func (rc *requestContext) handleEndpointError(
 		rpcTypeStr := metrics.NormalizeRPCType(rc.getCurrentRPCType().String())
 		reputationSignal := mapSignalTypeToMetricSignal(signal.Type)
 
-		// Extract status code from error if possible, otherwise use "error"
-		statusCodeStr := "error"
+		// Extract status code from error if possible, otherwise use the shared
+		// "no HTTP status at all" category.
+		statusCodeStr := metrics.StatusCategoryError
 		if statusCode, ok := extractHTTPStatusCode(endpointErr); ok {
 			statusCodeStr = metrics.GetStatusCodeCategory(statusCode)
 		}

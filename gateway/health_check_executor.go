@@ -1212,7 +1212,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Msg("Health check relay request failed")
 
 		// Record relay metric for failed request
-		metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), "error", metrics.SignalMajorError, metrics.RelayTypeHealthCheck, latency.Seconds())
+		metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), metrics.StatusCategoryError, metrics.SignalMajorError, metrics.RelayTypeHealthCheck, latency.Seconds())
 
 		// Still publish observations for failed requests
 		e.publishHealthCheckObservations(serviceID, endpointAddr, startTime, protocolCtx, &protocolObs)
