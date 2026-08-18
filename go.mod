@@ -1,6 +1,6 @@
 module github.com/pokt-network/path
 
-go 1.26.5
+go 1.26.6
 
 // DEVELOPER_TIP: Uncomment to use a local copies
 // replace github.com/pokt-network/poktroll => /Users/olshansky/workspace/pocket/poktroll
