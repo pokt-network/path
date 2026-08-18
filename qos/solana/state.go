@@ -118,14 +118,17 @@ func (s *ServiceState) ValidateEndpoint(endpointAddr protocol.EndpointAddr, endp
 		// Split the reason so "we have never observed this endpoint" is distinguishable from
 		// "this endpoint answered badly" — the two call for opposite responses, and lumping
 		// them together is what made the pre-fix exclusions unreadable.
-		// One reason per distinct cause. The first version of this mapping folded
-		// errNoGetHealthObs and errNoGetEpochInfoObs into a single block_height_unknown
-		// bucket, which meant telling them apart required inferring from the ABSENCE of a
-		// sibling series — the diagnosis that actually mattered rested on a negative.
+		// One reason per distinct cause. An earlier version of this mapping folded several
+		// causes into a single block_height_unknown bucket, which meant telling them apart
+		// required inferring from the ABSENCE of a sibling series — the diagnosis that
+		// actually mattered rested on a negative.
+		//
+		// There is no health_unknown case any more: a missing health observation is no longer
+		// a rejection at all (see validateBasic). QoSFilterReasonHealthUnknown is kept in the
+		// metrics vocabulary because it earned its keep — splitting it out is what made the
+		// pool collapse legible within minutes of the deploy that caused it.
 		reason := metrics.QoSFilterReasonInvalidResponse
 		switch {
-		case errors.Is(err, errNoGetHealthObs):
-			reason = metrics.QoSFilterReasonHealthUnknown
 		case errors.Is(err, errInvalidGetHealthObs):
 			reason = metrics.QoSFilterReasonUnhealthy
 		case errors.Is(err, errNoGetEpochInfoObs), errors.Is(err, errInvalidGetEpochInfoHeightZeroObs):

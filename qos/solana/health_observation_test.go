@@ -193,3 +193,60 @@ func Test_EpochLag_ToleratesOneEpoch(t *testing.T) {
 		})
 	}
 }
+
+// Test_PartiallyProbedEndpoint_StaysSelectable is the regression test for a behaviour
+// inversion introduced by the health-observation fix itself.
+//
+// Solana's health checks run two probes (getHealth and getBlockHeight) that land at
+// different moments, so between them an endpoint holds a block height and no health
+// observation. That intermediate state is not rare — every endpoint passes through it after
+// every restart, and there are two of them per check cycle.
+//
+// Before the health-observation fix, ExtractBlockHeight could not parse a getBlockHeight
+// response at all, so nothing was stored and the endpoint stayed ABSENT from the store —
+// where filterValidEndpoints waves it through as fresh. After the fix the block height IS
+// stored, which puts the endpoint IN the store, where a missing getHealth observation was
+// fatal. Net effect: learning MORE about an endpoint made it LESS selectable.
+//
+// That is the same "absence of a measurement is not evidence of badness" mistake already
+// fixed for Epoch in the same commit; it just was not carried across to the health field two
+// lines above it.
+func Test_PartiallyProbedEndpoint_StaysSelectable(t *testing.T) {
+	q := newQoSForHealthTest(t)
+
+	// Only the block-height probe has landed. No getHealth observation yet.
+	feedHealthCheck(t, q, healthCheckedAddr,
+		`{"jsonrpc":"2.0","id":1,"method":"getBlockHeight"}`,
+		`{"jsonrpc":"2.0","id":1,"result":418160000}`)
+
+	stored, found := q.endpoints[healthCheckedAddr]
+	require.True(t, found, "the block-height probe must have put the endpoint in the store")
+	require.Nil(t, stored.SolanaGetHealthResponse, "no health observation yet — the state under test")
+
+	require.NoError(t, q.ServiceState.ValidateEndpoint(healthCheckedAddr, stored),
+		"an endpoint awaiting its first health probe must not be rejected: "+
+			"unobserved is not unhealthy, and it was selectable before it entered the store")
+
+	picked, err := q.SelectMultipleWithArchival(protocol.EndpointAddrList{healthCheckedAddr}, 1, false)
+	require.NoError(t, err)
+	require.Equal(t, protocol.EndpointAddrList{healthCheckedAddr}, picked)
+}
+
+// Test_ObservedUnhealthy_IsStillRejected pins the other side of the boundary. Dropping the
+// "no observation" rejection must NOT also drop the "observed bad" one — otherwise a node
+// reporting itself behind becomes selectable, which is the opposite failure.
+func Test_ObservedUnhealthy_IsStillRejected(t *testing.T) {
+	q := newQoSForHealthTest(t)
+
+	feedHealthCheck(t, q, healthCheckedAddr,
+		`{"jsonrpc":"2.0","id":1,"method":"getBlockHeight"}`,
+		`{"jsonrpc":"2.0","id":1,"result":418160000}`)
+	feedHealthCheck(t, q, healthCheckedAddr,
+		`{"jsonrpc":"2.0","id":1,"method":"getHealth"}`,
+		`{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Node is behind by 42 slots"}}`)
+
+	stored := q.endpoints[healthCheckedAddr]
+	require.NotNil(t, stored.SolanaGetHealthResponse)
+	require.Error(t, q.ServiceState.ValidateEndpoint(healthCheckedAddr, stored),
+		"an endpoint that reported itself behind must stay rejected")
+}

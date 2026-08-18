@@ -30,7 +30,6 @@ const (
 
 // The errors below list all the possible basic validation errors on an endpoint.
 var (
-	errNoGetHealthObs                   = fmt.Errorf("endpoint has not had an observation of its response to a %q request", methodGetHealth)
 	errInvalidGetHealthObs              = fmt.Errorf("endpoint responded incorrectly to a %q request, expected: %q", methodGetHealth, resultGetHealthOK)
 	errNoGetEpochInfoObs                = fmt.Errorf("endpoint has not had an observation of its response to a %q request", methodGetEpochInfo)
 	errInvalidGetEpochInfoHeightZeroObs = fmt.Errorf("endpoint responded with blockHeight of 0 to a %q request, expected a blockHeight of > 0", methodGetEpochInfo)
@@ -67,10 +66,26 @@ func (e endpoint) validateBasic() error {
 	}
 
 	switch {
-	case e.SolanaGetHealthResponse == nil:
-		return errNoGetHealthObs
-
-	case e.Result != resultGetHealthOK:
+	// A MISSING health observation is not a fault — it means the getHealth probe has not
+	// landed yet. Solana's two health-check probes (getHealth and getBlockHeight) arrive at
+	// different moments, so every endpoint sits in this state briefly after every restart and
+	// between check cycles.
+	//
+	// Rejecting it inverted the previous behaviour: before block heights were stored at all,
+	// an unprobed endpoint was simply ABSENT from the store, and filterValidEndpoints waves
+	// absent endpoints through as fresh. Once the block-height probe began populating the
+	// store, that same endpoint became present-but-incomplete and was rejected — so learning
+	// MORE about an endpoint made it LESS selectable. Measured on canary 2026-08-18:
+	// rejections went from ~1.1k/s to ~12.6k/s and the selectable pool halved.
+	//
+	// Same principle as the Epoch case below: absence of a measurement is not evidence of
+	// badness. An observation that says the node is unhealthy still rejects, immediately
+	// below — that is a measurement, and it fails.
+	//
+	// The nil guard is load-bearing for the next case, not just for this one: Result is
+	// promoted from the embedded *SolanaGetHealthResponse, so reading it without the guard
+	// nil-dereferences.
+	case e.SolanaGetHealthResponse != nil && e.Result != resultGetHealthOK:
 		return fmt.Errorf("❌Invalid solana health response: %s :%w", e.Result, errInvalidGetHealthObs)
 
 	case e.SolanaGetEpochInfoResponse == nil:
