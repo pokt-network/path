@@ -24,14 +24,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Needed so release_build_cgo can produce arm64 artifacts on amd64 runner
-      - name: Install cross toolchains for CGO
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-
       - name: Build binaries for multiple architectures
-        run: make release_build_cross
+        run: make release_build_nocgo
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -51,21 +45,6 @@ jobs:
             type=sha,format=short,suffix=-rc
             type=ref,event=branch,pattern=latest
 
-      - name: Docker Metadata action (cgo)
-        id: meta_cgo
-        uses: docker/metadata-action@v5
-        env:
-          DOCKER_METADATA_PR_HEAD_SHA: "true"
-        with:
-          images: |
-            ghcr.io/pokt-network/path
-          tags: |
-            type=semver,pattern={{version}},suffix=-cgo
-            type=semver,pattern={{major}}.{{minor}},suffix=-cgo
-            type=ref,event=tag,suffix=-rc-cgo
-            type=sha,format=short,suffix=-rc-cgo
-            type=ref,event=branch,pattern=latest,suffix=-cgo
-
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -73,7 +52,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      # Non-CGO image (multi-arch, Alpine runtime)
+      # Runtime image (multi-arch, Alpine)
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -82,21 +61,6 @@ jobs:
           build-args: IMAGE_TAG=${{ steps.meta.outputs.version }}
           platforms: linux/amd64,linux/arm64
           file: Dockerfile.release
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          context: .
-
-      # CGO image (multi-arch, glibc runtime)
-      - name: Build and push Docker image (cgo)
-        uses: docker/build-push-action@v5
-        with:
-          push: true
-          tags: ${{ steps.meta_cgo.outputs.tags }}
-          build-args: |
-            IMAGE_TAG=${{ steps.meta.outputs.version }}
-            BINARY_SUFFIX=_cgo
-          platforms: linux/amd64,linux/arm64
-          file: Dockerfile.release.glibc
           cache-from: type=gha
           cache-to: type=gha,mode=max
           context: .

@@ -43,8 +43,5 @@ jobs:
         run: |
           git config --global url."https://${{ github.token }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
 
-      - name: Run unit tests without CGO
+      - name: Run unit tests
         run: CGO_ENABLED=0 go test ./... -short
-
-      - name: Run unit tests with CGO
-        run: CGO_ENABLED=1 go test -tags "ethereum_secp256k1" ./... -short
