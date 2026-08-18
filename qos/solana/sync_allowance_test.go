@@ -138,10 +138,10 @@ func Test_SyncAllowance_DefaultExcludesGenuinelyStale(t *testing.T) {
 }
 
 // Test_SyncAllowance_SurvivesTheConfiguredValue checks the boundary in both directions using
-// the value solana actually carries in the external health-check rules.
+// the value solana actually carries in pnf_path_rules.yaml.
 func Test_SyncAllowance_SurvivesTheConfiguredValue(t *testing.T) {
 	const perceived = uint64(418_160_000)
-	const configured = uint64(750)
+	const configured = uint64(1500)
 
 	atLimit := protocol.EndpointAddr("pokt1atlimit-https://c001.op-gamma.example")
 	pastLimit := protocol.EndpointAddr("pokt1pastlimit-https://d001.op-delta.example")

@@ -29,9 +29,16 @@ import (
 // receiving the traffic that would have refreshed them. No health-check rate fixes that; it
 // is a race re-lost every block.
 //
-// 750 blocks ≈ 5 minutes of Solana, and matches the sync_allowance already configured for
-// solana in the external health-check rules, so an unloaded config behaves like a loaded one.
-const defaultSolanaBlockNumberSyncAllowance = 750
+// 1500 blocks ≈ 10 minutes of Solana, matching the sync_allowance configured for solana in
+// pnf_path_rules.yaml, so an unloaded config behaves like a loaded one.
+//
+// Note that value was sized as a health-check gate, where being generous only risks probing
+// a stale endpoint. It now also governs which endpoints are selectable, so tightening it is
+// a routing change: lower it and endpoints leave the pool. Do not tune it below the margin
+// the starvation loop needs — an endpoint refreshed only by health checks trails the
+// perceived height by several blocks at all times, purely because something else reported
+// more recently.
+const defaultSolanaBlockNumberSyncAllowance = 1500
 
 // ServiceState keeps the expected current state of the Solana blockchain
 // based on the endpoints' responses to different requests.
