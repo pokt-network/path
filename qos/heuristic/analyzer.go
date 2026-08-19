@@ -2,6 +2,7 @@ package heuristic
 
 import (
 	"bytes"
+	"fmt"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
@@ -43,6 +44,21 @@ func (ra *ResponseAnalyzer) Analyze(responseBytes []byte, httpStatusCode int, rp
 	if statusResult.ShouldRetry && (httpStatusCode >= 500 || httpStatusCode == 429) {
 		// 5xx server errors and 429 rate limits are definitive - retry immediately
 		return statusResult
+	}
+
+	// A body-less status carries no body by definition, so an empty payload is the
+	// correct response rather than a fault. Without this, 204/205/304 were flagged
+	// as empty_response — harmless while that signal was MINOR, but it becomes a
+	// CRITICAL reputation penalty for correct behaviour once it is weighted as the
+	// protocol violation it is on a body-bearing status.
+	if len(responseBytes) == 0 && isBodylessHTTPStatus(httpStatusCode) {
+		return AnalysisResult{
+			ShouldRetry: false,
+			Confidence:  0.0,
+			Reason:      "no_body_expected",
+			Structure:   StructureValid,
+			Details:     fmt.Sprintf("HTTP %d carries no body; empty payload is correct", httpStatusCode),
+		}
 	}
 
 	// Level 1: Structural Analysis
@@ -227,6 +243,21 @@ func (ra *ResponseAnalyzer) AnalyzeQuick(responseBytes []byte, httpStatusCode in
 func (ra *ResponseAnalyzer) ShouldRetry(responseBytes []byte, httpStatusCode int, rpcType sharedtypes.RPCType, jsonrpcMethod string) bool {
 	result := ra.Analyze(responseBytes, httpStatusCode, rpcType, jsonrpcMethod)
 	return result.ShouldRetry
+}
+
+// isBodylessHTTPStatus reports whether a status code is defined to carry no message
+// body, making an empty payload the correct response rather than a supplier fault.
+//   - 204 No Content, 205 Reset Content: RFC 9110 forbids a body.
+//   - 304 Not Modified: RFC 9110 forbids a body.
+//
+// 1xx responses never reach the analyzer (they are not final), so they are omitted.
+func isBodylessHTTPStatus(statusCode int) bool {
+	switch statusCode {
+	case 204, 205, 304:
+		return true
+	default:
+		return false
+	}
 }
 
 // Package-level convenience functions using default analyzer

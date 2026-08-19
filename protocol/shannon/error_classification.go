@@ -329,9 +329,26 @@ func classifyHeuristicErrorAsSignal(
 			reputation.NewCriticalErrorSignal("protocol_error", latency)
 
 	// Category: Empty Response (MINOR -3)
-	case reason == "empty_response", reason == "small_no_result":
+	// An empty body on a body-bearing 2xx is a protocol violation, not a transient
+	// fault: no RPC type PATH forwards has a valid response of zero length, and the
+	// relay was signed and is settleable regardless. It sat at MINOR (-3) — the same
+	// weight as a passing blockchain_error — which is why an endpoint returning ~800
+	// empty responses in two minutes held a reputation score of 100: at a small
+	// fraction of total volume, successes outrun -3 indefinitely. Statuses that
+	// legitimately carry no body (204/205/304) never reach here; the heuristic
+	// exempts them, so this branch only ever sees a promise of content that was
+	// not delivered.
+	// Category: Supplier Protocol Violations (CRITICAL -25)
+	case reason == "empty_response":
 		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_UNEXPECTED_EOF,
-			reputation.NewMinorErrorSignal("empty_response")
+			reputation.NewCriticalErrorSignal("empty_response", latency)
+
+	// small_no_result stays MINOR: a short response missing a "result" field is
+	// ambiguous — it can be a truncated read or a terse upstream error — unlike a
+	// zero-length body, which has no valid reading.
+	case reason == "small_no_result":
+		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_UNEXPECTED_EOF,
+			reputation.NewMinorErrorSignal("small_no_result")
 
 	// Default: Treat as unknown malformed payload
 	default:
@@ -394,6 +411,19 @@ func classifyMalformedPayloadAsSignal(logger polylog.Logger, payloadContent stri
 		heuristicReason := payloadContent[idx+len(": heuristic detected "):]
 		// Clean up body for logging and further analysis
 		payloadContent = payloadContent[:idx]
+
+		// The producer appends " (method=<jsonrpc method>)" to the reason
+		// (context.go: "heuristic detected %s (method=%s)"), so the reason arrives as
+		// e.g. "empty_response (method=getTokenAccountsByOwner)". Every exact-equality
+		// case in classifyHeuristicErrorAsSignal — empty_response, small_no_result,
+		// html_error_page, bad_gateway, rest_error_field, rest_code_message_error —
+		// therefore never matched for a JSON-RPC request, and those responses fell
+		// through to the default unknown_payload_error at MINOR. Only the
+		// HasPrefix("error_indicator_...") cases survived, because prefix matching
+		// tolerates the suffix, which is why the gap stayed invisible.
+		if paren := strings.Index(heuristicReason, " ("); paren != -1 {
+			heuristicReason = heuristicReason[:paren]
+		}
 
 		logger = logger.With(
 			"payload_content_preview", payloadContent[:min(len(payloadContent), 200)],
