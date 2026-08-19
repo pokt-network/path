@@ -69,6 +69,22 @@ type Signal struct {
 	// endpoint that serves reads at 99.8% success). Set by the health-check executor.
 	IsHealthCheck bool
 
+	// IsProtocolViolation marks a response that is structurally invalid rather than merely
+	// failed — one that no configuration, capability limit, or transient fault makes correct.
+	// Today: a zero-length payload on a body-bearing 2xx.
+	//
+	// It exists because such a response is BOTH rare and never legitimate, so it needs a far
+	// lower rate threshold than a 5xx. The critical-rate detector is tuned for "unambiguously
+	// broken" (30% of requests); a violation sustained at well under 1% is invisible to it,
+	// yet is not a transient the network should absorb. Measured 2026-08-19: two domains at
+	// ~0.2-0.9% against a fleet noise floor of ~0.00003% — three orders of magnitude of
+	// separation that no per-event penalty could express, because an additive score at that
+	// rate is outvoted by successes (+998 vs -50 per 1000 requests).
+	//
+	// Set by the producer (the protocol-layer classifier), consumed by the invalid-rate
+	// detector, exactly as IsHealthCheck is.
+	IsProtocolViolation bool
+
 	// Metadata holds additional signal-specific data.
 	Metadata map[string]string
 }

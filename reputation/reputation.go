@@ -128,6 +128,17 @@ type Score struct {
 	// DefaultMaxCooldown. Mirrors the strike system's escalation, for the rate detector.
 	RateCooldownCount int
 
+	// RecentInvalidRate is an EWMA of the per-request protocol-violation indicator, the
+	// structural-validity counterpart to RecentCriticalRate. It uses a much longer memory and
+	// a much lower threshold: a violation rate that would be unremarkable for 5xx is damning
+	// for responses that are never legitimate. See InvalidRateEWMAAlpha / InvalidRateThreshold.
+	RecentInvalidRate float64
+
+	// InvalidRateCooldownCount counts consecutive invalid-rate trips for escalating backoff.
+	// Kept separate from RateCooldownCount so the two detectors escalate independently and a
+	// trip of one cannot be misread as a trip of the other.
+	InvalidRateCooldownCount int
+
 	// IsArchival indicates whether the endpoint has passed archival health checks.
 	// When true, the endpoint can serve historical blockchain data.
 	// This is shared across all replicas via Redis storage.
@@ -313,6 +324,29 @@ const (
 	// offense sits under one Shannon session (~20 min), so a transient spike recovers within
 	// the same session; only a persistent offender ramps toward a full hour.
 	DefaultRateCooldown = 10 * time.Minute
+
+	// InvalidRateEWMAAlpha is the smoothing factor for Score.RecentInvalidRate.
+	// Effective memory ≈ 1/alpha requests, so 0.001 ≈ a 1000-request window.
+	//
+	// The long window is load-bearing, not conservatism: CriticalRateEWMAAlpha's ~20-request
+	// memory CANNOT REPRESENT a sub-1% rate at all — the EWMA can only be 0 or ~0.05 there, so
+	// the quantity we care about is not measurable at that alpha regardless of threshold.
+	InvalidRateEWMAAlpha = 0.001
+
+	// InvalidRateThreshold is the sustained protocol-violation rate (0..1) at or above which
+	// an endpoint is cooled down. 0.005 = 0.5% of responses structurally invalid.
+	//
+	// Sized from production, not intuition (2026-08-19, one hour, fleet-wide): the two
+	// offending domains ran 0.216% and 0.065% of ALL their relays, and ~0.85% of the affected
+	// service; every other domain on the fleet sat at 0.00003% or exactly zero. 0.5% sits far
+	// above the noise floor and below the observed offender on the service where it happens.
+	// Raise it if healthy endpoints trip; do not lower it without fresh per-domain data.
+	InvalidRateThreshold = 0.005
+
+	// InvalidRateMinObservations is the minimum lifetime observations before the invalid-rate
+	// detector may trip. It must be at least ~1/alpha or the EWMA has not converged and a
+	// short unlucky burst on a new endpoint reads as a sustained rate.
+	InvalidRateMinObservations = 1000
 )
 
 // Key granularity options determine how endpoints are grouped for scoring.

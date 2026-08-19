@@ -38,6 +38,13 @@ func TestClassifyErrorAsSignal_EmptyResponseIsCritical(t *testing.T) {
 	require.Equal(t, reputation.SignalTypeCriticalError, signal.Type,
 		"an empty body on a body-bearing 2xx is a protocol violation, not a transient fault")
 	require.Equal(t, "empty_response", signal.Reason)
+
+	// The severity alone cannot express this at production rates: at ~0.2% of traffic an
+	// additive score earns +998 against -25 per 1000 requests and returns to its ceiling.
+	// The flag is what routes it to the rate-based detector, so it is load-bearing and must
+	// be asserted here — without this line, deleting it breaks nothing visible.
+	require.True(t, signal.IsProtocolViolation,
+		"empty_response must be flagged as a protocol violation so it feeds the invalid-rate detector")
 }
 
 // TestClassifyErrorAsSignal_SmallNoResultStaysMinor pins the deliberate split. A short

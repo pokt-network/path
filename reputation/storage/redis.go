@@ -47,6 +47,8 @@ const (
 	fieldArchivalExpires    = "archival_expires_at"
 	fieldRecentCriticalRate = "recent_critical_rate"
 	fieldRateCooldownCount  = "rate_cooldown_count"
+	fieldRecentInvalidRate  = "recent_invalid_rate"
+	fieldInvalidCooldownCnt = "invalid_rate_cooldown_count"
 )
 
 // perceivedBlockTTL bounds how long a perceived block-height entry lives in
@@ -205,6 +207,8 @@ func (r *RedisStorage) Set(ctx context.Context, key reputation.EndpointKey, scor
 		fieldArchivalExpires:    strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
 		fieldRecentCriticalRate: strconv.FormatFloat(score.RecentCriticalRate, 'f', -1, 64),
 		fieldRateCooldownCount:  strconv.Itoa(score.RateCooldownCount),
+		fieldRecentInvalidRate:  strconv.FormatFloat(score.RecentInvalidRate, 'f', -1, 64),
+		fieldInvalidCooldownCnt: strconv.Itoa(score.InvalidRateCooldownCount),
 	}
 
 	pipe := r.client.Pipeline()
@@ -250,6 +254,8 @@ func (r *RedisStorage) SetMultiple(ctx context.Context, scores map[reputation.En
 			fieldArchivalExpires:    strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
 			fieldRecentCriticalRate: strconv.FormatFloat(score.RecentCriticalRate, 'f', -1, 64),
 			fieldRateCooldownCount:  strconv.Itoa(score.RateCooldownCount),
+			fieldRecentInvalidRate:  strconv.FormatFloat(score.RecentInvalidRate, 'f', -1, 64),
+			fieldInvalidCooldownCnt: strconv.Itoa(score.InvalidRateCooldownCount),
 		}
 
 		pipe.HSet(ctx, redisKey, fields)
@@ -392,6 +398,19 @@ func (r *RedisStorage) parseScore(data map[string]string) (reputation.Score, err
 			return score, fmt.Errorf("invalid rate_cooldown_count: %w", err)
 		}
 		score.RateCooldownCount = count
+	}
+
+	// Protocol-violation rate EWMA and its escalation counter. Absent on older records,
+	// which correctly leaves a pre-existing endpoint at 0.0 rather than inventing history.
+	if v, ok := data[fieldRecentInvalidRate]; ok {
+		if rate, err := strconv.ParseFloat(v, 64); err == nil {
+			score.RecentInvalidRate = rate
+		}
+	}
+	if v, ok := data[fieldInvalidCooldownCnt]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			score.InvalidRateCooldownCount = n
+		}
 	}
 
 	// Parse archival fields (for multi-instance coordination)

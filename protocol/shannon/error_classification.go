@@ -340,8 +340,14 @@ func classifyHeuristicErrorAsSignal(
 	// not delivered.
 	// Category: Supplier Protocol Violations (CRITICAL -25)
 	case reason == "empty_response":
+		// Also flagged as a protocol violation so it feeds the invalid-rate detector.
+		// The CRITICAL severity alone cannot express this: at the rates observed in
+		// production (~0.2% of all relays) an additive score is outvoted by successes and
+		// returns to 100. Only a rate-based signal reaches it.
+		emptySignal := reputation.NewCriticalErrorSignal("empty_response", latency)
+		emptySignal.IsProtocolViolation = true
 		return protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_RAW_PAYLOAD_UNEXPECTED_EOF,
-			reputation.NewCriticalErrorSignal("empty_response", latency)
+			emptySignal
 
 	// small_no_result stays MINOR: a short response missing a "result" field is
 	// ambiguous — it can be a truncated read or a terse upstream error — unlike a

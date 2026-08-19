@@ -1088,6 +1088,31 @@ func RecordReputationRateCooldown(serviceID string) {
 	ReputationRateCooldownTotal.WithLabelValues(serviceID).Inc()
 }
 
+// ReputationInvalidRateCooldownTotal counts endpoints cooled down by the sustained
+// protocol-violation-rate detector, by service_id.
+//
+// Distinct from ReputationRateCooldownTotal because the two answer different questions and
+// share no threshold: that one fires at a 30% critical rate ("this endpoint is broken"), this
+// one at 0.5% structurally-invalid responses ("this endpoint returns things that are never
+// valid, at a low but sustained rate"). Folding them together would hide the second inside
+// the first, which is the entire failure this detector exists to correct.
+//
+// Expected to be zero or near-zero fleet-wide: measured 2026-08-19, only two domains produced
+// protocol violations above a 0.00003% noise floor. A broad nonzero rate means the threshold
+// is wrong, not that the fleet degraded.
+var ReputationInvalidRateCooldownTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "reputation_invalid_rate_cooldown_total",
+		Help: "Endpoints cooled down by the sustained protocol-violation-rate detector, by service_id. Expected near-zero; a broad nonzero rate means the threshold is mistuned.",
+	},
+	[]string{LabelServiceID},
+)
+
+// RecordReputationInvalidRateCooldown increments the invalid-rate cooldown counter.
+func RecordReputationInvalidRateCooldown(serviceID string) {
+	ReputationInvalidRateCooldownTotal.WithLabelValues(serviceID).Inc()
+}
+
 // ReputationPoolCollapseGuardTotal counts how often reputation filtering would have removed
 // EVERY endpoint for a service (all in cooldown or below threshold) and the pool-collapse
 // guard instead kept the least-bad tier. A nonzero rate is the signal that a service is

@@ -232,6 +232,58 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 					Dur("cooldown_duration", cooldownDuration).
 					Msg("[RATE_COOLDOWN] Endpoint cooled down due to sustained critical error rate (volume-independent)")
 			}
+
+		}
+
+		// Protocol-violation rate detector.
+		//
+		// Separate from the critical-rate detector above because the two measure different
+		// things. A 5xx is a transient the network is expected to absorb, so its threshold is
+		// 30%. A structurally invalid response — today, a zero-length payload on a body-bearing
+		// 2xx — is never legitimate at any rate, so it warrants a threshold three orders of
+		// magnitude lower and a correspondingly longer EWMA window.
+		//
+		// Without this, such a violation is unreachable by reputation: the additive score is
+		// outvoted by successes (at 0.2%, +998 against -50 per 1000 requests, so the score
+		// returns to 100), and the critical-rate EWMA's ~20-request memory cannot represent a
+		// sub-1% rate at all. Raising the per-event penalty does not help; only a rate does.
+		invalidIndicator := 0.0
+		if signal.IsProtocolViolation {
+			invalidIndicator = 1.0
+		}
+		score.RecentInvalidRate = score.RecentInvalidRate*(1-InvalidRateEWMAAlpha) + InvalidRateEWMAAlpha*invalidIndicator
+
+		if score.RecentInvalidRate >= InvalidRateThreshold &&
+			(score.SuccessCount+score.ErrorCount) >= InvalidRateMinObservations {
+			trippedInvalidRate := score.RecentInvalidRate
+
+			prevInvalidCooldownUntil := score.CooldownUntil
+			if !prevInvalidCooldownUntil.IsZero() && time.Since(prevInvalidCooldownUntil) < DefaultMaxCooldown {
+				score.InvalidRateCooldownCount++
+			} else {
+				score.InvalidRateCooldownCount = 1
+			}
+			invalidCooldownDuration := DefaultRateCooldown * time.Duration(score.InvalidRateCooldownCount)
+			if invalidCooldownDuration > DefaultMaxCooldown {
+				invalidCooldownDuration = DefaultMaxCooldown
+			}
+
+			invalidCooldownUntil := time.Now().Add(invalidCooldownDuration)
+			if invalidCooldownUntil.After(score.CooldownUntil) {
+				score.CooldownUntil = invalidCooldownUntil
+			}
+			// Reset so the endpoint starts clean and must re-accumulate a sustained violation
+			// rate to trip again, rather than re-flapping on its first post-cooldown request.
+			score.RecentInvalidRate = 0
+			metrics.RecordReputationInvalidRateCooldown(string(key.ServiceID))
+			if s.logger != nil {
+				s.logger.Warn().
+					Str("endpoint", key.String()).
+					Float64("invalid_rate", trippedInvalidRate).
+					Int("invalid_rate_cooldown_count", score.InvalidRateCooldownCount).
+					Dur("cooldown_duration", invalidCooldownDuration).
+					Msg("[INVALID_RATE_COOLDOWN] Endpoint cooled down due to sustained protocol-violation rate")
+			}
 		}
 	}
 
