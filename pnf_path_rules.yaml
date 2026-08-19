@@ -2091,7 +2091,7 @@
       expected_status_code: 200
       expected_response_contains: '"ok"'
       timeout: 5s
-      reputation_signal: critical_error
+      reputation_signal: major_error
     - name: getBlockHeight
       type: json_rpc
       method: POST
