@@ -685,6 +685,30 @@ func TestProtocolAnalysis_MethodAwareEmptyArray(t *testing.T) {
 			expectedRetry:  false,
 			expectedReason: "jsonrpc_success",
 		},
+		{
+			name:           "getProgramAccounts + empty array = valid (no accounts match the filters)",
+			method:         "getProgramAccounts",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getInflationReward + empty array = valid",
+			method:         "getInflationReward",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getSlotLeaders + empty array = valid",
+			method:         "getSlotLeaders",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
+		{
+			name:           "getConfirmedBlocksWithLimit + empty array = valid",
+			method:         "getConfirmedBlocksWithLimit",
+			expectedRetry:  false,
+			expectedReason: "jsonrpc_success",
+		},
 	}
 
 	for _, tt := range tests {
@@ -915,45 +939,45 @@ func TestRESTEmptyObjectPathWhitelist(t *testing.T) {
 	emptyObject := []byte(`{}`)
 
 	tests := []struct {
-		name          string
-		path          string
-		expectedRetry bool
+		name           string
+		path           string
+		expectedRetry  bool
 		expectedReason string
 	}{
 		{
-			name:          "No path — still flagged",
-			path:          "",
-			expectedRetry: true,
+			name:           "No path — still flagged",
+			path:           "",
+			expectedRetry:  true,
 			expectedReason: "rest_empty_object",
 		},
 		{
-			name:          "Tron /wallet/getaccount — whitelisted",
-			path:          "/wallet/getaccount",
-			expectedRetry: false,
+			name:           "Tron /wallet/getaccount — whitelisted",
+			path:           "/wallet/getaccount",
+			expectedRetry:  false,
 			expectedReason: "rest_no_error_indicator",
 		},
 		{
-			name:          "Tron /wallet/gettransactionbyid — whitelisted",
-			path:          "/wallet/gettransactionbyid",
-			expectedRetry: false,
+			name:           "Tron /wallet/gettransactionbyid — whitelisted",
+			path:           "/wallet/gettransactionbyid",
+			expectedRetry:  false,
 			expectedReason: "rest_no_error_indicator",
 		},
 		{
-			name:          "Tron /walletsolidity/getaccount — whitelisted",
-			path:          "/walletsolidity/getaccount",
-			expectedRetry: false,
+			name:           "Tron /walletsolidity/getaccount — whitelisted",
+			path:           "/walletsolidity/getaccount",
+			expectedRetry:  false,
 			expectedReason: "rest_no_error_indicator",
 		},
 		{
-			name:          "Cosmos REST path — whitelisted",
-			path:          "/cosmos/base/tendermint/v1beta1/blocks/latest",
-			expectedRetry: false,
+			name:           "Cosmos REST path — whitelisted",
+			path:           "/cosmos/base/tendermint/v1beta1/blocks/latest",
+			expectedRetry:  false,
 			expectedReason: "rest_no_error_indicator",
 		},
 		{
-			name:          "Root path — not whitelisted",
-			path:          "/",
-			expectedRetry: true,
+			name:           "Root path — not whitelisted",
+			path:           "/",
+			expectedRetry:  true,
 			expectedReason: "rest_empty_object",
 		},
 	}
@@ -1453,24 +1477,24 @@ func BenchmarkAnalyze_LargeResponse(b *testing.B) {
 
 func TestCheckRequestIDMismatch(t *testing.T) {
 	tests := []struct {
-		name        string
-		response    []byte
-		requestID   string
-		expectFlag  bool
+		name         string
+		response     []byte
+		requestID    string
+		expectFlag   bool
 		expectReason string
 	}{
 		{
-			name:        "ID mismatch — response null, request had integer ID",
-			response:    []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}`),
-			requestID:   "1",
-			expectFlag:  true,
+			name:         "ID mismatch — response null, request had integer ID",
+			response:     []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}`),
+			requestID:    "1",
+			expectFlag:   true,
 			expectReason: "jsonrpc_id_mismatch",
 		},
 		{
-			name:        "ID mismatch — response null, request had string ID",
-			response:    []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"service unavailable"}}`),
-			requestID:   `"abc"`,
-			expectFlag:  true,
+			name:         "ID mismatch — response null, request had string ID",
+			response:     []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"service unavailable"}}`),
+			requestID:    `"abc"`,
+			expectFlag:   true,
 			expectReason: "jsonrpc_id_mismatch",
 		},
 		{
