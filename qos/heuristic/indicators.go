@@ -159,6 +159,7 @@ var errorPatterns = []errorPattern{
 	// ONLY include errors that indicate supplier/node problems, NOT application-level errors
 	{[]byte("mdbx_panic"), CategoryBlockchainError, 0.98},                 // Erigon MDBX database corruption/disk full
 	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},          // Data corruption/sync issue
+	{[]byte("metadata is not found"), CategoryBlockchainError, 0.95},      // geth PBSS pruned state: "metadata is not found, <block>"
 	{[]byte("failed to call fallback"), CategoryBlockchainError, 0.95},    // Node's internal fallback for archival data failed
 	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95},      // Archival data not available
 	{[]byte("is pruned"), CategoryBlockchainError, 0.95},                  // Generic pruned error (e.g., "state at block #X is pruned")
@@ -273,6 +274,11 @@ func IsArchivalRelatedError(pattern string) bool {
 		"haven't been fully indexed",
 		"not been fully indexed",
 		"missing trie node",
+		// geth's path-based state scheme (PBSS) reports unavailable historical
+		// state as "metadata is not found, <block>". The trie-node and pruned
+		// wordings above are all hash-based-scheme (HBSS) messages, so a PBSS
+		// node's honest "I do not retain that state" matched nothing.
+		"metadata is not found",
 		"block has been pruned",
 		"height is not available":
 		return true
@@ -388,6 +394,8 @@ var capabilityLimitationSubstrings = []string{
 	"haven't been fully indexed",
 	"not been fully indexed",
 	"missing trie node",
+	// geth PBSS wording; see IsArchivalRelatedError.
+	"metadata is not found",
 	"block has been pruned",
 	"height is not available",
 	// CometBFT's real pruned-height message is "height %d is not available, lowest
