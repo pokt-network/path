@@ -70,7 +70,7 @@ func Test_HealthCheckAlone_MakesEndpointSelectable(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, protocol.EndpointAddrList{healthCheckedAddr}, picked)
 
-	require.NoError(t, q.ServiceState.ValidateEndpoint(healthCheckedAddr, stored),
+	require.NoError(t, q.ValidateEndpoint(healthCheckedAddr, stored),
 		"an endpoint fed only by health checks must be valid")
 }
 
@@ -90,7 +90,7 @@ func Test_HealthCheckAlone_UnhealthyIsStillRejected(t *testing.T) {
 	stored := q.endpoints[healthCheckedAddr]
 	require.NotNil(t, stored.SolanaGetHealthResponse)
 	require.Equal(t, resultGetHealthSyncing, stored.Result)
-	require.Error(t, q.ServiceState.ValidateEndpoint(healthCheckedAddr, stored),
+	require.Error(t, q.ValidateEndpoint(healthCheckedAddr, stored),
 		"an endpoint that reported itself behind must stay invalid")
 }
 
@@ -137,7 +137,7 @@ func Test_HealthOnlyObservation_DoesNotClobberBlockHeight(t *testing.T) {
 // routinely supplies, and therefore never given the traffic that would supply it.
 func Test_UnobservedEpoch_DoesNotInvalidate(t *testing.T) {
 	q := newQoSForHealthTest(t)
-	q.ServiceState.perceivedEpoch = 1018
+	q.perceivedEpoch = 1018
 
 	feedHealthCheck(t, q, healthCheckedAddr,
 		`{"jsonrpc":"2.0","id":1,"method":"getHealth"}`,
@@ -148,7 +148,7 @@ func Test_UnobservedEpoch_DoesNotInvalidate(t *testing.T) {
 
 	stored := q.endpoints[healthCheckedAddr]
 	require.Zero(t, stored.Epoch, "health checks supply no epoch — this is the case under test")
-	require.NoError(t, q.ServiceState.ValidateEndpoint(healthCheckedAddr, stored),
+	require.NoError(t, q.ValidateEndpoint(healthCheckedAddr, stored),
 		"an unobserved epoch means 'not measured', never 'behind'")
 }
 
@@ -169,7 +169,7 @@ func Test_EpochLag_ToleratesOneEpoch(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := newQoSForHealthTest(t)
-			q.ServiceState.perceivedEpoch = 1018
+			q.perceivedEpoch = 1018
 
 			feedHealthCheck(t, q, healthCheckedAddr,
 				`{"jsonrpc":"2.0","id":1,"method":"getHealth"}`,
@@ -182,9 +182,9 @@ func Test_EpochLag_ToleratesOneEpoch(t *testing.T) {
 
 			stored := q.endpoints[healthCheckedAddr]
 			require.NotNil(t, stored.SolanaGetEpochInfoResponse)
-			stored.SolanaGetEpochInfoResponse.Epoch = tc.epoch
+			stored.Epoch = tc.epoch
 
-			err := q.ServiceState.ValidateEndpoint(healthCheckedAddr, stored)
+			err := q.ValidateEndpoint(healthCheckedAddr, stored)
 			if tc.expectValid {
 				require.NoError(t, err)
 			} else {
@@ -223,7 +223,7 @@ func Test_PartiallyProbedEndpoint_StaysSelectable(t *testing.T) {
 	require.True(t, found, "the block-height probe must have put the endpoint in the store")
 	require.Nil(t, stored.SolanaGetHealthResponse, "no health observation yet — the state under test")
 
-	require.NoError(t, q.ServiceState.ValidateEndpoint(healthCheckedAddr, stored),
+	require.NoError(t, q.ValidateEndpoint(healthCheckedAddr, stored),
 		"an endpoint awaiting its first health probe must not be rejected: "+
 			"unobserved is not unhealthy, and it was selectable before it entered the store")
 
@@ -247,6 +247,6 @@ func Test_ObservedUnhealthy_IsStillRejected(t *testing.T) {
 
 	stored := q.endpoints[healthCheckedAddr]
 	require.NotNil(t, stored.SolanaGetHealthResponse)
-	require.Error(t, q.ServiceState.ValidateEndpoint(healthCheckedAddr, stored),
+	require.Error(t, q.ValidateEndpoint(healthCheckedAddr, stored),
 		"an endpoint that reported itself behind must stay rejected")
 }
