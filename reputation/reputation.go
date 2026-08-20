@@ -128,6 +128,17 @@ type Score struct {
 	// DefaultMaxCooldown. Mirrors the strike system's escalation, for the rate detector.
 	RateCooldownCount int
 
+	// RateCooldownUntil is the end of the last cooldown THIS detector set, and is the
+	// reference point RateCooldownCount escalates against.
+	//
+	// It exists because CooldownUntil is shared: the strike system, this detector and the
+	// invalid-rate detector all write it. Escalating against the shared field made a
+	// cooldown earned by any other mechanism read as "a consecutive trip of this one", so
+	// on an endpoint that is benched often for unrelated reasons the count ratcheted to the
+	// DefaultMaxCooldown cap on what was really a first offence. Selection still gates on
+	// CooldownUntil alone; only the escalation arithmetic reads this.
+	RateCooldownUntil time.Time
+
 	// RecentInvalidRate is an EWMA of the per-request protocol-violation indicator, the
 	// structural-validity counterpart to RecentCriticalRate. It uses a much longer memory and
 	// a much lower threshold: a violation rate that would be unremarkable for 5xx is damning
@@ -138,6 +149,13 @@ type Score struct {
 	// Kept separate from RateCooldownCount so the two detectors escalate independently and a
 	// trip of one cannot be misread as a trip of the other.
 	InvalidRateCooldownCount int
+
+	// InvalidRateCooldownUntil is the end of the last cooldown THIS detector set — the
+	// invalid-rate counterpart to RateCooldownUntil, and for the same reason. The separate
+	// COUNTER above was not sufficient on its own: both counters escalated against the
+	// shared CooldownUntil, so a critical-error burst still lengthened a protocol-violation
+	// bench, which is exactly what keeping the counters separate was supposed to prevent.
+	InvalidRateCooldownUntil time.Time
 
 	// IsArchival indicates whether the endpoint has passed archival health checks.
 	// When true, the endpoint can serve historical blockchain data.

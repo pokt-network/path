@@ -49,6 +49,8 @@ const (
 	fieldRateCooldownCount  = "rate_cooldown_count"
 	fieldRecentInvalidRate  = "recent_invalid_rate"
 	fieldInvalidCooldownCnt = "invalid_rate_cooldown_count"
+	fieldRateCooldownUntil  = "rate_cooldown_until"
+	fieldInvalidCooldownUnt = "invalid_rate_cooldown_until"
 )
 
 // perceivedBlockTTL bounds how long a perceived block-height entry lives in
@@ -209,6 +211,8 @@ func (r *RedisStorage) Set(ctx context.Context, key reputation.EndpointKey, scor
 		fieldRateCooldownCount:  strconv.Itoa(score.RateCooldownCount),
 		fieldRecentInvalidRate:  strconv.FormatFloat(score.RecentInvalidRate, 'f', -1, 64),
 		fieldInvalidCooldownCnt: strconv.Itoa(score.InvalidRateCooldownCount),
+		fieldRateCooldownUntil:  strconv.FormatInt(score.RateCooldownUntil.Unix(), 10),
+		fieldInvalidCooldownUnt: strconv.FormatInt(score.InvalidRateCooldownUntil.Unix(), 10),
 	}
 
 	pipe := r.client.Pipeline()
@@ -256,6 +260,8 @@ func (r *RedisStorage) SetMultiple(ctx context.Context, scores map[reputation.En
 			fieldRateCooldownCount:  strconv.Itoa(score.RateCooldownCount),
 			fieldRecentInvalidRate:  strconv.FormatFloat(score.RecentInvalidRate, 'f', -1, 64),
 			fieldInvalidCooldownCnt: strconv.Itoa(score.InvalidRateCooldownCount),
+			fieldRateCooldownUntil:  strconv.FormatInt(score.RateCooldownUntil.Unix(), 10),
+			fieldInvalidCooldownUnt: strconv.FormatInt(score.InvalidRateCooldownUntil.Unix(), 10),
 		}
 
 		pipe.HSet(ctx, redisKey, fields)
@@ -410,6 +416,21 @@ func (r *RedisStorage) parseScore(data map[string]string) (reputation.Score, err
 	if v, ok := data[fieldInvalidCooldownCnt]; ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			score.InvalidRateCooldownCount = n
+		}
+	}
+
+	// Per-detector cooldown ends. These are the reference points the two escalation
+	// counters compare against; they are NOT a second selection gate — CooldownUntil above
+	// remains the only field selection reads. Absent on records written before this field
+	// existed, which leaves them zero and costs at most one non-escalated trip.
+	if v, ok := data[fieldRateCooldownUntil]; ok {
+		if ts, err := strconv.ParseInt(v, 10, 64); err == nil && ts > 0 {
+			score.RateCooldownUntil = time.Unix(ts, 0)
+		}
+	}
+	if v, ok := data[fieldInvalidCooldownUnt]; ok {
+		if ts, err := strconv.ParseInt(v, 10, 64); err == nil && ts > 0 {
+			score.InvalidRateCooldownUntil = time.Unix(ts, 0)
 		}
 	}
 

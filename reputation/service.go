@@ -201,7 +201,14 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 			// for longer than that starts fresh at one session. Mirrors the strike system's
 			// exponential backoff so a persistently broken endpoint is benched progressively
 			// longer while a one-off transient spike costs only a single session.
-			prevCooldownUntil := score.CooldownUntil
+			//
+			// Escalate against the end of THIS detector's own previous cooldown, not the
+			// shared CooldownUntil. The shared field is also written by the strike system
+			// and by the invalid-rate detector, so reading it here counted a bench earned
+			// by an unrelated mechanism as a consecutive trip of this one — an endpoint
+			// cooled often for other reasons reached the DefaultMaxCooldown cap on its
+			// first actual rate offence.
+			prevCooldownUntil := score.RateCooldownUntil
 			if !prevCooldownUntil.IsZero() && time.Since(prevCooldownUntil) < DefaultMaxCooldown {
 				score.RateCooldownCount++
 			} else {
@@ -216,6 +223,7 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 			}
 
 			rateCooldownUntil := time.Now().Add(cooldownDuration)
+			score.RateCooldownUntil = rateCooldownUntil
 			if rateCooldownUntil.After(score.CooldownUntil) {
 				score.CooldownUntil = rateCooldownUntil
 			}
@@ -257,7 +265,10 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 			(score.SuccessCount+score.ErrorCount) >= InvalidRateMinObservations {
 			trippedInvalidRate := score.RecentInvalidRate
 
-			prevInvalidCooldownUntil := score.CooldownUntil
+			// Escalate against this detector's own previous cooldown end. Reading the
+			// shared CooldownUntil here defeated the point of keeping the two counters
+			// separate: a critical-error burst lengthened the protocol-violation bench.
+			prevInvalidCooldownUntil := score.InvalidRateCooldownUntil
 			if !prevInvalidCooldownUntil.IsZero() && time.Since(prevInvalidCooldownUntil) < DefaultMaxCooldown {
 				score.InvalidRateCooldownCount++
 			} else {
@@ -269,6 +280,7 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 			}
 
 			invalidCooldownUntil := time.Now().Add(invalidCooldownDuration)
+			score.InvalidRateCooldownUntil = invalidCooldownUntil
 			if invalidCooldownUntil.After(score.CooldownUntil) {
 				score.CooldownUntil = invalidCooldownUntil
 			}
