@@ -1519,9 +1519,26 @@ func (e *HealthCheckExecutor) processObservationSync(
 		Msg("Health check observation processed synchronously for block height extraction")
 }
 
-// archivalTTL is how long an archival status from health checks remains valid.
-// Health checks run periodically, so this should be longer than the health check interval.
-const archivalTTL = 30 * time.Minute
+// ArchivalStatusTTL is how long an archival status remains valid, for BOTH sources that
+// can grant it: an archival health check here, and a user-traffic confirmation in
+// qos/evm. It is exported and shared so the two cannot drift.
+//
+// They had drifted, by 16x, in the direction that does the most damage. The health-check
+// path pins an exact expected historical value in the rules file, so a node that ignores
+// the block parameter and answers from current state fails it — and that verified mark
+// expired in 30 minutes. The user-traffic path cannot pin a value, because the query is
+// whatever a client happened to send, so it grants archival status on any successful call
+// to an archival method — and that UNVERIFIED mark lasted 8 hours.
+//
+// Weaker evidence must not outlive stronger evidence. The comment on the 8h constant even
+// claimed it "matches health check archival TTL", which is probably why nobody noticed.
+//
+// Should be longer than the health check interval, so a passing endpoint is re-confirmed
+// before its mark lapses.
+const ArchivalStatusTTL = 30 * time.Minute
+
+// archivalTTL is the internal alias kept for readability at this package's call sites.
+const archivalTTL = ArchivalStatusTTL
 
 // markEndpointArchival marks an endpoint as archival-capable via the reputation service.
 // This is called ONLY after an archival health check passes ALL validations including error_detection.
