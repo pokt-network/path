@@ -71,3 +71,41 @@ func Test_IsArchival_PBSSPrunedStateDemotes(t *testing.T) {
 	require.NoError(t, err, "PBSS pruned-state error must be a definitive not-archival result")
 	require.False(t, isArchival)
 }
+
+// Test_IsArchival_HistoricalStateWordingsDemote covers two live prunedstate wordings
+// measured in production on 2026-08-20 by sending a deep historical block to endpoints
+// PATH had marked archival.
+//
+// Both missed every pattern in archivalErrorIndicators by a single word: "state not
+// available" does not match "state IS not available", and "historical data" does not
+// match "historical STATE". So both fell through to the "some other error" branch, which
+// returns an error rather than false, and the endpoint stayed in the archival pool that
+// had just failed it -- the exact failure the PBSS entry was added to fix, on a different
+// vendor's wording.
+//
+// Table-driven because the discriminating detail is the exact string; a single case would
+// pass on a pattern that only covers one of the two.
+func Test_IsArchival_HistoricalStateWordingsDemote(t *testing.T) {
+	// A request that genuinely asks for historical state, so a false result can only come
+	// from the error classification and not from the targetsHistoricalBlock gate.
+	request := []byte(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x0000000000000000000000000000000000000000","0x1312D00"],"id":1}`)
+
+	for _, tc := range []struct {
+		name    string
+		message string
+	}{
+		{"gnosis wording", "historical state is not available"},
+		{"poly wording", "historical state 654f28d19b44239d1012f27038f1f"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := NewEVMDataExtractor()
+			response := []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"` + tc.message + `"}}`)
+
+			isArchival, err := e.IsArchival(request, response)
+			require.NoError(t, err,
+				"an unavailable-historical-state error must be a DEFINITIVE not-archival result; "+
+					"returning an error instead leaves the endpoint in the archival pool")
+			require.False(t, isArchival)
+		})
+	}
+}

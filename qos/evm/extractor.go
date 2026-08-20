@@ -223,6 +223,24 @@ func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, er
 			"state histories",   // "state histories haven't been fully indexed yet"
 			"not fully indexed", // catch variations
 			"historical data",   // "historical data not available"
+			// Measured against production 2026-08-20 by probing archival-marked
+			// endpoints with a deep historical block. Two live wordings landed here
+			// and BOTH missed every entry above by a single word:
+			//
+			//   gnosis: "historical state is not available"  -- "state not available"
+			//           misses because the real text is "state IS not available", and
+			//           "historical data" misses because it is "historical STATE".
+			//   poly:   "historical state <hash>"
+			//
+			// Both fell through to the "some other error" branch, which returns an
+			// error rather than false, so the endpoint was never demoted and kept
+			// receiving archival requests it cannot serve. Same failure the PBSS
+			// entry above fixed, on a different vendor's wording.
+			//
+			// The bare prefix covers both observed forms. It is also already present
+			// in qos/heuristic/indicators.go, where this error IS recognised — the two
+			// catalogues had drifted, and this realigns them.
+			"historical state",
 		}
 
 		for _, indicator := range archivalErrorIndicators {
