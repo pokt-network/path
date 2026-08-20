@@ -180,8 +180,15 @@ type requestContext struct {
 	// outcome, so the Shannon layer SKIPS its RecordRelay for these — otherwise the same
 	// relay was ALSO recorded as request_type="normal", leaving every "excludes health
 	// checks" dashboard panel still containing 100% of health-check volume (phantom
-	// "normal" traffic on services with no user requests). Does not affect reputation
-	// signals or observations.
+	// "normal" traffic on services with no user requests).
+	//
+	// It is ALSO stamped onto every reputation signal this layer records. The rate
+	// detectors in reputation.RecordSignal are wrapped in `if !signal.IsHealthCheck`
+	// precisely so a probe cannot bench an endpoint on its own, but only the health-check
+	// executor's own three RecordSignal call sites set that flag — the relay path below
+	// left it false, so every health-check relay fed both rate EWMAs as if it were user
+	// traffic. The additive score is unaffected either way: a probe result still moves
+	// Value, exactly as before. Only the volume-independent rate detectors exclude it.
 	isHealthCheck bool
 
 	// tieredSelector provides access to tier-based selection and probation status.
@@ -1282,6 +1289,13 @@ func (rc *requestContext) handleEndpointError(
 		keyBuilder := rc.reputationService.KeyBuilderForService(rc.serviceID)
 		endpointKey := keyBuilder.BuildKey(rc.serviceID, selectedEndpointAddr, rc.getCurrentRPCType())
 
+		// Mark probe-originated signals so the volume-independent rate detectors skip them.
+		// See the isHealthCheck field doc: without this a health check's failure counts
+		// toward the very rates that decide whether to bench the endpoint, and a benched
+		// endpoint receives no user traffic — so probes become its only signal and it
+		// re-benches itself indefinitely.
+		signal.IsHealthCheck = rc.isHealthCheck
+
 		// Fire-and-forget: don't block request on reputation recording
 		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
 			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for error")
@@ -1424,6 +1438,12 @@ func (rc *requestContext) handleEndpointSuccess(
 			relayType = metrics.RelayTypeNormal
 		}
 
+		// Probe-originated signals are excluded from the rate detectors. This matters on
+		// the success path too: the EWMAs are ratios, so counting a probe's success in the
+		// denominator while its failures are excluded from the numerator would bias the
+		// measured rate downward instead of leaving it untouched.
+		signal.IsHealthCheck = rc.isHealthCheck
+
 		// Fire-and-forget: don't block request on reputation recording
 		if err := rc.reputationService.RecordSignal(rc.context, endpointKey, signal); err != nil {
 			rc.logger.Warn().Err(err).Msg("Failed to record reputation signal for success")
@@ -1502,6 +1522,10 @@ func (rc *requestContext) recordLatencyPenaltySignalsIfNeeded(
 	default:
 		return // Unknown signal type, skip
 	}
+
+	// A probe's latency is not user-experienced latency; exclude it from the rate
+	// detectors on the same grounds as the signals above.
+	penaltySignal.IsHealthCheck = rc.isHealthCheck
 
 	// Fire-and-forget: don't block request on reputation recording
 	if err := rc.reputationService.RecordSignal(rc.context, endpointKey, penaltySignal); err != nil {

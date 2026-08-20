@@ -1446,7 +1446,8 @@ func (e *HealthCheckExecutor) publishHealthCheckObservations(
 
 	// Apply protocol observations (for sanctioning, etc.)
 	if observations != nil {
-		if err := e.protocol.ApplyHTTPObservations(observations); err != nil {
+		// true: these observations are a probe by construction — this executor issues them.
+		if err := e.protocol.ApplyHTTPObservations(observations, true); err != nil {
 			e.logger.Debug().Err(err).Msg("Failed to apply protocol observations for health check")
 		}
 	}
@@ -1774,7 +1775,8 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 			Msg("Skipping websocket check reputation signal for over-serviced (stake-exhausted) supplier")
 
 	default:
-		if err := e.protocol.ApplyWebSocketObservations(protocolObs); err != nil {
+		// true: a websocket health-check probe, same as the HTTP path above.
+		if err := e.protocol.ApplyWebSocketObservations(protocolObs, true); err != nil {
 			e.logger.Warn().
 				Err(err).
 				Str("service_id", string(serviceID)).

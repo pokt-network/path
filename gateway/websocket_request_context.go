@@ -494,7 +494,8 @@ func (wrc *websocketRequestContext) BroadcastMessageObservations(
 	}
 
 	if protocolObservations := messageObservations.GetProtocol(); protocolObservations != nil {
-		err := wrc.protocol.ApplyWebSocketObservations(protocolObservations)
+		// false: a user's websocket connection.
+		err := wrc.protocol.ApplyWebSocketObservations(protocolObservations, false)
 		if err != nil {
 			wrc.logger.Warn().Err(err).Msg("error applying protocol observations for websocket.")
 		}

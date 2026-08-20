@@ -1036,7 +1036,7 @@ func (p *Protocol) websocketReconnectScoreFunc(
 // allowing endpoints to recover from failures via successful health checks.
 //
 // Implements gateway.Protocol interface.
-func (p *Protocol) ApplyWebSocketObservations(observations *protocolobservations.Observations) error {
+func (p *Protocol) ApplyWebSocketObservations(observations *protocolobservations.Observations, isHealthCheck bool) error {
 	// Sanity check the input
 	if observations == nil || observations.GetShannon() == nil {
 		p.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msg("SHOULD RARELY HAPPEN: ApplyWebSocketObservations called with nil input or nil Shannon observation list.")
@@ -1052,7 +1052,7 @@ func (p *Protocol) ApplyWebSocketObservations(observations *protocolobservations
 	// Record reputation signals from observations.
 	// This allows health check results (from hydrator) to update endpoint reputation scores.
 	if p.reputationService != nil {
-		p.recordReputationSignalsFromWebsocketObservations(shannonObservations)
+		p.recordReputationSignalsFromWebsocketObservations(shannonObservations, isHealthCheck)
 	}
 
 	return nil
@@ -1061,20 +1061,20 @@ func (p *Protocol) ApplyWebSocketObservations(observations *protocolobservations
 // recordReputationSignalsFromWebsocketObservations maps websocket protocol observations to reputation signals.
 // This is called by ApplyWebSocketObservations to update endpoint reputation scores based on
 // health check results from the hydrator or any other observation source.
-func (p *Protocol) recordReputationSignalsFromWebsocketObservations(shannonObservations []*protocolobservations.ShannonRequestObservations) {
+func (p *Protocol) recordReputationSignalsFromWebsocketObservations(shannonObservations []*protocolobservations.ShannonRequestObservations, isHealthCheck bool) {
 	for _, observationSet := range shannonObservations {
 		serviceID := protocol.ServiceID(observationSet.GetServiceId())
 
 		// Process connection observations
 		connObs := observationSet.GetWebsocketConnectionObservation()
 		if connObs != nil {
-			p.recordSignalFromWebsocketConnectionObservation(serviceID, connObs)
+			p.recordSignalFromWebsocketConnectionObservation(serviceID, connObs, isHealthCheck)
 		}
 	}
 }
 
 // recordSignalFromWebsocketConnectionObservation records a reputation signal for a websocket connection observation.
-func (p *Protocol) recordSignalFromWebsocketConnectionObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonWebsocketConnectionObservation) {
+func (p *Protocol) recordSignalFromWebsocketConnectionObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonWebsocketConnectionObservation, isHealthCheck bool) {
 	// Reconstruct the FULL endpoint address (<supplier>-<url>).
 	//
 	// Using the bare URL here silently broke every websocket health check: the reputation
@@ -1110,6 +1110,13 @@ func (p *Protocol) recordSignalFromWebsocketConnectionObservation(serviceID prot
 		// See ERROR_CLASSIFICATION.md for error category documentation
 		signal = errorTypeToSignal(errorType, 0)
 	}
+
+	// Probe-originated signals are excluded from the volume-independent rate detectors,
+	// exactly as on the HTTP observation path. A websocket check's FAILURE reaches
+	// reputation only through here (a passing check emits no observation and is recorded
+	// directly by the executor, already stamped), so this is the only site that can carry
+	// the verdict for a failing websocket probe.
+	signal.IsHealthCheck = isHealthCheck
 
 	// Record signal (fire-and-forget, non-blocking)
 	ctx := context.Background()

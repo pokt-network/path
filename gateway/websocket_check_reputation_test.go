@@ -54,7 +54,7 @@ func (m *websocketCheckProtocol) CheckWebsocketConnection(
 	return nil, m.obs
 }
 
-func (m *websocketCheckProtocol) ApplyWebSocketObservations(obs *protocolobservations.Observations) error {
+func (m *websocketCheckProtocol) ApplyWebSocketObservations(obs *protocolobservations.Observations, isHealthCheck bool) error {
 	if obs == nil || obs.GetShannon() == nil {
 		return nil
 	}
@@ -67,6 +67,9 @@ func (m *websocketCheckProtocol) ApplyWebSocketObservations(obs *protocolobserva
 		if connObs.GetErrorType() == protocolobservations.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED {
 			signal = reputation.NewSuccessSignal(0)
 		}
+		// Mirrors the real implementation, which stamps the caller's verdict onto the
+		// signal so the volume-independent rate detectors can exclude probe results.
+		signal.IsHealthCheck = isHealthCheck
 		if err := m.rep.RecordSignal(context.Background(), reputation.EndpointKey{}, signal); err != nil {
 			return err
 		}
@@ -275,6 +278,46 @@ func Test_WebsocketCheck_RecordsExactlyOneReputationSignal(t *testing.T) {
 		c.Equal(reputation.SignalTypeRecoverySuccess, signals[0].Type,
 			"the protocol emits NO observation on success, so the pass is recorded here; "+
 				"without it a penalized websocket endpoint would have no health-check route back")
+	})
+}
+
+// Test_WebsocketCheck_StampsSignalsAsHealthCheck covers the websocket half of the
+// probe-contamination fix.
+//
+// Both reputation writers on this path must stamp the signal, and they are reached by
+// different routes: a FAILING check goes out through ApplyWebSocketObservations, a PASSING
+// one is recorded directly by the executor because the protocol emits no observation on
+// success. Fixing only one leaves half of every websocket service's probe volume feeding
+// the volume-independent rate detectors, which is what benches an endpoint that no user
+// ever complained about.
+func Test_WebsocketCheck_StampsSignalsAsHealthCheck(t *testing.T) {
+	t.Run("failing check - stamped on the observation path", func(t *testing.T) {
+		c := require.New(t)
+
+		executor, _, rep, svcConfig := newWebsocketCheckExecutor(t, failedWebsocketObservation("i/o timeout"))
+
+		executor.runEndpointChecks(context.Background(), wsCheckService, wsCheckEndpoint, svcConfig, false, true, true)
+		executor.wsPool.StopAndWait()
+
+		signals := rep.RecordedSignals()
+		c.Len(signals, 1)
+		c.True(signals[0].IsHealthCheck,
+			"a websocket probe failure must not be able to trip the rate detectors on its own")
+	})
+
+	t.Run("passing check - stamped by the executor", func(t *testing.T) {
+		c := require.New(t)
+
+		executor, _, rep, svcConfig := newWebsocketCheckExecutor(t, nil)
+
+		executor.runEndpointChecks(context.Background(), wsCheckService, wsCheckEndpoint, svcConfig, false, true, true)
+		executor.wsPool.StopAndWait()
+
+		signals := rep.RecordedSignals()
+		c.Len(signals, 1)
+		c.True(signals[0].IsHealthCheck,
+			"a probe success must be excluded from the rate detectors too: the EWMAs are ratios, "+
+				"so leaving successes in the denominator while excluding failures biases them")
 	})
 }
 

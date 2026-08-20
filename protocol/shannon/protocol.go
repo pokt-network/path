@@ -960,7 +960,7 @@ func (p *Protocol) BuildHTTPRequestContextForEndpoint(
 // allowing endpoints to recover from failures via successful health checks.
 //
 // Implements gateway.Protocol interface.
-func (p *Protocol) ApplyHTTPObservations(observations *protocolobservations.Observations) error {
+func (p *Protocol) ApplyHTTPObservations(observations *protocolobservations.Observations, isHealthCheck bool) error {
 	// Sanity check the input
 	if observations == nil || observations.GetShannon() == nil {
 		p.logger.ProbabilisticDebugInfo(polylog.ProbabilisticDebugInfoProb).Msg("SHOULD RARELY HAPPEN: ApplyHTTPObservations called with nil input or nil Shannon observation list.")
@@ -976,7 +976,7 @@ func (p *Protocol) ApplyHTTPObservations(observations *protocolobservations.Obse
 	// Record reputation signals from observations.
 	// This allows health check results (from hydrator) to update endpoint reputation scores.
 	if p.reputationService != nil {
-		p.recordReputationSignalsFromObservations(shannonObservations)
+		p.recordReputationSignalsFromObservations(shannonObservations, isHealthCheck)
 	}
 
 	return nil
@@ -1523,7 +1523,7 @@ func (p *Protocol) HydrateDisqualifiedEndpointsResponse(serviceID protocol.Servi
 // recordReputationSignalsFromObservations maps protocol observations to reputation signals.
 // This is called by ApplyHTTPObservations to update endpoint reputation scores based on
 // health check results from the hydrator or any other observation source.
-func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations []*protocolobservations.ShannonRequestObservations) {
+func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations []*protocolobservations.ShannonRequestObservations, isHealthCheck bool) {
 	for _, observationSet := range shannonObservations {
 		httpObservations := observationSet.GetHttpObservations()
 		if httpObservations == nil {
@@ -1533,7 +1533,7 @@ func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations [
 		serviceID := protocol.ServiceID(observationSet.GetServiceId())
 
 		for _, endpointObs := range httpObservations.GetEndpointObservations() {
-			p.recordSignalFromObservation(serviceID, endpointObs)
+			p.recordSignalFromObservation(serviceID, endpointObs, isHealthCheck)
 		}
 	}
 }
@@ -1541,7 +1541,7 @@ func (p *Protocol) recordReputationSignalsFromObservations(shannonObservations [
 // recordSignalFromObservation records a reputation signal for a single endpoint observation.
 // It maps the observation's error type directly to a reputation signal and records it.
 // Also records probation traffic metrics if the endpoint is in probation.
-func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonEndpointObservation) {
+func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs *protocolobservations.ShannonEndpointObservation, isHealthCheck bool) {
 	// Reconstruct the FULL endpoint address (<supplier>-<url>).
 	//
 	// Using the bare URL here silently broke every websocket health check: the reputation
@@ -1593,6 +1593,13 @@ func (p *Protocol) recordSignalFromObservation(serviceID protocol.ServiceID, obs
 			signal = signal.WithMultiplier(selector.Config().Probation.RecoveryMultiplier)
 		}
 	}
+
+	// Mark probe-originated signals so the volume-independent rate detectors skip them.
+	//
+	// This is the SECOND path a health check reaches reputation by — the relay itself
+	// already recorded a signal through requestContext — so leaving it unstamped left
+	// half the probe volume feeding the rate EWMAs even after the relay path was fixed.
+	signal.IsHealthCheck = isHealthCheck
 
 	// Record signal (fire-and-forget, non-blocking)
 	ctx := context.Background()

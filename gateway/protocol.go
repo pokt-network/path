@@ -96,14 +96,24 @@ type Protocol interface {
 	// 	- protocol: Shannon
 	// 	- observation: "endpoint maxed-out or over-serviced (i.e. onchain rate limiting)"
 	// 	- result: skip the endpoint for a set time period until a new session begins.
-	ApplyHTTPObservations(*protocolobservations.Observations) error
+	//
+	// isHealthCheck reports whether these observations came from an active health-check
+	// probe rather than user traffic. It is a required parameter rather than a second
+	// method so that every caller has to state which it is at compile time: this path
+	// records reputation signals, and the volume-independent rate detectors must not act
+	// on probe results. The health-check executor is one of only two callers and its
+	// observations are 100% probes, so a silent default here was silently wrong.
+	ApplyHTTPObservations(observations *protocolobservations.Observations, isHealthCheck bool) error
 
 	// ApplyWebSocketObservations applies the supplied observations to the protocol instance's internal state.
 	// Hypothetical example (for illustrative purposes only):
 	// 	- protocol: Shannon
 	// 	- observation: "endpoint maxed-out or over-serviced (i.e. onchain rate limiting)"
 	// 	- result: skip the endpoint for a set time period until a new session begins.
-	ApplyWebSocketObservations(*protocolobservations.Observations) error
+	//
+	// isHealthCheck carries the same meaning as on ApplyHTTPObservations: probe-originated
+	// observations must not reach the volume-independent rate detectors.
+	ApplyWebSocketObservations(observations *protocolobservations.Observations, isHealthCheck bool) error
 
 	// TODO_FUTURE(@adshmh): support specifying the app(s) used for sending/signing synthetic relay requests by the hydrator.
 	// TODO_TECHDEBT: Enable the hydrator for gateway modes beyond Centralized only.

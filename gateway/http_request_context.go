@@ -835,7 +835,8 @@ func (rc *requestContext) broadcastObservationsInternal() {
 	// update protocol-level observations: no errors encountered setting up the protocol context.
 	rc.updateProtocolObservations(nil)
 	if rc.protocolObservations != nil {
-		err := rc.protocol.ApplyHTTPObservations(rc.protocolObservations)
+		// false: user traffic. Health-check relays never reach this request context.
+		err := rc.protocol.ApplyHTTPObservations(rc.protocolObservations, false)
 		if err != nil {
 			rc.logger.Warn().Err(err).Msg("error applying protocol observations.")
 		}
