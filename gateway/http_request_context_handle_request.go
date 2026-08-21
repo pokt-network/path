@@ -657,6 +657,16 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					}
 					checkResult := checkResponseSuccess(hedgeErr, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, hedgeRequestID, logger)
 					if checkResult.Success {
+						// Denominator for the circuit breaker's failure-rate gate — see RecordSuccess.
+						// On a service with a hedge delay EVERY first attempt returns through here,
+						// including the vast majority where the hedge never fires, so without this
+						// the gate is fed almost no successes and judges every domain on a fraction
+						// dominated by its failures.
+						if rc.circuitBreaker != nil && endpointAddr != "" {
+							if domain := extractDomainFromEndpoint(endpointAddr); domain != "" {
+								rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+							}
+						}
 						// Success! Process the response
 						for _, endpointResponse := range hedgeResponses {
 							rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode, endpointResponse.RequestID)
@@ -1342,6 +1352,12 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 				batchRequestID := extractRequestIDFromPayload(payload)
 				checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, batchRequestID, logger)
 				if checkResult.Success {
+					// Denominator for the circuit breaker's failure-rate gate — see RecordSuccess.
+					if rc.circuitBreaker != nil && resp.EndpointAddr != "" {
+						if domain := extractDomainFromEndpoint(resp.EndpointAddr); domain != "" {
+							rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+						}
+					}
 					// Extract request ID from payload
 					resp.RequestID = batchRequestID
 					logger.Debug().
