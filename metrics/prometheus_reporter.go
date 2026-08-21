@@ -200,8 +200,16 @@ func (pmr *PrometheusMetricsReporter) getReputationSignalFromEndpoint(hasError b
 	// Error field is set - check the specific error type
 	switch errorType {
 	case protocolobs.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_UNSPECIFIED:
-		// Error field was set but type is unknown - treat as major error
-		return SignalMajorError
+		// An error WAS recorded but the classifier left the type UNSPECIFIED. Every producer
+		// of that pair (protocol/shannon/error_classification.go: capability limitation,
+		// over-servicing, session mismatch, a heuristic verdict that was not a fault) records
+		// a SUCCESS reputation signal alongside it, and the protocol's own observation
+		// consumers (protocol.go, websocket_context.go) read UNSPECIFIED as success outright.
+		// This was the one place that read it as a MAJOR error, so a no-fault error — an
+		// endpoint honestly declining a request it cannot serve — showed on the observation
+		// pipeline as a penalty that reputation never applied. path_relays_total, which is
+		// labelled from the real signal, already reports the same relay as ok/error.
+		return SignalOK
 
 	case protocolobs.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_TIMEOUT,
 		protocolobs.ShannonEndpointErrorType_SHANNON_ENDPOINT_ERROR_HTTP_CONNECTION_TIMEOUT,
