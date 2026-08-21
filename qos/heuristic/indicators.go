@@ -157,16 +157,17 @@ var errorPatterns = []errorPattern{
 
 	// Blockchain-Specific Errors (EVM)
 	// ONLY include errors that indicate supplier/node problems, NOT application-level errors
-	{[]byte("mdbx_panic"), CategoryBlockchainError, 0.98},                 // Erigon MDBX database corruption/disk full
-	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},          // Data corruption/sync issue
-	{[]byte("metadata is not found"), CategoryBlockchainError, 0.95},      // geth PBSS pruned state: "metadata is not found, <block>"
-	{[]byte("failed to call fallback"), CategoryBlockchainError, 0.95},    // Node's internal fallback for archival data failed
-	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95},      // Archival data not available
-	{[]byte("is pruned"), CategoryBlockchainError, 0.95},                  // Generic pruned error (e.g., "state at block #X is pruned")
-	{[]byte("state not available"), CategoryBlockchainError, 0.90},        // Node sync issue
-	{[]byte("haven't been fully indexed"), CategoryBlockchainError, 0.95}, // Archival indexing not complete (BSC)
-	{[]byte("not been fully indexed"), CategoryBlockchainError, 0.95},     // Archival indexing not complete (variant)
-	{[]byte("historical state"), CategoryBlockchainError, 0.85},           // Historical state not available
+	{[]byte("mdbx_panic"), CategoryBlockchainError, 0.98},                              // Erigon MDBX database corruption/disk full
+	{[]byte("missing trie node"), CategoryBlockchainError, 0.95},                       // Data corruption/sync issue
+	{[]byte("metadata is not found"), CategoryBlockchainError, 0.95},                   // geth PBSS pruned state: "metadata is not found, <block>"
+	{[]byte("excluded from account secondary indexes"), CategoryBlockchainError, 0.95}, // Solana -32010: node has no secondary index for this key (config, not fault)
+	{[]byte("failed to call fallback"), CategoryBlockchainError, 0.95},                 // Node's internal fallback for archival data failed
+	{[]byte("state has been pruned"), CategoryBlockchainError, 0.95},                   // Archival data not available
+	{[]byte("is pruned"), CategoryBlockchainError, 0.95},                               // Generic pruned error (e.g., "state at block #X is pruned")
+	{[]byte("state not available"), CategoryBlockchainError, 0.90},                     // Node sync issue
+	{[]byte("haven't been fully indexed"), CategoryBlockchainError, 0.95},              // Archival indexing not complete (BSC)
+	{[]byte("not been fully indexed"), CategoryBlockchainError, 0.95},                  // Archival indexing not complete (variant)
+	{[]byte("historical state"), CategoryBlockchainError, 0.85},                        // Historical state not available
 
 	// Blockchain-Specific Errors (Solana)
 	{[]byte("node is behind"), CategoryBlockchainError, 0.90},    // Sync issue
@@ -298,6 +299,13 @@ func IsCapabilityLimitationError(pattern string) bool {
 	switch pattern {
 	case "capability_limitation": // Tron lite fullnode, "api not supported" plain text responses
 		return true
+	// Solana -32010 "<key> excluded from account secondary indexes; this RPC method
+	// unavailable for key": the node was started without a secondary account index for
+	// this program, so getProgramAccounts for it cannot be served here while another
+	// operator serves it from its index. Node configuration, not a fault — and not
+	// archival either, so it is deliberately not in IsArchivalRelatedError.
+	case "excluded from account secondary indexes":
+		return true
 	default:
 		return false
 	}
@@ -408,6 +416,8 @@ var capabilityLimitationSubstrings = []string{
 	// Capability limitation (e.g., Tron lite fullnodes)
 	"lite fullnode",
 	"api is not supported",
+	// Solana -32010 account-index exclusion; see IsCapabilityLimitationError.
+	"excluded from account secondary indexes",
 	// rest_protocol_mismatch_error: heuristic-detected honest JSON-RPC error
 	// returned to a REST-shaped request (supplier's backend doesn't speak REST).
 	// The structured AnalysisResult is lost when this surfaces through the
