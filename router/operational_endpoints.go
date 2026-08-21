@@ -571,3 +571,54 @@ func (r *router) handleWebsocketTumble(w http.ResponseWriter, req *http.Request)
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(result)
 }
+
+// handleRequestSample handles GET /admin/request-sample[/{serviceId}]
+//
+// Without a service ID: one summary row per observed service. With one: the full report —
+// uniqueness ratio, per-method distinct counts and the most repeated fingerprints with a
+// payload snippet. Query: window=previous (default: the live window), top=N (default 20).
+//
+// Per-pod: the sampler is in-memory, so ask several pods (or the one carrying the most
+// traffic) before drawing a fleet-wide conclusion.
+func (r *router) handleRequestSample(w http.ResponseWriter, req *http.Request) {
+	if r.requestSampleAdmin == nil {
+		http.Error(w, `{"error":"request sampling not enabled (PATH_REQUEST_SAMPLE_RATE=0)"}`, http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	serviceID := strings.TrimPrefix(strings.TrimPrefix(req.URL.Path, "/admin/request-sample"), "/")
+	if serviceID == "" {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"services": r.requestSampleAdmin.Summary(),
+			"hint":     "GET /admin/request-sample/{serviceId}?window=previous&top=20 for fingerprints",
+		})
+		return
+	}
+
+	q := req.URL.Query()
+	previous := q.Get("window") == "previous"
+	top := 20
+	if v := q.Get("top"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			http.Error(w, `{"error":"top must be a positive integer"}`, http.StatusBadRequest)
+			return
+		}
+		top = n
+	}
+
+	report, found := r.requestSampleAdmin.Report(serviceID, previous, top)
+	if !found {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"service_id": serviceID,
+			"window":     q.Get("window"),
+			"error":      "no sample for this service and window yet (service unobserved on this pod, or no completed window)",
+		})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(report)
+}

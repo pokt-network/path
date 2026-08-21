@@ -2006,3 +2006,31 @@ func GetStatusCodeCategory(statusCode int) string {
 		return "other"
 	}
 }
+
+// RequestSampleUniqueness and RequestSampleTop1Share describe the LAST COMPLETED request
+// sampling window per service (see gateway.RequestSampler). Uniqueness = distinct
+// fingerprints / sampled requests: 1.0 means every sampled request differed, near 0 means
+// the same few requests repeated. Top1Share = the single most repeated fingerprint's share.
+// Both are per service_id only — no method, no fingerprint — so cardinality is the service
+// list. Sampled (1-in-N), so read as a ratio, never as a count.
+var RequestSampleUniqueness = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: MetricPrefix + "request_sample_uniqueness",
+		Help: "distinct request fingerprints / sampled requests over the last completed sampling window, per service. 1.0 = all different; near 0 = the same few requests repeated. Sampled 1-in-N; see /admin/request-sample/{serviceId} for the fingerprints.",
+	},
+	[]string{LabelServiceID},
+)
+
+var RequestSampleTop1Share = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: MetricPrefix + "request_sample_top1_share",
+		Help: "share of sampled requests in the last completed sampling window that were the single most repeated fingerprint, per service.",
+	},
+	[]string{LabelServiceID},
+)
+
+// SetRequestSampleUniqueness publishes both gauges for a service's completed window.
+func SetRequestSampleUniqueness(serviceID string, uniqueness, top1Share float64) {
+	RequestSampleUniqueness.WithLabelValues(serviceID).Set(uniqueness)
+	RequestSampleTop1Share.WithLabelValues(serviceID).Set(top1Share)
+}

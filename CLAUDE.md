@@ -393,6 +393,48 @@ shortening a drain is worse than saying no), the shared key carries a TTL past i
 drain, and expired entries are filtered on read and reaped. There is no way to bench an
 operator indefinitely through this endpoint. Re-issue to extend.
 
+**Request Sample** (`GET /admin/request-sample[/{serviceId}]`)
+
+Answers one question about a service's traffic: **many different requests, or the same few
+over and over?** Every quality signal PATH has — latency, success, hedge wins, the
+reputation score — rewards whoever answers fastest, and an endpoint fronted by a cache
+answers a *repeated* request in sub-millisecond time without touching a node. Against
+repetitive traffic it wins every race; against unique traffic it is an ordinary node. Whether
+a fast operator is fast or merely cached therefore has to be read from the **traffic**, and
+nothing recorded the traffic's shape: `method` is a label, `params` never were, and a
+thousand `getAccountInfo` for a thousand accounts and a thousand for one account were one
+number.
+
+One request in N (`PATH_REQUEST_SAMPLE_RATE`, default 100, `0` disables) is fingerprinted:
+JSON-RPC → one fingerprint per item on `method` + compacted `params` (id and whitespace
+excluded, so rotating ids cannot make repetition look diverse); anything else → HTTP method
++ path + body. Counted per service in fixed windows (`PATH_REQUEST_SAMPLE_WINDOW`, default
+`10m`); the last completed window is kept. Table bounded at
+`PATH_REQUEST_SAMPLE_MAX_FINGERPRINTS` (default 5000) — past it new fingerprints are
+*counted* in `table_overflow` but not stored, so `uniqueness` stays honest and a big overflow
+is itself the answer (the traffic is diverse).
+
+```bash
+curl -s localhost:13069/admin/request-sample                          # one row per service
+curl -s "localhost:13069/admin/request-sample/solana?window=previous&top=20"
+```
+
+Read: `uniqueness` = distinct / sampled (1.0 all different, →0 the same few repeated);
+`top1_share`; `methods[]` with **per-method** uniqueness — block-height calls are legitimately
+repetitive, account/transaction lookups are not, so judge the method not the service; `top[]`
+with a 200-byte snippet of each most-repeated payload. `requests_seen` is every request,
+`sampled` is the 1-in-N — never read the sample as the total.
+
+Gauges `path_request_sample_uniqueness{service_id}` / `path_request_sample_top1_share` carry
+the last completed window — per service_id only, nothing about methods or payloads, so
+cardinality is the service list. **Per-pod, in-memory**: query the pod carrying the traffic,
+or several, before a fleet conclusion.
+
+What it cannot tell: requests, not clients — there is no client identity behind the edge
+([[no_portal_no_client_identity]]) — so repetition cannot be attributed to a sender; and a low
+ratio is a property of the traffic, not evidence against an operator: it says the conditions
+under which a cache wins are present, not that anyone runs one.
+
 **Domain Blacklist (`blocked_domains`) — the nuclear ban**
 
 Permanently bans an operator domain from serving specific RPC types on **ALL services**,
