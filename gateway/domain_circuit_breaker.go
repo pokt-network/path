@@ -189,9 +189,14 @@ func (cb *DomainCircuitBreaker) RecordSuccess(serviceID, domain string) {
 		return
 	}
 	cb.statsMu.Lock()
-	defer cb.statsMu.Unlock()
 	w := cb.windowLocked(serviceID, domain, time.Now())
 	w.successes++
+	cb.statsMu.Unlock()
+
+	// Expose the gate's denominator. Recorded outside the lock: the metric has its own
+	// synchronisation and holding statsMu across it would put a Prometheus write on the path
+	// every successful relay takes.
+	metrics.RecordCircuitBreakerOutcome(serviceID, domain, metrics.CircuitBreakerOutcomeSuccess)
 }
 
 // windowLocked returns the outcome window for a domain, rolling it over if the current one
@@ -231,6 +236,11 @@ func (cb *DomainCircuitBreaker) shouldBreak(serviceID, domain string, now time.T
 
 	w := cb.windowLocked(serviceID, domain, now)
 	w.failures++
+	// Numerator counterpart to RecordSuccess. Deliberately here rather than in MarkBroken:
+	// this is the point a failure actually enters the gate's window, and MarkBroken returns
+	// earlier for a domain already broken — counting there would credit failures the rate
+	// calculation never saw.
+	defer metrics.RecordCircuitBreakerOutcome(serviceID, domain, metrics.CircuitBreakerOutcomeFailure)
 
 	total := w.failures + w.successes
 	if w.failures < cb.minFailures || total == 0 {

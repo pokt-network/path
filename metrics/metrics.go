@@ -36,6 +36,7 @@ const (
 	LabelSupplier           = "supplier"
 	LabelSignalType         = "signal_type"
 	LabelSeverity           = "severity"
+	LabelOutcome            = "outcome"
 
 	// --- Latency signal values
 
@@ -464,6 +465,58 @@ func RecordCircuitBreakerEvent(serviceID, domain, reasonCategory, event string) 
 		return
 	}
 	DomainCircuitBreakerEventsTotal.WithLabelValues(serviceID, domain, reasonCategory, event).Inc()
+}
+
+// CircuitBreakerOutcomeTotal exposes the failure-rate gate's OWN inputs, per host.
+//
+// WHY THIS EXISTS. The gate keys on the full hostname, while path_relays_total keys on
+// eTLD+1. An operator running several relay miners under one domain therefore reports one
+// blended success rate, so a domain whose hosts range from 50% to 80% is indistinguishable
+// from one where every host sits at 65%. Those call for opposite responses — replace the bad
+// hosts, versus the operator has a systemic problem — and telling them apart cost four wrong
+// hypotheses in one production investigation purely because the number did not exist at the
+// granularity the decision is made at.
+//
+// CARDINALITY. Deliberately two labels, not three. Its sibling
+// circuit_breaker_events_total carries the same service_id x domain pair PLUS
+// reason_category x event and reached 233,269 series — the cross product, not a leaking
+// label. Dropping to a 2-value outcome keeps this at roughly a twelfth of that, and the
+// guard below bounds the live registry the same way. Note the guard bounds the REGISTRY, not
+// the series Prometheus retains: if the churn diagnostic ever shows distinct-over-8h running
+// well above the instant count, the label set is rotating and this metric costs multiples of
+// what it appears to.
+//
+// Counts what the GATE sees, which is deliberately not every relay: while a domain is broken
+// MarkBroken short-circuits before the gate, so failures are not counted and the host goes
+// ABSENT rather than reading as healthy. Read it as "the evidence the breaker acted on", not
+// as a traffic meter — a host at a suspiciously good rate here may simply have been broken
+// for most of the window.
+var CircuitBreakerOutcomeTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "circuit_breaker_outcome_total",
+		Help: "Relay outcomes as counted by the domain circuit-breaker's failure-rate gate, keyed on the full HOSTNAME the gate uses (path_relays_total keys on eTLD+1). outcome ∈ {success, failure}. Numerator and denominator of the rate that decides a break. Only counts what the gate sees: a broken domain is absent, not healthy.",
+	},
+	[]string{LabelServiceID, LabelDomain, LabelOutcome},
+)
+
+// Outcome values for CircuitBreakerOutcomeTotal.
+const (
+	CircuitBreakerOutcomeSuccess = "success"
+	CircuitBreakerOutcomeFailure = "failure"
+)
+
+// RecordCircuitBreakerOutcome records one outcome against the gate's window. Skipped silently
+// when domain is empty, matching RecordCircuitBreakerEvent — and sanitized after that check,
+// since SanitizeDomainLabel maps "" to DomainUnknown and would defeat the skip.
+func RecordCircuitBreakerOutcome(serviceID, domain, outcome string) {
+	if domain == "" {
+		return
+	}
+	domain = SanitizeDomainLabel(domain)
+	if !circuitBreakerOutcomeGuard.allow(serviceID, domain, outcome) {
+		return
+	}
+	CircuitBreakerOutcomeTotal.WithLabelValues(serviceID, domain, outcome).Inc()
 }
 
 // =============================================================================

@@ -4,6 +4,11 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/pokt-network/path/metrics"
 )
 
 // driveAtRate feeds the gate `total` outcomes with `failPct` of them failing, interleaved so
@@ -158,5 +163,55 @@ func TestCircuitBreaker_MarginLapsesWithEscalationMemory(t *testing.T) {
 	if !driveAtRate(t, cb, ctx, "solana", domain, 200, 21) {
 		t.Fatal("after escalation memory lapses the domain is a first offender again and the " +
 			"plain threshold must apply")
+	}
+}
+
+// The gate's inputs must be observable at the granularity the gate DECIDES at.
+//
+// path_relays_total keys on eTLD+1, so an operator running several relay miners under one
+// domain reports one blended rate and a per-host verdict cannot be checked against it. This
+// asserts the new counter keys on the full hostname instead, and that both sides of the
+// fraction are recorded — a numerator with no denominator is how the pre-rate-gate breaker
+// made every single failure look like a 100% failure rate.
+func TestCircuitBreaker_OutcomeMetricIsKeyedOnHostname(t *testing.T) {
+	cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
+	cb.failureWindow = time.Hour
+	ctx := context.Background()
+
+	// Two hosts under ONE registrable domain, the shape that motivated the metric.
+	const good = "host-a.relayminer.example.com"
+	const bad = "host-b.relayminer.example.com"
+
+	for i := 0; i < 12; i++ {
+		cb.RecordSuccess("solana", good)
+	}
+	for i := 0; i < defaultMinFailures; i++ {
+		cb.MarkBroken(ctx, "solana", bad, "retry: boom")
+	}
+
+	read := func(domain, outcome string) float64 {
+		c, err := metrics.CircuitBreakerOutcomeTotal.GetMetricWithLabelValues("solana", domain, outcome)
+		if err != nil {
+			t.Fatalf("metric lookup failed for %s/%s: %v", domain, outcome, err)
+		}
+		var m dto.Metric
+		if err := c.(prometheus.Metric).Write(&m); err != nil {
+			t.Fatalf("metric write failed: %v", err)
+		}
+		return m.GetCounter().GetValue()
+	}
+
+	if got := read(good, metrics.CircuitBreakerOutcomeSuccess); got != 12 {
+		t.Fatalf("successes for the healthy host: got %v, want 12 — the gate's DENOMINATOR "+
+			"must be visible, not just its failures", got)
+	}
+	if got := read(bad, metrics.CircuitBreakerOutcomeFailure); got != float64(defaultMinFailures) {
+		t.Fatalf("failures for the failing host: got %v, want %d", got, defaultMinFailures)
+	}
+	// The distinction the metric exists for: one host's failures must not be attributed to
+	// the sibling sharing its registrable domain.
+	if got := read(good, metrics.CircuitBreakerOutcomeFailure); got != 0 {
+		t.Fatalf("healthy host was charged %v failures from its domain sibling — the counter "+
+			"has collapsed to eTLD+1 and answers nothing path_relays_total does not", got)
 	}
 }

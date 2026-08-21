@@ -213,6 +213,7 @@ func packageGuards() []*cardinalityGuard {
 		probationEventsGuard,
 		observationPipelineGuard,
 		circuitBreakerEventsGuard,
+		circuitBreakerOutcomeGuard,
 		rpcTypeFallbackGuard,
 	}
 }
@@ -523,6 +524,13 @@ var (
 	circuitBreakerEventsGuard = newCardinalityGuard("circuit_breaker_events_total", defaultSeriesLimit).
 					withEviction(defaultGuardIdleWindow, func(lv []string) {
 			DomainCircuitBreakerEventsTotal.DeleteLabelValues(lv...)
+		})
+
+	// circuitBreakerOutcomeGuard — same service_id x domain pair as its sibling above, minus
+	// reason_category x event. Guarded on the same principle, not on an observed incident.
+	circuitBreakerOutcomeGuard = newCardinalityGuard("circuit_breaker_outcome_total", defaultSeriesLimit).
+					withEviction(defaultGuardIdleWindow, func(lv []string) {
+			CircuitBreakerOutcomeTotal.DeleteLabelValues(lv...)
 		})
 
 	// rpcTypeFallbackGuard — backstop only. The real fix was dropping the
