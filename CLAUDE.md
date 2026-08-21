@@ -445,6 +445,21 @@ call site was revert-checked (filter removed → tests fail).
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved
 - Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis
 
+**Circuit breaker failure-rate gate — what feeds the denominator.** The gate breaks a hostname
+on failures / (failures + successes) over a 30s window. Failures arrive from every path (each
+failed attempt re-enters the retry loop → `MarkBroken`); successes only arrive where the
+returning path calls `RecordSuccess`. The hedge-race success branch did not, and with a hedge
+delay configured *every* first attempt returns through it (including `primary_only`), so the
+gate saw ~5% of a high-volume operator's successes and 26% fleet-wide — a low-volume host read
+30–66% failure where the relay counters read ~21%, and no threshold tuning (hysteresis
+included) can hold against a rate inflated past it by construction. When the gate and
+`path_relays_total` disagree about a host's rate, suspect a missing `RecordSuccess` site
+before suspecting the threshold. `path_circuit_breaker_outcome_total{domain=<hostname>}`
+shows both sides of the fraction the gate actually computes; compare its success side against
+`path_relays_total{status_code="200"}` per operator — they should agree within the
+health-check/retry slice. Test through the real retry loop
+(`gateway/circuit_breaker_hedge_denominator_test.go`), not through the breaker's own API.
+
 ## WebSocket Frames Are Reward-Eligible Relays
 
 **Every endpoint→client WebSocket frame is signed by the relay miner and mined as a
