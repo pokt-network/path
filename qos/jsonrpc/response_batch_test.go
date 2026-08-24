@@ -94,20 +94,46 @@ func TestValidateAndBuildBatchResponse_NullIDResponseStillCoversAMissingRequest(
 	require.Len(t, got, 2)
 }
 
-// Notifications (no id) never get a response object; they must not be "filled".
-func TestValidateAndBuildBatchResponse_NotificationsAreNotFilled(t *testing.T) {
+// A request without an id is NOT a notification once it has been through PATH: every batch
+// item is relayed on its own with "id":null written out, and the node answers it with a
+// null-id response. Excluding such requests from the expected count rejected every batch
+// that carried one with "expected N, got N+1" — seen live the moment it shipped, on two
+// services within the hour. One request object, one response object, id or not.
+func TestValidateAndBuildBatchResponse_IDLessRequestExpectsItsNullIDResponse(t *testing.T) {
 	logger := polyzero.NewLogger()
 	payloads := map[ID]protocol.Payload{
-		IDFromInt(1): {Data: `{"id":1}`},
-		{}:           {Data: `{"method":"notify"}`},
+		IDFromInt(1): {Data: `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}`},
+		{}:           {Data: `{"jsonrpc":"2.0","id":null,"method":"eth_blockNumber"}`},
 	}
+
+	// The node answered both — the production shape.
 	out, err := ValidateAndBuildBatchResponse(logger, []json.RawMessage{
 		json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"0x10"}`),
+		json.RawMessage(`{"jsonrpc":"2.0","id":null,"result":"0x10"}`),
 	}, payloads)
 	require.NoError(t, err)
 	var got []Response
 	require.NoError(t, json.Unmarshal(out, &got))
-	require.Len(t, got, 1)
+	require.Len(t, got, 2)
+	for _, r := range got {
+		require.Nil(t, r.Error, "both answers must be returned untouched: %s", out)
+	}
+
+	// The id-less item got no answer: it is filled like any other, with a null id.
+	out, err = ValidateAndBuildBatchResponse(logger, []json.RawMessage{
+		json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"0x10"}`),
+	}, payloads)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(out, &got))
+	require.Len(t, got, 2)
+	filled := 0
+	for _, r := range got {
+		if r.ID.IsEmpty() {
+			filled++
+			require.NotNil(t, r.Error)
+		}
+	}
+	require.Equal(t, 1, filled)
 }
 
 // More responses than requests for one id: keep the LAST one per request slot (a retry's

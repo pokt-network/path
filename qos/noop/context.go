@@ -60,8 +60,8 @@ type requestContext struct {
 
 	// batchRequestIDs holds each batch item's id, in item order, so an item that gets no
 	// response can still be answered with an error object carrying its own id. Set alongside
-	// isBatch. An item whose id cannot be read is recorded as empty and treated as a
-	// notification (never filled) — it is still passed through untouched.
+	// isBatch. An item whose id cannot be read is recorded as empty and expects a null-id
+	// response, which is what a node returns for it — it is still passed through untouched.
 	batchRequestIDs []jsonrpc.ID
 
 	// endpointSelector is the selector used for choosing endpoints.
@@ -91,7 +91,7 @@ func (rc *requestContext) GetServicePayloads() []protocol.Payload {
 					var probe struct {
 						ID jsonrpc.ID `json:"id"`
 					}
-					_ = json.Unmarshal(item, &probe) // unreadable id → empty → notification
+					_ = json.Unmarshal(item, &probe) // unreadable id → empty → expects a null-id response
 					rc.batchRequestIDs = append(rc.batchRequestIDs, probe.ID)
 					payloads = append(payloads, protocol.Payload{
 						Data:    string(item),

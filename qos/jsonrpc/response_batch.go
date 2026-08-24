@@ -78,9 +78,11 @@ func ValidateAndBuildBatchResponse(
 //     not collapsed: two id:1 requests keep two id:1 responses.
 //   - Surplus responses for an id are trimmed from the front: the LATEST responses win, the
 //     same rule the single-request path applies.
-//   - A null-id response is the endpoint saying it could not read a request's id. It already
-//     stands in for one missing request (see validateResponseIDs) and is not doubled up.
-//   - Notifications (no id) never get a response object and are never filled.
+//   - A request without an id is not a notification here: every item is relayed on its own
+//     with "id":null written out and the node answers it with a null-id response. It expects
+//     one response like any other, and is filled with a null-id error if it gets none.
+//   - A null-id response beyond those is the endpoint saying it could not read a request's
+//     id. It stands in for one missing request (see validateResponseIDs) and is not doubled up.
 //   - The id keeps its JSON type: the typed ID from servicePayloads is used, not a string.
 func reconcileResponses(logger polylog.Logger, responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) []json.RawMessage {
 	requestIDs := make([]ID, 0, len(servicePayloads))
@@ -92,21 +94,20 @@ func reconcileResponses(logger polylog.Logger, responses []json.RawMessage, serv
 
 // ReconcileBatchResponses is reconcileResponses for callers that hold the batch's request
 // ids as a list rather than a payload map (the pass-through QoS keeps no typed payloads).
-// Same rules; a request id that is empty is a notification and is skipped.
+// Same rules. An empty request id is keyed as "null", matching ID.String.
 func ReconcileBatchResponses(logger polylog.Logger, responses []json.RawMessage, requestIDs []ID) []json.RawMessage {
 	// Requests awaiting a response, by id value. One typed representative per value.
 	pending := make(map[string]int, len(requestIDs))
 	representative := make(map[string]ID, len(requestIDs))
 	for _, reqID := range requestIDs {
-		if reqID.IsEmpty() {
-			continue // notification
-		}
 		key := reqID.String()
 		pending[key]++
 		representative[key] = reqID
 	}
+	nullKey := ID{}.String()
 
-	// Positions of the responses carrying each id, in arrival order.
+	// Positions of the responses carrying each id, in arrival order. Null-id responses are
+	// first matched to id-less requests; any beyond those are wildcards (see below).
 	positions := make(map[string][]int, len(pending))
 	nullIDResponses := 0
 	for i, respMsg := range responses {
@@ -114,11 +115,12 @@ func ReconcileBatchResponses(logger polylog.Logger, responses []json.RawMessage,
 		if err := json.Unmarshal(respMsg, &resp); err != nil {
 			continue // counted by length validation; not attributable to any request here
 		}
-		if resp.ID.IsEmpty() {
-			nullIDResponses++
+		key := resp.ID.String()
+		if resp.ID.IsEmpty() && len(positions[nullKey]) >= pending[nullKey] {
+			nullIDResponses++ // wildcard: no id-less request left for it to answer
 			continue
 		}
-		positions[resp.ID.String()] = append(positions[resp.ID.String()], i)
+		positions[key] = append(positions[key], i)
 	}
 
 	// Trim surplus: keep the last pending[key] responses for each id.
@@ -186,18 +188,12 @@ func ReconcileBatchResponses(logger polylog.Logger, responses []json.RawMessage,
 	return responses
 }
 
-// validateResponseLength ensures response count matches the count of requests that expect
-// a response (notifications — requests without an id — do not get one).
+// validateResponseLength ensures response count matches request count. Every request in
+// the batch expects exactly one response, id or not — see reconcileResponses.
 func validateResponseLength(responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) error {
-	expected := 0
-	for reqID := range servicePayloads {
-		if !reqID.IsEmpty() {
-			expected++
-		}
-	}
-	if len(responses) != expected {
+	if len(responses) != len(servicePayloads) {
 		return fmt.Errorf("%w: expected %d responses, got %d",
-			ErrBatchResponseLengthMismatch, expected, len(responses))
+			ErrBatchResponseLengthMismatch, len(servicePayloads), len(responses))
 	}
 	return nil
 }
@@ -239,12 +235,9 @@ func validateResponseIDs(responses []json.RawMessage, servicePayloads map[ID]pro
 		_ = found
 	}
 
-	// Count unmatched request IDs. Notifications (no id) expect no response.
+	// Count unmatched request IDs
 	unmatchedCount := 0
 	for reqID := range servicePayloads {
-		if reqID.IsEmpty() {
-			continue
-		}
 		if !matchedRequestIDs[reqID.String()] {
 			unmatchedCount++
 		}
