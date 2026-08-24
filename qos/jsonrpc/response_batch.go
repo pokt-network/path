@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -51,6 +52,20 @@ func ValidateAndBuildBatchResponse(
 	return marshalBatchResponse(responses)
 }
 
+// responseIDOf reads only the id of a raw response. A supplier's answer does not always
+// unmarshal as a Response — an error given as a bare string, an id of a type the parser
+// rejects — but it is still an answer to some item, and its id is usually readable.
+// ok is false when no id can be read at all (including invalid JSON).
+func responseIDOf(raw json.RawMessage) (id ID, ok bool) {
+	var probe struct {
+		ID ID `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return ID{}, false
+	}
+	return probe.ID, true
+}
+
 // reconcileResponses makes the collected responses line up one-to-one with the batch's
 // requests before validation: it drops surplus responses for an id and fills in an error
 // object for every request that has none.
@@ -83,6 +98,9 @@ func ValidateAndBuildBatchResponse(
 //     one response like any other, and is filled with a null-id error if it gets none.
 //   - A null-id response beyond those is the endpoint saying it could not read a request's
 //     id. It stands in for one missing request (see validateResponseIDs) and is not doubled up.
+//   - A response whose id cannot be read at all is likewise unattributable and stands in for
+//     one missing request; it is kept if it is valid JSON and dropped if it is not (it could
+//     not be placed in the array anyway). Filling on top of it made the batch one long.
 //   - The id keeps its JSON type: the typed ID from servicePayloads is used, not a string.
 func reconcileResponses(logger polylog.Logger, responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) []json.RawMessage {
 	requestIDs := make([]ID, 0, len(servicePayloads))
@@ -107,25 +125,31 @@ func ReconcileBatchResponses(logger polylog.Logger, responses []json.RawMessage,
 	nullKey := ID{}.String()
 
 	// Positions of the responses carrying each id, in arrival order. Null-id responses are
-	// first matched to id-less requests; any beyond those are wildcards (see below).
+	// first matched to id-less requests; any beyond those, and responses with no readable
+	// id, are wildcards (see below). Invalid JSON is dropped outright.
 	positions := make(map[string][]int, len(pending))
-	nullIDResponses := 0
+	wildcards := 0
+	drop := make(map[int]bool)
 	for i, respMsg := range responses {
-		var resp Response
-		if err := json.Unmarshal(respMsg, &resp); err != nil {
-			continue // counted by length validation; not attributable to any request here
+		id, ok := responseIDOf(respMsg)
+		if !ok {
+			if !json.Valid(respMsg) {
+				drop[i] = true
+				continue
+			}
+			wildcards++
+			continue
 		}
-		key := resp.ID.String()
-		if resp.ID.IsEmpty() && len(positions[nullKey]) >= pending[nullKey] {
-			nullIDResponses++ // wildcard: no id-less request left for it to answer
+		key := id.String()
+		if id.IsEmpty() && len(positions[nullKey]) >= pending[nullKey] {
+			wildcards++ // no id-less request left for it to answer
 			continue
 		}
 		positions[key] = append(positions[key], i)
 	}
 
 	// Trim surplus: keep the last pending[key] responses for each id.
-	drop := make(map[int]bool)
-	trimmed := 0
+	trimmed := len(drop)
 	for key, idx := range positions {
 		want := pending[key]
 		if len(idx) > want {
@@ -157,9 +181,9 @@ func ReconcileBatchResponses(logger polylog.Logger, responses []json.RawMessage,
 	}
 	sort.Strings(missing)
 
-	// Null-id responses cover missing requests first, as the id validation already allows.
-	if nullIDResponses < len(missing) {
-		missing = missing[nullIDResponses:]
+	// Wildcards cover missing requests first, as the id validation already allows.
+	if wildcards < len(missing) {
+		missing = missing[wildcards:]
 	} else {
 		missing = nil
 	}
@@ -192,10 +216,30 @@ func ReconcileBatchResponses(logger polylog.Logger, responses []json.RawMessage,
 // the batch expects exactly one response, id or not — see reconcileResponses.
 func validateResponseLength(responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) error {
 	if len(responses) != len(servicePayloads) {
-		return fmt.Errorf("%w: expected %d responses, got %d",
-			ErrBatchResponseLengthMismatch, len(servicePayloads), len(responses))
+		return fmt.Errorf("%w: expected %d responses, got %d (response ids: %s)",
+			ErrBatchResponseLengthMismatch, len(servicePayloads), len(responses), summarizeResponseIDs(responses))
 	}
 	return nil
+}
+
+// summarizeResponseIDs lists the ids of the responses, bounded, for the mismatch error — the
+// only thing that has ever told the shapes of this failure apart in production. "?" marks a
+// response whose id could not be read.
+func summarizeResponseIDs(responses []json.RawMessage) string {
+	const maxIDs = 24
+	ids := make([]string, 0, len(responses))
+	for i, respMsg := range responses {
+		if i == maxIDs {
+			ids = append(ids, fmt.Sprintf("…+%d", len(responses)-maxIDs))
+			break
+		}
+		if id, ok := responseIDOf(respMsg); ok {
+			ids = append(ids, id.String())
+		} else {
+			ids = append(ids, "?")
+		}
+	}
+	return "[" + strings.Join(ids, ",") + "]"
 }
 
 // validateResponseIDs ensures all request IDs are present in the responses.
@@ -208,31 +252,22 @@ func validateResponseIDs(responses []json.RawMessage, servicePayloads map[ID]pro
 	nullIDCount := 0
 	matchedRequestIDs := make(map[string]bool)
 
-	for i, respMsg := range responses {
-		var resp Response
-		if err := json.Unmarshal(respMsg, &resp); err != nil {
-			// Log unmarshal error for debugging
-			_ = i    // prevent unused variable warning
-			continue // Skip invalid responses - they'll be handled elsewhere
-		}
-
-		// Check if this response has a null ID
-		if resp.ID.IsEmpty() {
+	for _, respMsg := range responses {
+		// Same id reading as reconcileResponses: a response with no readable id is as much
+		// a wildcard as one with a null id — it answers something, we cannot say what.
+		respID, ok := responseIDOf(respMsg)
+		if !ok || respID.IsEmpty() {
 			nullIDCount++
 			continue
 		}
 
 		// Find matching request ID
-		found := false
 		for reqID := range servicePayloads {
-			if reqID.Equal(resp.ID) {
+			if reqID.Equal(respID) {
 				matchedRequestIDs[reqID.String()] = true
-				found = true
 				break
 			}
 		}
-		// Debug: if not found, this is the problematic response
-		_ = found
 	}
 
 	// Count unmatched request IDs

@@ -181,3 +181,74 @@ func TestValidateAndBuildBatchResponse_SurplusWithDuplicateValueIDsKeepsOnePerRe
 	require.Len(t, got, 2)
 	require.ElementsMatch(t, []string{`"second"`, `"third"`}, []string{string(*got[0].Result), string(*got[1].Result)})
 }
+
+// A response that can be attributed to no request — an id the batch never sent, or bytes that
+// are not a JSON-RPC response at all — is still the supplier's answer to SOME item. Filling
+// the item it most likely belongs to on top of it made the batch one response long
+// ("expected N, got N+1"), and the length check threw the whole batch away. Like a null-id
+// response, an unattributable one stands in for a missing request; only requests beyond
+// those are filled.
+func TestValidateAndBuildBatchResponse_UnattributableResponseCoversAMissingRequest(t *testing.T) {
+	logger := polyzero.NewLogger()
+	payloads := map[ID]protocol.Payload{
+		IDFromInt(1): {Data: `{"id":1}`},
+		IDFromInt(2): {Data: `{"id":2}`},
+	}
+
+	t.Run("unknown id", func(t *testing.T) {
+		out, err := ValidateAndBuildBatchResponse(logger, []json.RawMessage{
+			json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"0x1"}`),
+			json.RawMessage(`{"jsonrpc":"2.0","id":99,"error":{"code":-32000,"message":"relayer error"}}`),
+		}, payloads)
+		require.NoError(t, err)
+		var got []Response
+		require.NoError(t, json.Unmarshal(out, &got))
+		require.Len(t, got, 2, "%s", out)
+	})
+
+	t.Run("not a json-rpc response", func(t *testing.T) {
+		out, err := ValidateAndBuildBatchResponse(logger, []json.RawMessage{
+			json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"0x1"}`),
+			json.RawMessage(`{"jsonrpc":"2.0","id":2.5,"result":"0x2"}`), // id type the parser rejects
+		}, payloads)
+		require.NoError(t, err)
+		var got []json.RawMessage
+		require.NoError(t, json.Unmarshal(out, &got))
+		require.Len(t, got, 2, "%s", out)
+	})
+
+	t.Run("unattributable plus a genuinely missing request is filled once", func(t *testing.T) {
+		three := map[ID]protocol.Payload{
+			IDFromInt(1): {Data: `{"id":1}`},
+			IDFromInt(2): {Data: `{"id":2}`},
+			IDFromInt(3): {Data: `{"id":3}`},
+		}
+		out, err := ValidateAndBuildBatchResponse(logger, []json.RawMessage{
+			json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"0x1"}`),
+			json.RawMessage(`{"jsonrpc":"2.0","id":99,"result":"0x2"}`),
+		}, three)
+		require.NoError(t, err)
+		var got []Response
+		require.NoError(t, json.Unmarshal(out, &got))
+		require.Len(t, got, 3, "%s", out)
+	})
+}
+
+// The likely production shape: a relay-miner or proxy error with "error" as a bare string.
+// It does not unmarshal as a Response, but its id is right there — attribute it, do not fill.
+func TestValidateAndBuildBatchResponse_StringErrorResponseIsAttributedByID(t *testing.T) {
+	logger := polyzero.NewLogger()
+	payloads := map[ID]protocol.Payload{
+		IDFromInt(1): {Data: `{"id":1}`},
+		IDFromInt(2): {Data: `{"id":2}`},
+	}
+	out, err := ValidateAndBuildBatchResponse(logger, []json.RawMessage{
+		json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"0x1"}`),
+		json.RawMessage(`{"jsonrpc":"2.0","id":2,"error":"upstream request timeout"}`),
+	}, payloads)
+	require.NoError(t, err)
+	var got []json.RawMessage
+	require.NoError(t, json.Unmarshal(out, &got))
+	require.Len(t, got, 2, "%s", out)
+	require.Contains(t, string(out), `"upstream request timeout"`, "the supplier's own answer is returned, not a synthesized one")
+}
