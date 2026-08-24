@@ -96,6 +96,7 @@ func (n *NoOpQoS) ParseHTTPRequest(_ context.Context, httpRequest *http.Request,
 	}
 
 	return &requestContext{
+		logger:            n.logger,
 		httpRequestBody:   bz,
 		httpRequestMethod: httpRequest.Method,
 		httpRequestPath:   httpRequest.URL.Path,

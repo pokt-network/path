@@ -73,10 +73,21 @@ func ValidateAndBuildBatchResponse(
 //   - Notifications (no id) never get a response object and are never filled.
 //   - The id keeps its JSON type: the typed ID from servicePayloads is used, not a string.
 func fillMissingResponses(logger polylog.Logger, responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) []json.RawMessage {
-	// Requests awaiting a response, by id value. One typed representative per value.
-	pending := make(map[string]int, len(servicePayloads))
-	representative := make(map[string]ID, len(servicePayloads))
+	requestIDs := make([]ID, 0, len(servicePayloads))
 	for reqID := range servicePayloads {
+		requestIDs = append(requestIDs, reqID)
+	}
+	return FillMissingBatchResponses(logger, responses, requestIDs)
+}
+
+// FillMissingBatchResponses is fillMissingResponses for callers that hold the batch's request
+// ids as a list rather than a payload map (the pass-through QoS keeps no typed payloads). Same
+// rules; a request id that is empty is a notification and is skipped.
+func FillMissingBatchResponses(logger polylog.Logger, responses []json.RawMessage, requestIDs []ID) []json.RawMessage {
+	// Requests awaiting a response, by id value. One typed representative per value.
+	pending := make(map[string]int, len(requestIDs))
+	representative := make(map[string]ID, len(requestIDs))
+	for _, reqID := range requestIDs {
 		if reqID.IsEmpty() {
 			continue // notification
 		}
@@ -116,7 +127,7 @@ func fillMissingResponses(logger polylog.Logger, responses []json.RawMessage, se
 	missing = missing[nullIDResponses:]
 
 	logger.Warn().
-		Int("batch_requests", len(servicePayloads)).
+		Int("batch_requests", len(requestIDs)).
 		Int("responses_received", len(responses)).
 		Int("responses_filled", len(missing)).
 		Msg("Batch items without any endpoint response: returning a per-request error object for each")
