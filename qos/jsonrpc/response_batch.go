@@ -34,8 +34,8 @@ func ValidateAndBuildBatchResponse(
 	responses []json.RawMessage,
 	servicePayloads map[ID]protocol.Payload,
 ) ([]byte, error) {
-	// A request nothing answered still gets a response object of its own.
-	responses = fillMissingResponses(logger, responses, servicePayloads)
+	// One response object per request object: drop surplus, fill missing.
+	responses = reconcileResponses(logger, responses, servicePayloads)
 
 	// Validate response length matches request length
 	if err := validateResponseLength(responses, servicePayloads); err != nil {
@@ -51,14 +51,22 @@ func ValidateAndBuildBatchResponse(
 	return marshalBatchResponse(responses)
 }
 
-// fillMissingResponses appends an error response object, carrying the request's own id, for
-// every request in the batch that has no response.
+// reconcileResponses makes the collected responses line up one-to-one with the batch's
+// requests before validation: it drops surplus responses for an id and fills in an error
+// object for every request that has none.
 //
-// A batch item that fails every attempt (transport error, no endpoint left to try) produces
-// no body, so the collected responses came up one short of the requests. The length check
-// below then rejected the WHOLE batch with a single id:null error — every other item's
-// answer, already relayed and paid for, thrown away because one item had none. Measured on
-// one batch-heavy service at ~7-8% of all requests, almost all of them "expected N, got N-1".
+// Missing (fewer responses than requests): a batch item that fails every attempt (transport
+// error, no endpoint left to try) produces no body, so the collected responses came up one
+// short of the requests. The length check below then rejected the WHOLE batch with a single
+// id:null error — every other item's answer, already relayed and paid for, thrown away
+// because one item had none. Every retained log line of that failure on one batch-heavy
+// service was "expected N, got N-1" or close.
+//
+// Surplus (more responses than requests): a one-element batch is a batch, but with one
+// payload it runs down the single-request path, which records every response it saw — the
+// attempt that failed and then the retry that succeeded, or all N answers of a parallel
+// fan-out. The single path returns the latest; the batch assembler collected all of them,
+// saw 2 for 1, and replaced a request that had SUCCEEDED with an id:null error.
 //
 // Per JSON-RPC 2.0 every request object in a batch gets exactly one response object; a
 // request the server could not serve gets an error object with that request's id, next to
@@ -67,23 +75,25 @@ func ValidateAndBuildBatchResponse(
 //
 // Rules:
 //   - Matching is by id value (ID.String), so same-value ids — legal in a batch — are counted,
-//     not collapsed: two id:1 requests with one id:1 response are one short.
+//     not collapsed: two id:1 requests keep two id:1 responses.
+//   - Surplus responses for an id are trimmed from the front: the LATEST responses win, the
+//     same rule the single-request path applies.
 //   - A null-id response is the endpoint saying it could not read a request's id. It already
 //     stands in for one missing request (see validateResponseIDs) and is not doubled up.
 //   - Notifications (no id) never get a response object and are never filled.
 //   - The id keeps its JSON type: the typed ID from servicePayloads is used, not a string.
-func fillMissingResponses(logger polylog.Logger, responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) []json.RawMessage {
+func reconcileResponses(logger polylog.Logger, responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) []json.RawMessage {
 	requestIDs := make([]ID, 0, len(servicePayloads))
 	for reqID := range servicePayloads {
 		requestIDs = append(requestIDs, reqID)
 	}
-	return FillMissingBatchResponses(logger, responses, requestIDs)
+	return ReconcileBatchResponses(logger, responses, requestIDs)
 }
 
-// FillMissingBatchResponses is fillMissingResponses for callers that hold the batch's request
-// ids as a list rather than a payload map (the pass-through QoS keeps no typed payloads). Same
-// rules; a request id that is empty is a notification and is skipped.
-func FillMissingBatchResponses(logger polylog.Logger, responses []json.RawMessage, requestIDs []ID) []json.RawMessage {
+// ReconcileBatchResponses is reconcileResponses for callers that hold the batch's request
+// ids as a list rather than a payload map (the pass-through QoS keeps no typed payloads).
+// Same rules; a request id that is empty is a notification and is skipped.
+func ReconcileBatchResponses(logger polylog.Logger, responses []json.RawMessage, requestIDs []ID) []json.RawMessage {
 	// Requests awaiting a response, by id value. One typed representative per value.
 	pending := make(map[string]int, len(requestIDs))
 	representative := make(map[string]ID, len(requestIDs))
@@ -96,8 +106,10 @@ func FillMissingBatchResponses(logger polylog.Logger, responses []json.RawMessag
 		representative[key] = reqID
 	}
 
+	// Positions of the responses carrying each id, in arrival order.
+	positions := make(map[string][]int, len(pending))
 	nullIDResponses := 0
-	for _, respMsg := range responses {
+	for i, respMsg := range responses {
 		var resp Response
 		if err := json.Unmarshal(respMsg, &resp); err != nil {
 			continue // counted by length validation; not attributable to any request here
@@ -106,9 +118,32 @@ func FillMissingBatchResponses(logger polylog.Logger, responses []json.RawMessag
 			nullIDResponses++
 			continue
 		}
-		if key := resp.ID.String(); pending[key] > 0 {
-			pending[key]--
+		positions[resp.ID.String()] = append(positions[resp.ID.String()], i)
+	}
+
+	// Trim surplus: keep the last pending[key] responses for each id.
+	drop := make(map[int]bool)
+	trimmed := 0
+	for key, idx := range positions {
+		want := pending[key]
+		if len(idx) > want {
+			for _, i := range idx[:len(idx)-want] {
+				drop[i] = true
+			}
+			trimmed += len(idx) - want
+			pending[key] = 0
+		} else {
+			pending[key] -= len(idx)
 		}
+	}
+	if len(drop) > 0 {
+		kept := make([]json.RawMessage, 0, len(responses)-len(drop))
+		for i, respMsg := range responses {
+			if !drop[i] {
+				kept = append(kept, respMsg)
+			}
+		}
+		responses = kept
 	}
 
 	// Deterministic order so the same batch always fills the same way.
@@ -121,16 +156,22 @@ func FillMissingBatchResponses(logger polylog.Logger, responses []json.RawMessag
 	sort.Strings(missing)
 
 	// Null-id responses cover missing requests first, as the id validation already allows.
-	if nullIDResponses >= len(missing) {
+	if nullIDResponses < len(missing) {
+		missing = missing[nullIDResponses:]
+	} else {
+		missing = nil
+	}
+
+	if trimmed == 0 && len(missing) == 0 {
 		return responses
 	}
-	missing = missing[nullIDResponses:]
 
 	logger.Warn().
 		Int("batch_requests", len(requestIDs)).
-		Int("responses_received", len(responses)).
+		Int("responses_received", len(responses)+trimmed).
+		Int("responses_trimmed", trimmed).
 		Int("responses_filled", len(missing)).
-		Msg("Batch items without any endpoint response: returning a per-request error object for each")
+		Msg("Batch responses reconciled to one per request: surplus dropped (latest kept), missing filled with a per-request error object")
 
 	for _, key := range missing {
 		errResp := NewErrResponseNoEndpointResponse(representative[key])

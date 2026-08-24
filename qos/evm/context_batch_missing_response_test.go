@@ -50,3 +50,27 @@ func TestGetHTTPResponse_BatchItemWithoutResponseGetsItsOwnErrorObject(t *testin
 	require.Equal(t, jsonrpc.ResponseCodeDefaultInternalErr, byID["2"].Error.Code)
 	require.NotContains(t, string(resp.GetPayload()), "length mismatch")
 }
+
+// The mirror image: a one-element batch `[{...}]` is a batch, but with one payload the
+// gateway runs it down the single-request path, which records EVERY response it saw — the
+// failed attempt and then the retry that succeeded (or all N answers of a parallel fan-out).
+// The single path returns the latest and is fine; the batch assembler collected both, saw 2
+// responses for 1 request, and replaced a request that had SUCCEEDED with id:null -31001.
+func TestGetHTTPResponse_OneElementBatchRetriedReturnsTheLatestResponse(t *testing.T) {
+	rc := &requestContext{
+		logger:  polyzero.NewLogger(),
+		isBatch: true,
+		servicePayloads: map[jsonrpc.ID]protocol.Payload{
+			jsonrpc.IDFromInt(1): {Data: `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`},
+		},
+	}
+	rc.UpdateWithResponse("pokt1a-https://a.example.com", []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}`), http.StatusInternalServerError, "1")
+	rc.UpdateWithResponse("pokt1b-https://b.example.com", []byte(`{"jsonrpc":"2.0","id":1,"result":"0x10"}`), http.StatusOK, "1")
+
+	resp := rc.GetHTTPResponse()
+	var got []jsonrpc.Response
+	require.NoError(t, json.Unmarshal(resp.GetPayload(), &got), "payload: %s", resp.GetPayload())
+	require.Len(t, got, 1, "one response object per request object; payload: %s", resp.GetPayload())
+	require.Nil(t, got[0].Error, "the retry succeeded; the client must get that answer, not the failed attempt")
+	require.NotContains(t, string(resp.GetPayload()), "length mismatch")
+}

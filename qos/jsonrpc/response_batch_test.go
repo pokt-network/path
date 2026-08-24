@@ -109,3 +109,49 @@ func TestValidateAndBuildBatchResponse_NotificationsAreNotFilled(t *testing.T) {
 	require.NoError(t, json.Unmarshal(out, &got))
 	require.Len(t, got, 1)
 }
+
+// More responses than requests for one id: keep the LAST one per request slot (a retry's
+// success supersedes the attempt that failed), never reject the batch.
+func TestValidateAndBuildBatchResponse_SurplusResponsesForAnIDKeepTheLatest(t *testing.T) {
+	logger := polyzero.NewLogger()
+	payloads := map[ID]protocol.Payload{
+		IDFromInt(1): {Data: `{"id":1}`},
+		IDFromInt(2): {Data: `{"id":2}`},
+	}
+	out, err := ValidateAndBuildBatchResponse(logger, []json.RawMessage{
+		json.RawMessage(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}`),
+		json.RawMessage(`{"jsonrpc":"2.0","id":2,"result":"0x2"}`),
+		json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"0x1"}`),
+	}, payloads)
+	require.NoError(t, err)
+	var got []Response
+	require.NoError(t, json.Unmarshal(out, &got))
+	require.Len(t, got, 2)
+	byID := map[string]Response{}
+	for _, r := range got {
+		byID[r.ID.String()] = r
+	}
+	require.Nil(t, byID["1"].Error, "the later (successful) response for id 1 wins")
+	require.JSONEq(t, `"0x1"`, string(*byID["1"].Result))
+	require.JSONEq(t, `"0x2"`, string(*byID["2"].Result))
+}
+
+// Same-value ids: two id:1 requests keep two id:1 responses — the LAST two.
+func TestValidateAndBuildBatchResponse_SurplusWithDuplicateValueIDsKeepsOnePerRequest(t *testing.T) {
+	logger := polyzero.NewLogger()
+	payloads := map[ID]protocol.Payload{
+		IDFromInt(1): {Data: `{"id":1}`},
+		IDFromInt(1): {Data: `{"id":1}`},
+	}
+	require.Len(t, payloads, 2)
+	out, err := ValidateAndBuildBatchResponse(logger, []json.RawMessage{
+		json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"first"}`),
+		json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"second"}`),
+		json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":"third"}`),
+	}, payloads)
+	require.NoError(t, err)
+	var got []Response
+	require.NoError(t, json.Unmarshal(out, &got))
+	require.Len(t, got, 2)
+	require.ElementsMatch(t, []string{`"second"`, `"third"`}, []string{string(*got[0].Result), string(*got[1].Result)})
+}

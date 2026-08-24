@@ -171,10 +171,11 @@ func (rc *requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 			return getNoEndpointResponse()
 		}
 
-		// An item that failed every attempt arrived with no body and was skipped above. It
-		// still gets a response object — an error carrying its own id — rather than silently
-		// vanishing from the array the client correlates on.
-		items = jsonrpc.FillMissingBatchResponses(rc.logger, items, rc.batchRequestIDs)
+		// One response object per request object. An item that failed every attempt arrived
+		// with no body and was skipped above: it still gets an error object carrying its own
+		// id rather than silently vanishing from the array the client correlates on. A
+		// one-element batch that retried recorded every attempt: the latest is kept.
+		items = jsonrpc.ReconcileBatchResponses(rc.logger, items, rc.batchRequestIDs)
 
 		batchPayload, err := json.Marshal(items)
 		if err != nil {
