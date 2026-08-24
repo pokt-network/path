@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/pokt-network/path/protocol"
 	"github.com/pokt-network/poktroll/pkg/polylog"
@@ -33,6 +34,9 @@ func ValidateAndBuildBatchResponse(
 	responses []json.RawMessage,
 	servicePayloads map[ID]protocol.Payload,
 ) ([]byte, error) {
+	// A request nothing answered still gets a response object of its own.
+	responses = fillMissingResponses(logger, responses, servicePayloads)
+
 	// Validate response length matches request length
 	if err := validateResponseLength(responses, servicePayloads); err != nil {
 		return nil, err
@@ -47,11 +51,101 @@ func ValidateAndBuildBatchResponse(
 	return marshalBatchResponse(responses)
 }
 
-// validateResponseLength ensures response count matches request count
+// fillMissingResponses appends an error response object, carrying the request's own id, for
+// every request in the batch that has no response.
+//
+// A batch item that fails every attempt (transport error, no endpoint left to try) produces
+// no body, so the collected responses came up one short of the requests. The length check
+// below then rejected the WHOLE batch with a single id:null error — every other item's
+// answer, already relayed and paid for, thrown away because one item had none. Measured on
+// one batch-heavy service at ~7-8% of all requests, almost all of them "expected N, got N-1".
+//
+// Per JSON-RPC 2.0 every request object in a batch gets exactly one response object; a
+// request the server could not serve gets an error object with that request's id, next to
+// the successes. That is what the single-request path already returns (responseNone), and
+// what a node does.
+//
+// Rules:
+//   - Matching is by id value (ID.String), so same-value ids — legal in a batch — are counted,
+//     not collapsed: two id:1 requests with one id:1 response are one short.
+//   - A null-id response is the endpoint saying it could not read a request's id. It already
+//     stands in for one missing request (see validateResponseIDs) and is not doubled up.
+//   - Notifications (no id) never get a response object and are never filled.
+//   - The id keeps its JSON type: the typed ID from servicePayloads is used, not a string.
+func fillMissingResponses(logger polylog.Logger, responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) []json.RawMessage {
+	// Requests awaiting a response, by id value. One typed representative per value.
+	pending := make(map[string]int, len(servicePayloads))
+	representative := make(map[string]ID, len(servicePayloads))
+	for reqID := range servicePayloads {
+		if reqID.IsEmpty() {
+			continue // notification
+		}
+		key := reqID.String()
+		pending[key]++
+		representative[key] = reqID
+	}
+
+	nullIDResponses := 0
+	for _, respMsg := range responses {
+		var resp Response
+		if err := json.Unmarshal(respMsg, &resp); err != nil {
+			continue // counted by length validation; not attributable to any request here
+		}
+		if resp.ID.IsEmpty() {
+			nullIDResponses++
+			continue
+		}
+		if key := resp.ID.String(); pending[key] > 0 {
+			pending[key]--
+		}
+	}
+
+	// Deterministic order so the same batch always fills the same way.
+	missing := make([]string, 0, len(pending))
+	for key, n := range pending {
+		for i := 0; i < n; i++ {
+			missing = append(missing, key)
+		}
+	}
+	sort.Strings(missing)
+
+	// Null-id responses cover missing requests first, as the id validation already allows.
+	if nullIDResponses >= len(missing) {
+		return responses
+	}
+	missing = missing[nullIDResponses:]
+
+	logger.Warn().
+		Int("batch_requests", len(servicePayloads)).
+		Int("responses_received", len(responses)).
+		Int("responses_filled", len(missing)).
+		Msg("Batch items without any endpoint response: returning a per-request error object for each")
+
+	for _, key := range missing {
+		errResp := NewErrResponseNoEndpointResponse(representative[key])
+		bz, err := json.Marshal(errResp)
+		if err != nil {
+			// Cannot happen for a Response built here; leave the length check to report it.
+			logger.Error().Err(err).Msg("failed to marshal synthesized batch error response")
+			continue
+		}
+		responses = append(responses, json.RawMessage(bz))
+	}
+	return responses
+}
+
+// validateResponseLength ensures response count matches the count of requests that expect
+// a response (notifications — requests without an id — do not get one).
 func validateResponseLength(responses []json.RawMessage, servicePayloads map[ID]protocol.Payload) error {
-	if len(responses) != len(servicePayloads) {
+	expected := 0
+	for reqID := range servicePayloads {
+		if !reqID.IsEmpty() {
+			expected++
+		}
+	}
+	if len(responses) != expected {
 		return fmt.Errorf("%w: expected %d responses, got %d",
-			ErrBatchResponseLengthMismatch, len(servicePayloads), len(responses))
+			ErrBatchResponseLengthMismatch, expected, len(responses))
 	}
 	return nil
 }
@@ -93,9 +187,12 @@ func validateResponseIDs(responses []json.RawMessage, servicePayloads map[ID]pro
 		_ = found
 	}
 
-	// Count unmatched request IDs
+	// Count unmatched request IDs. Notifications (no id) expect no response.
 	unmatchedCount := 0
 	for reqID := range servicePayloads {
+		if reqID.IsEmpty() {
+			continue
+		}
 		if !matchedRequestIDs[reqID.String()] {
 			unmatchedCount++
 		}
