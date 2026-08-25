@@ -84,7 +84,11 @@ func getCometBFTTestMethods() []string {
 		cometbftMethodCommit,
 		cometbftMethodABCIInfo,
 		cometbftMethodBlock,
-		cometbftMethodBlockResults,
+		// block_results is a heavy call that operators commonly disable at the node
+		// (custom middleware answering -32603 "block_results disabled"). Every reachable
+		// pocket supplier refuses it, so the shard fails on every run regardless of the
+		// branch under test. Re-enable if suppliers start serving it.
+		// cometbftMethodBlockResults,
 		cometbftMethodValidators,
 	}
 }
