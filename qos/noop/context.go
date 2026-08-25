@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/pokt-network/poktroll/pkg/polylog"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 
 	"github.com/pokt-network/path/gateway"
 	pathhttp "github.com/pokt-network/path/network/http"
 	qosobservations "github.com/pokt-network/path/observation/qos"
 	"github.com/pokt-network/path/protocol"
+	"github.com/pokt-network/path/qos/jsonrpc"
 )
 
 // requestContext implements all the functionality required by gateway.RequestQoSContext interface.
@@ -53,6 +55,15 @@ type requestContext struct {
 	// Set by GetServicePayloads when batch splitting occurs.
 	isBatch bool
 
+	// logger is the QoS service's logger; used only to report batch items that got no response.
+	logger polylog.Logger
+
+	// batchRequestIDs holds each batch item's id, in item order, so an item that gets no
+	// response can still be answered with an error object carrying its own id. Set alongside
+	// isBatch. An item whose id cannot be read is recorded as empty and expects a null-id
+	// response, which is what a node returns for it — it is still passed through untouched.
+	batchRequestIDs []jsonrpc.ID
+
 	// endpointSelector is the selector used for choosing endpoints.
 	// When block height tracking is active, this performs sync-allowance filtering.
 	endpointSelector protocol.EndpointSelector
@@ -74,8 +85,14 @@ func (rc *requestContext) GetServicePayloads() []protocol.Payload {
 			var items []json.RawMessage
 			if err := json.Unmarshal(trimmed, &items); err == nil && len(items) > 1 {
 				rc.isBatch = true
+				rc.batchRequestIDs = make([]jsonrpc.ID, 0, len(items))
 				payloads := make([]protocol.Payload, 0, len(items))
 				for _, item := range items {
+					var probe struct {
+						ID jsonrpc.ID `json:"id"`
+					}
+					_ = json.Unmarshal(item, &probe) // unreadable id → empty → expects a null-id response
+					rc.batchRequestIDs = append(rc.batchRequestIDs, probe.ID)
 					payloads = append(payloads, protocol.Payload{
 						Data:    string(item),
 						Method:  rc.httpRequestMethod,
@@ -153,6 +170,12 @@ func (rc *requestContext) GetHTTPResponse() pathhttp.HTTPResponse {
 		if len(items) == 0 {
 			return getNoEndpointResponse()
 		}
+
+		// One response object per request object. An item that failed every attempt arrived
+		// with no body and was skipped above: it still gets an error object carrying its own
+		// id rather than silently vanishing from the array the client correlates on. A
+		// one-element batch that retried recorded every attempt: the latest is kept.
+		items = jsonrpc.ReconcileBatchResponses(rc.logger, items, rc.batchRequestIDs)
 
 		batchPayload, err := json.Marshal(items)
 		if err != nil {

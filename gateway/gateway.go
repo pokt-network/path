@@ -74,6 +74,11 @@ type Gateway struct {
 	// Optional - if nil, no cross-pod domain circuit breaking occurs.
 	DomainCircuitBreaker *DomainCircuitBreaker
 
+	// RequestSampler fingerprints one request in N per service to answer whether a
+	// service's traffic is diverse or the same few requests repeated. nil disables it.
+	// Backs GET /admin/request-sample/{serviceId}.
+	RequestSampler *RequestSampler
+
 	// WebsocketConnectionLimiter bounds the number of concurrent live websocket
 	// connections held open by this gateway. Optional - if nil, no limit is applied.
 	WebsocketConnectionLimiter *WebsocketConnectionLimiter
@@ -159,6 +164,10 @@ func (g Gateway) handleHTTPServiceRequest(
 		logger.Error().Err(err).Msg("❌ RPC type validation failed")
 		return
 	}
+
+	// Sample the request shape (method + params) — before any relay, so the sample
+	// describes what clients send rather than what succeeded.
+	g.RequestSampler.Observe(gatewayRequestCtx.serviceID, httpReq.Method, httpReq.URL.Path, gatewayRequestCtx.httpRequestBody)
 
 	// TODO_CHECK_IF_DONE(@adshmh): Pass the context with deadline to QoS once it can handle deadlines.
 	// Build the QoS context for the target service ID using the HTTP request's payload.

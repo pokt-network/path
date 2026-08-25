@@ -199,8 +199,11 @@ func (qos *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data
 	// - Health checks validate archival capability via eth_getBlockByNumber for ancient blocks
 	// - User requests can confirm (IsArchival=true) or invalidate (IsArchival=false) archival status
 	if data.ArchivalCheckPerformed {
-		// Default TTL for archival status (8 hours - matches health check archival TTL)
-		archivalTTL := 8 * time.Hour
+		// Shared with the health-check path so the two sources cannot drift; see
+		// gateway.ArchivalStatusTTL for why that matters. This path is the WEAKER of the
+		// two — it cannot assert an expected value, only that some archival-method call
+		// succeeded — so it must not grant a longer-lived mark than the verified one.
+		archivalTTL := gateway.ArchivalStatusTTL
 		expiresAt := time.Now().Add(archivalTTL)
 
 		storedEndpoint.checkArchival = endpointCheckArchival{
@@ -670,9 +673,9 @@ func (qos *QoS) StartBackgroundSync(ctx context.Context, syncInterval time.Durat
 // IMPORTANT: Performs immediate refresh on startup to ensure cache is warm before serving requests.
 //
 // Recommended startup sequence for full cross-replica sync:
-//   1. qos.SetReputationService(svc)
-//   2. qos.StartBackgroundSync(ctx, 5*time.Second)        // Perceived block number
-//   3. qos.StartArchivalCacheRefreshWorker(ctx, 2*time.Hour) // Archival status
+//  1. qos.SetReputationService(svc)
+//  2. qos.StartBackgroundSync(ctx, 5*time.Second)        // Perceived block number
+//  3. qos.StartArchivalCacheRefreshWorker(ctx, 2*time.Hour) // Archival status
 func (qos *QoS) StartArchivalCacheRefreshWorker(ctx context.Context, refreshInterval time.Duration) {
 	if qos.reputationSvc == nil {
 		qos.logger.Warn().Msg("Cannot start archival cache refresh: reputation service not set")
@@ -736,8 +739,8 @@ func (qos *QoS) StartArchivalCacheRefreshWorker(ctx context.Context, refreshInte
 func (qos *QoS) refreshArchivalCacheFromRedis(parentCtx context.Context) {
 	serviceID := qos.serviceQoSConfig.GetServiceID()
 
-	// Use 8-hour TTL matching archival status expiry
-	const archivalTTL = 8 * time.Hour
+	// Matches archival status expiry; see gateway.ArchivalStatusTTL.
+	const archivalTTL = gateway.ArchivalStatusTTL
 
 	var refreshed, failed int
 

@@ -154,11 +154,15 @@ var emptyArrayValidMethods = map[string]bool{
 	"getBlocks":                         true, // array of slot numbers in range
 	"getBlocksWithLimit":                true, // array of slot numbers
 	"getConfirmedBlocks":                true, // deprecated, same as getBlocks
+	"getConfirmedBlocksWithLimit":       true, // deprecated, same as getBlocksWithLimit
 	"getSignaturesForAddress":           true, // array of signature info objects
 	"getConfirmedSignaturesForAddress2": true, // deprecated, same as above
 	"getRecentPerformanceSamples":       true, // array of performance samples
 	"getClusterNodes":                   true, // array of node info
 	"getRecentPrioritizationFees":       true, // array of fee objects
+	"getProgramAccounts":                true, // array of {pubkey, account}; [] whenever the filters match nothing
+	"getInflationReward":                true, // array of reward objects, entries may be null
+	"getSlotLeaders":                    true, // array of validator pubkeys
 }
 
 // Tier 2: Protocol-Specific Success Checks

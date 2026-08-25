@@ -475,7 +475,12 @@ func (ss *serviceState) categorizeValidationFailure(err error) qosobservations.E
 //
 // Note: This function is lock-free - perceivedBlockNumber uses atomic operations.
 func (ss *serviceState) basicEndpointValidation(endpointAddr protocol.EndpointAddr, endpoint endpoint, requiresArchival bool) error {
-	supplier, _ := endpointAddr.GetAddress()
+	// Operator domain, not the supplier address: path_qos_filter_rejection_total is
+	// keyed on domain since 2026-08-12. With a supplier label it had the worst
+	// churn of any gateway metric (1,271 live series vs 24,708 distinct over one
+	// pod's 7.7h life) because rejections are sporadic per supplier while the
+	// supplier set rotates every session. Memoized — see DomainFromEndpointAddr.
+	domain := metrics.DomainFromEndpointAddr(string(endpointAddr))
 	serviceID := string(ss.serviceQoSConfig.GetServiceID())
 
 	// Check if the endpoint has returned an empty response within the timeout period.
@@ -483,13 +488,13 @@ func (ss *serviceState) basicEndpointValidation(endpointAddr protocol.EndpointAd
 	if endpoint.hasReturnedEmptyResponse && endpoint.invalidResponseLastObserved != nil {
 		timeSinceEmptyResponse := time.Since(*endpoint.invalidResponseLastObserved)
 		if timeSinceEmptyResponse < invalidResponseTimeout {
-			metrics.RecordQoSFilterRejection(supplier, serviceID, metrics.QoSFilterReasonEmptyResponse)
+			metrics.RecordQoSFilterRejection(domain, serviceID, metrics.QoSFilterReasonEmptyResponse)
 			return fmt.Errorf("recent empty response validation failed (%.0f minutes ago): %w",
 				timeSinceEmptyResponse.Minutes(), errEmptyResponseObs)
 		}
 	} else if endpoint.hasReturnedEmptyResponse {
 		// Fallback for cases where hasReturnedEmptyResponse is true but invalidResponseLastObserved is nil
-		metrics.RecordQoSFilterRejection(supplier, serviceID, metrics.QoSFilterReasonEmptyResponse)
+		metrics.RecordQoSFilterRejection(domain, serviceID, metrics.QoSFilterReasonEmptyResponse)
 		return fmt.Errorf("empty response validation failed: %w", errEmptyResponseObs)
 	}
 
@@ -497,7 +502,7 @@ func (ss *serviceState) basicEndpointValidation(endpointAddr protocol.EndpointAd
 	if endpoint.hasReturnedInvalidResponse && endpoint.invalidResponseLastObserved != nil {
 		timeSinceInvalidResponse := time.Since(*endpoint.invalidResponseLastObserved)
 		if timeSinceInvalidResponse < invalidResponseTimeout {
-			metrics.RecordQoSFilterRejection(supplier, serviceID, metrics.QoSFilterReasonInvalidResponse)
+			metrics.RecordQoSFilterRejection(domain, serviceID, metrics.QoSFilterReasonInvalidResponse)
 			return fmt.Errorf("recent invalid response validation failed (%.0f minutes ago): %w. Empty response: %t. Response validation error: %s",
 				timeSinceInvalidResponse.Minutes(), errRecentInvalidResponseObs, endpoint.hasReturnedEmptyResponse, endpoint.invalidResponseError)
 		}
@@ -510,13 +515,13 @@ func (ss *serviceState) basicEndpointValidation(endpointAddr protocol.EndpointAd
 		if errors.Is(err, errNoBlockNumberObs) {
 			reason = metrics.QoSFilterReasonBlockHeightUnknown
 		}
-		metrics.RecordQoSFilterRejection(supplier, serviceID, reason)
+		metrics.RecordQoSFilterRejection(domain, serviceID, reason)
 		return fmt.Errorf("block number validation failed: %w", err)
 	}
 
 	// Check if the endpoint's EVM chain ID matches the expected chain ID.
 	if err := ss.isChainIDValid(endpoint.checkChainID); err != nil {
-		metrics.RecordQoSFilterRejection(supplier, serviceID, metrics.QoSFilterReasonChainIDMismatch)
+		metrics.RecordQoSFilterRejection(domain, serviceID, metrics.QoSFilterReasonChainIDMismatch)
 		return fmt.Errorf("chain ID validation failed: %w", err)
 	}
 
@@ -558,7 +563,7 @@ func (ss *serviceState) basicEndpointValidation(endpointAddr protocol.EndpointAd
 		}
 
 		// Both checks failed - return structured error with diagnostic details
-		metrics.RecordQoSFilterRejection(supplier, serviceID, metrics.QoSFilterReasonArchivalRequired)
+		metrics.RecordQoSFilterRejection(domain, serviceID, metrics.QoSFilterReasonArchivalRequired)
 		return NewArchivalFilterError(string(endpointAddr), archivalDetails, errEndpointNotArchival)
 	}
 

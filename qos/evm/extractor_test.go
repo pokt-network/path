@@ -221,7 +221,11 @@ func TestEVMDataExtractor_IsArchival(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			request := []byte(`{"jsonrpc":"2.0","method":"eth_getBalance","id":1}`)
+			// The block parameter is load-bearing: a success only proves archival
+			// capability when the request actually asked for historical state.
+			// This case previously omitted params entirely, which EVM clients
+			// default to "latest" — the shape a pruned node answers perfectly.
+			request := []byte(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0xabc","0x13570a9"],"id":1}`)
 			isArchival, err := extractor.IsArchival(request, []byte(tt.response))
 			if tt.expectError {
 				assert.Error(t, err)

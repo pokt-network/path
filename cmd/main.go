@@ -282,6 +282,10 @@ func main() {
 	// Uses the same Redis client as leader election. Nil-safe (local-only mode if no Redis).
 	domainCircuitBreaker := gateway.NewDomainCircuitBreaker(redisClient, logger)
 
+	// Request-shape sampler behind GET /admin/request-sample/{serviceId}. nil when disabled
+	// via PATH_REQUEST_SAMPLE_RATE=0; the gateway hook and the admin endpoint both accept nil.
+	requestSampler := gateway.NewRequestSamplerFromEnv(logger)
+
 	healthCheckExecutor, leaderElector := setupHealthCheckExecutor(
 		backgroundCtx,
 		logger,
@@ -324,6 +328,7 @@ func main() {
 		WebsocketMessageBufferSize: config.GetRouterConfig().WebsocketMessageBufferSize,
 		ObservationQueue:           observationQueue,
 		DomainCircuitBreaker:       domainCircuitBreaker,
+		RequestSampler:             requestSampler,
 		WebsocketConnectionLimiter: gateway.NewWebsocketConnectionLimiter(config.GetRouterConfig().MaxConcurrentWebsocketConnections),
 	}
 
@@ -383,6 +388,7 @@ func main() {
 		websocketAdmin,
 		reputationAdmin,
 		unifiedServicesConfig,
+		requestSampleAdminOrNil(requestSampler),
 	)
 
 	// -------------------- Start PATH API Router --------------------
@@ -590,4 +596,14 @@ func getConfigPath(defaultConfigPath string) (string, error) {
 	configPath = filepath.Join(filepath.Dir(exeDir), defaultConfigPath)
 
 	return configPath, nil
+}
+
+// requestSampleAdminOrNil keeps a disabled sampler (typed nil) from reaching the router as
+// a non-nil interface, so the admin endpoint reports 503 "not enabled" instead of an empty
+// report.
+func requestSampleAdminOrNil(s *gateway.RequestSampler) router.RequestSampleAdmin {
+	if s == nil {
+		return nil
+	}
+	return s
 }

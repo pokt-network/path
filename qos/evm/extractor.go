@@ -209,14 +209,38 @@ func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, er
 		errMsg := strings.ToLower(gjson.GetBytes(response, "error.message").String())
 		archivalErrorIndicators := []string{
 			"missing trie node",
+			// geth's path-based state scheme (PBSS) reports unavailable historical
+			// state as "metadata is not found, <block>". Without this entry the
+			// check fell through to the "some other error" branch below, returned
+			// an error rather than false, and the endpoint was never demoted out
+			// of the archival pool that had just failed it.
+			"metadata is not found",
 			"pruned",
 			"ancient block",
 			"block not found",
 			"header not found",
 			"state not available",
-			"state histories",      // "state histories haven't been fully indexed yet"
-			"not fully indexed",    // catch variations
-			"historical data",      // "historical data not available"
+			"state histories",   // "state histories haven't been fully indexed yet"
+			"not fully indexed", // catch variations
+			"historical data",   // "historical data not available"
+			// Measured against production 2026-08-20 by probing archival-marked
+			// endpoints with a deep historical block. Two live wordings landed here
+			// and BOTH missed every entry above by a single word:
+			//
+			//   gnosis: "historical state is not available"  -- "state not available"
+			//           misses because the real text is "state IS not available", and
+			//           "historical data" misses because it is "historical STATE".
+			//   poly:   "historical state <hash>"
+			//
+			// Both fell through to the "some other error" branch, which returns an
+			// error rather than false, so the endpoint was never demoted and kept
+			// receiving archival requests it cannot serve. Same failure the PBSS
+			// entry above fixed, on a different vendor's wording.
+			//
+			// The bare prefix covers both observed forms. It is also already present
+			// in qos/heuristic/indicators.go, where this error IS recognised — the two
+			// catalogues had drifted, and this realigns them.
+			"historical state",
 		}
 
 		for _, indicator := range archivalErrorIndicators {
@@ -234,11 +258,63 @@ func (e *EVMDataExtractor) IsArchival(request []byte, response []byte) (bool, er
 	// Check for result field
 	resultField := gjson.GetBytes(response, "result")
 	if resultField.Exists() && resultField.Type != gjson.Null {
+		// A success only proves archival capability when the request actually asked
+		// for historical state. Every method in archivalMethods is also the ordinary
+		// way to read CURRENT state -- eth_getBalance(addr, "latest") is among the
+		// most common calls on the network -- and a pruned node answers those
+		// perfectly. Treating any success as proof promoted pruned nodes into the
+		// archival pool, which then handed them the historical queries they cannot
+		// serve.
+		if !targetsHistoricalBlock(request, method) {
+			return false, fmt.Errorf("archival check inconclusive: %s did not target a historical block", method)
+		}
 		// The archival query succeeded - endpoint is archival-capable
 		return true, nil
 	}
 
 	return false, fmt.Errorf("archival check response missing both result and error")
+}
+
+// targetsHistoricalBlock reports whether the request's block parameter names a
+// historical block rather than the chain tip.
+//
+// False for an omitted parameter (EVM defaults it to "latest"), for the
+// latest/pending/safe/finalized tags, and for anything that is not a parseable
+// block number -- a block hash, or an EIP-1898 object, carries no depth here.
+//
+// Known limitation: without the perceived chain tip this cannot separate a deep
+// historical block from one a few blocks back, so a numeric parameter near the tip
+// still reads as archival. The DataExtractor interface carries only
+// (request, response), so the tip is not reachable from here. The tag case is the
+// one that mattered in practice: it is the shape of nearly all current-state
+// traffic, and it was the whole of the pollution.
+func targetsHistoricalBlock(request []byte, method string) bool {
+	info, ok := evmMethodBlockParams[method]
+	if !ok {
+		return false
+	}
+
+	path := "params." + strconv.Itoa(info.paramIndex)
+	if info.isObject {
+		path += "." + info.objectKey
+	}
+
+	param := gjson.GetBytes(request, path)
+	if !param.Exists() {
+		// An omitted block parameter defaults to "latest".
+		return false
+	}
+
+	blockParam := param.String()
+	switch BlockTag(strings.ToLower(blockParam)) {
+	case BlockTagEarliest:
+		return true
+	case BlockTagLatest, BlockTagPending, BlockTagSafe, BlockTagFinalized:
+		return false
+	}
+
+	_, err := parseBlockNumber(blockParam)
+	return err == nil
 }
 
 // IsValidResponse checks if the response is a valid JSON-RPC 2.0 response.

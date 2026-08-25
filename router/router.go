@@ -41,6 +41,7 @@ type (
 		websocketAdmin                WebsocketAdmin
 		reputationAdmin               ReputationAdmin
 		staticResponses               StaticResponseResolver
+		requestSampleAdmin            RequestSampleAdmin
 	}
 	gatewayHandler interface {
 		HandleServiceRequest(context.Context, *http.Request, http.ResponseWriter)
@@ -65,6 +66,13 @@ type (
 	// perceived block height; err is non-nil only if the reset itself failed.
 	ChainStateAdmin interface {
 		ResetChainState(ctx context.Context, serviceID string) (found bool, err error)
+	}
+	// RequestSampleAdmin reads the request-shape sampler: is a service's traffic many
+	// different requests or the same few repeated? found=false means the service has not
+	// been observed (or the requested window does not exist yet).
+	RequestSampleAdmin interface {
+		Report(serviceID string, previous bool, top int) (report gateway.RequestSampleReport, found bool)
+		Summary() []gateway.RequestSampleSummary
 	}
 	// WebsocketAdmin allows redistributing live websocket connections via admin
 	// endpoints. A websocket connection binds one endpoint for its whole lifetime, so
@@ -95,6 +103,7 @@ func NewRouter(
 	websocketAdmin WebsocketAdmin,
 	reputationAdmin ReputationAdmin,
 	staticResponses StaticResponseResolver,
+	requestSampleAdmin RequestSampleAdmin,
 ) *router {
 	r := &router{
 		logger: logger.With("package", "router"),
@@ -110,6 +119,7 @@ func NewRouter(
 		websocketAdmin:                websocketAdmin,
 		reputationAdmin:               reputationAdmin,
 		staticResponses:               staticResponses,
+		requestSampleAdmin:            requestSampleAdmin,
 	}
 	r.handleRoutes()
 	return r
@@ -154,6 +164,13 @@ func (r *router) handleRoutes() {
 	// POST /admin/reputation/drain/{serviceId} - temporarily benches one operator's
 	// endpoints for a service (cooldown only; reputation itself is left untouched)
 	r.mux.HandleFunc("POST /admin/reputation/drain/", r.handleReputationDrain)
+
+	// GET /admin/request-sample[/{serviceId}] - sampled request-shape report: uniqueness
+	// ratio, top repeated fingerprints, per-method distinct counts. Answers "is this
+	// traffic diverse or the same few requests over and over" — the condition under which a
+	// cached endpoint wins every race. Per-pod sample (in-memory).
+	r.mux.HandleFunc("GET /admin/request-sample", r.handleRequestSample)
+	r.mux.HandleFunc("GET /admin/request-sample/", r.handleRequestSample)
 
 	// requestHandlerFn defines the middleware chain for all service requests.
 	// staticResponseMiddleware runs after the prefix strip (so it sees the cleaned path)

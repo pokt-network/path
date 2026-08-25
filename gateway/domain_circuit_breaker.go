@@ -45,6 +45,27 @@ const (
 	// recovers. Escalation is meant to punish an domain that breaks AGAIN after being let
 	// back in; without memory across expiry every episode looks like a first offence.
 	defaultEscalationMemory = 60 * time.Minute
+	// defaultRebreakMargin widens the threshold for a domain that broke recently, giving the
+	// gate hysteresis instead of a single line it oscillates across.
+	//
+	// WHY. The threshold is used to break and nothing but TTL expiry restores, so a domain
+	// whose true failure rate sits just above failureRateThreshold breaks every single time
+	// it is let back in, forever, while a domain far above it is treated identically.
+	//
+	// Measured in production: six relay-miner hosts behind one operator domain, success rates
+	// against a threshold of exactly 80%:
+	//
+	//   marginal: 79.7% · 79.3% · 78.3% · 72.5%      genuinely broken: 58.6% · 49.7%
+	//
+	// The four marginal hosts sat within 1.7 points of the line and flapped, spending 69-92%
+	// of a six-hour window removed from the pool — while one of them, still marked broken,
+	// answered 40 consecutive probes with zero errors at a latency matching the host carrying
+	// nearly all of that service. The two genuinely broken hosts must stay broken.
+	//
+	// 0.15 puts the re-break line at 35% failure: comfortably above where the marginal hosts
+	// live and comfortably below where the broken ones do. A first break is unaffected — this
+	// only governs whether a domain that already served its TTL is removed again.
+	defaultRebreakMargin = 0.15
 )
 
 // classifyCircuitBreakReason maps the free-text reason string passed to
@@ -99,6 +120,7 @@ type DomainCircuitBreaker struct {
 	failureWindow        time.Duration
 	minFailures          int
 	failureRateThreshold float64
+	rebreakMargin        float64
 	escalationMemory     time.Duration
 	statsMu              sync.Mutex
 	stats                map[string]map[string]*domainOutcomeWindow // serviceID -> domain
@@ -153,6 +175,7 @@ func NewDomainCircuitBreaker(redisClient *redis.Client, logger polylog.Logger) *
 		failureWindow:        defaultFailureWindow,
 		minFailures:          defaultMinFailures,
 		failureRateThreshold: defaultFailureRateThreshold,
+		rebreakMargin:        defaultRebreakMargin,
 		escalationMemory:     defaultEscalationMemory,
 		stats:                make(map[string]map[string]*domainOutcomeWindow),
 	}
@@ -166,9 +189,14 @@ func (cb *DomainCircuitBreaker) RecordSuccess(serviceID, domain string) {
 		return
 	}
 	cb.statsMu.Lock()
-	defer cb.statsMu.Unlock()
 	w := cb.windowLocked(serviceID, domain, time.Now())
 	w.successes++
+	cb.statsMu.Unlock()
+
+	// Expose the gate's denominator. Recorded outside the lock: the metric has its own
+	// synchronisation and holding statsMu across it would put a Prometheus write on the path
+	// every successful relay takes.
+	metrics.RecordCircuitBreakerOutcome(serviceID, domain, metrics.CircuitBreakerOutcomeSuccess)
 }
 
 // windowLocked returns the outcome window for a domain, rolling it over if the current one
@@ -208,12 +236,30 @@ func (cb *DomainCircuitBreaker) shouldBreak(serviceID, domain string, now time.T
 
 	w := cb.windowLocked(serviceID, domain, now)
 	w.failures++
+	// Numerator counterpart to RecordSuccess. Deliberately here rather than in MarkBroken:
+	// this is the point a failure actually enters the gate's window, and MarkBroken returns
+	// earlier for a domain already broken — counting there would credit failures the rate
+	// calculation never saw.
+	defer metrics.RecordCircuitBreakerOutcome(serviceID, domain, metrics.CircuitBreakerOutcomeFailure)
 
 	total := w.failures + w.successes
 	if w.failures < cb.minFailures || total == 0 {
 		return false, 0
 	}
-	if float64(w.failures)/float64(total) < cb.failureRateThreshold {
+
+	// A domain that broke recently must be CLEARLY worse to be removed again, not merely
+	// over the same line it was over last time. Without this a domain sitting just above the
+	// threshold re-breaks on every readmission indefinitely, and escalation then holds it out
+	// for progressively longer — the flap this margin exists to stop. See defaultRebreakMargin.
+	//
+	// Deliberately shares its predicate with escalation below: "broke recently" must mean the
+	// same thing to both, or a domain could be escalated for an episode the margin let pass.
+	recentlyBroken := !w.lastEpisodeAt.IsZero() && now.Sub(w.lastEpisodeAt) <= cb.escalationMemory
+	threshold := cb.failureRateThreshold
+	if recentlyBroken {
+		threshold += cb.rebreakMargin
+	}
+	if float64(w.failures)/float64(total) < threshold {
 		return false, 0
 	}
 
@@ -221,7 +267,7 @@ func (cb *DomainCircuitBreaker) shouldBreak(serviceID, domain string, now time.T
 	// was let back in and failed again. Concurrent duplicate marks within one episode are
 	// filtered upstream in MarkBroken and never reach here.
 	hitCount := 1
-	if !w.lastEpisodeAt.IsZero() && now.Sub(w.lastEpisodeAt) <= cb.escalationMemory {
+	if recentlyBroken {
 		hitCount = w.lastHitCount + 1
 	}
 	w.lastEpisodeAt = now

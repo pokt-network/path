@@ -38,6 +38,52 @@ import (
 // to cover realistic active per-supplier workloads (~1000 suppliers × ~5
 // active services × small fan-out) without exposing the heap to a runaway
 // label leak.
+//
+// ⭐ WHAT THIS CANNOT BOUND, and why no cap value fixes it (measured 2026-08-12)
+//
+// A guard bounds the number of label tuples LIVE IN THIS PROCESS'S REGISTRY. It
+// does NOT bound the number of distinct series the scraping Prometheus has to
+// store, and those two numbers diverge without limit when a label's value set
+// rotates over time.
+//
+// path_supplier_signal_total was guarded, honored its guard at ~26% of the cap
+// (6,523 live tuples on one pod), and was still one of the two largest sources of
+// series in the entire gateway job: 60,674 DISTINCT series over that pod's 7.7h
+// life. path_supplier_reputation_score was worse — 4,510 live, 74,639 distinct,
+// 16.5×, ~232K series/pod/day, each retained for the full 6-day window. The
+// control is path_relay_latency_seconds_bucket at exactly 1.0×: its labels are
+// persistent, so its registry count and its TSDB cost are the same number.
+//
+// Eviction is NOT the cause and removing it would NOT help: evicting a tuple and
+// later re-admitting it recreates the SAME label set, hence the same Prometheus
+// series with a gap in it, never a new one. The distinct-series count is
+// identical with or without eviction — eviction only decides whether the cost
+// lands on this pod's heap as well.
+//
+// So a metric can sit at 20% of its cap forever and still be the most expensive
+// thing in the TSDB. The only thing that bounds the series stream is the size of
+// each label's VALUE SET. Concretely, when adding a label:
+//
+//   - Bounded by our config (service_id, rpc_type, reason, status class, role):
+//     safe. The set is fixed at deploy time.
+//   - Bounded by the operator set (domain / eTLD+1): safe. 13 values measured
+//     fleet-wide, and it grows only when a new operator joins.
+//   - Bounded by the CHAIN (supplier address): NOT safe at any cap value. ~5,200
+//     suppliers and growing with the network, rotating in and out of sessions
+//     every ~20 blocks. Aggregate to domain, or serve the per-supplier question
+//     from /ready/<service>?detailed=true, which is a point lookup rather than a
+//     retained timeseries.
+//   - Client-controlled (method, path): only a guard makes this survivable, and
+//     then only because the cap converts unbounded minting into a bounded cost
+//     plus a WARN. See observationPipelineGuard.
+//
+// Diagnostic, per pod (see the PNF follow-up report for the full recipe):
+//
+//	count(count_over_time(<metric>{pod="<pod>"}[10m]))   # live
+//	count(count_over_time(<metric>{pod="<pod>"}[8h]))    # distinct over 8h
+//
+// A ratio above ~1.5 means the label set rotates and the metric costs multiples
+// of what its instantaneous count suggests.
 const DefaultSeriesLimit = 25_000
 
 // seriesLimitEnvVar overrides DefaultSeriesLimit at process start.
@@ -161,14 +207,13 @@ func InitCardinalityGuards(l polylog.Logger) {
 // guards must not end up on a process-wide list.
 func packageGuards() []*cardinalityGuard {
 	return []*cardinalityGuard{
-		supplierSignalGuard,
-		supplierReputationGuard,
 		hedgeSupplierGuard,
 		qosFilterRejectionGuard,
 		healthCheckStatusGuard,
 		probationEventsGuard,
 		observationPipelineGuard,
 		circuitBreakerEventsGuard,
+		circuitBreakerOutcomeGuard,
 		rpcTypeFallbackGuard,
 	}
 }
@@ -413,15 +458,13 @@ func hashLabelValues(labelValues []string) uint64 {
 // keyed on its metric's FULL label tuple, in declaration order, so eviction can
 // delete precisely the series it reclaims (see DefaultSeriesLimit).
 var (
-	supplierSignalGuard = newCardinalityGuard("supplier_signal_total", defaultSeriesLimit).
-				withEviction(defaultGuardIdleWindow, func(lv []string) {
-			SupplierSignalTotal.DeleteLabelValues(lv...)
-		})
-
-	supplierReputationGuard = newCardinalityGuard("supplier_reputation_score", defaultSeriesLimit).
-				withEviction(defaultGuardIdleWindow, func(lv []string) {
-			SupplierReputationScore.DeleteLabelValues(lv...)
-		})
+	// supplierSignalGuard and supplierReputationGuard were removed along with
+	// path_supplier_signal_total and path_supplier_reputation_score (2026-08-12).
+	// Both metrics honored their cap and were still among the largest series
+	// sources in the gateway job — see the finding recorded on
+	// DefaultSeriesLimit. Their remaining two peers below are now keyed on
+	// `domain` rather than `supplier`, so they are backstops rather than working
+	// caps.
 
 	hedgeSupplierGuard = newCardinalityGuard("hedge_supplier_latency_seconds", defaultSeriesLimit).
 				withEviction(defaultGuardIdleWindow, func(lv []string) {
@@ -481,6 +524,13 @@ var (
 	circuitBreakerEventsGuard = newCardinalityGuard("circuit_breaker_events_total", defaultSeriesLimit).
 					withEviction(defaultGuardIdleWindow, func(lv []string) {
 			DomainCircuitBreakerEventsTotal.DeleteLabelValues(lv...)
+		})
+
+	// circuitBreakerOutcomeGuard — same service_id x domain pair as its sibling above, minus
+	// reason_category x event. Guarded on the same principle, not on an observed incident.
+	circuitBreakerOutcomeGuard = newCardinalityGuard("circuit_breaker_outcome_total", defaultSeriesLimit).
+					withEviction(defaultGuardIdleWindow, func(lv []string) {
+			CircuitBreakerOutcomeTotal.DeleteLabelValues(lv...)
 		})
 
 	// rpcTypeFallbackGuard — backstop only. The real fix was dropping the

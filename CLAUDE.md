@@ -393,6 +393,48 @@ shortening a drain is worse than saying no), the shared key carries a TTL past i
 drain, and expired entries are filtered on read and reaped. There is no way to bench an
 operator indefinitely through this endpoint. Re-issue to extend.
 
+**Request Sample** (`GET /admin/request-sample[/{serviceId}]`)
+
+Answers one question about a service's traffic: **many different requests, or the same few
+over and over?** Every quality signal PATH has — latency, success, hedge wins, the
+reputation score — rewards whoever answers fastest, and an endpoint fronted by a cache
+answers a *repeated* request in sub-millisecond time without touching a node. Against
+repetitive traffic it wins every race; against unique traffic it is an ordinary node. Whether
+a fast operator is fast or merely cached therefore has to be read from the **traffic**, and
+nothing recorded the traffic's shape: `method` is a label, `params` never were, and a
+thousand `getAccountInfo` for a thousand accounts and a thousand for one account were one
+number.
+
+One request in N (`PATH_REQUEST_SAMPLE_RATE`, default 100, `0` disables) is fingerprinted:
+JSON-RPC → one fingerprint per item on `method` + compacted `params` (id and whitespace
+excluded, so rotating ids cannot make repetition look diverse); anything else → HTTP method
++ path + body. Counted per service in fixed windows (`PATH_REQUEST_SAMPLE_WINDOW`, default
+`10m`); the last completed window is kept. Table bounded at
+`PATH_REQUEST_SAMPLE_MAX_FINGERPRINTS` (default 5000) — past it new fingerprints are
+*counted* in `table_overflow` but not stored, so `uniqueness` stays honest and a big overflow
+is itself the answer (the traffic is diverse).
+
+```bash
+curl -s localhost:13069/admin/request-sample                          # one row per service
+curl -s "localhost:13069/admin/request-sample/solana?window=previous&top=20"
+```
+
+Read: `uniqueness` = distinct / sampled (1.0 all different, →0 the same few repeated);
+`top1_share`; `methods[]` with **per-method** uniqueness — block-height calls are legitimately
+repetitive, account/transaction lookups are not, so judge the method not the service; `top[]`
+with a 200-byte snippet of each most-repeated payload. `requests_seen` is every request,
+`sampled` is the 1-in-N — never read the sample as the total.
+
+Gauges `path_request_sample_uniqueness{service_id}` / `path_request_sample_top1_share` carry
+the last completed window — per service_id only, nothing about methods or payloads, so
+cardinality is the service list. **Per-pod, in-memory**: query the pod carrying the traffic,
+or several, before a fleet conclusion.
+
+What it cannot tell: requests, not clients — there is no client identity behind the edge
+([[no_portal_no_client_identity]]) — so repetition cannot be attributed to a sender; and a low
+ratio is a property of the traffic, not evidence against an operator: it says the conditions
+under which a cache wins are present, not that anyone runs one.
+
 **Domain Blacklist (`blocked_domains`) — the nuclear ban**
 
 Permanently bans an operator domain from serving specific RPC types on **ALL services**,
@@ -444,6 +486,21 @@ call site was revert-checked (filter removed → tests fail).
 - After deploying a fix for a bug that caused false positive circuit breaker lockouts
 - When a domain is stuck in circuit breaker state due to a transient issue that has resolved
 - Rolling restarts alone don't work because `refreshFromRedis` repopulates in-memory state from Redis
+
+**Circuit breaker failure-rate gate — what feeds the denominator.** The gate breaks a hostname
+on failures / (failures + successes) over a 30s window. Failures arrive from every path (each
+failed attempt re-enters the retry loop → `MarkBroken`); successes only arrive where the
+returning path calls `RecordSuccess`. The hedge-race success branch did not, and with a hedge
+delay configured *every* first attempt returns through it (including `primary_only`), so the
+gate saw ~5% of a high-volume operator's successes and 26% fleet-wide — a low-volume host read
+30–66% failure where the relay counters read ~21%, and no threshold tuning (hysteresis
+included) can hold against a rate inflated past it by construction. When the gate and
+`path_relays_total` disagree about a host's rate, suspect a missing `RecordSuccess` site
+before suspecting the threshold. `path_circuit_breaker_outcome_total{domain=<hostname>}`
+shows both sides of the fraction the gate actually computes; compare its success side against
+`path_relays_total{status_code="200"}` per operator — they should agree within the
+health-check/retry slice. Test through the real retry loop
+(`gateway/circuit_breaker_hedge_denominator_test.go`), not through the breaker's own API.
 
 ## WebSocket Frames Are Reward-Eligible Relays
 
@@ -579,6 +636,73 @@ Recorded on **every** band pick, so `outcome="reshaped"` over the total is the r
 **Cannot starve a retry:** the cap reweights the band, it never filters it. The set of endpoints a retry can reach is bit-for-bit what it was before, at any cap value.
 
 **What to watch after enabling:** `path_supplier_exhausted_total` for the **thin** operators the excess lands on, not the capped one — a solo-registration backend gains share while still holding one supplier's per-session allowance. Same failure mode as the backend-URL dedup, and self-correcting. Retry success rate — `path_relays_total{request_type="retry"}` split by `status_code` — must not fall; roughly 60% of retries already fail, so that pool is marginal to begin with.
+
+## Adding a Prometheus Label — What Actually Bounds Cardinality
+
+Two rounds of a production cardinality incident (2026-08-12) converged on one rule:
+**only a label's VALUE SET bounds it.** Neither a sanitizer nor a guard does, and each fails
+in a way that looks like success.
+
+- A **sanitizer** bounds a value's *shape*, never the *set*. `SanitizeMethodLabel` was already
+  wired when 5,000 route-shaped probe paths sailed through it.
+- A **cardinality guard** bounds the **live registry**, never the number of distinct series
+  Prometheus retains. `path_supplier_signal_total` sat at ~26% of its 25K cap and was still one
+  of the two largest series sources in the whole job — 6,523 tuples live in a 10-minute window
+  against **60,674 distinct over one pod's 7.7h life**. Eviction is not the cause and removing
+  it would not help: re-admitting an evicted tuple recreates the *same label set*, hence the
+  same series with a gap, never a new one. Eviction only decides whether the cost also lands on
+  pod heap.
+
+Tiers, in the order to reach for them:
+
+| label source | example | verdict |
+|---|---|---|
+| our config | `service_id`, `rpc_type`, `reason`, `role`, status class | safe — fixed at deploy |
+| operator set | `domain` (eTLD+1) | safe — 15 values fleet-wide, grows only when an operator joins |
+| **the chain** | `supplier` | **never safe at any cap** — ~5,200 addresses, grows with the network, rotates every session |
+| the client | `method`, REST path | guard-only, and only because the cap converts unbounded minting into a bounded cost plus a WARN |
+
+**A label on a histogram costs ~12× what it costs on the counter beside it** (one series per
+bucket plus `_sum`/`_count`). `path_relay_latency_seconds_bucket` was 31.6% of all gateway
+series because it carried `status_code` × `reputation_signal` — a 20× pair that no dashboard
+ever queried *from the histogram*. Put the outcome taxonomy on the counter; keep the histogram
+on topology labels only.
+
+**`supplier` is gone from every aggregate metric.** Per-supplier questions are served by
+`GET /ready/<service>?detailed=true` — a point lookup, not 74K retained timeseries. Three
+metrics keep it deliberately (`supplier_exhausted_total`, `supplier_nil_pubkey_total`,
+`supplier_pubkey_cache_events_total`): there the address is the actionable payload, not a way
+of naming an operator. `Test_SupplierLabelIsGone` enforces the rest.
+
+Churn diagnostic — run it whenever a metric looks cheap but the TSDB disagrees:
+
+```promql
+count(count_over_time(<metric>{pod="<pod>"}[10m]))   # live
+count(count_over_time(<metric>{pod="<pod>"}[8h]))    # distinct over 8h
+```
+
+Above ~1.5× means the label set rotates and the metric costs multiples of its instant count.
+`path_relay_latency_seconds_bucket` at 1.0× is the control.
+
+**Testing traps specific to metrics** (same family as the routing ones below):
+
+- `Gather()` reports the labels of **child series**, so a vec with no children reports no
+  labels at all. A registry-walk test passes on a revert that re-adds the label. **Populate
+  through the production `Record*` helper first**, then walk — and assert the population
+  happened, or the test decays into asserting nothing.
+- Detect a **removed** metric by registration collision (`Register` a same-named probe and
+  expect no `AlreadyRegisteredError`), not by walking `Gather()` — a re-added vec that nothing
+  populates is invisible to a walk.
+- A `supplier`→`domain` re-key **compiles silently** when the call site keeps passing the
+  address: both are strings and the label *name* is right. Assert on the label **value** from
+  the production caller — a bech32 address sanitizes to the `supplier_addr` sentinel, which is
+  the tell. `qos/evm/qos_filter_rejection_label_test.go` and
+  `gateway/hedge_outcome_label_test.go` do this; both were revert-checked.
+
+**Never `labeldrop` these on the Prometheus side.** Collapsing thousands of series onto one
+label set produces `duplicate sample for timestamp`, which fails the **whole scrape** —
+`up=0`, every gateway metric lost, not a partial blinding. The collision-free stopgap is
+`action: drop` on `__name__` for a specific metric.
 
 ## Testing Changes That Affect Routing
 

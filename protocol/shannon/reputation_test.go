@@ -1447,7 +1447,7 @@ func TestReputationWebSocketRecording_RPCType(t *testing.T) {
 	}
 
 	// Record the WebSocket observation
-	p.recordSignalFromWebsocketConnectionObservation(serviceID, obs)
+	p.recordSignalFromWebsocketConnectionObservation(serviceID, obs, false)
 
 	// Give it a moment to process (fire-and-forget)
 	time.Sleep(50 * time.Millisecond)

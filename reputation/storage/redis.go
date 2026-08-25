@@ -47,6 +47,10 @@ const (
 	fieldArchivalExpires    = "archival_expires_at"
 	fieldRecentCriticalRate = "recent_critical_rate"
 	fieldRateCooldownCount  = "rate_cooldown_count"
+	fieldRecentInvalidRate  = "recent_invalid_rate"
+	fieldInvalidCooldownCnt = "invalid_rate_cooldown_count"
+	fieldRateCooldownUntil  = "rate_cooldown_until"
+	fieldInvalidCooldownUnt = "invalid_rate_cooldown_until"
 )
 
 // perceivedBlockTTL bounds how long a perceived block-height entry lives in
@@ -205,6 +209,10 @@ func (r *RedisStorage) Set(ctx context.Context, key reputation.EndpointKey, scor
 		fieldArchivalExpires:    strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
 		fieldRecentCriticalRate: strconv.FormatFloat(score.RecentCriticalRate, 'f', -1, 64),
 		fieldRateCooldownCount:  strconv.Itoa(score.RateCooldownCount),
+		fieldRecentInvalidRate:  strconv.FormatFloat(score.RecentInvalidRate, 'f', -1, 64),
+		fieldInvalidCooldownCnt: strconv.Itoa(score.InvalidRateCooldownCount),
+		fieldRateCooldownUntil:  strconv.FormatInt(score.RateCooldownUntil.Unix(), 10),
+		fieldInvalidCooldownUnt: strconv.FormatInt(score.InvalidRateCooldownUntil.Unix(), 10),
 	}
 
 	pipe := r.client.Pipeline()
@@ -250,6 +258,10 @@ func (r *RedisStorage) SetMultiple(ctx context.Context, scores map[reputation.En
 			fieldArchivalExpires:    strconv.FormatInt(score.ArchivalExpiresAt.Unix(), 10),
 			fieldRecentCriticalRate: strconv.FormatFloat(score.RecentCriticalRate, 'f', -1, 64),
 			fieldRateCooldownCount:  strconv.Itoa(score.RateCooldownCount),
+			fieldRecentInvalidRate:  strconv.FormatFloat(score.RecentInvalidRate, 'f', -1, 64),
+			fieldInvalidCooldownCnt: strconv.Itoa(score.InvalidRateCooldownCount),
+			fieldRateCooldownUntil:  strconv.FormatInt(score.RateCooldownUntil.Unix(), 10),
+			fieldInvalidCooldownUnt: strconv.FormatInt(score.InvalidRateCooldownUntil.Unix(), 10),
 		}
 
 		pipe.HSet(ctx, redisKey, fields)
@@ -392,6 +404,34 @@ func (r *RedisStorage) parseScore(data map[string]string) (reputation.Score, err
 			return score, fmt.Errorf("invalid rate_cooldown_count: %w", err)
 		}
 		score.RateCooldownCount = count
+	}
+
+	// Protocol-violation rate EWMA and its escalation counter. Absent on older records,
+	// which correctly leaves a pre-existing endpoint at 0.0 rather than inventing history.
+	if v, ok := data[fieldRecentInvalidRate]; ok {
+		if rate, err := strconv.ParseFloat(v, 64); err == nil {
+			score.RecentInvalidRate = rate
+		}
+	}
+	if v, ok := data[fieldInvalidCooldownCnt]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			score.InvalidRateCooldownCount = n
+		}
+	}
+
+	// Per-detector cooldown ends. These are the reference points the two escalation
+	// counters compare against; they are NOT a second selection gate — CooldownUntil above
+	// remains the only field selection reads. Absent on records written before this field
+	// existed, which leaves them zero and costs at most one non-escalated trip.
+	if v, ok := data[fieldRateCooldownUntil]; ok {
+		if ts, err := strconv.ParseInt(v, 10, 64); err == nil && ts > 0 {
+			score.RateCooldownUntil = time.Unix(ts, 0)
+		}
+	}
+	if v, ok := data[fieldInvalidCooldownUnt]; ok {
+		if ts, err := strconv.ParseInt(v, 10, 64); err == nil && ts > 0 {
+			score.InvalidRateCooldownUntil = time.Unix(ts, 0)
+		}
 	}
 
 	// Parse archival fields (for multi-instance coordination)

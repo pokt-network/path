@@ -113,7 +113,16 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 		hasBlock = true
 	}
 
-	if !hasBlock {
+	// A getHealth observation is as load-bearing as a block height: ValidateEndpoint rejects
+	// any endpoint without one (errNoGetHealthObs), and this is the ONLY path by which a
+	// health check can supply it.
+	//
+	// Before this, health checks wrote block height and nothing else, so an endpoint whose
+	// observations came only from health checks sat in the store permanently invalid — the
+	// configured getHealth probe ran, passed, and populated nothing the validator reads. That
+	// is self-reinforcing: invalid means no user traffic, and user traffic was the only other
+	// source of a health observation.
+	if !hasBlock && !data.SyncCheckPerformed {
 		return nil
 	}
 
@@ -129,12 +138,28 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 
 	storedEndpoint := q.endpoints[endpointAddr]
 
+	// Record the health observation when this response was a getHealth response.
+	// SyncCheckPerformed distinguishes "observed healthy" from "never asked" — without it the
+	// zero value would silently assert health nobody measured.
+	if data.SyncCheckPerformed {
+		result := resultGetHealthOK
+		if data.IsSyncing {
+			result = resultGetHealthSyncing
+		}
+		if storedEndpoint.SolanaGetHealthResponse == nil {
+			storedEndpoint.SolanaGetHealthResponse = &qosobservations.SolanaGetHealthResponse{}
+		}
+		storedEndpoint.Result = result
+	}
+
 	// Update the endpoint's block height observation (Solana uses block height from getEpochInfo)
 	// Create or update the SolanaGetEpochInfoResponse with just the block height
-	if storedEndpoint.SolanaGetEpochInfoResponse == nil {
-		storedEndpoint.SolanaGetEpochInfoResponse = &qosobservations.SolanaGetEpochInfoResponse{}
+	if hasBlock {
+		if storedEndpoint.SolanaGetEpochInfoResponse == nil {
+			storedEndpoint.SolanaGetEpochInfoResponse = &qosobservations.SolanaGetEpochInfoResponse{}
+		}
+		storedEndpoint.BlockHeight = blockHeight
 	}
-	storedEndpoint.BlockHeight = blockHeight
 
 	// Store the updated endpoint back
 	q.endpoints[endpointAddr] = storedEndpoint
@@ -171,8 +196,10 @@ func (q *QoS) UpdateFromExtractedData(endpointAddr protocol.EndpointAddr, data *
 		}
 	}
 
-	// Write per-endpoint block height to Redis for cross-replica sync (async, non-blocking)
-	if q.reputationSvc != nil {
+	// Write per-endpoint block height to Redis for cross-replica sync (async, non-blocking).
+	// Guarded on hasBlock: a health-only observation carries blockHeight 0, and writing that
+	// would clobber a real height across every replica.
+	if hasBlock && q.reputationSvc != nil {
 		go func(addr protocol.EndpointAddr, bn uint64, svcID protocol.ServiceID) {
 			rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()

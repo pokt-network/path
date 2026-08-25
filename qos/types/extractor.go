@@ -113,7 +113,17 @@ type ExtractedData struct {
 	ChainID string
 
 	// IsSyncing indicates if the endpoint is syncing.
+	// Only meaningful when SyncCheckPerformed is true.
 	IsSyncing bool
+
+	// SyncCheckPerformed indicates whether a sync/health check was actually performed.
+	// When true, IsSyncing contains a definitive result. When false, IsSyncing should be
+	// ignored — the response simply was not one that carries sync status.
+	//
+	// Mirrors ArchivalCheckPerformed. Without this flag, "not syncing" (the zero value) is
+	// indistinguishable from "never checked", which is exactly the distinction a QoS needs
+	// in order to record a health observation rather than assume one.
+	SyncCheckPerformed bool
 
 	// IsArchival indicates if the endpoint supports archival queries.
 	// Only meaningful when ArchivalCheckPerformed is true.
@@ -182,6 +192,7 @@ func (ed *ExtractedData) ExtractAll(extractor DataExtractor, request []byte) {
 	// Check sync status
 	if isSyncing, err := extractor.IsSyncing(request, ed.RawResponse); err == nil {
 		ed.IsSyncing = isSyncing
+		ed.SyncCheckPerformed = true // Mark that we got a definitive result
 	} else {
 		ed.ExtractionErrors["is_syncing"] = err.Error()
 	}
@@ -261,6 +272,7 @@ func (ed *ExtractedData) ExtractWithConfig(extractor DataExtractor, request []by
 	if config.CheckSyncStatus {
 		if isSyncing, err := extractor.IsSyncing(request, ed.RawResponse); err == nil {
 			ed.IsSyncing = isSyncing
+			ed.SyncCheckPerformed = true // Mark that we got a definitive result
 		} else {
 			ed.ExtractionErrors["is_syncing"] = err.Error()
 		}

@@ -1212,7 +1212,7 @@ func (e *HealthCheckExecutor) ExecuteCheckViaProtocol(
 			Msg("Health check relay request failed")
 
 		// Record relay metric for failed request
-		metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), "error", metrics.SignalMajorError, metrics.RelayTypeHealthCheck, latency.Seconds())
+		metrics.RecordRelay(domain, rpcTypeStr, string(serviceID), metrics.StatusCategoryError, metrics.SignalMajorError, metrics.RelayTypeHealthCheck, latency.Seconds())
 
 		// Still publish observations for failed requests
 		e.publishHealthCheckObservations(serviceID, endpointAddr, startTime, protocolCtx, &protocolObs)
@@ -1446,7 +1446,8 @@ func (e *HealthCheckExecutor) publishHealthCheckObservations(
 
 	// Apply protocol observations (for sanctioning, etc.)
 	if observations != nil {
-		if err := e.protocol.ApplyHTTPObservations(observations); err != nil {
+		// true: these observations are a probe by construction — this executor issues them.
+		if err := e.protocol.ApplyHTTPObservations(observations, true); err != nil {
 			e.logger.Debug().Err(err).Msg("Failed to apply protocol observations for health check")
 		}
 	}
@@ -1518,9 +1519,26 @@ func (e *HealthCheckExecutor) processObservationSync(
 		Msg("Health check observation processed synchronously for block height extraction")
 }
 
-// archivalTTL is how long an archival status from health checks remains valid.
-// Health checks run periodically, so this should be longer than the health check interval.
-const archivalTTL = 30 * time.Minute
+// ArchivalStatusTTL is how long an archival status remains valid, for BOTH sources that
+// can grant it: an archival health check here, and a user-traffic confirmation in
+// qos/evm. It is exported and shared so the two cannot drift.
+//
+// They had drifted, by 16x, in the direction that does the most damage. The health-check
+// path pins an exact expected historical value in the rules file, so a node that ignores
+// the block parameter and answers from current state fails it — and that verified mark
+// expired in 30 minutes. The user-traffic path cannot pin a value, because the query is
+// whatever a client happened to send, so it grants archival status on any successful call
+// to an archival method — and that UNVERIFIED mark lasted 8 hours.
+//
+// Weaker evidence must not outlive stronger evidence. The comment on the 8h constant even
+// claimed it "matches health check archival TTL", which is probably why nobody noticed.
+//
+// Should be longer than the health check interval, so a passing endpoint is re-confirmed
+// before its mark lapses.
+const ArchivalStatusTTL = 30 * time.Minute
+
+// archivalTTL is the internal alias kept for readability at this package's call sites.
+const archivalTTL = ArchivalStatusTTL
 
 // markEndpointArchival marks an endpoint as archival-capable via the reputation service.
 // This is called ONLY after an archival health check passes ALL validations including error_detection.
@@ -1774,7 +1792,8 @@ func (e *HealthCheckExecutor) ExecuteWebSocketCheckViaProtocol(
 			Msg("Skipping websocket check reputation signal for over-serviced (stake-exhausted) supplier")
 
 	default:
-		if err := e.protocol.ApplyWebSocketObservations(protocolObs); err != nil {
+		// true: a websocket health-check probe, same as the HTTP path above.
+		if err := e.protocol.ApplyWebSocketObservations(protocolObs, true); err != nil {
 			e.logger.Warn().
 				Err(err).
 				Str("service_id", string(serviceID)).

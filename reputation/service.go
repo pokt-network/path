@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -202,7 +201,14 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 			// for longer than that starts fresh at one session. Mirrors the strike system's
 			// exponential backoff so a persistently broken endpoint is benched progressively
 			// longer while a one-off transient spike costs only a single session.
-			prevCooldownUntil := score.CooldownUntil
+			//
+			// Escalate against the end of THIS detector's own previous cooldown, not the
+			// shared CooldownUntil. The shared field is also written by the strike system
+			// and by the invalid-rate detector, so reading it here counted a bench earned
+			// by an unrelated mechanism as a consecutive trip of this one — an endpoint
+			// cooled often for other reasons reached the DefaultMaxCooldown cap on its
+			// first actual rate offence.
+			prevCooldownUntil := score.RateCooldownUntil
 			if !prevCooldownUntil.IsZero() && time.Since(prevCooldownUntil) < DefaultMaxCooldown {
 				score.RateCooldownCount++
 			} else {
@@ -217,6 +223,7 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 			}
 
 			rateCooldownUntil := time.Now().Add(cooldownDuration)
+			score.RateCooldownUntil = rateCooldownUntil
 			if rateCooldownUntil.After(score.CooldownUntil) {
 				score.CooldownUntil = rateCooldownUntil
 			}
@@ -232,6 +239,62 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 					Int("rate_cooldown_count", score.RateCooldownCount).
 					Dur("cooldown_duration", cooldownDuration).
 					Msg("[RATE_COOLDOWN] Endpoint cooled down due to sustained critical error rate (volume-independent)")
+			}
+
+		}
+
+		// Protocol-violation rate detector.
+		//
+		// Separate from the critical-rate detector above because the two measure different
+		// things. A 5xx is a transient the network is expected to absorb, so its threshold is
+		// 30%. A structurally invalid response — today, a zero-length payload on a body-bearing
+		// 2xx — is never legitimate at any rate, so it warrants a threshold three orders of
+		// magnitude lower and a correspondingly longer EWMA window.
+		//
+		// Without this, such a violation is unreachable by reputation: the additive score is
+		// outvoted by successes (at 0.2%, +998 against -50 per 1000 requests, so the score
+		// returns to 100), and the critical-rate EWMA's ~20-request memory cannot represent a
+		// sub-1% rate at all. Raising the per-event penalty does not help; only a rate does.
+		invalidIndicator := 0.0
+		if signal.IsProtocolViolation {
+			invalidIndicator = 1.0
+		}
+		score.RecentInvalidRate = score.RecentInvalidRate*(1-InvalidRateEWMAAlpha) + InvalidRateEWMAAlpha*invalidIndicator
+
+		if score.RecentInvalidRate >= InvalidRateThreshold &&
+			(score.SuccessCount+score.ErrorCount) >= InvalidRateMinObservations {
+			trippedInvalidRate := score.RecentInvalidRate
+
+			// Escalate against this detector's own previous cooldown end. Reading the
+			// shared CooldownUntil here defeated the point of keeping the two counters
+			// separate: a critical-error burst lengthened the protocol-violation bench.
+			prevInvalidCooldownUntil := score.InvalidRateCooldownUntil
+			if !prevInvalidCooldownUntil.IsZero() && time.Since(prevInvalidCooldownUntil) < DefaultMaxCooldown {
+				score.InvalidRateCooldownCount++
+			} else {
+				score.InvalidRateCooldownCount = 1
+			}
+			invalidCooldownDuration := DefaultRateCooldown * time.Duration(score.InvalidRateCooldownCount)
+			if invalidCooldownDuration > DefaultMaxCooldown {
+				invalidCooldownDuration = DefaultMaxCooldown
+			}
+
+			invalidCooldownUntil := time.Now().Add(invalidCooldownDuration)
+			score.InvalidRateCooldownUntil = invalidCooldownUntil
+			if invalidCooldownUntil.After(score.CooldownUntil) {
+				score.CooldownUntil = invalidCooldownUntil
+			}
+			// Reset so the endpoint starts clean and must re-accumulate a sustained violation
+			// rate to trip again, rather than re-flapping on its first post-cooldown request.
+			score.RecentInvalidRate = 0
+			metrics.RecordReputationInvalidRateCooldown(string(key.ServiceID))
+			if s.logger != nil {
+				s.logger.Warn().
+					Str("endpoint", key.String()).
+					Float64("invalid_rate", trippedInvalidRate).
+					Int("invalid_rate_cooldown_count", score.InvalidRateCooldownCount).
+					Dur("cooldown_duration", invalidCooldownDuration).
+					Msg("[INVALID_RATE_COOLDOWN] Endpoint cooled down due to sustained protocol-violation rate")
 			}
 		}
 	}
@@ -251,30 +314,16 @@ func (s *service) RecordSignal(ctx context.Context, key EndpointKey, signal Sign
 		// Buffer full, write will be picked up on next flush from cache
 	}
 
-	// Per-supplier observability: emit a supplier-labeled signal counter so
-	// relay-miner operators can see what's happening on their endpoints.
-	// Empty supplier (per-domain reputation keys) is dropped by RecordSupplierSignal.
-	metrics.RecordSupplierSignal(supplierFromKey(key), string(key.ServiceID), string(signal.Type))
+	// A supplier-labeled signal counter (path_supplier_signal_total) was emitted
+	// here until 2026-08-12. RecordSignal runs ~14,400/s fleet-wide and the
+	// supplier set rotates every session, so the metric minted 60,674 distinct
+	// series over one pod's 7.7h life while only 6,523 were ever live — a cost no
+	// cardinality guard can bound, since the guard caps the live registry and not
+	// the number of distinct series Prometheus retains. The same signal is
+	// available per operator, with the full taxonomy rather than a 3-class
+	// collapse, on path_relays_total{domain, reputation_signal, request_type}.
 
 	return nil
-}
-
-// supplierFromKey extracts the supplier address from an EndpointKey.
-// Returns "" for per-domain keys (where supplier is not recoverable).
-//
-// The EndpointKey.EndpointAddr varies by KeyGranularity:
-//   - per-endpoint  → "pokt1abc-https://..." (has dash, supplier before)
-//   - per-supplier  → "pokt1abc..." (bech32 only)
-//   - per-domain    → "node.example.com" (host only — no supplier available)
-func supplierFromKey(key EndpointKey) string {
-	addr := string(key.EndpointAddr)
-	if i := strings.IndexByte(addr, '-'); i > 0 {
-		return addr[:i]
-	}
-	if strings.HasPrefix(addr, "pokt1") {
-		return addr
-	}
-	return ""
 }
 
 // GetScore retrieves the current reputation score for an endpoint.

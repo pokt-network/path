@@ -377,11 +377,11 @@ func (m *mockProtocolForRetry) SupportedGatewayModes() []protocol.GatewayMode {
 	return nil
 }
 
-func (m *mockProtocolForRetry) ApplyHTTPObservations(observations *protocolobservations.Observations) error {
+func (m *mockProtocolForRetry) ApplyHTTPObservations(observations *protocolobservations.Observations, _ bool) error {
 	return nil
 }
 
-func (m *mockProtocolForRetry) ApplyWebSocketObservations(observations *protocolobservations.Observations) error {
+func (m *mockProtocolForRetry) ApplyWebSocketObservations(observations *protocolobservations.Observations, _ bool) error {
 	return nil
 }
 

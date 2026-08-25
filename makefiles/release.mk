@@ -144,23 +144,38 @@ release_build_cross: release_build_nocgo release_build_cgo ## Build both CGO-dis
 	@echo "All binaries built successfully!"
 
 .PHONY: release_build_nocgo
+# Platforms build CONCURRENTLY. `go build` already parallelises internally, so the win comes
+# from overlapping each target's largely single-threaded link phase rather than from the
+# compile phase — expect a partial speedup, not a halving, and less of one on a CPU-starved
+# runner.
+#
+# Failures must be propagated by hand: `set -e` does not fire for a background job, so a
+# failed cross-compile would otherwise leave this target reporting success with a missing or
+# stale binary, which the image build would then happily package.
 release_build_nocgo: ## Build CGO-disabled (static-friendly) binaries for multiple platforms
-	@echo "Building (CGO=0) binaries for multiple platforms..."
+	@echo "Building (CGO=0) binaries for multiple platforms (concurrently)..."
 	@mkdir -p $(RELEASE_DIR)
 	@set -e; \
+	pids=""; \
 	for platform in $(RELEASE_PLATFORMS); do \
 		GOOS=$${platform%%/*}; \
 		GOARCH=$${platform##*/}; \
 		out_nocgo="$(RELEASE_DIR)/path-$$GOOS-$$GOARCH"; \
 		echo "→ CGO=0: $$GOOS/$$GOARCH"; \
 		TAGS="$(NOCGO_EFFECTIVE_TAGS)"; \
-		if [ -n "$$TAGS" ]; then \
-			CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go build -tags "$$TAGS" -ldflags '$(LDFLAGS)' -o "$$out_nocgo" ./cmd; \
-		else \
-			CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go build -ldflags '$(LDFLAGS)' -o "$$out_nocgo" ./cmd; \
-		fi; \
-		echo "  ✓ Built $$out_nocgo"; \
-	done
+		( \
+			if [ -n "$$TAGS" ]; then \
+				CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go build -tags "$$TAGS" -ldflags '$(LDFLAGS)' -o "$$out_nocgo" ./cmd; \
+			else \
+				CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go build -ldflags '$(LDFLAGS)' -o "$$out_nocgo" ./cmd; \
+			fi; \
+			echo "  ✓ Built $$out_nocgo"; \
+		) & \
+		pids="$$pids $$!"; \
+	done; \
+	rc=0; \
+	for pid in $$pids; do wait $$pid || rc=1; done; \
+	if [ $$rc -ne 0 ]; then echo "  ✗ one or more platform builds FAILED"; exit 1; fi
 
 .PHONY: release_build_cgo
 release_build_cgo: ## Build CGO-enabled (glibc) binaries for multiple platforms

@@ -657,6 +657,16 @@ func (rc *requestContext) handleSingleRelayRequest() error {
 					}
 					checkResult := checkResponseSuccess(hedgeErr, statusCode, responseBytesForHeuristic, heuristicRPCType, jsonrpcMethod, hedgeRequestID, logger)
 					if checkResult.Success {
+						// Denominator for the circuit breaker's failure-rate gate — see RecordSuccess.
+						// On a service with a hedge delay EVERY first attempt returns through here,
+						// including the vast majority where the hedge never fires, so without this
+						// the gate is fed almost no successes and judges every domain on a fraction
+						// dominated by its failures.
+						if rc.circuitBreaker != nil && endpointAddr != "" {
+							if domain := extractDomainFromEndpoint(endpointAddr); domain != "" {
+								rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+							}
+						}
 						// Success! Process the response
 						for _, endpointResponse := range hedgeResponses {
 							rc.qosCtx.UpdateWithResponse(endpointResponse.EndpointAddr, endpointResponse.Bytes, endpointResponse.HTTPStatusCode, endpointResponse.RequestID)
@@ -1274,6 +1284,19 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// The request is gone (client hung up, or the request deadline passed) — nothing
+		// below can reach the client, and no attempt made now says anything about a domain.
+		// Mirrors the single-request retry loop.
+		select {
+		case <-rc.context.Done():
+			logger.Debug().Int("attempt", attempt).Msg("Request canceled before batch item attempt started")
+			if lastErr == nil {
+				lastErr = rc.context.Err()
+			}
+			return lastResponse, lastErr
+		default:
+		}
+
 		// Get available endpoints
 		availableEndpoints, _, err := rc.protocol.AvailableHTTPEndpoints(
 			rc.context, rc.serviceID, rpcType, rc.originalHTTPRequest)
@@ -1342,6 +1365,12 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 				batchRequestID := extractRequestIDFromPayload(payload)
 				checkResult := checkResponseSuccess(nil, resp.HTTPStatusCode, resp.Bytes, heuristicRPCType, jsonrpcMethod, batchRequestID, logger)
 				if checkResult.Success {
+					// Denominator for the circuit breaker's failure-rate gate — see RecordSuccess.
+					if rc.circuitBreaker != nil && resp.EndpointAddr != "" {
+						if domain := extractDomainFromEndpoint(resp.EndpointAddr); domain != "" {
+							rc.circuitBreaker.RecordSuccess(string(rc.serviceID), domain)
+						}
+					}
 					// Extract request ID from payload
 					resp.RequestID = batchRequestID
 					logger.Debug().
@@ -1391,7 +1420,14 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 			// Skip circuit breaking for archival-related errors — the domain isn't broken,
 			// it just can't serve historical state. The error string from the protocol layer
 			// contains the archival pattern (e.g., "historical state is not available").
-			if rc.circuitBreaker != nil {
+			//
+			// Also skip when the request context itself is done: the client hung up (or the
+			// request deadline passed) while this item was in flight, so the transport error
+			// is the abort of OUR request, not a fault of the domain holding it. Every
+			// in-flight item of the batch fails this way at once, on whichever suppliers they
+			// happened to land on — measured as 43 of 43 breaks on one batch-heavy service,
+			// spread across every operator serving it.
+			if rc.circuitBreaker != nil && rc.context.Err() == nil {
 				if domain := extractDomainFromEndpoint(selectedEndpoint); domain != "" {
 					if shouldCircuitBreak(nil, 0, lastErr) {
 						rc.circuitBreaker.MarkBroken(rc.context, string(rc.serviceID), domain,

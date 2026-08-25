@@ -572,8 +572,20 @@ func (hr *hedgeRacer) recordWinner(result hedgeResult) {
 			Bool("success", result.err == nil).
 			Msg("🏆 Race winner determined")
 
-		metrics.RecordHedgeSupplierOutcome(result.supplierAddr, metrics.HedgeRoleWinner, result.duration.Seconds())
+		metrics.RecordHedgeSupplierOutcome(hedgeOutcomeDomain(result), metrics.HedgeRoleWinner, result.duration.Seconds())
 	})
+}
+
+// hedgeOutcomeDomain resolves the operator domain for a hedge outcome.
+//
+// path_hedge_supplier_outcome_total is keyed on domain (eTLD+1), not on the
+// supplier address: hedge asks an operator-level question — "did racing a
+// different operator help" — and as a supplier-keyed counter it was 49,231 series
+// fleet-wide with 1.8× churn, scaling with the chain's supplier set rather than
+// with our traffic. Derived from endpointAddr rather than supplierAddr because the
+// address alone carries no domain.
+func hedgeOutcomeDomain(result hedgeResult) string {
+	return metrics.DomainFromEndpointAddr(string(result.endpointAddr))
 }
 
 // recordLoser records the losing request for reputation tracking.
@@ -601,7 +613,7 @@ func (hr *hedgeRacer) recordLoser(result hedgeResult) {
 		Err(result.err).
 		Msg("Race loser recorded")
 
-	metrics.RecordHedgeSupplierOutcome(result.supplierAddr, metrics.HedgeRoleLoser, result.duration.Seconds())
+	metrics.RecordHedgeSupplierOutcome(hedgeOutcomeDomain(result), metrics.HedgeRoleLoser, result.duration.Seconds())
 }
 
 // collectLoserSync gives the loser a short (100ms) synchronous window to be recorded
