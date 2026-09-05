@@ -45,7 +45,9 @@ func TestCloseEndpointConn_SendsCloseFrameInsteadOfDroppingTheSocket(t *testing.
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
 
-	CloseEndpointConn(conn, websocket.CloseNormalClosure, "health check complete")
+	// Empty reason: the shipped health-check probe sends the code with no text, so the
+	// handshake has to stay clean without one.
+	CloseEndpointConn(conn, websocket.CloseNormalClosure, "")
 
 	select {
 	case err := <-closeErr:

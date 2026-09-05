@@ -38,13 +38,24 @@ func TestProcessSinglePayloadWithRetry_ClientCancelDoesNotFeedCircuitBreaker(t *
 		domain    = "a.example.com"
 	)
 
+	// The control deliberately does NOT use context.Canceled. An endpoint cannot cancel our
+	// context — only we can — so a cancel is never evidence about the endpoint, whether or
+	// not the client's own context is still live. The original control asserted the
+	// opposite and encoded the hedge-cancel bug as expected behavior: the hedge racer
+	// cancels the primary branch's detached context on every exit path, and a batch item
+	// falling through from the race reused it, so "cancel + live parent" was reached in
+	// production constantly and benched healthy operators. connection refused is what a
+	// genuinely broken endpoint produces, and that must still break.
+	connRefused := errors.New("dial tcp 10.0.0.1:443: connect: connection refused")
 	for _, tc := range []struct {
 		name         string
 		cancelParent bool
+		relayErr     error
 		wantFailures int
 	}{
 		{name: "client hung up mid-relay", cancelParent: true, wantFailures: 0},
-		{name: "genuine transport error (control)", cancelParent: false, wantFailures: 1},
+		{name: "cancel with the client context still live (hedge race)", cancelParent: false, wantFailures: 0},
+		{name: "genuine transport error (control)", cancelParent: false, relayErr: connRefused, wantFailures: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -53,6 +64,7 @@ func TestProcessSinglePayloadWithRetry_ClientCancelDoesNotFeedCircuitBreaker(t *
 			cb := NewDomainCircuitBreaker(nil, testCircuitBreakerLogger())
 			protocolCtx := &transportErrorProtocolCtx{
 				endpoint: endpoint,
+				relayErr: tc.relayErr,
 				onRelay: func() {
 					if tc.cancelParent {
 						cancel()
@@ -105,13 +117,20 @@ type transportErrorProtocolCtx struct {
 	endpoint protocol.EndpointAddr
 	onRelay  func()
 	calls    int
+	// relayErr is the wrapped cause the relay fails with. Nil means context.Canceled,
+	// the shape a canceled in-flight request produces.
+	relayErr error
 }
 
 func (m *transportErrorProtocolCtx) HandleServiceRequest([]protocol.Payload) ([]protocol.Response, error) {
 	m.calls++
 	m.onRelay()
+	cause := m.relayErr
+	if cause == nil {
+		cause = context.Canceled
+	}
 	return nil, fmt.Errorf("relay: error sending relay: %w: connection error: Post \"https://a.example.com\": %w",
-		errors.New("HTTP relay request failed"), context.Canceled)
+		errors.New("HTTP relay request failed"), cause)
 }
 
 func (m *transportErrorProtocolCtx) SetParentContext(context.Context) {}
@@ -128,6 +147,10 @@ type pluggableCtxProtocol struct {
 	mockProtocolForRetry
 	endpoints   protocol.EndpointAddrList
 	protocolCtx ProtocolRequestContext
+	// onBuild, when set, fires on every protocol-context build. Lets a test see the
+	// ORDER of builds and relays, which is what distinguishes a fallthrough that reused
+	// a context from one that rebuilt it.
+	onBuild func()
 }
 
 func (m *pluggableCtxProtocol) AvailableHTTPEndpoints(
@@ -139,5 +162,8 @@ func (m *pluggableCtxProtocol) AvailableHTTPEndpoints(
 func (m *pluggableCtxProtocol) BuildHTTPRequestContextForEndpoint(
 	_ context.Context, _ protocol.ServiceID, _ protocol.EndpointAddr, _ sharedtypes.RPCType, _ *http.Request, _ bool,
 ) (ProtocolRequestContext, protocolobservations.Observations, error) {
+	if m.onBuild != nil {
+		m.onBuild()
+	}
 	return m.protocolCtx, protocolobservations.Observations{}, nil
 }

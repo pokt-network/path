@@ -2013,25 +2013,7 @@ func (e *HealthCheckExecutor) runEndpointChecks(
 			// TrySubmit rather than Submit: when the websocket pool is saturated the
 			// right move is to SKIP this round, not to queue. A skipped check costs a
 			// refresh interval; a growing queue reintroduces the stall it is avoiding.
-			wsCheck := check
-			wsEndpoint := endpointAddr
-			wsAllowance := syncAllowance
-			if e.wsPool != nil {
-				if _, ok := e.wsPool.TrySubmit(func() {
-					if ctx.Err() != nil {
-						return
-					}
-					latency, err := e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, wsEndpoint, wsCheck, wsAllowance)
-					e.recordCheckResult(ctx, serviceID, wsEndpoint, wsCheck, err, latency)
-				}); !ok {
-					e.logger.Debug().
-						Str("service_id", string(serviceID)).
-						Str("endpoint", string(wsEndpoint)).
-						Str("check", wsCheck.Name).
-						Uint64("ws_pool_waiting", e.wsPool.WaitingTasks()).
-						Msg("websocket check skipped this round - check pool saturated")
-				}
-			}
+			e.submitWebsocketCheck(ctx, serviceID, endpointAddr, check, syncAllowance, nil)
 		case HealthCheckTypeGRPC:
 			// gRPC checks not yet implemented
 			e.logger.Debug().
@@ -2054,6 +2036,122 @@ func (e *HealthCheckExecutor) runEndpointChecks(
 		}
 	}
 	return httpOutcomes
+}
+
+// submitWebsocketCheck runs ONE websocket probe off the health-check cycle and records
+// its result for probeAddr plus every address in fanTo.
+//
+// Run OFF the cycle. See wsPool: a websocket check can block for its full timeout, and
+// the cycle waits on everything it submits, so keeping these inline lets one silent
+// endpoint throttle every other check in the gateway.
+//
+// TrySubmit rather than Submit: when the websocket pool is saturated the right move is
+// to SKIP this round, not to queue. A skipped check costs a refresh interval; a growing
+// queue reintroduces the stall it is avoiding.
+//
+// fanTo carries the suppliers that share probeAddr's backend websocket URL. They are
+// RECORDED, never skipped: a websocket probe is a property of the backend, so a broken
+// backend must move every sharing supplier's websocket reputation key. Skipping them
+// would penalize only the probed supplier and leave its siblings on the same backend
+// clean and selectable — the endpoint would be reached anyway, through a different
+// supplier address.
+func (e *HealthCheckExecutor) submitWebsocketCheck(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	probeAddr protocol.EndpointAddr,
+	check HealthCheckConfig,
+	syncAllowance uint64,
+	fanTo []protocol.EndpointAddr,
+) {
+	if e.wsPool == nil {
+		return
+	}
+	if _, ok := e.wsPool.TrySubmit(func() {
+		if ctx.Err() != nil {
+			return
+		}
+		latency, err := e.ExecuteWebSocketCheckViaProtocol(ctx, serviceID, probeAddr, check, syncAllowance)
+		e.recordCheckResult(ctx, serviceID, probeAddr, check, err, latency)
+		for _, addr := range fanTo {
+			e.recordCheckResult(ctx, serviceID, addr, check, err, latency)
+			metrics.RecordHealthCheckDeduped(string(serviceID))
+		}
+	}); !ok {
+		e.logger.Debug().
+			Str("service_id", string(serviceID)).
+			Str("endpoint", string(probeAddr)).
+			Str("check", check.Name).
+			Uint64("ws_pool_waiting", e.wsPool.WaitingTasks()).
+			Msg("websocket check skipped this round - check pool saturated")
+	}
+}
+
+// submitDedupedWebsocketChecks fires ONE websocket handshake per distinct backend
+// websocket URL held by members, and records that result for every supplier sharing it.
+//
+// HTTP checks were deduplicated by backend URL; websocket checks were not, so a backend
+// carrying N supplier registrations took N full TCP+TLS+WS handshakes per cycle where
+// HTTP took one. Measured 2026-09-05: 29.85 websocket checks/s fleetwide, of which 6.62/s
+// landed on a single operator and arrived as ~3/s of full-TLS handshakes per gateway
+// egress IP — enough for that operator to read it as an attack. Stacked registrations are
+// common (four registrations behind one URL on one service), so the multiplier tracks how
+// a provider spreads its registrations, not how much traffic it serves.
+//
+// Members with no websocket URL, or whose session has ended, are left out entirely: a skip
+// is neither a pass nor a failure, and recording either would invent a signal.
+func (e *HealthCheckExecutor) submitDedupedWebsocketChecks(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	svcConfig *ServiceHealthCheckConfig,
+	cycle uint64,
+	members []EndpointInfo,
+) {
+	var syncAllowance uint64
+	if svcConfig.SyncAllowance != nil && *svcConfig.SyncAllowance > 0 {
+		syncAllowance = uint64(*svcConfig.SyncAllowance)
+	}
+
+	byWSURL := make(map[string][]protocol.EndpointAddr)
+	for _, m := range members {
+		if m.WebSocketURL == "" {
+			continue
+		}
+		if !e.endpointSessionActive(ctx, serviceID, m) {
+			continue
+		}
+		byWSURL[m.WebSocketURL] = append(byWSURL[m.WebSocketURL], m.Addr)
+	}
+	if len(byWSURL) == 0 {
+		return
+	}
+
+	urls := make([]string, 0, len(byWSURL))
+	for u := range byWSURL {
+		urls = append(urls, u)
+	}
+	sort.Strings(urls)
+
+	for _, check := range svcConfig.Checks {
+		if check.Type != HealthCheckTypeWebSocket {
+			continue
+		}
+		for _, u := range urls {
+			addrs := byWSURL[u]
+			// Sorted so the rotation below is stable across cycles and pods.
+			sort.Slice(addrs, func(i, j int) bool { return addrs[i] < addrs[j] })
+			// Rotate which supplier carries the handshake, so each one's own websocket
+			// path is directly probed every len(addrs) cycles rather than one supplier
+			// answering for the group forever.
+			repIdx := representativeIndex(cycle, len(addrs))
+			fanTo := make([]protocol.EndpointAddr, 0, len(addrs)-1)
+			for i, addr := range addrs {
+				if i != repIdx {
+					fanTo = append(fanTo, addr)
+				}
+			}
+			e.submitWebsocketCheck(ctx, serviceID, addrs[repIdx], check, syncAllowance, fanTo)
+		}
+	}
 }
 
 // fanOutcomeToSibling replays a representative's HTTP check outcomes onto a sibling
@@ -2500,13 +2598,15 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 					}
 				}
 
+				// runWS=false on both the representative and the siblings: websocket
+				// checks are deduplicated by backend WEBSOCKET url below, which is a
+				// different grouping from this HTTP-url group.
 				var outcomes []checkOutcome
 				if e.endpointSessionActive(ctx, serviceID, rep) {
-					outcomes = e.runEndpointChecks(ctx, serviceID, rep.Addr, &cfg, true, true, rep.WebSocketURL != "")
+					outcomes = e.runEndpointChecks(ctx, serviceID, rep.Addr, &cfg, true, false, rep.WebSocketURL != "")
 				}
 
-				// Siblings: fan the representative's HTTP outcomes (no relay), and still
-				// probe each sibling's own WebSocket connectivity (per-endpoint).
+				// Siblings: fan the representative's HTTP outcomes (no relay).
 				for i := range grp {
 					if i == repIdx {
 						continue
@@ -2521,8 +2621,10 @@ func (e *HealthCheckExecutor) RunAllChecksViaProtocol(
 					if len(outcomes) > 0 {
 						e.fanOutcomeToSibling(ctx, serviceID, sib.Addr, outcomes)
 					}
-					e.runEndpointChecks(ctx, serviceID, sib.Addr, &cfg, false, true, sib.WebSocketURL != "")
 				}
+
+				// One handshake per distinct backend websocket URL in this group.
+				e.submitDedupedWebsocketChecks(ctx, serviceID, &cfg, cycle, grp)
 			})
 			totalJobs++
 		}
