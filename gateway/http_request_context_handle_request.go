@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -217,6 +218,21 @@ func shouldCircuitBreak(heuristicResult *heuristic.AnalysisResult, httpStatusCod
 	// HTTP 4xx = client error. The domain correctly rejected a bad request.
 	// Don't punish domains for clients sending malformed requests.
 	if httpStatusCode >= 400 && httpStatusCode < 500 {
+		return false
+	}
+	// A cancellation is OURS by construction: an endpoint cannot cancel our context, only
+	// we can. A slow endpoint surfaces as context.DeadlineExceeded, which IS a signal about
+	// the endpoint and still breaks. Conflating the two benched operators for our own
+	// cancels — the hedge racer cancels the primary branch's detached context on every exit
+	// path, and a batch item that falls through from the race to the normal request path
+	// reused that dead context, producing "connection error: Post ...: context canceled"
+	// against a healthy endpoint. Measured 2026-09-05 on one batch-heavy service: every
+	// break carried this signature, and the three operators serving it from a single
+	// hostname each were locked out for hours at gate failure rates under 4%.
+	//
+	// Deliberately here rather than at one call site: MarkBroken has four callers and the
+	// invariant — we never bench a domain for a cancel we issued — belongs to all of them.
+	if lastErr != nil && errors.Is(lastErr, context.Canceled) {
 		return false
 	}
 	// Capability limitation errors (archival, lite fullnode, etc.) are expected from
@@ -1401,7 +1417,23 @@ func (rc *requestContext) processSinglePayloadWithRetry(
 				}
 				continue
 			}
-			// Hedge failed, fall through to normal request
+			// Hedge failed, fall through to normal request.
+			//
+			// race() hands protocolCtx a DETACHED parent context (hedge.go: SetParentContext)
+			// and cancels it on every exit path, so the context this ctx was built on is dead
+			// by the time we get here. Reusing it made the fallthrough fail instantly with
+			// "context canceled" — never reaching the endpoint at all — which then read as a
+			// transport fault of whichever endpoint happened to be primary. Rebuild so the
+			// fallthrough actually sends.
+			rebuiltCtx, _, rebuildErr := rc.protocol.BuildHTTPRequestContextForEndpoint(
+				rc.context, rc.serviceID, selectedEndpoint, rpcType, rc.originalHTTPRequest, true)
+			if rebuildErr != nil {
+				lastErr = rebuildErr
+				logger.Warn().Err(rebuildErr).Str("endpoint", string(selectedEndpoint)).
+					Msg("Failed to rebuild protocol context after hedge race")
+				continue
+			}
+			protocolCtx = rebuiltCtx
 		}
 
 		// Normal request path - send single payload
