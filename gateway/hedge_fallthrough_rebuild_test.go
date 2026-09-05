@@ -82,5 +82,5 @@ func TestProcessSinglePayloadWithRetry_HedgeFallthroughRebuildsProtocolContext(t
 	c.Equal("relay", trace[len(trace)-1], "the fallthrough must end in a relay: %v", trace)
 	c.Equal("build", trace[len(trace)-2],
 		"the fallthrough relay must use a freshly built protocol context, not the one the "+
-			"hedge race cancelled: %v", trace)
+			"hedge race canceled: %v", trace)
 }

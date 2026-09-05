@@ -365,7 +365,7 @@ func (p *Protocol) CheckWebsocketConnection(
 	//
 	// The reason string is deliberately empty. The close CODE is what keeps these out of
 	// the endpoint's error budget; the text added nothing an operator could act on and
-	// only labelled every probe in their logs.
+	// only labeled every probe in their logs.
 	defer websockets.CloseEndpointConn(conn, gorillaws.CloseNormalClosure, "")
 
 	// Handshake-only probe: connecting was the whole test.

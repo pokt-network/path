@@ -41,7 +41,7 @@ func TestProcessSinglePayloadWithRetry_ClientCancelDoesNotFeedCircuitBreaker(t *
 	// The control deliberately does NOT use context.Canceled. An endpoint cannot cancel our
 	// context — only we can — so a cancel is never evidence about the endpoint, whether or
 	// not the client's own context is still live. The original control asserted the
-	// opposite and encoded the hedge-cancel bug as expected behaviour: the hedge racer
+	// opposite and encoded the hedge-cancel bug as expected behavior: the hedge racer
 	// cancels the primary branch's detached context on every exit path, and a batch item
 	// falling through from the race reused it, so "cancel + live parent" was reached in
 	// production constantly and benched healthy operators. connection refused is what a
@@ -118,7 +118,7 @@ type transportErrorProtocolCtx struct {
 	onRelay  func()
 	calls    int
 	// relayErr is the wrapped cause the relay fails with. Nil means context.Canceled,
-	// the shape a cancelled in-flight request produces.
+	// the shape a canceled in-flight request produces.
 	relayErr error
 }
 
