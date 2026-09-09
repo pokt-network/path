@@ -417,6 +417,17 @@ func NewProtocol(
 	// Only rebind-capable connections are registered, so this is tied to the same switch.
 	if protocolInstance.websocketSessionRebindEnabled {
 		protocolInstance.wsConnRegistry.startRateSampler(ctx)
+
+		// Spread heavy websocket connections across operators. Depends on the sampler
+		// above for its rate signal, and on rebind for its only means of acting, so it is
+		// tied to the same switch and additionally gated OFF by default.
+		if heavyConnRebalanceEnabled(shannonLogger) {
+			newHeavyConnRebalancer(protocolInstance.wsConnRegistry).run(ctx, shannonLogger)
+			shannonLogger.Warn().Msgf(
+				"⚠️ EXPERIMENTAL websocket heavy-connection rebalance ENABLED (default-on; set PATH_WS_HEAVY_REBALANCE=false to disable) interval=%s heavy=%.1f frames/s min_spread=%d max_stalled=%d",
+				websocketRebalanceInterval, websocketRebalanceHeavyFPS, websocketRebalanceMinSpread, websocketRebalanceMaxStalled,
+			)
+		}
 	}
 
 	// Initialize reputation service if enabled.

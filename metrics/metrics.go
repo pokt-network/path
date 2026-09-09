@@ -1482,6 +1482,33 @@ var WebsocketSubscriptionsReplayedTotal = promauto.NewCounterVec(
 	[]string{LabelDomain, LabelServiceID},
 )
 
+// Websocket heavy-connection rebalance outcomes.
+const (
+	WSRebalanceMoved   = "moved"
+	WSRebalanceSkipped = "skipped"
+	// WSRebalanceStalled marks a service the loop has stopped acting on because its
+	// moves stopped relocating anything. This is the signal that matters operationally:
+	// a service sitting on "stalled" is imbalanced and the rebalancer cannot fix it.
+	WSRebalanceStalled = "stalled"
+)
+
+// WebsocketRebalanceTotal counts heavy-connection rebalance decisions.
+//
+// Recorded only when the loop decides an operator is over-loaded and acts, so this is the
+// "is it engaging" signal rather than a per-pass heartbeat. A configured-but-never-engaging
+// rebalancer is the red flag: it means the spread test never fires, which is either a
+// genuinely balanced fleet or a threshold set past the traffic.
+//
+// Labels are bounded: service_id is our config, domain is the operator set (eTLD+1, a
+// handful fleet-wide), outcome is the two constants above.
+var WebsocketRebalanceTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: MetricPrefix + "websocket_rebalance_total",
+		Help: "Websocket heavy-connection rebalance decisions, by service_id, domain moved off, and outcome. EXPERIMENTAL.",
+	},
+	[]string{LabelServiceID, LabelDomain, "outcome"},
+)
+
 // WebsocketEndpointStallTotal counts endpoint-staleness watchdog firings by outcome.
 // EXPERIMENTAL / canary observability for the silent-supplier-stall detector: a supplier
 // that keeps answering pings but stops delivering subscription data (invisible to
@@ -1923,6 +1950,13 @@ func RecordWebsocketRebind(domain, serviceID, result, trigger string, replayedSu
 	if replayedSubscriptions > 0 {
 		WebsocketSubscriptionsReplayedTotal.WithLabelValues(domain, serviceID).Add(float64(replayedSubscriptions))
 	}
+}
+
+// RecordWebsocketRebalance records one heavy-connection rebalance decision. domain is the
+// operator the connection was moved OFF.
+func RecordWebsocketRebalance(serviceID, domain, outcome string) {
+	domain = SanitizeDomainLabel(domain)
+	WebsocketRebalanceTotal.WithLabelValues(serviceID, domain, outcome).Inc()
 }
 
 // RecordWebsocketEndpointStall records a staleness-watchdog firing. gaveUp distinguishes a
