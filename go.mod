@@ -28,7 +28,7 @@ require (
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/pokt-network/poktroll v0.1.35
 	github.com/pokt-network/ring-go v0.2.0
-	github.com/pokt-network/shannon-sdk v0.0.0-20260812141256-a508808fbbe0
+	github.com/pokt-network/shannon-sdk v0.0.0-20260910074948-31b7e437f1b8
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.19.0
