@@ -826,6 +826,8 @@ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRI
 github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/pokt-network/go-dleq v0.0.0-20250925202155-488f42ad642a h1:zgSFcOX8m9dmriiqPiRbGJJpR3sJCFxLskxQ7/ofS0o=
 github.com/pokt-network/go-dleq v0.0.0-20250925202155-488f42ad642a/go.mod h1:KVsT8HO2EXHwMY1wnyYhR/lSZFNFIit8dJ+aDb1dSkA=
+github.com/pokt-network/go-dleq v0.0.0-20260910080229-86b20e4865eb h1:6sEybbwBng4lGCEOmpHf2Wy6y/8vNz2nGPD+TG/cAZw=
+github.com/pokt-network/go-dleq v0.0.0-20260910080229-86b20e4865eb/go.mod h1:KVsT8HO2EXHwMY1wnyYhR/lSZFNFIit8dJ+aDb1dSkA=
 github.com/pokt-network/poktroll v0.1.35 h1:JdJYY9y5Uotko5IFBdptOegntXY+ez79zzJBlhMqvh8=
 github.com/pokt-network/poktroll v0.1.35/go.mod h1:cH4r4HaR1treTgNaFR1gJVRrODkFID9RM78NT7W3G/Y=
 github.com/pokt-network/ring-go v0.2.0 h1:jXF/SOS8DgRfCCJBKXket5dBkTTqMDxplX+EnE4+aNU=
@@ -834,6 +836,10 @@ github.com/pokt-network/shannon-sdk v0.0.0-20260812141256-a508808fbbe0 h1:++QTUC
 github.com/pokt-network/shannon-sdk v0.0.0-20260812141256-a508808fbbe0/go.mod h1:YoFQsznZEk/ofl+sQt68jjGpUrkkAkFVSpINBNAyUVo=
 github.com/pokt-network/shannon-sdk v0.0.0-20260910074948-31b7e437f1b8 h1:7oQ7jbCwChdFXs9mxqIdo2t9Y+eF5O52aTb4UDtN6qc=
 github.com/pokt-network/shannon-sdk v0.0.0-20260910074948-31b7e437f1b8/go.mod h1:aCLuGeQQG5LkEfORMEcdF+d0apmHEAF7VKY21VH1NfU=
+github.com/pokt-network/shannon-sdk v0.0.0-20260910080629-b10dc059868e h1:PMnobk40tQsFerb45aXBcp9u7M5OTiKE1vT8piCOguE=
+github.com/pokt-network/shannon-sdk v0.0.0-20260910080629-b10dc059868e/go.mod h1:UCeLu4O87Ol8lZZVN6h2GP3PDMu0tYzbBs0hJ4Ccy/A=
+github.com/pokt-network/shannon-sdk v0.0.0-20260910080906-b1ba68f94c6e h1:RTSNGnWG3qvV1Vi7YdlT4MFPFRbav5tkh7ursonx7a8=
+github.com/pokt-network/shannon-sdk v0.0.0-20260910080906-b1ba68f94c6e/go.mod h1:UCeLu4O87Ol8lZZVN6h2GP3PDMu0tYzbBs0hJ4Ccy/A=
 github.com/pokt-network/smt v0.14.1 h1:q8pZCo01RY+kzGurRcHArSGGEV3UhBywUZnbVn9nDM8=
 github.com/pokt-network/smt v0.14.1/go.mod h1:TehzlxITd3EqLzo428VY0QID7Ajdn7QJP4ZzdPiYbZE=
 github.com/pokt-network/smt/kvstore/pebble v0.0.0-20240822175047-21ea8639c188 h1:QK1WmFKQ/OzNVob/br55Brh+EFbWhcdq41WGC8UMihM=

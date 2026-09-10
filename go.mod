@@ -28,7 +28,7 @@ require (
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/pokt-network/poktroll v0.1.35
 	github.com/pokt-network/ring-go v0.2.0
-	github.com/pokt-network/shannon-sdk v0.0.0-20260910074948-31b7e437f1b8
+	github.com/pokt-network/shannon-sdk v0.0.0-20260910080906-b1ba68f94c6e
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.19.0
@@ -243,7 +243,7 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/pokt-network/go-dleq v0.0.0-20250925202155-488f42ad642a // indirect
+	github.com/pokt-network/go-dleq v0.0.0-20260910080229-86b20e4865eb // indirect
 	github.com/pokt-network/smt v0.14.1 // indirect
 	github.com/pokt-network/smt/kvstore/pebble v0.0.0-20240822175047-21ea8639c188 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
