@@ -21,8 +21,8 @@ type ringCacheKey struct {
 }
 
 // signer wraps an SDK signer for signing relay requests.
-// The sdkSigner is created once and reused across requests to benefit from
-// SignerContext caching, which pre-computes expensive cryptographic operations.
+// The sdkSigner is reused across requests to benefit from SignerContext caching,
+// which pre-computes expensive cryptographic operations.
 //
 // Ring caching: We cache *ring.Ring instances by (appAddress, sessionEndHeight) because:
 // - The SDK's SignerContext cache is keyed by ring pointer
@@ -31,7 +31,22 @@ type ringCacheKey struct {
 // - By caching the ring pointer per session, SignerContext cache hits work properly
 type signer struct {
 	accountClient sdk.AccountClient
-	sdkSigner     *sdk.Signer
+
+	// sdkSigner is held behind an atomic pointer because rollover REPLACES it rather
+	// than mutating it.
+	//
+	// The SDK's only cache-eviction method is ClearSignerContextCache, which does
+	// `s.signerContextCache = sync.Map{}` — a multi-word, unsynchronized assignment over
+	// a map that concurrent signers are calling Load on. That is a genuine data race:
+	// a reader can observe the new map's keyHash together with the old map's nil root
+	// and dereference it. Seen in production as a SIGSEGV in
+	// internal/sync.(*HashTrieMap).Load, reached from the hedge path — hedging doubles
+	// the concurrent signing rate, which is what makes the window reachable.
+	//
+	// Swapping the whole Signer is race-free by construction: each signer observes one
+	// immutable Signer for the duration of its call, and the replaced one is collected
+	// once its in-flight users finish. Do NOT reintroduce ClearSignerContextCache here.
+	sdkSigner atomic.Pointer[sdk.Signer]
 
 	// ringCache caches *ring.Ring instances by (appAddress, sessionEndHeight).
 	// This ensures the same ring pointer is reused within a session,
@@ -53,10 +68,9 @@ func newSigner(accountClient sdk.AccountClient, privateKeyHex string) (*signer, 
 	if err != nil {
 		return nil, fmt.Errorf("newSigner: error creating SDK signer: %w", err)
 	}
-	return &signer{
-		accountClient: accountClient,
-		sdkSigner:     sdkSigner,
-	}, nil
+	s := &signer{accountClient: accountClient}
+	s.sdkSigner.Store(sdkSigner)
+	return s, nil
 }
 
 // SignRelayRequest signs the relay request using the application's ring signature.
@@ -75,7 +89,7 @@ func (s *signer) SignRelayRequest(req *servicetypes.RelayRequest, app apptypes.A
 	// SignOffChainWithRing uses ring-go's hash-cache fast path — safe here because
 	// PATH relay signing is off-chain (not consensus-critical). The deterministic
 	// Signer.Sign path is intentionally not used on this hot path.
-	req, err = s.sdkSigner.SignOffChainWithRing(context.Background(), req, appRing)
+	req, err = s.sdkSigner.Load().SignOffChainWithRing(context.Background(), req, appRing)
 	if err != nil {
 		return nil, fmt.Errorf("SignRequest: error signing relay request: %w", err)
 	}
@@ -164,7 +178,22 @@ func (s *signer) evictStaleRingsOnRollover(sessionEndHeight uint64) {
 		return true
 	})
 
-	// Release the SDK's per-ring SignerContexts. Only a full clear is exposed;
-	// rings kept in ringCache rebuild their context on next sign.
-	s.sdkSigner.ClearSignerContextCache()
+	// Release the SDK's per-ring SignerContexts by replacing the Signer outright.
+	//
+	// ClearSignerContextCache would be the obvious call and is unsafe: it assigns a
+	// fresh sync.Map over one that concurrent signers are reading (see sdkSigner).
+	// A pointer swap publishes the new Signer atomically, so an in-flight sign keeps
+	// using the Signer it loaded and the old one is collected when it finishes.
+	//
+	// Rebuilding re-derives the key scalar from the retained hex. That is once per
+	// session rollover (~20 min), against a signing path that runs thousands of times
+	// a second, so the cost is irrelevant next to the race it removes.
+	prev := s.sdkSigner.Load()
+	fresh, err := sdk.NewSignerFromHex(prev.PrivateKeyHex)
+	if err != nil {
+		// Keep the existing Signer: a stale-but-working cache is strictly better than
+		// no signer. The cache stays bounded by the next successful rollover.
+		return
+	}
+	s.sdkSigner.Store(fresh)
 }

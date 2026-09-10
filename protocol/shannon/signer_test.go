@@ -20,7 +20,9 @@ func newTestSigner(t *testing.T) *signer {
 	if err != nil {
 		t.Fatalf("NewSignerFromHex: %v", err)
 	}
-	return &signer{sdkSigner: sdkSigner}
+	s := &signer{}
+	s.sdkSigner.Store(sdkSigner)
+	return s
 }
 
 func (s *signer) putTestRing(sessionEndHeight uint64) {
